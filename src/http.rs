@@ -5,6 +5,8 @@ use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
 use crate::adapters::responses_to_chat;
+use crate::client_auth::ClientAuthOutcome;
+use crate::client_auth::ClientIdentity;
 use crate::dashboard_api::dashboard_catalog;
 use crate::dashboard_api::dashboard_flow_detail;
 use crate::dashboard_api::dashboard_flows;
@@ -31,6 +33,10 @@ use crate::models::anthropic::AnthropicThinking;
 use crate::models::chat::ChatCompletionRequest;
 use crate::models::chat::normalize_stop;
 use crate::models::responses::ResponsesRequest;
+use crate::persistent_history_api::history_metrics;
+use crate::persistent_history_api::history_request_detail;
+use crate::persistent_history_api::history_requests;
+use crate::persistent_history_api::history_usage;
 use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
 use crate::upstream::BackendChatRequest;
@@ -194,6 +200,13 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
+        .route("/dashboard/api/history/requests", get(history_requests))
+        .route(
+            "/dashboard/api/history/requests/{id}",
+            get(history_request_detail),
+        )
+        .route("/dashboard/api/history/usage", get(history_usage))
+        .route("/dashboard/api/history/metrics", get(history_metrics))
         .route_layer(middleware::map_response(dashboard_api_no_store));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
@@ -339,6 +352,71 @@ fn is_flow_capture_request(method: &axum::http::Method, path: &str) -> bool {
         )
 }
 
+fn is_authenticated_client_api_request(method: &axum::http::Method, path: &str) -> bool {
+    (path == "/v1" || path.starts_with("/v1/"))
+        && !(path == "/v1/messages"
+            && matches!(
+                *method,
+                axum::http::Method::HEAD | axum::http::Method::OPTIONS
+            ))
+}
+
+fn client_auth_error(
+    path: &str,
+    anthropic_surface: bool,
+    status: StatusCode,
+    message: &'static str,
+) -> Response {
+    let error_type = if status == StatusCode::UNAUTHORIZED {
+        "authentication_error"
+    } else {
+        "permission_error"
+    };
+    if anthropic_surface || matches!(path, "/v1/messages" | "/v1/messages/count_tokens") {
+        return (
+            status,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": { "type": error_type, "message": message }
+            })),
+        )
+            .into_response();
+    }
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": message, "type": error_type }
+        })),
+    )
+        .into_response()
+}
+
+fn unknown_model_error(anthropic_surface: bool) -> Response {
+    if anthropic_surface {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "not_found_error",
+                    "message": "requested model is not configured"
+                }
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": {
+                "message": "requested model is not configured",
+                "type": "invalid_request_error"
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// Whether `path` is a dashboard auth endpoint whose request body carries the
 /// session secret (the login `{"token": ...}`; logout is bodyless but symmetric).
 /// D7a R2 #1: the bare JSON key `token` is NOT in the global sensitive-key set
@@ -464,6 +542,27 @@ async fn log_api_call(
     let uri = request.uri().clone();
     let headers = request.headers().clone();
     let started_at = Instant::now();
+    let anthropic_surface =
+        headers.contains_key("anthropic-version") || headers.contains_key("anthropic-beta");
+
+    // Authenticate client-facing calls before buffering or logging their body.
+    // Dashboard/session authentication remains a separate env-only layer.
+    let client_identity = if is_authenticated_client_api_request(&method, uri.path()) {
+        match gateway.client_auth().authenticate_headers(&headers) {
+            ClientAuthOutcome::Authenticated(identity) => Some(identity),
+            ClientAuthOutcome::Open => None,
+            ClientAuthOutcome::Rejected => {
+                return client_auth_error(
+                    uri.path(),
+                    anthropic_surface,
+                    StatusCode::UNAUTHORIZED,
+                    "missing or invalid API key",
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     // The configurable inbound body cap (default 10 MiB), read from the gateway
     // config — the SAME value `build_router` hands `DefaultBodyLimit::max`, so the
@@ -577,6 +676,120 @@ async fn log_api_call(
         parts.headers.insert(header::CONTENT_LENGTH, len);
     }
 
+    // Parse once for the existing authorization/logging surfaces. Large
+    // inference bodies move this CPU-bound JSON walk to the blocking pool and
+    // return a right-sized redacted copy for durable ingress, so persistence
+    // never adds another 10 MiB scan on the Tokio worker.
+    let instrument = is_flow_capture_request(&method, uri.path());
+    let persistence_requested = instrument && gateway.persistence_enabled();
+    let persistence_inbound = if persistence_requested {
+        Some(offload_persistence_inbound(body_bytes.clone()).await)
+    } else {
+        None
+    };
+    // Authorize the client-facing name before any profile, alias, or backend
+    // rewrite. Invalid JSON remains the protocol handler's responsibility.
+    let body_is_json = persistence_inbound.as_ref().map_or_else(
+        || serde_json::from_slice::<Value>(&body_bytes).is_ok(),
+        |body| body.valid_json,
+    );
+    let requested_model = match &persistence_inbound {
+        Some(body) => body.model.clone(),
+        None => serde_json::from_slice::<Value>(&body_bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+    };
+    if method == axum::http::Method::POST
+        && is_client_api_path_with_model(uri.path())
+        && gateway
+            .validate_operational_model(requested_model.as_deref().unwrap_or_default())
+            .is_err()
+    {
+        return unknown_model_error(anthropic_surface);
+    }
+    if let Some(identity) = &client_identity
+        && !identity.allowed_models().is_empty()
+    {
+        match requested_model.as_deref() {
+            Some(model) if identity.allows_model(model) => {}
+            Some(_) => {
+                return client_auth_error(
+                    uri.path(),
+                    anthropic_surface,
+                    StatusCode::FORBIDDEN,
+                    "API key is not authorized for the requested model",
+                );
+            }
+            None if method == axum::http::Method::POST => {
+                return client_auth_error(
+                    uri.path(),
+                    anthropic_surface,
+                    StatusCode::FORBIDDEN,
+                    "a model is required for a model-scoped API key",
+                );
+            }
+            None => {}
+        }
+    }
+
+    // Durable persistence has its own gate on the same three inference routes.
+    // It remains active with both the dashboard FlowStore and disk turn capture
+    // disabled. Begin + inbound are queued only after authentication, bounded
+    // body collection, and model authorization have all succeeded.
+    let persistence_gate = instrument && body_is_json && gateway.persistence_enabled();
+    let persistence_capture = if persistence_gate {
+        let queue = gateway
+            .persistence_queue()
+            .expect("persistence_enabled implies a queue")
+            .clone();
+        let client_model = requested_model.as_deref().unwrap_or_default();
+        let conversation_id = headers
+            .get(gateway.conversation_id_header())
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let row = crate::flow_persistence::begin_request(
+            crate::flow_persistence::BeginPersistenceInput {
+                api_call_id: &api_call_id,
+                conversation_id,
+                virtual_key_id: client_identity
+                    .as_ref()
+                    .map(|identity| identity.key_id.as_str()),
+                client_protocol: crate::flow_persistence::client_protocol_for_path(uri.path())
+                    .expect("instrumented paths have a protocol"),
+                client_model,
+                alias: gateway.operational_alias(client_model),
+                created_at_ms: epoch_millis(),
+            },
+        );
+        let _ = queue.try_begin(row);
+        let inbound = persistence_inbound
+            .as_ref()
+            .expect("persistence gate has inbound capture");
+        let inbound = crate::flow_persistence::redacted_request_payload_event(
+            &api_call_id,
+            crate::flow_persistence::PayloadSection::InboundRequest,
+            epoch_millis(),
+            body_bytes.len(),
+            &inbound.redacted,
+            inbound.partial,
+        );
+        let _ = queue.try_event(inbound);
+        let capture = crate::flow_persistence::PersistenceCapture::new(queue, &api_call_id);
+        parts.extensions.insert(Arc::clone(&capture));
+        Some(capture)
+    } else {
+        None
+    };
+    if let Some(identity) = client_identity {
+        parts.extensions.insert(identity);
+    }
+
     // D7a R3 #1: for a dashboard auth endpoint (login/logout) NO body-derived
     // field may be logged — a `body_sha256` + `body_bytes` length on the login
     // body is an offline token-verification oracle. `body_log_fields` returns
@@ -634,7 +847,6 @@ async fn log_api_call(
     // Shared "instrument this request?" predicate (POST + whitelisted inference
     // path). Both the dashboard FlowStore gate and the F1 turn-capture gate hang
     // off it, so a HEAD/OPTIONS probe or a non-whitelisted path opens neither.
-    let instrument = is_flow_capture_request(&method, uri.path());
     // D1: dashboard FlowStore capture is gated on the debug UI (`flow_store()` is
     // `disabled()` off `--with-debug-ui`).
     let flow_gate = instrument && gateway.flow_store().is_enabled();
@@ -647,7 +859,7 @@ async fn log_api_call(
     // The `api_call_id` extension the engine reads to link `response_id →
     // api_call_id` (D1) and to reach the per-turn capture state (F1c) is inserted
     // ONCE if EITHER gate wants it — never double-inserted when both fire.
-    if flow_gate || capture_gate {
+    if flow_gate || capture_gate || persistence_gate {
         parts
             .extensions
             .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
@@ -736,6 +948,12 @@ async fn log_api_call(
 
     let request = Request::from_parts(parts, Body::from(body_bytes));
     let response = next.run(request).await;
+    if let Some(capture) = &persistence_capture {
+        // If an extractor/adapter rejected before the engine claimed the turn,
+        // close the two absent upstream hops as partial and terminate the row.
+        // Engine-owned turns make this an atomic no-op.
+        capture.finish_unclaimed(response.status().as_u16());
+    }
     // F1b served-body tee (spec Design #4): wrap the outbound response `Body` so
     // every served byte — streaming SSE, non-streaming JSON, or a handler error
     // body — is copied to the `served_response` section; its `Drop` marks
@@ -745,9 +963,10 @@ async fn log_api_call(
     // POST-gate error response (an engine error, a `Reject`, any 4xx/5xx minted
     // after the gate inserted the `ApiCallId` extension) is teed too — only the
     // PRE-body-read 413/400 rejections above (no turn minted) are out of scope.
-    let response = match turn_capture_state {
-        Some(state) => tee_served_body(response, state),
-        None => response,
+    let response = if turn_capture_state.is_some() || persistence_capture.is_some() {
+        tee_served_body(response, turn_capture_state, persistence_capture)
+    } else {
+        response
     };
     // Per-request model-resolution audit: the handler tags the response with the
     // served model (and the requested model when it differs) via
@@ -767,6 +986,17 @@ async fn log_api_call(
         "inbound API response prepared"
     );
     response
+}
+
+fn is_client_api_path_with_model(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/responses"
+            | "/v1/messages"
+            | "/v1/messages/count_tokens"
+            | "/v1/chat/completions"
+            | "/v1/completions"
+    )
 }
 
 async fn api_not_found() -> Response {
@@ -894,10 +1124,18 @@ fn redacted_inbound_section(body: &[u8]) -> (Option<String>, Vec<u8>) {
             (model, bytes)
         }
         Err(_) => {
-            // Non-JSON body: still strip image URIs from the raw text so a
-            // `data:`/signed URL in a malformed/odd payload is not captured raw.
-            let redacted = crate::redaction::redact_image_uris(&String::from_utf8_lossy(body));
-            (None, redacted.into_bytes())
+            // A malformed payload has no trustworthy key boundaries, so image-
+            // only redaction could retain an unterminated `api_key` value. The
+            // shared capped redactor emits a fixed marker for malformed/non-UTF8
+            // input and retains none of the source bytes.
+            (
+                None,
+                crate::redaction::capture_capped_redacted(
+                    body,
+                    crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
+                    4 * 1024,
+                ),
+            )
         }
     }
 }
@@ -944,6 +1182,76 @@ async fn offload_redacted_inbound_section(body: Bytes) -> (Option<String>, Vec<u
                 b"<turn-capture: inbound redaction task failed>".to_vec(),
                 true,
             )
+        }
+    }
+}
+
+struct PersistenceInbound {
+    valid_json: bool,
+    model: Option<String>,
+    redacted: Vec<u8>,
+    partial: bool,
+}
+
+/// Persistence ingress shares the turn-capture redactor, but hard-caps the
+/// retained section. Large bodies are copied into a right-sized `Vec` and parsed
+/// on the blocking pool; no `Bytes` clone can pin the middleware allocation.
+async fn offload_persistence_inbound(body: Bytes) -> PersistenceInbound {
+    if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
+        let valid_json = serde_json::from_slice::<Value>(&body).is_ok();
+        let (model, mut redacted) = redacted_inbound_section(&body);
+        redacted.truncate(crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES);
+        return PersistenceInbound {
+            valid_json,
+            model,
+            redacted,
+            partial: false,
+        };
+    }
+
+    let owned = body.to_vec();
+    drop(body);
+    match tokio::task::spawn_blocking(move || {
+        // Establish validity and extract `model` in one parse. The durable body
+        // preview then uses the shared streaming redactor directly over the owned
+        // bytes: it retains at most the event cap and never materializes a second
+        // full redacted `Value`/serialization. Both O(body) scans stay off Tokio.
+        let parsed = serde_json::from_slice::<Value>(&owned);
+        let (valid_json, model) = match parsed {
+            Ok(value) => {
+                let model = value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                (true, model)
+            }
+            Err(_) => (false, None),
+        };
+        let redacted = crate::redaction::capture_capped_redacted(
+            &owned,
+            crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
+            4 * 1024,
+        );
+        PersistenceInbound {
+            valid_json,
+            model,
+            redacted,
+            partial: false,
+        }
+    })
+    .await
+    {
+        Ok(capture) => capture,
+        Err(err) => {
+            tracing::warn!(error = %err, "persistence inbound redaction task failed");
+            PersistenceInbound {
+                // A detached/panicked parse cannot establish valid JSON. Do not
+                // open a durable row that the typed extractor may never claim.
+                valid_json: false,
+                model: None,
+                redacted: b"[redacted: persistence inbound task failed]".to_vec(),
+                partial: true,
+            }
         }
     }
 }
@@ -1389,13 +1697,18 @@ fn json_type(value: &Value) -> &'static str {
 async fn post_responses(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
+    persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let served = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
     let stream = gateway
-        .stream_responses_with_api_call_id(request, api_call_id.map(|extension| extension.0.0))
+        .stream_responses_with_capture(
+            request,
+            api_call_id.map(|extension| extension.0.0),
+            persistence.map(|extension| extension.0),
+        )
         .await?;
     let response = if wants_stream {
         stream_responses_response(stream)
@@ -1585,10 +1898,18 @@ async fn send_responses_ws_error(
 async fn post_messages(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
+    persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
     let api_call_id = api_call_id.map(|extension| extension.0.0);
-    match handle_post_messages(gateway, request, api_call_id).await {
+    match handle_post_messages(
+        gateway,
+        request,
+        api_call_id,
+        persistence.map(|extension| extension.0),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(err) => anthropic_error_response(err),
     }
@@ -1623,9 +1944,7 @@ async fn handle_count_tokens(
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
-    let roles = gateway
-        .config()
-        .resolve_roles_config_for_resolved_model(&original_model, &resolved_model);
+    let roles = gateway.roles_for_request(&original_model, &resolved_model);
     let lowered = responses_to_chat::lower_request_with_image_agent_and_roles(
         &responses_request,
         Vec::new(),
@@ -1682,6 +2001,7 @@ async fn handle_count_tokens(
 async fn post_chat_completions(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
+    persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
@@ -1693,9 +2013,10 @@ async fn post_chat_completions(
         .is_some_and(|options| options.include_usage);
     let responses_request = chat_completions::convert_request(request)?;
     let stream = gateway
-        .stream_responses_with_api_call_id(
+        .stream_responses_with_capture(
             responses_request,
             api_call_id.map(|extension| extension.0.0),
+            persistence.map(|extension| extension.0),
         )
         .await?;
 
@@ -1723,6 +2044,7 @@ async fn handle_post_messages(
     gateway: Arc<Gateway>,
     request: AnthropicRequest,
     api_call_id: Option<String>,
+    persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
@@ -1733,7 +2055,7 @@ async fn handle_post_messages(
     );
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let stream = gateway
-        .stream_responses_with_api_call_id(responses_request, api_call_id)
+        .stream_responses_with_capture(responses_request, api_call_id, persistence)
         .await?;
 
     let response = if wants_stream {
@@ -1786,7 +2108,8 @@ fn with_model_headers(mut response: Response, requested: &str, served: &str) -> 
 /// client-facing stream itself still ended cleanly.
 struct TeeBody {
     inner: Body,
-    state: Arc<crate::turn_capture::TurnCaptureState>,
+    state: Option<Arc<crate::turn_capture::TurnCaptureState>>,
+    persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
     /// Back-pressured sink into the `served_response` section's BOUNDED writer
     /// channel (F1b review #1). `None` once the writer is gone (a section write
     /// error closed the channel) — capture then stops but the served stream
@@ -1832,7 +2155,9 @@ impl http_body::Body for TeeBody {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(_)) => {
                     this.served_sink = None;
-                    this.state.mark_served_degraded();
+                    if let Some(state) = &this.state {
+                        state.mark_served_degraded();
+                    }
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -1852,7 +2177,12 @@ impl http_body::Body for TeeBody {
                         && sink.send(data.to_vec()).is_err()
                     {
                         this.served_sink = None;
-                        this.state.mark_served_degraded();
+                        if let Some(state) = &this.state {
+                            state.mark_served_degraded();
+                        }
+                    }
+                    if let Some(persistence) = &this.persistence {
+                        persistence.push_served_response(data);
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
@@ -1888,7 +2218,12 @@ impl Drop for TeeBody {
         // never be reported as a complete capture just because the client still
         // saw a clean end.
         let clean = self.clean_eos || self.exact_len.is_some_and(|len| self.forwarded >= len);
-        self.state.served_done(!clean);
+        if let Some(state) = &self.state {
+            state.served_done(!clean);
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.finish_served_response(!clean);
+        }
     }
 }
 
@@ -1898,7 +2233,8 @@ impl Drop for TeeBody {
 /// response keeps its `Content-Length` and framing.
 fn tee_served_body(
     response: Response,
-    state: Arc<crate::turn_capture::TurnCaptureState>,
+    state: Option<Arc<crate::turn_capture::TurnCaptureState>>,
+    persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let exact_len = http_body::Body::size_hint(&body).exact();
@@ -1908,12 +2244,15 @@ fn tee_served_body(
     // `served_done`; the backstop stays inert. Only a pre-tee unwind (this never
     // runs) leaves the flag false, so the backstop fires `served_done` to resolve the
     // barrier instead of leaking the turn.
-    state.mark_served_tee_installed();
+    if let Some(state) = &state {
+        state.mark_served_tee_installed();
+    }
     // Take the back-pressured served sink BEFORE moving `state` into the tee.
-    let served_sink = state.served_sink();
+    let served_sink = state.as_ref().and_then(|state| state.served_sink());
     let tee = TeeBody {
         inner: body,
         state,
+        persistence,
         served_sink,
         clean_eos: false,
         forwarded: 0,
@@ -2183,10 +2522,23 @@ async fn get_models(
     headers: HeaderMap,
     Query(query): Query<ModelsListQuery>,
     State(gateway): State<Arc<Gateway>>,
+    identity: Option<Extension<ClientIdentity>>,
 ) -> AppResult<Response> {
     let anthropic_models = is_anthropic_models_request(&headers);
     let response = gateway.upstream_client().list_models().await?;
-    let (status, body, etag) = collect_models_response(response).await?;
+    let (status, body, mut etag) = collect_models_response(response).await?;
+    let body = if let Some(Extension(identity)) = identity {
+        if identity.allowed_models().is_empty() {
+            body
+        } else {
+            // The upstream ETag describes the unfiltered catalog, not this
+            // key-specific view, so it cannot be shared across auth scopes.
+            etag = None;
+            filter_models_for_identity(body, &identity)
+        }
+    } else {
+        body
+    };
     let body = if anthropic_models {
         transform_models_response_for_anthropic(body, &query, gateway.config())?
     } else {
@@ -2201,6 +2553,31 @@ async fn get_models(
         );
     }
     Ok((status, headers, Json(body)).into_response())
+}
+
+fn filter_models_for_identity(mut body: Value, identity: &ClientIdentity) -> Value {
+    fn retain_allowed(entries: &mut Vec<Value>, identity: &ClientIdentity) {
+        entries.retain(|entry| {
+            entry
+                .as_str()
+                .or_else(|| entry.get("id").and_then(Value::as_str))
+                .is_some_and(|id| identity.allows_model(id))
+        });
+    }
+
+    match &mut body {
+        Value::Array(entries) => retain_allowed(entries, identity),
+        Value::Object(map) => {
+            if let Some(entries) = map.get_mut("data").and_then(Value::as_array_mut) {
+                retain_allowed(entries, identity);
+            }
+            if let Some(entries) = map.get_mut("models").and_then(Value::as_array_mut) {
+                retain_allowed(entries, identity);
+            }
+        }
+        _ => {}
+    }
+    body
 }
 
 fn is_anthropic_models_request(headers: &HeaderMap) -> bool {
@@ -2561,6 +2938,42 @@ mod tests {
         assert!(
             observer.try_into_mut().is_ok(),
             "offload retained no clone of the inbound Bytes backing"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_inbound_large_body_is_bounded_and_does_not_pin_bytes() {
+        let body = Bytes::from(format!(
+            r#"{{"model":"large-model","api_key":"sk-large-secret","input":"{}"}}"#,
+            "x".repeat(2 * 1024 * 1024)
+        ));
+        let observer = body.clone();
+        let capture = super::offload_persistence_inbound(body).await;
+        assert!(capture.valid_json);
+        assert_eq!(capture.model.as_deref(), Some("large-model"));
+        assert!(!capture.partial);
+        assert!(
+            capture.redacted.len() <= crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
+            "persistence retains only the configured preview cap"
+        );
+        let text = String::from_utf8(capture.redacted).unwrap();
+        assert!(!text.contains("sk-large-secret"));
+        assert!(
+            observer.try_into_mut().is_ok(),
+            "offload pins no Bytes clone"
+        );
+    }
+
+    #[test]
+    fn malformed_inbound_never_retains_unterminated_secret() {
+        let malformed = br#"{"api_key":"super-secret-without-a-close"#;
+        let (model, captured) = super::redacted_inbound_section(malformed);
+        assert!(model.is_none());
+        let captured = String::from_utf8(captured).unwrap();
+        assert!(!captured.contains("super-secret"));
+        assert_eq!(
+            captured,
+            format!("[redacted: unparseable body {} bytes]", malformed.len())
         );
     }
 

@@ -133,6 +133,17 @@ type UnknownToolCounterKey = (String, String, UnknownToolOutcome);
 #[derive(Clone)]
 pub struct Gateway {
     config: Config,
+    /// Client-facing `/v1/*` virtual-key authentication. This is deliberately
+    /// separate from env-only dashboard session authentication.
+    client_auth: crate::client_auth::ClientAuth,
+    /// Inbound header used to group durable request rows into conversations.
+    /// This is request attribution only; it is not forwarded upstream.
+    conversation_id_header: String,
+    /// Exact operational alias -> primary profile mapping. Alias dispatch stays
+    /// in the upstream routing stack; this map prevents pre-normalization from
+    /// collapsing the alias and selects its request-level profile policy.
+    operational_alias_profiles: BTreeMap<String, String>,
+    operational_unknown_model_policy: crate::control_plane::UnknownModelPolicy,
     replay_store: ReplayStore,
     upstream: Arc<dyn UpstreamClient>,
     search: Arc<dyn SearchClient>,
@@ -174,6 +185,13 @@ pub struct Gateway {
     /// keyed only on `config.turn_capture_dir` (spec Design overview #1 --
     /// its own instrumentation gate, independent of the debug UI).
     turn_capture: crate::turn_capture::TurnCapture,
+    /// Bounded, nonblocking terminal/event writer used by the inference hot path.
+    /// `None` keeps persistence at zero overhead. Kept separate from the read/admin
+    /// store so an inference request can never await a database operation.
+    persistence_queue: Option<crate::control_plane_store::PersistenceQueue>,
+    /// Durable store handle for admin/history reads only. Inference writes use
+    /// `persistence_queue` above; request execution never awaits this trait object.
+    persistence_store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
     /// D6 AbortHub: the live-cancellation registry keyed by `api_call_id`, so the
     /// dashboard kill route can cancel a stuck server-side stream. Gated identically to
     /// the FlowStore (enabled iff `flow_store.is_enabled()`), because the D3 L1 guard —
@@ -702,6 +720,11 @@ impl Gateway {
         };
         Self {
             config,
+            client_auth: crate::client_auth::ClientAuth::open(),
+            conversation_id_header: crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER
+                .to_string(),
+            operational_alias_profiles: BTreeMap::new(),
+            operational_unknown_model_policy: crate::control_plane::UnknownModelPolicy::Passthrough,
             replay_store,
             upstream,
             search,
@@ -721,10 +744,93 @@ impl Gateway {
             // enabled sink via `with_turn_capture` when `turn_capture_dir` is
             // configured -- independent of `--with-debug-ui`.
             turn_capture: crate::turn_capture::TurnCapture::disabled(),
+            persistence_queue: None,
+            persistence_store: None,
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
         }
+    }
+
+    /// Attach the hot-swappable virtual-key registry used by client-facing
+    /// `/v1/*` routes. Existing embedders remain open by default.
+    pub fn with_client_auth(mut self, client_auth: crate::client_auth::ClientAuth) -> Self {
+        self.client_auth = client_auth;
+        self
+    }
+
+    pub fn client_auth(&self) -> &crate::client_auth::ClientAuth {
+        &self.client_auth
+    }
+
+    pub fn with_conversation_id_header(mut self, header: impl Into<String>) -> Self {
+        let header = header.into();
+        let header = header.trim();
+        self.conversation_id_header = if header.is_empty() {
+            crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER.to_string()
+        } else {
+            header.to_string()
+        };
+        self
+    }
+
+    pub fn conversation_id_header(&self) -> &str {
+        &self.conversation_id_header
+    }
+
+    pub fn with_operational_models(
+        mut self,
+        aliases: impl IntoIterator<Item = (String, String)>,
+        unknown_model_policy: crate::control_plane::UnknownModelPolicy,
+    ) -> Self {
+        self.operational_alias_profiles = aliases.into_iter().collect();
+        self.operational_unknown_model_policy = unknown_model_policy;
+        self
+    }
+
+    pub fn validate_operational_model(&self, model: &str) -> Result<(), &'static str> {
+        if self.operational_unknown_model_policy != crate::control_plane::UnknownModelPolicy::Reject
+            || self
+                .operational_alias_profiles
+                .keys()
+                .any(|alias| alias.eq_ignore_ascii_case(model.trim()))
+            || self
+                .config
+                .model_profiles
+                .keys()
+                .any(|profile| profile.eq_ignore_ascii_case(model.trim()))
+            || self.config.matches_model_route(model)
+        {
+            Ok(())
+        } else {
+            Err("requested model is not configured")
+        }
+    }
+
+    /// Canonical configured alias for a case-insensitive client model match.
+    pub fn operational_alias<'a>(&'a self, model: &str) -> Option<&'a str> {
+        self.operational_alias_profiles
+            .keys()
+            .find(|alias| alias.eq_ignore_ascii_case(model.trim()))
+            .map(String::as_str)
+    }
+
+    fn operational_profile_for<'a>(&'a self, model: &'a str) -> &'a str {
+        self.operational_alias_profiles
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(model.trim()))
+            .map_or(model, |(_, profile)| profile.as_str())
+    }
+
+    pub fn roles_for_request(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+    ) -> Option<&crate::config::RolesConfig> {
+        self.config.resolve_roles_config_for_resolved_model(
+            self.operational_profile_for(request_model),
+            resolved_model,
+        )
     }
 
     /// E1: record one unknown-tool-call outcome into the bounded always-on
@@ -794,6 +900,40 @@ impl Gateway {
     /// no-op (no thread, no alloc, no fs). Independent of the debug UI.
     pub fn turn_capture(&self) -> &crate::turn_capture::TurnCapture {
         &self.turn_capture
+    }
+
+    /// Attach the bounded hot-path persistence writer. The queue's `try_*`
+    /// methods are the only persistence operations inference code may call.
+    pub fn with_persistence_queue(
+        mut self,
+        queue: crate::control_plane_store::PersistenceQueue,
+    ) -> Self {
+        self.persistence_queue = Some(queue);
+        self
+    }
+
+    pub fn persistence_queue(&self) -> Option<&crate::control_plane_store::PersistenceQueue> {
+        self.persistence_queue.as_ref()
+    }
+
+    pub fn persistence_enabled(&self) -> bool {
+        self.persistence_queue.is_some()
+    }
+
+    /// Attach the read/admin persistence handle. It is intentionally distinct
+    /// from the nonblocking writer queue and is never awaited by inference.
+    pub fn with_persistence_store(
+        mut self,
+        store: Arc<dyn crate::control_plane_store::PersistenceStore>,
+    ) -> Self {
+        self.persistence_store = Some(store);
+        self
+    }
+
+    pub fn persistence_store(
+        &self,
+    ) -> Option<Arc<dyn crate::control_plane_store::PersistenceStore>> {
+        self.persistence_store.clone()
     }
 
     /// D5: record a TERMINAL response into the metrics rings at the engine's D3
@@ -1001,7 +1141,16 @@ impl Gateway {
     /// `native_vision` override attaches ONLY when the request genuinely maps to
     /// the served backend (G4 round-8 #1).
     pub async fn resolve_request_model(&self, request_model: &str) -> (String, bool) {
-        let configured_model = self.config.resolve_upstream_model(request_model);
+        // Operational aliases own their provider/model rewrite in the routing
+        // layer. Preserve the canonical alias until that layer sees it; applying
+        // the top-level `upstream_model` remap first would erase the alias and
+        // silently dispatch the request through the ordinary primary provider.
+        // Non-operational models retain the existing profile -> global -> request
+        // resolution order unchanged.
+        let configured_model = self
+            .operational_alias(request_model)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.config.resolve_upstream_model(request_model));
         self.normalize_upstream_model(&configured_model).await
     }
 
@@ -1156,9 +1305,9 @@ impl Gateway {
     /// Public entry point: stream a canonical Responses request. Thin wrapper that
     /// delegates to [`stream_responses_with_api_call_id`](Self::stream_responses_with_api_call_id)
     /// with no `api_call_id`, so existing callers (tests, non-instrumented paths)
-    /// keep this exact signature. The HTTP handlers pass the `api_call_id` from the
-    /// request extension via the `_with_api_call_id` variant so the engine can
-    /// `flow_store.link(response_id, api_call_id)` (D1).
+    /// keep this exact signature. Direct callers may use `_with_api_call_id` for
+    /// dashboard telemetry; durable persistence is armed only by HTTP's explicit
+    /// crate-private capture capability after its begin + inbound-event seam.
     pub async fn stream_responses(
         self: Arc<Self>,
         request: ResponsesRequest,
@@ -1171,11 +1320,52 @@ impl Gateway {
         request: ResponsesRequest,
         api_call_id: Option<String>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_capture(request, api_call_id, None)
+            .await
+    }
+
+    pub(crate) async fn stream_responses_with_capture(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
         // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
         // telemetry guard built BELOW and every per-turn `BackendChatRequest` in
         // `run_turn` share the SAME `Arc` — the failover/routing layers tag
         // `{route, provider}` on it, and the guard reads that pair at finalize.
         let serving_token = Arc::new(crate::upstream::ServingToken::default());
+        // Durable persistence has its OWN request-scoped terminal guard. An explicit
+        // `PersistenceCapture` is the capability proving HTTP already enqueued Begin
+        // and fixed-seq inbound event 1. Never synthesize it from an arbitrary
+        // `api_call_id`: direct engine/dashboard callers must not create orphan event
+        // or terminal rows. Persistence-only production still works because HTTP
+        // passes this capability independently of the debug FlowStore.
+        let persistence_guard = api_call_id
+            .as_ref()
+            .zip(self.persistence_queue.as_ref())
+            .zip(persistence_capture)
+            .map(|((id, queue), capture)| {
+                debug_assert_eq!(capture.api_call_id(), id);
+                crate::flow_persistence::PersistenceTerminalGuard::new(
+                    queue.clone(),
+                    id.clone(),
+                    Arc::clone(&serving_token),
+                    capture,
+                )
+            });
+        let persistence_phases = persistence_guard
+            .as_ref()
+            .map(crate::flow_persistence::PersistenceTerminalGuard::phases);
+        let persistence_capture = persistence_guard
+            .as_ref()
+            .map(crate::flow_persistence::PersistenceTerminalGuard::capture);
+        // Mint the response id before any fallible pre-spawn work so even a
+        // validation/lowering failure can durably join it to the HTTP api_call_id.
+        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+        if let Some(guard) = &persistence_guard {
+            guard.set_response_id(&response_id);
+        }
         // D3 L1: claim the flow record (`OpenL0 → ClaimedL1`) BEFORE any pre-spawn
         // early return. A lowering/budget failure below finalizes the record
         // explicitly `Failed` (via `finalize_pre_spawn_err`) so it carries the right
@@ -1231,13 +1421,6 @@ impl Gateway {
         }
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
 
-        // D1/E2b: minted here rather than just before the `tokio::spawn` below
-        // (its only prior use) so the E2b residual-image-degrade monitor
-        // emission further down can key off the SAME id every other event for
-        // this turn uses. Pure reordering: nothing between here and the spawn
-        // reads or depends on this value.
-        let response_id = format!("resp_{}", Uuid::new_v4().simple());
-
         // G4/E2b: the resolved-backend native-vision decision, computed ONCE
         // and shared between G4 gating (`activate_image_agent`, which used to
         // recompute this itself) and the E2b residual-image pass below, so the
@@ -1266,10 +1449,11 @@ impl Gateway {
         // reason — NOT fall through to the `Drop` fallback's `Cancelled`. Helper to
         // finalize-then-return on the `?` paths without duplicating the guard plumbing.
         let finalize_pre_spawn_err = |err: AppError| -> AppError {
+            let error_detail = err.to_string();
             if let Some(guard) = &telemetry_guard {
                 guard.finalize(
                     crate::dashboard_flow::FlowStatus::Failed,
-                    Some(err.to_string()),
+                    Some(error_detail.clone()),
                 );
                 // D5: record the terminal into the metrics rings at the SAME seam as
                 // the finalize (co-located so a pre-spawn failure is counted exactly
@@ -1282,13 +1466,20 @@ impl Gateway {
                     guard.elapsed().as_millis(),
                 );
             }
+            if let Some(guard) = &persistence_guard {
+                guard.finalize(
+                    crate::flow_persistence::PersistenceOutcome::Failed,
+                    Some(err.code.as_deref().unwrap_or("gateway_error")),
+                    Some(&err.client_message),
+                );
+            }
             // F1c: a pre-spawn failure (bad request / lowering / budget) is always
             // `failed`. Record it on the capture guard so the artifact carries the
             // terminal reason; the served side is the error body the handler returns
             // (teed by the HTTP layer), so the both-`done` barrier still resolves and
             // writes a `status:"failed"` artifact — never a hang (AC-7). Idempotent.
             if let Some(guard) = &capture_guard {
-                guard.finalize("failed", Some(&err.to_string()));
+                guard.finalize("failed", Some(&error_detail));
             }
             err
         };
@@ -1381,6 +1572,9 @@ impl Gateway {
         // was threaded (the public wrapper / non-instrumented paths). Done after the
         // pre-spawn `?` paths above could have early-returned, but BEFORE lowering so
         // it reflects exactly what the engine hands to `lower_request_with_image_agent`.
+        if let Some(phases) = &persistence_phases {
+            phases.stamp_normalization_done();
+        }
         if self.flow_store().is_enabled()
             && let Some(api_call_id) = api_call_id.as_deref()
         {
@@ -1397,9 +1591,7 @@ impl Gateway {
         // a side-effect-free read, so computing them here is safe. Pass the image
         // agent flag so an injected/caller `analyzeImage` tool lowers as the
         // server-side ImageAnalysis kind (run by the gateway) on active turns.
-        let roles = self
-            .config
-            .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
+        let roles = self.roles_for_request(&request.model, &resolved_model);
         let lowered = lower_request_with_image_agent_and_roles(
             &tail_request,
             baseline_record
@@ -1457,7 +1649,7 @@ impl Gateway {
         // could not be resolved) and whose egress never reads the field
         // (Chat/Responses egress convert/strip it away -- see
         // `http.rs::responses_wire_event_data`, CR1.1). We cannot skip the
-        // compute for that combination: `stream_responses_with_api_call_id` is
+        // compute for that combination: `stream_responses_with_capture` is
         // the single funnel for all three egress surfaces (Anthropic/Chat/
         // Responses) and has no visibility into which one the caller
         // (`http.rs`, one layer up) will use to drain the returned stream --
@@ -1504,6 +1696,9 @@ impl Gateway {
         if let Some(api_call_id) = api_call_id.as_deref() {
             self.flow_store().stamp_routing_decision(api_call_id);
         }
+        if let Some(phases) = &persistence_phases {
+            phases.stamp_routing_decision();
+        }
         // Chat-message length of the replayed prefix (the baseline handed to
         // lowering above). Threaded into `run_turn` so its pre-send adjacency
         // merge is tail-scoped and never rewrites the cache-stable prefix.
@@ -1536,6 +1731,12 @@ impl Gateway {
                     // read by the guard at finalize) threaded onto every per-turn
                     // `BackendChatRequest`.
                     serving_token,
+                    // Durable timing is request-owned and survives a disabled/evicted
+                    // dashboard FlowStore. `None` when persistence is off.
+                    persistence_phases,
+                    // Bounded four-hop state shared with the concrete upstream
+                    // leaves. It is independent of disk turn capture.
+                    persistence_capture,
                     tx.clone(),
                     // D6: the flow's kill token, composed with every `tx.closed()`
                     // client-hangup check inside `run_turn` + its helpers.
@@ -1577,6 +1778,44 @@ impl Gateway {
                 // latency). No-op when the metrics layer is off. Runs AFTER
                 // `guard.finalize`, which assembled those inputs.
                 gateway.record_terminal_metrics(guard, status, guard.elapsed().as_millis());
+            }
+            // Durable terminal persistence shares this single typed-result choke
+            // point but does not depend on the dashboard guard. The request-owned
+            // guard atomically claims finalization, snapshots the ServingToken
+            // (usage + ordered attempts + wire TTFB), and calls only `try_finish`.
+            // Thus persistence-only production works with FlowStore disabled and
+            // cannot block or duplicate a terminal update.
+            if let Some(guard) = &persistence_guard {
+                match &result {
+                    Ok(TurnCompletion::Completed) => {
+                        guard.finalize(
+                            crate::flow_persistence::PersistenceOutcome::Completed,
+                            Some("response.completed"),
+                            None,
+                        );
+                    }
+                    Ok(TurnCompletion::Incomplete) => {
+                        guard.finalize(
+                            crate::flow_persistence::PersistenceOutcome::Incomplete,
+                            Some("response.incomplete"),
+                            None,
+                        );
+                    }
+                    Err(err) if err.is_cancelled() => {
+                        guard.finalize(
+                            crate::flow_persistence::PersistenceOutcome::Cancelled,
+                            Some("client_disconnected"),
+                            Some(&err.client_message),
+                        );
+                    }
+                    Err(err) => {
+                        guard.finalize(
+                            crate::flow_persistence::PersistenceOutcome::Failed,
+                            Some(err.code.as_deref().unwrap_or("gateway_error")),
+                            Some(&err.client_message),
+                        );
+                    }
+                }
             }
             // F1c: report the SAME engine terminal to the capture guard (status +
             // reason come from the engine seam ONLY, never the served tee). Idempotent
@@ -1632,10 +1871,10 @@ impl Gateway {
         mut request: ResponsesRequest,
         resolved_model: &str,
     ) -> ResponsesRequest {
-        let Some(prefix) = self
-            .config
-            .resolve_system_prompt_prefix_for_resolved_model(&request.model, resolved_model)
-        else {
+        let Some(prefix) = self.config.resolve_system_prompt_prefix_for_resolved_model(
+            self.operational_profile_for(&request.model),
+            resolved_model,
+        ) else {
             return request;
         };
         request.instructions = if request.instructions.is_empty() {
@@ -1822,7 +2061,7 @@ impl Gateway {
         response_format: Option<Value>,
         reasoning_effort: Option<String>,
         // C3: the pre-spawn G3 estimate (`estimate_input_tokens`) for THIS turn's
-        // lowered payload, computed once by the caller (`stream_responses_with_api_call_id`).
+        // lowered payload, computed once by the caller (`stream_responses_with_capture`).
         // Stamped onto `response.created` (`created_event`, below) so the Anthropic
         // streaming converter can seed a non-zero `message_start.usage.input_tokens`
         // instead of a hardcoded `0` — see that fn's doc comment for why the REAL
@@ -1839,13 +2078,17 @@ impl Gateway {
         // fires at the RequestStarted seam below.
         api_call_id: Option<String>,
         // D2/D3: the flow's shared serving token (allocated once in
-        // `stream_responses_with_api_call_id`, tagged by routing/failover) threaded
+        // `stream_responses_with_capture`, tagged by routing/failover) threaded
         // onto every per-turn `BackendChatRequest`. The D3 L1 telemetry guard stays
         // in the spawn closure (the single finalize choke point) rather than here, so
         // the terminal status is classified from `run_turn`'s typed `Result`
         // (cancelled vs failed vs completed) and the guard's `Drop` still covers a
         // panic inside this function (it unwinds through the closure).
         serving_token: Arc<crate::upstream::ServingToken>,
+        // Request-owned durable phase clock. Independent of the bounded dashboard
+        // FlowStore so persistence-only production records true client TTFT.
+        persistence_phases: Option<crate::flow_persistence::PersistencePhaseClock>,
+        persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
         tx: mpsc::Sender<SseEvent>,
         // D6: the flow's cancellation token (registered in the AbortHub by the L1 guard
         // under `api_call_id`). COMPOSED with — never a replacement for — every existing
@@ -2194,7 +2437,7 @@ impl Gateway {
             .and_then(Value::as_object)
             .cloned();
         // D2: the FRESH per-flow serving token is now allocated in
-        // `stream_responses_with_api_call_id` (so the D3 L1 guard built pre-spawn
+        // `stream_responses_with_capture` (so the D3 L1 guard built pre-spawn
         // shares the SAME `Arc`) and threaded in. The routing layer fills `route`,
         // the failover layer fills `provider`; because it is per-flow, concurrent
         // flows never overwrite each other's `{route, provider}` (the rev2
@@ -2243,9 +2486,7 @@ impl Gateway {
         // initial lowering used (`resolve_roles_config_for_resolved_model`,
         // pre-spawn). Drives the pre-send adjacency merge + repair-note shaping
         // below. `None` for a model with no `roles` profile (legacy passthrough).
-        let roles = self
-            .config
-            .resolve_roles_config_for_resolved_model(&request.model, &upstream_model);
+        let roles = self.roles_for_request(&request.model, &upstream_model);
         loop {
             // D6: compose the kill token with the client-hangup check — a dashboard
             // `abort()` flips `abort_token`, surfacing `cancelled()` (499) like a hang-up.
@@ -2304,7 +2545,8 @@ impl Gateway {
             .with_thinking_override(request.thinking)
             // F1d: attach the turn-capture handle (see above) so the leaf's
             // `upstream_request` write can reach this turn's artifact.
-            .with_capture(capture.clone());
+            .with_capture(capture.clone())
+            .with_persistence_capture(persistence_capture.clone());
             let stream_result = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
@@ -2529,6 +2771,9 @@ impl Gateway {
                             // skips even the disabled-store early-return's call overhead.
                             if let Some(api_call_id) = &api_call_id {
                                 self.flow_store().stamp_first_content_delta(api_call_id);
+                            }
+                            if let Some(phases) = &persistence_phases {
+                                phases.stamp_first_content_delta();
                             }
                         }
                         StreamEmission::ReasoningItemAdded(item) => {
@@ -3003,6 +3248,9 @@ impl Gateway {
         if let Some(api_call_id) = &api_call_id {
             self.flow_store().stamp_stream_end(api_call_id);
         }
+        if let Some(phases) = &persistence_phases {
+            phases.stamp_stream_end();
+        }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
         // F1c (finding #3): carry the terminal shape to the seam so the capture
         // artifact records `incomplete` for a max-token truncation. `is_incomplete`
@@ -3062,7 +3310,12 @@ impl Gateway {
             }
             return (exact, true);
         }
-        if self.config.matches_model_route(model) {
+        if self.config.matches_model_route(model)
+            || self
+                .operational_alias_profiles
+                .keys()
+                .any(|alias| alias.eq_ignore_ascii_case(model.trim()))
+        {
             // Leave the model as-is; `RoutingUpstreamClient::resolve` performs
             // the route match + upstream-model rewrite. A route match is genuine.
             return (model.to_string(), true);

@@ -1,0 +1,56 @@
+# Docker-ready example. Copy this file to config.yaml for private endpoints,
+# credentials, and model names; docker-compose.yml can use either file.
+bind_addr: "127.0.0.1:4000"
+
+# Legacy/default route. It remains the passthrough target when a request does
+# not select the operational alias below.
+upstream_base_url: "http://host.docker.internal:8000/v1"
+upstream_model: "Qwen3.5"
+
+# The control-plane namespace is additive: ordinary upstream llmconduit fields
+# remain at the document root and survive operational edits unchanged.
+control_plane:
+  storage:
+    backend: sqlite
+    url: "sqlite:///data/llmconduit.sqlite3"
+    # Request-path persistence is non-blocking. A full queue drops telemetry
+    # rather than delaying inference; shutdown logs report its counters.
+    queue_capacity: 1024
+    # SQL history and daily JSONL files older than this are pruned.
+    retention_days: 30
+
+  # Client inference auth is separate from /dashboard session auth. With no
+  # operational keys and require:false, /v1 inference endpoints remain open.
+  auth:
+    require: false
+    conversation_id_header: "x-conversation-id"
+
+  operational:
+    backends:
+      - id: "10000000-0000-4000-8000-000000000001"
+        name: "local"
+        base_url: "http://host.docker.internal:8000/v1"
+        # For authenticated providers, prefer an env reference over an inline secret.
+        # api_key_env: OPENAI_API_KEY
+        enabled: true
+
+    # Profiles retain the complete upstream profile schema. `backends` is an
+    # ordered list of stable backend UUIDs and therefore survives renames.
+    model_profiles:
+      - id: "20000000-0000-4000-8000-000000000001"
+        name: "qwen-local"
+        backends:
+          - "10000000-0000-4000-8000-000000000001"
+        upstream_model: "Qwen3.5"
+
+    # The client-facing alias expands to the profiles' ordered backend chains.
+    aliases:
+      - id: "30000000-0000-4000-8000-000000000001"
+        name: "local"
+        profiles:
+          - "20000000-0000-4000-8000-000000000001"
+
+    # Add virtual keys here before setting auth.require to true. Store a
+    # `sha256:<hex>` digest for deployed keys; allowed_aliases contains UUIDs.
+    keys: []
+    unknown_model_policy: passthrough

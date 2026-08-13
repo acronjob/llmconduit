@@ -28,6 +28,11 @@ The default config path is:
 ```
 
 Configuration is loaded at startup. Restart llmconduit after editing the file.
+Older control-plane configs with root-level `auth`, `storage`, `backends`, or
+`aliases` are accepted through a deterministic in-memory compatibility migration.
+Persist that conversion—and replace legacy plaintext client keys with digests—using
+`llmconduit migrate-config --config /path/to/config.yaml`; the rewrite is atomic
+and owner-only (`0600` on Unix).
 
 Minimal config:
 
@@ -88,6 +93,113 @@ with per-model kwargs and explicit request values taking precedence.
 
 The legacy top-level `upstream_*` and `fallback_upstreams` settings still work
 when `upstreams` is not configured.
+
+### Control-plane overlay
+
+YAML configurations may add a `control_plane:` namespace without moving or
+duplicating the ordinary gateway settings above. The loader retains the original
+top-level YAML mapping, so operational edits do not erase newer upstream fields it
+does not understand. TOML remains an upstream-compatible, read-only configuration
+format and cannot contain this overlay. Environment storage/auth overrides and a
+selected legacy SQL database can still activate their corresponding runtime
+control-plane behavior with TOML. The current integration reads this state at
+process startup; it does not expose control-plane CRUD or hot reload.
+
+Operational backends, profiles, aliases, and virtual keys use stable UUIDs for
+references. Names remain the human- and client-facing handles, but renaming an
+entity does not break its references. An operational profile contains the full
+upstream model-profile shape—including `extends`, `roles`, capability and
+reasoning settings—plus its ordered backend UUID chain. An alias expands its
+ordered profile UUIDs into one ordered, pre-first-chunk failover route.
+
+See [`config.example.yaml`](config.example.yaml) for a complete Docker-ready
+configuration. The essential shape is:
+
+```yaml
+control_plane:
+  storage:
+    backend: sqlite
+    url: "sqlite:///data/llmconduit.sqlite3"
+    queue_capacity: 1024
+    retention_days: 30
+  auth:
+    require: false
+    conversation_id_header: x-conversation-id
+  operational:
+    backends:
+      - id: "10000000-0000-4000-8000-000000000001"
+        name: local
+        base_url: "http://127.0.0.1:8000/v1"
+        # api_key_env: OPENAI_API_KEY
+    model_profiles:
+      - id: "20000000-0000-4000-8000-000000000001"
+        name: qwen-local
+        backends: ["10000000-0000-4000-8000-000000000001"]
+        upstream_model: Qwen3.5
+    aliases:
+      - id: "30000000-0000-4000-8000-000000000001"
+        name: local
+        profiles: ["20000000-0000-4000-8000-000000000001"]
+    keys: []
+    unknown_model_policy: passthrough
+```
+
+`unknown_model_policy: passthrough` preserves the normal catalog/default route
+for unknown names; `reject` returns 404 before contacting an upstream. Disabled
+backends are omitted from operational route plans. Empty provider chains and
+dangling or duplicate UUID references fail startup rather than silently changing
+routing.
+
+Operational backend credentials may be supplied with `api_key_env`; the named
+environment variable is resolved once at startup and its value is never written
+back to configuration or shown in debug output. Setting both `api_key` and
+`api_key_env` is an error. Containers receive only explicitly forwarded
+variables: Compose forwards `OPENAI_API_KEY` for the checked-in example; add an
+environment mapping if you choose another variable name.
+
+Client inference authentication is independent of dashboard authentication.
+Virtual keys accept `Authorization: Bearer ...` or `x-api-key`. Store deployed
+secrets as `sha256:<64 lowercase hex characters>` and keep the plaintext outside
+the config; `allowed_aliases` is a list of alias UUIDs and an empty list permits
+any model. With `require: true`, a valid configured key is mandatory; starting
+with no keys deliberately leaves every protected route inaccessible. The gate
+covers `/v1` data routes, including models, token counting, and raw completions
+(Anthropic `HEAD`/`OPTIONS` probes remain open). Adding any keys also activates
+key verification so requests can be attributed; leave `keys: []` with
+`require: false` for an open development gateway.
+
+Storage backends are `none` (disabled), `jsonl` (write-only diagnostic records;
+requires `jsonl_dir`), `sqlite`, and `postgres` (both require `url`).
+Remote PostgreSQL URLs must select encrypted transport with `sslmode=require`,
+`verify-ca`, or preferably `verify-full`; local and Unix-socket connections may
+explicitly use `sslmode=disable`.
+`queue_capacity` defaults to `1024` and must be nonzero. `retention_days`
+defaults to `30`: SQL request/event/metric rows are pruned hourly, while JSONL
+uses daily gateway-owned files and attempts to remove expired files on the first
+subsequent append each process-day. Request-path writes use non-blocking enqueue:
+saturation drops persistence records instead of delaying inference, and
+accepted/drop/failure counters are logged during graceful shutdown.
+
+The SQL migration set is compiled into the binary and is applied when a SQLite or
+Postgres store is opened; migration files do not need to be mounted into the
+runtime container. SQLite needs a writable parent directory for the database plus
+its WAL/SHM files. The Docker image and Compose file therefore reserve the
+nonroot-writable `/data` volume. SQL storage exposes durable request summaries,
+bounded event history, retention-windowed usage rollups, and minute-level
+provider health/counter samples through the
+session-authenticated `/dashboard/api/history/*` reads. `none` and JSONL are not
+queryable and those endpoints return 503. SQL-backed API-key rows are snapshotted
+at startup; there is no live database-key reload. For compatibility with the old
+control plane, a seeded legacy `settings.operational` document or relational
+operational state is authoritative over YAML operational routes, profiles, keys,
+and unknown-model policy. That SQL import is read-only and startup-only;
+`migrate-config` rewrites YAML and does not mutate legacy SQL rows.
+
+The first four migrations are byte-identical to the pre-upstream control-plane
+history so existing sqlx ledgers remain valid. Some comments in those immutable
+historical migrations describe the retired `/ui` user-management implementation;
+they are historical text, not current behavior. This build keeps dashboard auth
+env-only and exposes no user/config mutation API.
 
 Global and per-model request defaults:
 
@@ -421,22 +533,63 @@ codex -p llmconduit "what files are in this directory?"
 ## Docker
 
 The Docker build compiles and embeds the complete dashboard in a separate Node
-stage; Node and the frontend sources are not present in the final image.
+stage; Node, frontend sources, and SQL migration source files are not present in
+the final image. Migrations are copied into the Rust builder because
+`sqlx::migrate!` embeds them at compile time. The final image runs as distroless
+`nonroot`; `/data` is prepared with matching ownership for SQLite.
+
+The quickest local deployment uses the checked-in Docker-ready config and a
+named data volume:
+
+```bash
+docker compose up --build
+curl http://127.0.0.1:4000/health
+```
+
+For a private configuration, copy the example and select it without adding it to
+the image build context:
+
+```bash
+cp config.example.yaml config.yaml
+# Edit config.yaml, then:
+LLMCONDUIT_CONFIG_FILE=./config.yaml docker compose up --build
+```
+
+The config is mounted read-only as bootstrap input; SQLite and its sidecars live
+on the `llmconduit-data` volume mounted at `/data`. To remove that durable state,
+stop the service and explicitly remove its volume with `docker compose down -v`.
+
+A direct `docker run` equivalent is:
 
 ```bash
 docker build -t llmconduit .
-docker run --rm -p 4000:4000 \
+docker run --rm -p 127.0.0.1:4000:4000 \
+  -e LLMCONDUIT_BIND_ADDR=0.0.0.0:4000 \
+  -e OPENAI_API_KEY \
   --add-host=host.docker.internal:host-gateway \
-  -e LLMCONDUIT_UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
-  llmconduit
+  -v llmconduit-data:/data \
+  -v "$PWD/config.example.yaml:/etc/llmconduit/config.yaml:ro" \
+  llmconduit start --config /etc/llmconduit/config.yaml
 ```
 
-To expose `/debug` and `/dashboard`, replace the final line with
-`llmconduit start --with-debug-ui`.
+`/debug` and `/dashboard` exist only when the global `--with-debug-ui` flag is
+passed. On the container's non-loopback bind, authenticated dashboard exposure
+also requires `LLMCONDUIT_DASHBOARD_TOKEN`, a stable base64 session key decoding
+to at least 32 bytes (`LLMCONDUIT_DASHBOARD_SESSION_KEY`), and an exact HTTPS
+`LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`. These env-only secrets must not be placed in
+`control_plane.auth` or persisted config. To deliberately run tokenless over
+plaintext on a trusted development network, set
+`LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1`; startup logs a prominent warning because
+the debug surfaces are then fully unauthenticated.
 
-Non-loopback dashboard access requires authentication by default. To deliberately
-run tokenless on a trusted network, set `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1`;
-startup logs a prominent warning because `/debug` and `/dashboard` will be open.
+Dashboard mutations are disabled unless
+`LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`; the kill endpoint additionally enforces
+the authenticated session and double-submit CSRF token. Raw upstream response
+capture is independently opt-in with
+`LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE=1`. A non-secret caller-id header
+may be selected with `LLMCONDUIT_DASHBOARD_CLIENT_HEADER` for dashboard
+attribution; values from credential-bearing header names are retained only as a
+one-way short hash, never verbatim.
 
 ## Endpoints
 
@@ -445,9 +598,19 @@ startup logs a prominent warning because `/debug` and `/dashboard` will be open.
 | `POST /v1/responses` | OpenAI Responses API |
 | `POST /v1/chat/completions` | OpenAI Chat Completions API |
 | `POST /v1/messages` | Anthropic Messages API |
+| `POST /v1/messages/count_tokens` | Anthropic token counting |
+| `POST /v1/completions` | Legacy completions passthrough |
 | `GET /v1/models` | Proxied model list |
-| `GET /healthz` | Health check |
+| `GET /health` | Health check (`{"status":"healthy"}`) |
+| `GET /` | Process check (`{"status":"ok"}`) |
 | `GET /debug` | Debug UI when started with `--with-debug-ui` |
+| `GET /dashboard` | Embedded Argus dashboard when started with `--with-debug-ui` and its env-only auth gate permits registration |
+| `GET /dashboard/api/*` | Authenticated Argus flow, metrics, topology, catalog, and snapshot APIs |
+| `GET /dashboard/api/history/requests` | Authenticated durable request summaries (SQL storage) |
+| `GET /dashboard/api/history/requests/:id` | Authenticated durable request and event detail (SQL storage) |
+| `GET /dashboard/api/history/usage` | Authenticated durable usage rollups (SQL storage) |
+| `GET /dashboard/api/history/metrics` | Authenticated durable minute-level provider health/counter history (SQL storage) |
+| `POST /dashboard/api/flows/:id/kill` | Abort a live flow when dashboard mutations are enabled; requires a session and CSRF token |
 
 ## Environment
 
@@ -468,6 +631,20 @@ LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS
 LLMCONDUIT_MAX_REPLAY_ENTRIES
 LLMCONDUIT_FLATTEN_CONTENT
 LLMCONDUIT_TURN_CAPTURE_DIR
+LLMCONDUIT_STORAGE_BACKEND
+LLMCONDUIT_DATABASE_URL
+LLMCONDUIT_STORAGE_JSONL_DIR
+LLMCONDUIT_PERSISTENCE_QUEUE_CAPACITY
+LLMCONDUIT_PERSISTENCE_RETENTION_DAYS
+LLMCONDUIT_REQUIRE_AUTH
+LLMCONDUIT_CONVERSATION_ID_HEADER
+LLMCONDUIT_DASHBOARD_TOKEN
+LLMCONDUIT_DASHBOARD_SESSION_KEY
+LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN
+LLMCONDUIT_ALLOW_INSECURE_DASHBOARD
+LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS
+LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE
+LLMCONDUIT_DASHBOARD_CLIENT_HEADER
 BRAVE_SEARCH_API_KEY
 OPENAI_API_KEY
 ```

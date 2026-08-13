@@ -1,0 +1,3294 @@
+//! Durable control-plane persistence, deliberately independent from the gateway's
+//! runtime configuration and request engine.
+//!
+//! The SQL schema is compatible with the historical `store.rs` migrations. Hot
+//! request-path writes can be handed to [`PersistenceQueue`], whose `try_*`
+//! methods never wait for the database or for queue capacity. Read/admin calls
+//! use [`PersistenceStore`] directly.
+
+use async_trait::async_trait;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use sqlx::Row;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::net::IpAddr;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
+use subtle::ConstantTimeEq;
+use tokio::sync::{mpsc, oneshot};
+
+pub type StoreResult<T> = Result<T, String>;
+
+/// Shared wire/storage form used by `client_auth`: SHA-256 is appropriate for
+/// high-entropy generated API keys and lets authentication remain deterministic.
+const API_KEY_HASH_PREFIX: &str = "sha256:";
+
+/// Lifecycle row created at the HTTP ingress seam. `id` is the stable
+/// `api_call_id`; the response id and actual winning backend are unknown here.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RequestRow {
+    pub id: String,
+    pub response_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub virtual_key_id: Option<String>,
+    pub client_protocol: String,
+    pub client_model: String,
+    pub alias: Option<String>,
+    pub backend: Option<String>,
+    pub resolved_model: Option<String>,
+    pub status: String,
+    pub created_at_ms: i64,
+}
+
+/// One bounded/redacted hop event. Callers must use the existing turn-capture
+/// redactor before populating `payload`; this module never accepts raw headers.
+/// SQL persistence treats `(request_id, seq)` as last-writer-wins. JSONL is
+/// append-only, so readers of that format must likewise keep the last duplicate.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EventRow {
+    pub request_id: String,
+    pub seq: i64,
+    pub ts_ms: i64,
+    pub hop: String,
+    pub kind: String,
+    pub payload: Option<String>,
+    pub bytes: Option<i64>,
+}
+
+/// Authoritative terminal aggregate. `backend` and `resolved_model` are the
+/// winner from the final served attempt, not the configured primary. They stay
+/// `None` for pre-dispatch/all-failed requests.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct RequestFinish {
+    pub response_id: Option<String>,
+    pub status: String,
+    pub completed_at_ms: i64,
+    /// Epoch-ms of the first content delta, not merely the first upstream byte.
+    pub first_token_at_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub error: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub backend: Option<String>,
+    pub resolved_model: Option<String>,
+    pub attempts_json: Option<String>,
+    pub timings_json: Option<String>,
+    pub client_label: Option<String>,
+    pub client_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageFilter {
+    pub virtual_key_id: Option<String>,
+    pub since_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UsageBucket {
+    pub virtual_key_id: Option<String>,
+    pub alias: Option<String>,
+    pub resolved_model: Option<String>,
+    pub backend: Option<String>,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub reasoning_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RequestSummary {
+    pub id: String,
+    pub response_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub virtual_key_id: Option<String>,
+    pub client_protocol: String,
+    pub client_model: String,
+    pub alias: Option<String>,
+    pub backend: Option<String>,
+    pub resolved_model: Option<String>,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub first_token_at_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub error: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub attempts_json: Option<String>,
+    pub timings_json: Option<String>,
+    pub client_label: Option<String>,
+    pub client_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MetricSample {
+    pub backend: String,
+    pub ts_ms: i64,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UserRecord {
+    pub id: String,
+    pub username: String,
+    pub is_admin: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAuth {
+    pub id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub is_admin: bool,
+}
+
+/// API-key metadata. The secret (or its digest) is intentionally never exposed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ApiKeyRecord {
+    pub id: String,
+    pub label: Option<String>,
+    pub user_id: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// Authentication snapshot carrying only one-way digests. This is the safe
+/// bridge to `ClientAuth::from_specs`; the database's raw `secret` column never
+/// crosses the store boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKeyAuthSpec {
+    pub id: String,
+    pub label: Option<String>,
+    pub user_id: Option<String>,
+    pub secret_hash: String,
+}
+
+/// Read-only recovery result for databases written by the pre-upstream
+/// control plane. A nonblank `settings.operational` document is authoritative;
+/// otherwise the legacy relational tables are projected into the current type.
+///
+/// The custom `Debug` intentionally exposes only provenance and cardinality:
+/// both representations may contain upstream or client authentication material.
+#[derive(Clone, PartialEq)]
+pub enum LegacyOperationalRead {
+    SettingsDocument(String),
+    Relational(crate::control_plane::OperationalConfig),
+}
+
+impl fmt::Debug for LegacyOperationalRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SettingsDocument(document) => formatter
+                .debug_struct("LegacyOperationalRead")
+                .field("source", &"settings.operational")
+                .field("document_bytes", &document.len())
+                .finish(),
+            Self::Relational(operational) => formatter
+                .debug_struct("LegacyOperationalRead")
+                .field("source", &"relational")
+                .field("backends", &operational.backends.len())
+                .field("model_profiles", &operational.model_profiles.len())
+                .field("aliases", &operational.aliases.len())
+                .field("keys", &operational.keys.len())
+                .field("unknown_model_policy", &operational.unknown_model_policy)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for ApiKeyAuthSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiKeyAuthSpec")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("user_id", &self.user_id)
+            .field("secret_hash", &"[redacted]")
+            .finish()
+    }
+}
+
+#[async_trait]
+pub trait PersistenceWriter: Send + Sync {
+    async fn begin_request(&self, row: RequestRow) -> StoreResult<()>;
+    async fn append_event(&self, event: EventRow) -> StoreResult<()>;
+    async fn finish_request(&self, id: &str, finish: RequestFinish) -> StoreResult<()>;
+}
+
+#[async_trait]
+pub trait PersistenceStore: PersistenceWriter {
+    async fn get_request(&self, id: &str) -> StoreResult<Option<RequestSummary>>;
+    async fn request_events(&self, request_id: &str) -> StoreResult<Vec<EventRow>>;
+    /// Newest `limit` request events, returned in sequence order.
+    async fn request_events_limited(
+        &self,
+        request_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<EventRow>>;
+    async fn list_requests(&self, limit: i64) -> StoreResult<Vec<RequestSummary>>;
+    async fn usage_summary(&self, filter: &UsageFilter) -> StoreResult<Vec<UsageBucket>>;
+    async fn usage_summary_limited(
+        &self,
+        filter: &UsageFilter,
+        limit: usize,
+    ) -> StoreResult<Vec<UsageBucket>>;
+    /// Atomically remove requests older than `before_ms` and their event rows.
+    /// A request exactly at the cutoff is retained.
+    async fn prune_request_history(&self, before_ms: i64) -> StoreResult<()>;
+
+    async fn get_setting(&self, key: &str) -> StoreResult<Option<String>>;
+    async fn set_setting(&self, key: &str, value: &str) -> StoreResult<()>;
+    async fn delete_setting(&self, key: &str) -> StoreResult<()>;
+
+    async fn record_backend_metrics(&self, sample: MetricSample) -> StoreResult<()>;
+    async fn backend_metrics_history(&self, since_ms: i64) -> StoreResult<Vec<MetricSample>>;
+    /// Newest `limit` samples at/after `since_ms`, returned oldest-first. The
+    /// database applies the limit before rows enter process memory.
+    async fn backend_metrics_history_limited(
+        &self,
+        since_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<MetricSample>>;
+    async fn prune_backend_metrics(&self, before_ms: i64) -> StoreResult<()>;
+
+    async fn list_users(&self) -> StoreResult<Vec<UserRecord>>;
+    async fn count_users(&self) -> StoreResult<i64>;
+    async fn get_user_auth(&self, username: &str) -> StoreResult<Option<UserAuth>>;
+    async fn create_user(
+        &self,
+        username: &str,
+        password_hash: &str,
+        is_admin: bool,
+        actor: &str,
+    ) -> StoreResult<UserRecord>;
+    async fn update_user(
+        &self,
+        id: &str,
+        password_hash: Option<&str>,
+        is_admin: Option<bool>,
+        actor: &str,
+    ) -> StoreResult<()>;
+    async fn delete_user(&self, id: &str, actor: &str) -> StoreResult<()>;
+
+    async fn list_api_keys(&self) -> StoreResult<Vec<ApiKeyRecord>>;
+    async fn api_key_auth_specs(&self) -> StoreResult<Vec<ApiKeyAuthSpec>>;
+    async fn put_api_key(
+        &self,
+        id: &str,
+        plaintext: &str,
+        label: Option<&str>,
+        user_id: Option<&str>,
+        actor: &str,
+    ) -> StoreResult<ApiKeyRecord>;
+    async fn verify_api_key(&self, plaintext: &str) -> StoreResult<Option<ApiKeyRecord>>;
+    async fn delete_api_key(&self, id: &str, actor: &str) -> StoreResult<()>;
+}
+
+/// Append-only, log-only persistence for installations that do not need the
+/// queryable history API. File IO is always moved to `spawn_blocking`; the
+/// inference path still talks only to [`PersistenceQueue`].
+#[derive(Clone)]
+pub struct JsonlWriter {
+    dir: PathBuf,
+    lock: Arc<Mutex<()>>,
+    retention_days: Option<NonZeroU64>,
+    last_prune_day: Arc<AtomicI64>,
+}
+
+impl JsonlWriter {
+    /// Create an append-only writer. On Unix the target directory is tightened
+    /// to `0700`; each file is tightened to `0600` whenever it is opened.
+    pub fn new(dir: impl AsRef<Path>) -> StoreResult<Self> {
+        Self::new_inner(dir, None)
+    }
+
+    /// Create a daily-rotated writer that removes only its own expired JSONL
+    /// files. Unrelated files in the directory are never considered.
+    pub fn new_with_retention(
+        dir: impl AsRef<Path>,
+        retention_days: NonZeroU64,
+    ) -> StoreResult<Self> {
+        Self::new_inner(dir, Some(retention_days))
+    }
+
+    fn new_inner(dir: impl AsRef<Path>, retention_days: Option<NonZeroU64>) -> StoreResult<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+        secure_jsonl_directory(&dir)?;
+        Ok(Self {
+            dir,
+            lock: Arc::new(Mutex::new(())),
+            retention_days,
+            last_prune_day: Arc::new(AtomicI64::new(i64::MIN)),
+        })
+    }
+
+    async fn append(&self, stem: &'static str, value: serde_json::Value) -> StoreResult<()> {
+        let dir = self.dir.clone();
+        let lock = Arc::clone(&self.lock);
+        let retention_days = self.retention_days;
+        let last_prune_day = Arc::clone(&self.last_prune_day);
+        tokio::task::spawn_blocking(move || {
+            let _guard = lock
+                .lock()
+                .map_err(|error| format!("jsonl lock poisoned: {error}"))?;
+            if let Some(retention_days) = retention_days
+                && let Err(error) = maybe_prune_jsonl(&dir, retention_days, &last_prune_day)
+            {
+                tracing::warn!(
+                    directory = %dir.display(),
+                    %error,
+                    "failed to prune expired JSONL persistence files; continuing append"
+                );
+            }
+            let filename = retention_days.map_or_else(
+                || format!("{stem}.jsonl"),
+                |_| format!("{stem}-{}.jsonl", chrono::Utc::now().format("%Y-%m-%d")),
+            );
+            let path = dir.join(filename);
+            let mut line = serde_json::to_vec(&value)
+                .map_err(|error| format!("failed to serialize JSONL row: {error}"))?;
+            line.push(b'\n');
+            open_private_append_file(&path)
+                .and_then(|mut file| file.write_all(&line))
+                .map_err(|error| format!("failed to append {}: {error}", path.display()))
+        })
+        .await
+        .map_err(|error| format!("JSONL writer task failed: {error}"))?
+    }
+}
+
+fn maybe_prune_jsonl(
+    dir: &Path,
+    retention_days: NonZeroU64,
+    last_prune_day: &AtomicI64,
+) -> StoreResult<()> {
+    let now = SystemTime::now();
+    let epoch_day = chrono::Utc::now().timestamp().div_euclid(86_400);
+    // Pruning is maintenance, not part of the durability contract for the row
+    // being appended. Attempt it at most once per process/day so a transient
+    // filesystem error cannot turn every persistence write into another failed
+    // directory scan.
+    if last_prune_day.swap(epoch_day, Ordering::Relaxed) == epoch_day {
+        return Ok(());
+    }
+    let max_age = Duration::from_secs(retention_days.get().saturating_mul(86_400));
+    let cutoff = now.checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("failed to inspect {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("failed to inspect JSONL entry: {error}"))?;
+        let filename = entry.file_name();
+        let filename = filename.to_string_lossy();
+        let owned = filename == "requests.jsonl"
+            || filename == "events.jsonl"
+            || (filename.starts_with("requests-") && filename.ends_with(".jsonl"))
+            || (filename.starts_with("events-") && filename.ends_with(".jsonl"));
+        if !owned {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("failed to inspect {}: {error}", entry.path().display()))?;
+        if metadata.is_file() && metadata.modified().is_ok_and(|modified| modified < cutoff) {
+            std::fs::remove_file(entry.path())
+                .map_err(|error| format!("failed to prune {}: {error}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_jsonl_directory(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("JSONL path is not a directory: {}", path.display()));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("failed to secure {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn secure_jsonl_directory(_path: &Path) -> StoreResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_append_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` applies only at creation; explicitly tighten a pre-existing file.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_append_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+#[async_trait]
+impl PersistenceWriter for JsonlWriter {
+    async fn begin_request(&self, row: RequestRow) -> StoreResult<()> {
+        let mut value = serde_json::to_value(row).map_err(store_error)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("event".to_string(), serde_json::json!("begin"));
+        }
+        self.append("requests", value).await
+    }
+
+    async fn append_event(&self, event: EventRow) -> StoreResult<()> {
+        let value = serde_json::to_value(event).map_err(store_error)?;
+        self.append("events", value).await
+    }
+
+    async fn finish_request(&self, id: &str, finish: RequestFinish) -> StoreResult<()> {
+        let mut value = serde_json::to_value(finish).map_err(store_error)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("event".to_string(), serde_json::json!("finish"));
+            object.insert("id".to_string(), serde_json::json!(id));
+        }
+        self.append("requests", value).await
+    }
+}
+
+#[derive(Clone)]
+enum SqlPool {
+    Sqlite(sqlx::SqlitePool),
+    Postgres(sqlx::PgPool),
+}
+
+#[derive(Clone)]
+pub struct SqlStore {
+    pool: SqlPool,
+}
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+macro_rules! execute {
+    ($self:expr, $sql:expr $(, $bind:expr )* $(,)?) => {{
+        match &$self.pool {
+            SqlPool::Sqlite(pool) => {
+                #[allow(unused_mut)]
+                let mut query = sqlx::query($sql);
+                $(query = query.bind($bind);)*
+                query.execute(pool).await.map_err(store_error)?;
+            }
+            SqlPool::Postgres(pool) => {
+                #[allow(unused_mut)]
+                let mut query = sqlx::query($sql);
+                $(query = query.bind($bind);)*
+                query.execute(pool).await.map_err(store_error)?;
+            }
+        }
+    }};
+}
+
+impl SqlStore {
+    /// Connect and migrate SQLite storage. On Unix a file-backed database is
+    /// tightened to `0600`, including when it already exists. Its parent is not
+    /// chmodded because it may be shared or operator-owned; deployments must
+    /// place the database in a private directory when pathname privacy matters.
+    pub async fn connect_sqlite(url: &str) -> StoreResult<Self> {
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(url)
+            // The connection string can carry URI parameters; never repeat it.
+            .map_err(|_| "invalid SQLite connection URL".to_string())?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(if sqlite_url_is_memory(url) {
+                sqlx::sqlite::SqliteJournalMode::Memory
+            } else {
+                sqlx::sqlite::SqliteJournalMode::Wal
+            })
+            .busy_timeout(Duration::from_secs(5));
+        let database_path = (!sqlite_url_is_memory(url)).then(|| options.get_filename().to_owned());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .map_err(|_| "SQLite storage connection failed".to_string())?;
+        if let Some(path) = database_path {
+            // The database itself is always owner-only. We deliberately do not
+            // chmod its parent: it may be a shared directory selected by the
+            // operator, who remains responsible for making that directory private.
+            secure_sqlite_database_file(&path)?;
+        }
+        let store = Self {
+            pool: SqlPool::Sqlite(pool),
+        };
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    /// Connect and migrate PostgreSQL storage. Remote hosts must select a TLS
+    /// mode that cannot silently fall back to plaintext; local developer
+    /// endpoints retain libpq/SQLx's default-mode flexibility.
+    pub async fn connect_postgres(url: &str) -> StoreResult<Self> {
+        let options = PgConnectOptions::from_str(url)
+            // Never repeat a potentially credential-bearing URL in an error.
+            .map_err(|_| "invalid PostgreSQL connection URL".to_string())?;
+        validate_postgres_transport(&options)?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(options)
+            .await
+            .map_err(|_| "PostgreSQL storage connection failed".to_string())?;
+        let store = Self {
+            pool: SqlPool::Postgres(pool),
+        };
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    pub async fn close(&self) {
+        match &self.pool {
+            SqlPool::Sqlite(pool) => pool.close().await,
+            SqlPool::Postgres(pool) => pool.close().await,
+        }
+    }
+
+    fn postgres(&self) -> bool {
+        matches!(self.pool, SqlPool::Postgres(_))
+    }
+
+    async fn migrate(&self) -> StoreResult<()> {
+        match &self.pool {
+            SqlPool::Sqlite(pool) => MIGRATOR.run(pool).await.map_err(store_error),
+            SqlPool::Postgres(pool) => MIGRATOR.run(pool).await.map_err(store_error),
+        }
+    }
+}
+
+fn sqlite_url_is_memory(url: &str) -> bool {
+    let stripped = url
+        .trim_start_matches("sqlite://")
+        .trim_start_matches("sqlite:");
+    let (database, query) = stripped
+        .split_once('?')
+        .map_or((stripped, None), |(database, query)| {
+            (database, Some(query))
+        });
+    database == ":memory:"
+        || query.is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .any(|(key, value)| key == "mode" && value == "memory")
+        })
+}
+
+#[cfg(unix)]
+fn secure_sqlite_database_file(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
+        format!(
+            "failed to secure SQLite database {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn secure_sqlite_database_file(_path: &Path) -> StoreResult<()> {
+    Ok(())
+}
+
+fn validate_postgres_transport(options: &PgConnectOptions) -> StoreResult<()> {
+    let host = options.get_host();
+    let local = options.get_socket().is_some()
+        || host.starts_with('/')
+        || host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    let encrypted_only = matches!(
+        options.get_ssl_mode(),
+        PgSslMode::Require | PgSslMode::VerifyCa | PgSslMode::VerifyFull
+    );
+    if !local && !encrypted_only {
+        return Err(
+            "remote PostgreSQL storage requires sslmode=require, verify-ca, or verify-full (prefer verify-full)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn store_error(error: impl fmt::Display) -> String {
+    error.to_string()
+}
+
+fn placeholder(postgres: bool, index: usize) -> String {
+    if postgres {
+        format!("${index}")
+    } else {
+        "?".to_string()
+    }
+}
+
+fn placeholders(postgres: bool, count: usize) -> String {
+    (1..=count)
+        .map(|index| placeholder(postgres, index))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn api_key_digest(plaintext: &str) -> String {
+    let digest = Sha256::digest(plaintext.as_bytes());
+    format!("{API_KEY_HASH_PREFIX}{}", hex::encode(digest))
+}
+
+fn is_canonical_api_key_digest(value: &str) -> bool {
+    let Some(encoded) = value.strip_prefix(API_KEY_HASH_PREFIX) else {
+        return false;
+    };
+    encoded.len() == 64 && hex::decode(encoded).is_ok()
+}
+
+fn canonical_api_key_digest(stored: &str) -> String {
+    if is_canonical_api_key_digest(stored) {
+        stored.to_ascii_lowercase()
+    } else {
+        api_key_digest(stored)
+    }
+}
+
+fn digest_matches(stored: &str, candidate: &str) -> bool {
+    let stored_bytes: [u8; 32] = if is_canonical_api_key_digest(stored) {
+        let stored_hex = stored
+            .strip_prefix(API_KEY_HASH_PREFIX)
+            .expect("canonical digest has prefix");
+        hex::decode(stored_hex)
+            .expect("canonical digest is hexadecimal")
+            .try_into()
+            .expect("canonical digest has 32 bytes")
+    } else {
+        // Pre-integration binaries need plaintext rows to remain on disk for
+        // rollback compatibility. Hash in memory without rewriting the row.
+        Sha256::digest(stored.as_bytes()).into()
+    };
+    let candidate_bytes: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+    stored_bytes.ct_eq(&candidate_bytes).into()
+}
+
+const REQUEST_COLUMNS: &str = "SELECT id, response_id, conversation_id, virtual_key_id, \
+    client_protocol, client_model, alias, backend, resolved_model, status, created_at_ms, \
+    completed_at_ms, first_token_at_ms, input_tokens, output_tokens, cached_tokens, \
+    reasoning_tokens, error, terminal_reason, attempts_json, timings_json, client_label, \
+    client_source FROM requests";
+
+fn decode_request<R>(row: &R) -> StoreResult<RequestSummary>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(RequestSummary {
+        id: row.try_get(0).map_err(store_error)?,
+        response_id: row.try_get(1).map_err(store_error)?,
+        conversation_id: row.try_get(2).map_err(store_error)?,
+        virtual_key_id: row.try_get(3).map_err(store_error)?,
+        client_protocol: row.try_get(4).map_err(store_error)?,
+        client_model: row.try_get(5).map_err(store_error)?,
+        alias: row.try_get(6).map_err(store_error)?,
+        backend: row.try_get(7).map_err(store_error)?,
+        resolved_model: row.try_get(8).map_err(store_error)?,
+        status: row.try_get(9).map_err(store_error)?,
+        created_at_ms: row.try_get(10).map_err(store_error)?,
+        completed_at_ms: row.try_get(11).map_err(store_error)?,
+        first_token_at_ms: row.try_get(12).map_err(store_error)?,
+        input_tokens: row.try_get(13).map_err(store_error)?,
+        output_tokens: row.try_get(14).map_err(store_error)?,
+        cached_tokens: row.try_get(15).map_err(store_error)?,
+        reasoning_tokens: row.try_get(16).map_err(store_error)?,
+        error: row.try_get(17).map_err(store_error)?,
+        terminal_reason: row.try_get(18).map_err(store_error)?,
+        attempts_json: row.try_get(19).map_err(store_error)?,
+        timings_json: row.try_get(20).map_err(store_error)?,
+        client_label: row.try_get(21).map_err(store_error)?,
+        client_source: row.try_get(22).map_err(store_error)?,
+    })
+}
+
+fn decode_event<R>(row: &R) -> StoreResult<EventRow>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(EventRow {
+        request_id: row.try_get(0).map_err(store_error)?,
+        seq: row.try_get(1).map_err(store_error)?,
+        ts_ms: row.try_get(2).map_err(store_error)?,
+        hop: row.try_get(3).map_err(store_error)?,
+        kind: row.try_get(4).map_err(store_error)?,
+        payload: row.try_get(5).map_err(store_error)?,
+        bytes: row.try_get(6).map_err(store_error)?,
+    })
+}
+
+fn decode_metric<R>(row: &R) -> StoreResult<MetricSample>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(MetricSample {
+        backend: row.try_get(0).map_err(store_error)?,
+        ts_ms: row.try_get(1).map_err(store_error)?,
+        data: row.try_get(2).map_err(store_error)?,
+    })
+}
+
+fn decode_user<R>(row: &R) -> StoreResult<UserRecord>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(UserRecord {
+        id: row.try_get(0).map_err(store_error)?,
+        username: row.try_get(1).map_err(store_error)?,
+        is_admin: row.try_get::<i64, _>(2).map_err(store_error)? != 0,
+        created_at_ms: row.try_get(3).map_err(store_error)?,
+        updated_at_ms: row.try_get(4).map_err(store_error)?,
+    })
+}
+
+fn decode_key<R>(row: &R) -> StoreResult<ApiKeyRecord>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(ApiKeyRecord {
+        id: row.try_get(0).map_err(store_error)?,
+        label: row.try_get(1).map_err(store_error)?,
+        user_id: row.try_get(2).map_err(store_error)?,
+        created_at_ms: row.try_get(3).map_err(store_error)?,
+        updated_at_ms: row.try_get(4).map_err(store_error)?,
+    })
+}
+
+fn decode_key_auth<R>(row: &R) -> StoreResult<ApiKeyAuthSpec>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    let stored: String = row.try_get(3).map_err(store_error)?;
+    Ok(ApiKeyAuthSpec {
+        id: row.try_get(0).map_err(store_error)?,
+        label: row.try_get(1).map_err(store_error)?,
+        user_id: row.try_get(2).map_err(store_error)?,
+        // Legacy plaintext remains untouched on disk, but never crosses this
+        // authentication boundary in plaintext.
+        secret_hash: canonical_api_key_digest(&stored),
+    })
+}
+
+struct LegacyBackendRow {
+    id: String,
+    name: String,
+    base_url: String,
+    api_key: Option<String>,
+    request_log_path: Option<String>,
+    enabled: i64,
+    metrics_json: Option<String>,
+    deleted_at_ms: Option<i64>,
+}
+
+struct LegacyProfileRow {
+    id: String,
+    name: String,
+    upstream_model: Option<String>,
+    system_prompt_prefix: Option<String>,
+    upstream_chat_kwargs_json: Option<String>,
+    deleted_at_ms: Option<i64>,
+}
+
+struct LegacyNamedRow {
+    id: String,
+    name: String,
+    deleted_at_ms: Option<i64>,
+}
+
+struct LegacyKeyRow {
+    id: String,
+    secret: String,
+    label: Option<String>,
+    user_id: Option<String>,
+    deleted_at_ms: Option<i64>,
+}
+
+fn decode_legacy_backend<R>(row: &R) -> StoreResult<LegacyBackendRow>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(LegacyBackendRow {
+        id: row.try_get(0).map_err(store_error)?,
+        name: row.try_get(1).map_err(store_error)?,
+        base_url: row.try_get(2).map_err(store_error)?,
+        api_key: row.try_get(3).map_err(store_error)?,
+        request_log_path: row.try_get(4).map_err(store_error)?,
+        enabled: row.try_get(5).map_err(store_error)?,
+        metrics_json: row.try_get(6).map_err(store_error)?,
+        deleted_at_ms: row.try_get(7).map_err(store_error)?,
+    })
+}
+
+fn decode_legacy_profile<R>(row: &R) -> StoreResult<LegacyProfileRow>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(LegacyProfileRow {
+        id: row.try_get(0).map_err(store_error)?,
+        name: row.try_get(1).map_err(store_error)?,
+        upstream_model: row.try_get(2).map_err(store_error)?,
+        system_prompt_prefix: row.try_get(3).map_err(store_error)?,
+        upstream_chat_kwargs_json: row.try_get(4).map_err(store_error)?,
+        deleted_at_ms: row.try_get(5).map_err(store_error)?,
+    })
+}
+
+fn decode_legacy_named<R>(row: &R) -> StoreResult<LegacyNamedRow>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(LegacyNamedRow {
+        id: row.try_get(0).map_err(store_error)?,
+        name: row.try_get(1).map_err(store_error)?,
+        deleted_at_ms: row.try_get(2).map_err(store_error)?,
+    })
+}
+
+fn decode_legacy_key<R>(row: &R) -> StoreResult<LegacyKeyRow>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(LegacyKeyRow {
+        id: row.try_get(0).map_err(store_error)?,
+        secret: row.try_get(1).map_err(store_error)?,
+        label: row.try_get(2).map_err(store_error)?,
+        user_id: row.try_get(3).map_err(store_error)?,
+        deleted_at_ms: row.try_get(4).map_err(store_error)?,
+    })
+}
+
+fn decode_legacy_edge<R>(row: &R) -> StoreResult<(String, String)>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok((
+        row.try_get(0).map_err(store_error)?,
+        row.try_get(1).map_err(store_error)?,
+    ))
+}
+
+macro_rules! fetch_all_decoded {
+    ($self:expr, $sql:expr, [$($bind:expr),* $(,)?], $decoder:path) => {{
+        match &$self.pool {
+            SqlPool::Sqlite(pool) => {
+                #[allow(unused_mut)]
+                let mut query = sqlx::query($sql);
+                $(query = query.bind($bind);)*
+                query.fetch_all(pool).await.map_err(store_error)?
+                    .iter().map($decoder).collect::<StoreResult<Vec<_>>>()?
+            }
+            SqlPool::Postgres(pool) => {
+                #[allow(unused_mut)]
+                let mut query = sqlx::query($sql);
+                $(query = query.bind($bind);)*
+                query.fetch_all(pool).await.map_err(store_error)?
+                    .iter().map($decoder).collect::<StoreResult<Vec<_>>>()?
+            }
+        }
+    }};
+}
+
+impl SqlStore {
+    /// Recover a legacy SQL operational configuration without mutating it.
+    ///
+    /// A nonblank name-map/JSON document in `settings.operational` wins and is
+    /// returned byte-for-byte so the current parser can migrate or reject it at
+    /// startup. Otherwise the relational representation is assembled using
+    /// only live entities and live edge targets. `None` means genuinely
+    /// unseeded; tombstones still count as seeded and produce `Some(empty)`.
+    pub async fn load_legacy_operational(&self) -> StoreResult<Option<LegacyOperationalRead>> {
+        if let Some(document) = self.get_setting("operational").await?
+            && !document.trim().is_empty()
+        {
+            return Ok(Some(LegacyOperationalRead::SettingsDocument(document)));
+        }
+
+        let backends: Vec<LegacyBackendRow> = fetch_all_decoded!(
+            self,
+            "SELECT id, name, base_url, api_key, request_log_path, enabled, metrics_json, \
+             deleted_at_ms FROM backends ORDER BY created_at_ms, id",
+            [],
+            decode_legacy_backend
+        );
+        let profiles: Vec<LegacyProfileRow> = fetch_all_decoded!(
+            self,
+            "SELECT id, name, upstream_model, system_prompt_prefix, upstream_chat_kwargs_json, \
+             deleted_at_ms FROM model_profiles ORDER BY created_at_ms, id",
+            [],
+            decode_legacy_profile
+        );
+        let aliases: Vec<LegacyNamedRow> = fetch_all_decoded!(
+            self,
+            "SELECT id, name, deleted_at_ms FROM aliases ORDER BY created_at_ms, id",
+            [],
+            decode_legacy_named
+        );
+        let keys: Vec<LegacyKeyRow> = fetch_all_decoded!(
+            self,
+            "SELECT id, secret, label, user_id, deleted_at_ms FROM api_keys \
+             ORDER BY created_at_ms, id",
+            [],
+            decode_legacy_key
+        );
+        let policy = self.get_setting("unknown_model_policy").await?;
+
+        if backends.is_empty()
+            && profiles.is_empty()
+            && aliases.is_empty()
+            && keys.is_empty()
+            && policy.is_none()
+        {
+            return Ok(None);
+        }
+
+        let backend_ids = strict_legacy_ids("backend", backends.iter().map(|row| &row.id))?;
+        let profile_ids = strict_legacy_ids("model profile", profiles.iter().map(|row| &row.id))?;
+        let alias_ids = strict_legacy_ids("alias", aliases.iter().map(|row| &row.id))?;
+        let key_ids = strict_legacy_ids("API key", keys.iter().map(|row| &row.id))?;
+
+        let live_backends: HashSet<&str> = backends
+            .iter()
+            .filter(|row| row.deleted_at_ms.is_none())
+            .map(|row| row.id.as_str())
+            .collect();
+        let live_profiles: HashSet<&str> = profiles
+            .iter()
+            .filter(|row| row.deleted_at_ms.is_none())
+            .map(|row| row.id.as_str())
+            .collect();
+        let live_aliases: HashSet<&str> = aliases
+            .iter()
+            .filter(|row| row.deleted_at_ms.is_none())
+            .map(|row| row.id.as_str())
+            .collect();
+
+        let profile_backends = self
+            .load_legacy_edges(
+                "SELECT profile_id, backend_id FROM profile_backends \
+                 ORDER BY profile_id, ordinal, backend_id",
+            )
+            .await?;
+        let alias_profiles = self
+            .load_legacy_edges(
+                "SELECT alias_id, profile_id FROM alias_profiles \
+                 ORDER BY alias_id, ordinal, profile_id",
+            )
+            .await?;
+        let key_aliases = self
+            .load_legacy_edges("SELECT key_id, alias_id FROM key_aliases ORDER BY key_id, alias_id")
+            .await?;
+
+        let operational = crate::control_plane::OperationalConfig {
+            backends: backends
+                .iter()
+                .filter(|row| row.deleted_at_ms.is_none())
+                .map(|row| {
+                    Ok(crate::control_plane::OpBackend {
+                        id: backend_ids[&row.id],
+                        name: row.name.clone(),
+                        base_url: row.base_url.clone(),
+                        api_key: row.api_key.clone(),
+                        api_key_env: None,
+                        request_log_path: row.request_log_path.clone(),
+                        enabled: row.enabled != 0,
+                        extra: legacy_backend_extra(row.metrics_json.as_deref())?,
+                    })
+                })
+                .collect::<StoreResult<Vec<_>>>()?,
+            model_profiles: profiles
+                .iter()
+                .filter(|row| row.deleted_at_ms.is_none())
+                .map(|row| {
+                    Ok(crate::control_plane::OpProfile {
+                        id: profile_ids[&row.id],
+                        name: row.name.clone(),
+                        backends: live_legacy_edges(
+                            &profile_backends,
+                            &row.id,
+                            &live_backends,
+                            &backend_ids,
+                        ),
+                        profile: crate::config::PersistedModelProfile {
+                            upstream_model: row.upstream_model.clone(),
+                            system_prompt_prefix: row.system_prompt_prefix.clone(),
+                            upstream_chat_kwargs: legacy_kwargs(
+                                row.upstream_chat_kwargs_json.as_deref(),
+                            )?,
+                            ..crate::config::PersistedModelProfile::default()
+                        },
+                    })
+                })
+                .collect::<StoreResult<Vec<_>>>()?,
+            aliases: aliases
+                .iter()
+                .filter(|row| row.deleted_at_ms.is_none())
+                .map(|row| crate::control_plane::OpAlias {
+                    id: alias_ids[&row.id],
+                    name: row.name.clone(),
+                    profiles: live_legacy_edges(
+                        &alias_profiles,
+                        &row.id,
+                        &live_profiles,
+                        &profile_ids,
+                    ),
+                    extra: BTreeMap::new(),
+                })
+                .collect(),
+            keys: keys
+                .iter()
+                .filter(|row| row.deleted_at_ms.is_none())
+                .map(|row| {
+                    let stored_scopes = key_aliases.get(&row.id).map_or(0, Vec::len);
+                    let allowed_aliases = live_legacy_edges(
+                        &key_aliases,
+                        &row.id,
+                        &live_aliases,
+                        &alias_ids,
+                    );
+                    if stored_scopes > 0 && allowed_aliases.is_empty() {
+                        return Err(format!(
+                            "legacy API key '{}' has scopes but no live aliases; refusing to widen it to unrestricted access",
+                            row.id
+                        ));
+                    }
+                    Ok(crate::control_plane::OpKey {
+                        id: key_ids[&row.id],
+                        // Never surface a legacy plaintext secret. The database
+                        // remains unchanged so an old binary can still roll back.
+                        key: canonical_api_key_digest(&row.secret),
+                        label: row.label.clone(),
+                        user_id: row
+                            .user_id
+                            .as_deref()
+                            .map(|id| strict_legacy_uuid("API key owner", id))
+                            .transpose()?,
+                        allowed_aliases,
+                        extra: BTreeMap::new(),
+                    })
+                })
+                .collect::<StoreResult<Vec<_>>>()?,
+            unknown_model_policy: match policy.as_deref().map(str::trim) {
+                Some(value) if value.eq_ignore_ascii_case("reject") => {
+                    crate::control_plane::UnknownModelPolicy::Reject
+                }
+                _ => crate::control_plane::UnknownModelPolicy::Passthrough,
+            },
+            extra: BTreeMap::new(),
+        };
+        operational.validate()?;
+        Ok(Some(LegacyOperationalRead::Relational(operational)))
+    }
+
+    async fn load_legacy_edges(&self, sql: &str) -> StoreResult<HashMap<String, Vec<String>>> {
+        let pairs: Vec<(String, String)> = fetch_all_decoded!(self, sql, [], decode_legacy_edge);
+        let mut edges = HashMap::<String, Vec<String>>::new();
+        for (parent, child) in pairs {
+            edges.entry(parent).or_default().push(child);
+        }
+        Ok(edges)
+    }
+}
+
+fn strict_legacy_uuid(kind: &str, value: &str) -> StoreResult<uuid::Uuid> {
+    uuid::Uuid::parse_str(value)
+        .map_err(|_| format!("legacy {kind} id is not a valid UUID: {value:?}"))
+}
+
+fn strict_legacy_ids<'a>(
+    kind: &str,
+    values: impl Iterator<Item = &'a String>,
+) -> StoreResult<HashMap<String, uuid::Uuid>> {
+    values
+        .map(|value| Ok((value.clone(), strict_legacy_uuid(kind, value)?)))
+        .collect()
+}
+
+fn live_legacy_edges(
+    edges: &HashMap<String, Vec<String>>,
+    parent: &str,
+    live_children: &HashSet<&str>,
+    ids: &HashMap<String, uuid::Uuid>,
+) -> Vec<uuid::Uuid> {
+    edges
+        .get(parent)
+        .into_iter()
+        .flatten()
+        .filter(|child| live_children.contains(child.as_str()))
+        .filter_map(|child| ids.get(child).copied())
+        .collect()
+}
+
+fn legacy_backend_extra(raw: Option<&str>) -> StoreResult<BTreeMap<String, serde_json::Value>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(BTreeMap::new());
+    };
+    let metrics = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid legacy backend metrics JSON: {error}"))?;
+    Ok(BTreeMap::from([("metrics".to_string(), metrics)]))
+}
+
+fn legacy_kwargs(raw: Option<&str>) -> StoreResult<serde_json::Map<String, serde_json::Value>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(serde_json::Map::new());
+    };
+    serde_json::from_str(raw)
+        .map_err(|error| format!("invalid legacy profile kwargs JSON: {error}"))
+}
+
+#[async_trait]
+impl PersistenceWriter for SqlStore {
+    async fn begin_request(&self, row: RequestRow) -> StoreResult<()> {
+        let sql = format!(
+            "INSERT INTO requests (id, response_id, conversation_id, virtual_key_id, \
+             client_protocol, client_model, alias, backend, resolved_model, status, created_at_ms) \
+             VALUES ({})",
+            placeholders(self.postgres(), 11)
+        );
+        execute!(
+            self,
+            &sql,
+            row.id,
+            row.response_id,
+            row.conversation_id,
+            row.virtual_key_id,
+            row.client_protocol,
+            row.client_model,
+            row.alias,
+            row.backend,
+            row.resolved_model,
+            row.status,
+            row.created_at_ms,
+        );
+        Ok(())
+    }
+
+    async fn append_event(&self, event: EventRow) -> StoreResult<()> {
+        let sql = format!(
+            "INSERT INTO request_events (request_id, seq, ts_ms, hop, kind, payload, bytes) \
+             VALUES ({}) ON CONFLICT (request_id, seq) DO UPDATE SET \
+             ts_ms = excluded.ts_ms, hop = excluded.hop, kind = excluded.kind, \
+             payload = excluded.payload, bytes = excluded.bytes",
+            placeholders(self.postgres(), 7)
+        );
+        execute!(
+            self,
+            &sql,
+            event.request_id,
+            event.seq,
+            event.ts_ms,
+            event.hop,
+            event.kind,
+            event.payload,
+            event.bytes,
+        );
+        Ok(())
+    }
+
+    async fn finish_request(&self, id: &str, finish: RequestFinish) -> StoreResult<()> {
+        let pg = self.postgres();
+        let sql = format!(
+            "INSERT INTO requests (id, client_protocol, client_model, status, created_at_ms, \
+             response_id, completed_at_ms, first_token_at_ms, input_tokens, output_tokens, \
+             cached_tokens, reasoning_tokens, error, terminal_reason, backend, resolved_model, \
+             attempts_json, timings_json, client_label, client_source) VALUES ({}, 'unknown', '', \
+             {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             ON CONFLICT (id) DO UPDATE SET response_id = excluded.response_id, \
+             status = excluded.status, completed_at_ms = excluded.completed_at_ms, \
+             first_token_at_ms = excluded.first_token_at_ms, input_tokens = excluded.input_tokens, \
+             output_tokens = excluded.output_tokens, cached_tokens = excluded.cached_tokens, \
+             reasoning_tokens = excluded.reasoning_tokens, error = excluded.error, \
+             terminal_reason = excluded.terminal_reason, backend = excluded.backend, \
+             resolved_model = excluded.resolved_model, attempts_json = excluded.attempts_json, \
+             timings_json = excluded.timings_json, client_label = excluded.client_label, \
+             client_source = excluded.client_source",
+            placeholder(pg, 1),
+            placeholder(pg, 2),
+            placeholder(pg, 3),
+            placeholder(pg, 4),
+            placeholder(pg, 5),
+            placeholder(pg, 6),
+            placeholder(pg, 7),
+            placeholder(pg, 8),
+            placeholder(pg, 9),
+            placeholder(pg, 10),
+            placeholder(pg, 11),
+            placeholder(pg, 12),
+            placeholder(pg, 13),
+            placeholder(pg, 14),
+            placeholder(pg, 15),
+            placeholder(pg, 16),
+            placeholder(pg, 17),
+            placeholder(pg, 18),
+        );
+        execute!(
+            self,
+            &sql,
+            id,
+            finish.status,
+            finish.completed_at_ms,
+            finish.response_id,
+            finish.completed_at_ms,
+            finish.first_token_at_ms,
+            finish.input_tokens,
+            finish.output_tokens,
+            finish.cached_tokens,
+            finish.reasoning_tokens,
+            finish.error,
+            finish.terminal_reason,
+            finish.backend,
+            finish.resolved_model,
+            finish.attempts_json,
+            finish.timings_json,
+            finish.client_label,
+            finish.client_source,
+        );
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PersistenceStore for SqlStore {
+    async fn get_request(&self, id: &str) -> StoreResult<Option<RequestSummary>> {
+        let sql = format!(
+            "{REQUEST_COLUMNS} WHERE id = {}",
+            placeholder(self.postgres(), 1)
+        );
+        match &self.pool {
+            SqlPool::Sqlite(pool) => sqlx::query(&sql)
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(store_error)?
+                .map(|row| decode_request(&row))
+                .transpose(),
+            SqlPool::Postgres(pool) => sqlx::query(&sql)
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(store_error)?
+                .map(|row| decode_request(&row))
+                .transpose(),
+        }
+    }
+
+    async fn request_events(&self, request_id: &str) -> StoreResult<Vec<EventRow>> {
+        let sql = format!(
+            "SELECT request_id, seq, ts_ms, hop, kind, payload, bytes FROM request_events \
+             WHERE request_id = {} ORDER BY seq",
+            placeholder(self.postgres(), 1)
+        );
+        Ok(fetch_all_decoded!(self, &sql, [request_id], decode_event))
+    }
+
+    async fn request_events_limited(
+        &self,
+        request_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<EventRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pg = self.postgres();
+        let sql = format!(
+            "SELECT request_id, seq, ts_ms, hop, kind, payload, bytes FROM (\
+                 SELECT request_id, seq, ts_ms, hop, kind, payload, bytes \
+                 FROM request_events WHERE request_id = {} \
+                 ORDER BY seq DESC LIMIT {}\
+             ) AS recent ORDER BY seq",
+            placeholder(pg, 1),
+            placeholder(pg, 2),
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(fetch_all_decoded!(
+            self,
+            &sql,
+            [request_id, limit],
+            decode_event
+        ))
+    }
+
+    async fn list_requests(&self, limit: i64) -> StoreResult<Vec<RequestSummary>> {
+        let sql = format!(
+            "{REQUEST_COLUMNS} ORDER BY created_at_ms DESC LIMIT {}",
+            placeholder(self.postgres(), 1)
+        );
+        Ok(fetch_all_decoded!(self, &sql, [limit], decode_request))
+    }
+
+    async fn usage_summary(&self, filter: &UsageFilter) -> StoreResult<Vec<UsageBucket>> {
+        let pg = self.postgres();
+        let mut sql = String::from(
+            "SELECT virtual_key_id, alias, resolved_model, backend, \
+             CAST(COUNT(*) AS BIGINT), CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(cached_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) FROM requests",
+        );
+        let mut clauses = Vec::new();
+        if filter.virtual_key_id.is_some() {
+            clauses.push(format!(
+                "virtual_key_id = {}",
+                placeholder(pg, clauses.len() + 1)
+            ));
+        }
+        if filter.since_ms.is_some() {
+            clauses.push(format!(
+                "created_at_ms >= {}",
+                placeholder(pg, clauses.len() + 1)
+            ));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" GROUP BY virtual_key_id, alias, resolved_model, backend");
+
+        macro_rules! query_usage {
+            ($pool:expr) => {{
+                let mut query = sqlx::query(&sql);
+                if let Some(key) = filter.virtual_key_id.as_deref() {
+                    query = query.bind(key);
+                }
+                if let Some(since) = filter.since_ms {
+                    query = query.bind(since);
+                }
+                query
+                    .fetch_all($pool)
+                    .await
+                    .map_err(store_error)?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(UsageBucket {
+                            virtual_key_id: row.try_get(0).map_err(store_error)?,
+                            alias: row.try_get(1).map_err(store_error)?,
+                            resolved_model: row.try_get(2).map_err(store_error)?,
+                            backend: row.try_get(3).map_err(store_error)?,
+                            requests: row.try_get(4).map_err(store_error)?,
+                            input_tokens: row.try_get(5).map_err(store_error)?,
+                            output_tokens: row.try_get(6).map_err(store_error)?,
+                            cached_tokens: row.try_get(7).map_err(store_error)?,
+                            reasoning_tokens: row.try_get(8).map_err(store_error)?,
+                        })
+                    })
+                    .collect::<StoreResult<Vec<_>>>()
+            }};
+        }
+        match &self.pool {
+            SqlPool::Sqlite(pool) => query_usage!(pool),
+            SqlPool::Postgres(pool) => query_usage!(pool),
+        }
+    }
+
+    async fn usage_summary_limited(
+        &self,
+        filter: &UsageFilter,
+        limit: usize,
+    ) -> StoreResult<Vec<UsageBucket>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pg = self.postgres();
+        let mut sql = String::from(
+            "SELECT virtual_key_id, alias, resolved_model, backend, \
+             CAST(COUNT(*) AS BIGINT) AS request_count, \
+             CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(cached_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) FROM requests",
+        );
+        let mut clauses = Vec::new();
+        if filter.virtual_key_id.is_some() {
+            clauses.push(format!(
+                "virtual_key_id = {}",
+                placeholder(pg, clauses.len() + 1)
+            ));
+        }
+        if filter.since_ms.is_some() {
+            clauses.push(format!(
+                "created_at_ms >= {}",
+                placeholder(pg, clauses.len() + 1)
+            ));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" GROUP BY virtual_key_id, alias, resolved_model, backend");
+        sql.push_str(" ORDER BY request_count DESC LIMIT ");
+        sql.push_str(&placeholder(pg, clauses.len() + 1));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        macro_rules! query_usage_limited {
+            ($pool:expr) => {{
+                let mut query = sqlx::query(&sql);
+                if let Some(key) = filter.virtual_key_id.as_deref() {
+                    query = query.bind(key);
+                }
+                if let Some(since) = filter.since_ms {
+                    query = query.bind(since);
+                }
+                query = query.bind(limit);
+                query
+                    .fetch_all($pool)
+                    .await
+                    .map_err(store_error)?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(UsageBucket {
+                            virtual_key_id: row.try_get(0).map_err(store_error)?,
+                            alias: row.try_get(1).map_err(store_error)?,
+                            resolved_model: row.try_get(2).map_err(store_error)?,
+                            backend: row.try_get(3).map_err(store_error)?,
+                            requests: row.try_get(4).map_err(store_error)?,
+                            input_tokens: row.try_get(5).map_err(store_error)?,
+                            output_tokens: row.try_get(6).map_err(store_error)?,
+                            cached_tokens: row.try_get(7).map_err(store_error)?,
+                            reasoning_tokens: row.try_get(8).map_err(store_error)?,
+                        })
+                    })
+                    .collect::<StoreResult<Vec<_>>>()
+            }};
+        }
+        match &self.pool {
+            SqlPool::Sqlite(pool) => query_usage_limited!(pool),
+            SqlPool::Postgres(pool) => query_usage_limited!(pool),
+        }
+    }
+
+    async fn prune_request_history(&self, before_ms: i64) -> StoreResult<()> {
+        let pg = self.postgres();
+        let delete_events = format!(
+            "DELETE FROM request_events WHERE request_id IN (\
+                 SELECT id FROM requests WHERE created_at_ms < {}\
+             )",
+            placeholder(pg, 1)
+        );
+        let delete_requests = format!(
+            "DELETE FROM requests WHERE created_at_ms < {}",
+            placeholder(pg, 1)
+        );
+        let delete_orphan_events = format!(
+            "DELETE FROM request_events WHERE ts_ms < {} AND NOT EXISTS (\
+                 SELECT 1 FROM requests WHERE requests.id = request_events.request_id\
+             )",
+            placeholder(pg, 1)
+        );
+
+        macro_rules! prune_in_transaction {
+            ($pool:expr) => {{
+                let mut transaction = $pool.begin().await.map_err(store_error)?;
+                sqlx::query(&delete_events)
+                    .bind(before_ms)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(store_error)?;
+                sqlx::query(&delete_requests)
+                    .bind(before_ms)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(store_error)?;
+                sqlx::query(&delete_orphan_events)
+                    .bind(before_ms)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(store_error)?;
+                transaction.commit().await.map_err(store_error)
+            }};
+        }
+
+        match &self.pool {
+            SqlPool::Sqlite(pool) => prune_in_transaction!(pool),
+            SqlPool::Postgres(pool) => prune_in_transaction!(pool),
+        }
+    }
+
+    async fn get_setting(&self, key: &str) -> StoreResult<Option<String>> {
+        let sql = format!(
+            "SELECT value FROM settings WHERE key = {}",
+            placeholder(self.postgres(), 1)
+        );
+        match &self.pool {
+            SqlPool::Sqlite(pool) => sqlx::query(&sql)
+                .bind(key)
+                .fetch_optional(pool)
+                .await
+                .map_err(store_error)?
+                .map(|row| row.try_get(0).map_err(store_error))
+                .transpose(),
+            SqlPool::Postgres(pool) => sqlx::query(&sql)
+                .bind(key)
+                .fetch_optional(pool)
+                .await
+                .map_err(store_error)?
+                .map(|row| row.try_get(0).map_err(store_error))
+                .transpose(),
+        }
+    }
+
+    async fn set_setting(&self, key: &str, value: &str) -> StoreResult<()> {
+        let pg = self.postgres();
+        let sql = format!(
+            "INSERT INTO settings (key, value) VALUES ({}, {}) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            placeholder(pg, 1),
+            placeholder(pg, 2)
+        );
+        execute!(self, &sql, key, value);
+        Ok(())
+    }
+
+    async fn delete_setting(&self, key: &str) -> StoreResult<()> {
+        let sql = format!(
+            "DELETE FROM settings WHERE key = {}",
+            placeholder(self.postgres(), 1)
+        );
+        execute!(self, &sql, key);
+        Ok(())
+    }
+
+    async fn record_backend_metrics(&self, sample: MetricSample) -> StoreResult<()> {
+        let sql = format!(
+            "INSERT INTO backend_metrics (id, backend, ts_ms, data) VALUES ({})",
+            placeholders(self.postgres(), 4)
+        );
+        execute!(
+            self,
+            &sql,
+            new_id(),
+            sample.backend,
+            sample.ts_ms,
+            sample.data
+        );
+        Ok(())
+    }
+
+    async fn backend_metrics_history(&self, since_ms: i64) -> StoreResult<Vec<MetricSample>> {
+        let sql = format!(
+            "SELECT backend, ts_ms, data FROM backend_metrics WHERE ts_ms >= {} ORDER BY ts_ms",
+            placeholder(self.postgres(), 1)
+        );
+        Ok(fetch_all_decoded!(self, &sql, [since_ms], decode_metric))
+    }
+
+    async fn backend_metrics_history_limited(
+        &self,
+        since_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<MetricSample>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pg = self.postgres();
+        let sql = format!(
+            "SELECT backend, ts_ms, data FROM (\
+                 SELECT id, backend, ts_ms, data FROM backend_metrics \
+                 WHERE ts_ms >= {} ORDER BY ts_ms DESC, id DESC LIMIT {}\
+             ) AS recent ORDER BY ts_ms, id",
+            placeholder(pg, 1),
+            placeholder(pg, 2),
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(fetch_all_decoded!(
+            self,
+            &sql,
+            [since_ms, limit],
+            decode_metric
+        ))
+    }
+
+    async fn prune_backend_metrics(&self, before_ms: i64) -> StoreResult<()> {
+        let sql = format!(
+            "DELETE FROM backend_metrics WHERE ts_ms < {}",
+            placeholder(self.postgres(), 1)
+        );
+        execute!(self, &sql, before_ms);
+        Ok(())
+    }
+
+    async fn list_users(&self) -> StoreResult<Vec<UserRecord>> {
+        Ok(fetch_all_decoded!(
+            self,
+            "SELECT id, username, is_admin, created_at_ms, updated_at_ms FROM users \
+             WHERE deleted_at_ms IS NULL ORDER BY username",
+            [],
+            decode_user
+        ))
+    }
+
+    async fn count_users(&self) -> StoreResult<i64> {
+        let sql = "SELECT CAST(COUNT(*) AS BIGINT) FROM users WHERE deleted_at_ms IS NULL";
+        match &self.pool {
+            SqlPool::Sqlite(pool) => sqlx::query(sql)
+                .fetch_one(pool)
+                .await
+                .map_err(store_error)?
+                .try_get(0)
+                .map_err(store_error),
+            SqlPool::Postgres(pool) => sqlx::query(sql)
+                .fetch_one(pool)
+                .await
+                .map_err(store_error)?
+                .try_get(0)
+                .map_err(store_error),
+        }
+    }
+
+    async fn get_user_auth(&self, username: &str) -> StoreResult<Option<UserAuth>> {
+        let sql = format!(
+            "SELECT id, username, password_hash, is_admin FROM users \
+             WHERE username = {} AND deleted_at_ms IS NULL",
+            placeholder(self.postgres(), 1)
+        );
+        macro_rules! get_auth {
+            ($pool:expr) => {{
+                sqlx::query(&sql)
+                    .bind(username)
+                    .fetch_optional($pool)
+                    .await
+                    .map_err(store_error)?
+                    .map(|row| {
+                        Ok(UserAuth {
+                            id: row.try_get(0).map_err(store_error)?,
+                            username: row.try_get(1).map_err(store_error)?,
+                            password_hash: row.try_get(2).map_err(store_error)?,
+                            is_admin: row.try_get::<i64, _>(3).map_err(store_error)? != 0,
+                        })
+                    })
+                    .transpose()
+            }};
+        }
+        match &self.pool {
+            SqlPool::Sqlite(pool) => get_auth!(pool),
+            SqlPool::Postgres(pool) => get_auth!(pool),
+        }
+    }
+
+    async fn create_user(
+        &self,
+        username: &str,
+        password_hash: &str,
+        is_admin: bool,
+        actor: &str,
+    ) -> StoreResult<UserRecord> {
+        let id = new_id();
+        let now = now_ms();
+        let sql = format!(
+            "INSERT INTO users (id, username, password_hash, is_admin, created_at_ms, created_by, \
+             updated_at_ms, updated_by) VALUES ({})",
+            placeholders(self.postgres(), 8)
+        );
+        execute!(
+            self,
+            &sql,
+            &id,
+            username,
+            password_hash,
+            is_admin as i64,
+            now,
+            actor,
+            now,
+            actor
+        );
+        Ok(UserRecord {
+            id,
+            username: username.to_string(),
+            is_admin,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    async fn update_user(
+        &self,
+        id: &str,
+        password_hash: Option<&str>,
+        is_admin: Option<bool>,
+        actor: &str,
+    ) -> StoreResult<()> {
+        let pg = self.postgres();
+        let now = now_ms();
+        match (password_hash, is_admin) {
+            (None, None) => return Ok(()),
+            (Some(hash), None) => {
+                let sql = format!(
+                    "UPDATE users SET password_hash = {}, updated_at_ms = {}, updated_by = {}, \
+                     deleted_at_ms = NULL WHERE id = {}",
+                    placeholder(pg, 1),
+                    placeholder(pg, 2),
+                    placeholder(pg, 3),
+                    placeholder(pg, 4)
+                );
+                execute!(self, &sql, hash, now, actor, id);
+            }
+            (None, Some(admin)) => {
+                let sql = format!(
+                    "UPDATE users SET is_admin = {}, updated_at_ms = {}, updated_by = {}, \
+                     deleted_at_ms = NULL WHERE id = {}",
+                    placeholder(pg, 1),
+                    placeholder(pg, 2),
+                    placeholder(pg, 3),
+                    placeholder(pg, 4)
+                );
+                execute!(self, &sql, admin as i64, now, actor, id);
+            }
+            (Some(hash), Some(admin)) => {
+                let sql = format!(
+                    "UPDATE users SET password_hash = {}, is_admin = {}, updated_at_ms = {}, \
+                     updated_by = {}, deleted_at_ms = NULL WHERE id = {}",
+                    placeholder(pg, 1),
+                    placeholder(pg, 2),
+                    placeholder(pg, 3),
+                    placeholder(pg, 4),
+                    placeholder(pg, 5)
+                );
+                execute!(self, &sql, hash, admin as i64, now, actor, id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_user(&self, id: &str, actor: &str) -> StoreResult<()> {
+        let pg = self.postgres();
+        let now = now_ms();
+        let sql = format!(
+            "UPDATE users SET deleted_at_ms = {}, updated_at_ms = {}, updated_by = {} WHERE id = {}",
+            placeholder(pg, 1),
+            placeholder(pg, 2),
+            placeholder(pg, 3),
+            placeholder(pg, 4)
+        );
+        execute!(self, &sql, now, now, actor, id);
+        Ok(())
+    }
+
+    async fn list_api_keys(&self) -> StoreResult<Vec<ApiKeyRecord>> {
+        Ok(fetch_all_decoded!(
+            self,
+            "SELECT id, label, user_id, created_at_ms, updated_at_ms FROM api_keys \
+             WHERE deleted_at_ms IS NULL ORDER BY created_at_ms",
+            [],
+            decode_key
+        ))
+    }
+
+    async fn api_key_auth_specs(&self) -> StoreResult<Vec<ApiKeyAuthSpec>> {
+        Ok(fetch_all_decoded!(
+            self,
+            "SELECT id, label, user_id, secret FROM api_keys \
+             WHERE deleted_at_ms IS NULL ORDER BY created_at_ms",
+            [],
+            decode_key_auth
+        ))
+    }
+
+    async fn put_api_key(
+        &self,
+        id: &str,
+        plaintext: &str,
+        label: Option<&str>,
+        user_id: Option<&str>,
+        actor: &str,
+    ) -> StoreResult<ApiKeyRecord> {
+        if plaintext.is_empty() {
+            return Err("API key must not be empty".to_string());
+        }
+        let now = now_ms();
+        let digest = api_key_digest(plaintext);
+        let pg = self.postgres();
+        let sql = format!(
+            "INSERT INTO api_keys (id, secret, label, user_id, created_at_ms, created_by, \
+             updated_at_ms, updated_by, deleted_at_ms) VALUES ({}) \
+             ON CONFLICT (id) DO UPDATE SET secret = excluded.secret, label = excluded.label, \
+             user_id = excluded.user_id, updated_at_ms = excluded.updated_at_ms, \
+             updated_by = excluded.updated_by, deleted_at_ms = NULL",
+            placeholders(pg, 9)
+        );
+        execute!(
+            self,
+            &sql,
+            id,
+            digest,
+            label,
+            user_id,
+            now,
+            actor,
+            now,
+            actor,
+            Option::<i64>::None
+        );
+        let created_at_ms = match &self.pool {
+            SqlPool::Sqlite(pool) => sqlx::query("SELECT created_at_ms FROM api_keys WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .map_err(store_error)?
+                .try_get(0)
+                .map_err(store_error)?,
+            SqlPool::Postgres(pool) => {
+                sqlx::query("SELECT created_at_ms FROM api_keys WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(store_error)?
+                    .try_get(0)
+                    .map_err(store_error)?
+            }
+        };
+        Ok(ApiKeyRecord {
+            id: id.to_string(),
+            label: label.map(str::to_string),
+            user_id: user_id.map(str::to_string),
+            created_at_ms,
+            updated_at_ms: now,
+        })
+    }
+
+    async fn verify_api_key(&self, plaintext: &str) -> StoreResult<Option<ApiKeyRecord>> {
+        if plaintext.is_empty() {
+            return Ok(None);
+        }
+        macro_rules! scan {
+            ($pool:expr) => {{
+                let rows = sqlx::query(
+                    "SELECT id, secret, label, user_id, created_at_ms, updated_at_ms FROM api_keys \
+                     WHERE deleted_at_ms IS NULL",
+                )
+                .fetch_all($pool)
+                .await
+                .map_err(store_error)?;
+                let mut found = None;
+                for row in rows {
+                    let secret: String = row.try_get(1).map_err(store_error)?;
+                    if digest_matches(&secret, plaintext) {
+                        found = Some(ApiKeyRecord {
+                            id: row.try_get(0).map_err(store_error)?,
+                            label: row.try_get(2).map_err(store_error)?,
+                            user_id: row.try_get(3).map_err(store_error)?,
+                            created_at_ms: row.try_get(4).map_err(store_error)?,
+                            updated_at_ms: row.try_get(5).map_err(store_error)?,
+                        });
+                    }
+                }
+                Ok(found)
+            }};
+        }
+        match &self.pool {
+            SqlPool::Sqlite(pool) => scan!(pool),
+            SqlPool::Postgres(pool) => scan!(pool),
+        }
+    }
+
+    async fn delete_api_key(&self, id: &str, actor: &str) -> StoreResult<()> {
+        let pg = self.postgres();
+        let now = now_ms();
+        let sql = format!(
+            "UPDATE api_keys SET deleted_at_ms = {}, updated_at_ms = {}, updated_by = {} WHERE id = {}",
+            placeholder(pg, 1),
+            placeholder(pg, 2),
+            placeholder(pg, 3),
+            placeholder(pg, 4)
+        );
+        execute!(self, &sql, now, now, actor, id);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded, nonblocking hot-path writer
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum WriteCommand {
+    Begin(RequestRow),
+    Event(EventRow),
+    Finish {
+        request_id: String,
+        finish: RequestFinish,
+    },
+    Flush(oneshot::Sender<()>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueError {
+    Full,
+    Closed,
+}
+
+impl fmt::Display for EnqueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => formatter.write_str("persistence queue is full"),
+            Self::Closed => formatter.write_str("persistence queue is closed"),
+        }
+    }
+}
+
+impl std::error::Error for EnqueueError {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistenceQueueStats {
+    pub accepted: u64,
+    pub dropped_full: u64,
+    pub dropped_closed: u64,
+    pub write_failures: u64,
+}
+
+#[derive(Default)]
+struct QueueCounters {
+    accepted: AtomicU64,
+    dropped_full: AtomicU64,
+    dropped_closed: AtomicU64,
+    write_failures: AtomicU64,
+}
+
+/// Cloneable producer for a single FIFO writer task. The request path calls only
+/// `try_*`; a full or stopped queue is reported immediately and never applies
+/// backpressure to an SSE/body stream.
+#[derive(Clone)]
+pub struct PersistenceQueue {
+    sender: mpsc::Sender<WriteCommand>,
+    counters: Arc<QueueCounters>,
+}
+
+impl PersistenceQueue {
+    pub fn spawn(store: Arc<dyn PersistenceWriter>, capacity: NonZeroUsize) -> Self {
+        let (sender, mut receiver) = mpsc::channel(capacity.get());
+        let counters = Arc::new(QueueCounters::default());
+        let worker_counters = Arc::clone(&counters);
+        tokio::spawn(async move {
+            const FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(30);
+            let mut last_failure_warning: Option<std::time::Instant> = None;
+            let mut suppressed_failures = 0_u64;
+            while let Some(command) = receiver.recv().await {
+                let result = match command {
+                    WriteCommand::Begin(row) => store.begin_request(row).await,
+                    WriteCommand::Event(event) => store.append_event(event).await,
+                    WriteCommand::Finish { request_id, finish } => {
+                        store.finish_request(&request_id, finish).await
+                    }
+                    WriteCommand::Flush(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
+                if let Err(error) = result {
+                    worker_counters
+                        .write_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    let should_warn = last_failure_warning
+                        .is_none_or(|last| last.elapsed() >= FAILURE_WARN_INTERVAL);
+                    if should_warn {
+                        tracing::warn!(
+                            error = %error,
+                            suppressed_failures,
+                            "asynchronous persistence write failed"
+                        );
+                        last_failure_warning = Some(std::time::Instant::now());
+                        suppressed_failures = 0;
+                    } else {
+                        suppressed_failures = suppressed_failures.saturating_add(1);
+                    }
+                }
+            }
+            if suppressed_failures > 0 {
+                tracing::warn!(
+                    suppressed_failures,
+                    "persistence writer stopped after additional coalesced failures"
+                );
+            }
+        });
+        Self { sender, counters }
+    }
+
+    pub fn try_begin(&self, row: RequestRow) -> Result<(), EnqueueError> {
+        self.try_enqueue(WriteCommand::Begin(row))
+    }
+
+    pub fn try_event(&self, event: EventRow) -> Result<(), EnqueueError> {
+        self.try_enqueue(WriteCommand::Event(event))
+    }
+
+    pub fn try_finish(
+        &self,
+        request_id: String,
+        finish: RequestFinish,
+    ) -> Result<(), EnqueueError> {
+        self.try_enqueue(WriteCommand::Finish { request_id, finish })
+    }
+
+    fn try_enqueue(&self, command: WriteCommand) -> Result<(), EnqueueError> {
+        match self.sender.try_send(command) {
+            Ok(()) => {
+                self.counters.accepted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.counters.dropped_full.fetch_add(1, Ordering::Relaxed);
+                Err(EnqueueError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.counters.dropped_closed.fetch_add(1, Ordering::Relaxed);
+                Err(EnqueueError::Closed)
+            }
+        }
+    }
+
+    /// Wait until every command accepted before this call has been processed.
+    /// This is a shutdown/test seam and must not be used on a streaming path.
+    pub async fn flush(&self) -> StoreResult<()> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::Flush(done_tx))
+            .await
+            .map_err(|_| "persistence queue is closed".to_string())?;
+        done_rx
+            .await
+            .map_err(|_| "persistence writer stopped before flush".to_string())
+    }
+
+    pub fn stats(&self) -> PersistenceQueueStats {
+        PersistenceQueueStats {
+            accepted: self.counters.accepted.load(Ordering::Relaxed),
+            dropped_full: self.counters.dropped_full.load(Ordering::Relaxed),
+            dropped_closed: self.counters.dropped_closed.load(Ordering::Relaxed),
+            write_failures: self.counters.write_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    fn request(id: &str) -> RequestRow {
+        RequestRow {
+            id: id.to_string(),
+            response_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            virtual_key_id: Some("key-1".to_string()),
+            client_protocol: "responses".to_string(),
+            client_model: "public-model".to_string(),
+            alias: Some("public-model".to_string()),
+            backend: None,
+            resolved_model: None,
+            status: "running".to_string(),
+            created_at_ms: 100,
+        }
+    }
+
+    fn finish() -> RequestFinish {
+        RequestFinish {
+            response_id: Some("resp-1".to_string()),
+            status: "completed".to_string(),
+            completed_at_ms: 200,
+            first_token_at_ms: Some(130),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cached_tokens: Some(2),
+            reasoning_tokens: Some(3),
+            terminal_reason: Some("stop".to_string()),
+            backend: Some("winner".to_string()),
+            resolved_model: Some("served-model".to_string()),
+            attempts_json: Some(r#"[{"status":"served"}]"#.to_string()),
+            timings_json: Some(r#"{"total_ms":100}"#.to_string()),
+            client_label: Some("key-abcd".to_string()),
+            client_source: Some("key_hash".to_string()),
+            ..RequestFinish::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_migrations_and_terminal_round_trip() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        store
+            .begin_request(request("api-call-1"))
+            .await
+            .expect("begin");
+        store
+            .append_event(EventRow {
+                request_id: "api-call-1".to_string(),
+                seq: 2,
+                ts_ms: 150,
+                hop: "upstream_in".to_string(),
+                kind: "body".to_string(),
+                payload: Some(r#"{"safe":true}"#.to_string()),
+                bytes: Some(13),
+            })
+            .await
+            .expect("event");
+        store
+            .finish_request("api-call-1", finish())
+            .await
+            .expect("finish");
+
+        let got = store
+            .get_request("api-call-1")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.id, "api-call-1");
+        assert_eq!(got.response_id.as_deref(), Some("resp-1"));
+        assert_eq!(got.backend.as_deref(), Some("winner"));
+        assert_eq!(got.resolved_model.as_deref(), Some("served-model"));
+        assert_eq!(got.reasoning_tokens, Some(3));
+        assert_eq!(got.client_label.as_deref(), Some("key-abcd"));
+        assert_eq!(
+            got.attempts_json.as_deref(),
+            Some(r#"[{"status":"served"}]"#)
+        );
+        assert_eq!(store.request_events("api-call-1").await.unwrap().len(), 1);
+
+        let usage = store
+            .usage_summary(&UsageFilter::default())
+            .await
+            .expect("usage");
+        assert_eq!(usage[0].reasoning_tokens, 3);
+        assert_eq!(usage[0].backend.as_deref(), Some("winner"));
+
+        let migration_versions: Vec<i64> = match &store.pool {
+            SqlPool::Sqlite(pool) => sqlx::query(
+                "SELECT version FROM _sqlx_migrations WHERE success = 1 ORDER BY version",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get(0).unwrap())
+            .collect(),
+            SqlPool::Postgres(_) => unreachable!(),
+        };
+        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6]);
+        let request_indexes: Vec<String> = match &store.pool {
+            SqlPool::Sqlite(pool) => sqlx::query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND name IN ('idx_requests_created_at_ms', \
+                              'idx_requests_virtual_key_created_at_ms') ORDER BY name",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("request indexes")
+            .into_iter()
+            .map(|row| row.try_get(0).expect("index name"))
+            .collect(),
+            SqlPool::Postgres(_) => unreachable!(),
+        };
+        assert_eq!(
+            request_indexes,
+            [
+                "idx_requests_created_at_ms".to_string(),
+                "idx_requests_virtual_key_created_at_ms".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_upsert_recovers_when_begin_was_dropped() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        store
+            .finish_request("missing-begin", finish())
+            .await
+            .expect("terminal upsert");
+        let request = store
+            .get_request("missing-begin")
+            .await
+            .expect("lookup")
+            .expect("terminal row");
+        assert_eq!(request.status, "completed");
+        assert_eq!(request.created_at_ms, 200);
+        assert_eq!(request.completed_at_ms, Some(200));
+        assert_eq!(request.client_protocol, "unknown");
+        assert_eq!(request.client_model, "");
+    }
+
+    #[tokio::test]
+    async fn request_history_pruning_removes_old_events_and_retains_boundary() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        for (id, created_at_ms) in [("old", 99_i64), ("boundary", 100), ("new", 101)] {
+            let mut row = request(id);
+            row.created_at_ms = created_at_ms;
+            store.begin_request(row).await.expect("request");
+            store
+                .append_event(EventRow {
+                    request_id: id.to_string(),
+                    seq: 1,
+                    ts_ms: created_at_ms,
+                    hop: "client_in".to_string(),
+                    kind: "body".to_string(),
+                    payload: None,
+                    bytes: None,
+                })
+                .await
+                .expect("event");
+        }
+
+        store
+            .prune_request_history(100)
+            .await
+            .expect("prune old history");
+        assert!(
+            store
+                .get_request("old")
+                .await
+                .expect("old lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .request_events("old")
+                .await
+                .expect("old events")
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_request("boundary")
+                .await
+                .expect("boundary lookup")
+                .is_some(),
+            "the cutoff is exclusive"
+        );
+        assert_eq!(
+            store
+                .request_events("boundary")
+                .await
+                .expect("boundary events")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .get_request("new")
+                .await
+                .expect("new lookup")
+                .is_some()
+        );
+
+        let orphan_events: i64 = match &store.pool {
+            SqlPool::Sqlite(pool) => sqlx::query(
+                "SELECT COUNT(*) FROM request_events AS event \
+                 LEFT JOIN requests AS request ON request.id = event.request_id \
+                 WHERE request.id IS NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("orphan count")
+            .try_get(0)
+            .expect("count"),
+            SqlPool::Postgres(_) => unreachable!(),
+        };
+        assert_eq!(orphan_events, 0);
+
+        store
+            .prune_request_history(101)
+            .await
+            .expect("prune boundary row");
+        assert!(
+            store
+                .get_request("boundary")
+                .await
+                .expect("boundary after later cutoff")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_request("new")
+                .await
+                .expect("new retained")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_event_sequence_is_last_writer_wins() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        store
+            .append_event(EventRow {
+                request_id: "retry".to_string(),
+                seq: 2,
+                ts_ms: 10,
+                hop: "upstream_out".to_string(),
+                kind: "attempt".to_string(),
+                payload: Some(r#"{"attempt":1}"#.to_string()),
+                bytes: Some(13),
+            })
+            .await
+            .expect("first event");
+        store
+            .append_event(EventRow {
+                request_id: "retry".to_string(),
+                seq: 2,
+                ts_ms: 20,
+                hop: "upstream_out".to_string(),
+                kind: "terminal_attempt".to_string(),
+                payload: Some(r#"{"attempt":2}"#.to_string()),
+                bytes: Some(14),
+            })
+            .await
+            .expect("replacement event");
+
+        let events = store.request_events("retry").await.expect("read events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ts_ms, 20);
+        assert_eq!(events[0].kind, "terminal_attempt");
+        assert_eq!(events[0].payload.as_deref(), Some(r#"{"attempt":2}"#));
+        assert_eq!(events[0].bytes, Some(14));
+    }
+
+    #[test]
+    fn legacy_migration_bytes_remain_compatible() {
+        let fixtures = [
+            (
+                include_bytes!("../migrations/0001_baseline.sql").as_slice(),
+                "4a31c23a430907f123abfef6fd9eaa0dba182cdcdf011dfd245a73677cbbe1f2",
+            ),
+            (
+                include_bytes!("../migrations/0002_relational_config.sql").as_slice(),
+                "045ddec0689ebcb61d94134d08ff62b436356071db816fb82738bde02bea9c7b",
+            ),
+            (
+                include_bytes!("../migrations/0003_users.sql").as_slice(),
+                "da9c0ae00eba35e81a0a3d5bde9452c0f48d4b8102c2997f9e8e5253a2707d4a",
+            ),
+            (
+                include_bytes!("../migrations/0004_api_key_owner.sql").as_slice(),
+                "a53c96f937157966e74b4438acdee2b4ef89eb6e49876d791105428c31b46aef",
+            ),
+        ];
+        for (bytes, expected) in fixtures {
+            assert_eq!(hex::encode(Sha256::digest(bytes)), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_keys_are_hashed_and_verifiable_without_plaintext_exposure() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        store
+            .put_api_key("key-1", "sk-super-secret", Some("team"), None, "test")
+            .await
+            .expect("put");
+
+        assert_eq!(
+            store
+                .verify_api_key("sk-super-secret")
+                .await
+                .expect("verify")
+                .expect("match")
+                .id,
+            "key-1"
+        );
+        assert!(
+            store
+                .verify_api_key("wrong")
+                .await
+                .expect("verify")
+                .is_none()
+        );
+
+        let specs = store.api_key_auth_specs().await.expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].secret_hash, api_key_digest("sk-super-secret"));
+        assert!(!specs[0].secret_hash.contains("super-secret"));
+        assert!(!format!("{:?}", specs[0]).contains(&specs[0].secret_hash));
+
+        let stored: String = match &store.pool {
+            SqlPool::Sqlite(pool) => sqlx::query("SELECT secret FROM api_keys WHERE id = ?")
+                .bind("key-1")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+                .try_get(0)
+                .unwrap(),
+            SqlPool::Postgres(_) => unreachable!(),
+        };
+        assert!(stored.starts_with(API_KEY_HASH_PREFIX));
+        assert_ne!(stored, "sk-super-secret");
+
+        store.delete_api_key("key-1", "test").await.expect("delete");
+        assert!(
+            store
+                .verify_api_key("sk-super-secret")
+                .await
+                .expect("verify deleted")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_settings_metrics_and_users_crud() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+
+        store.set_setting("mode", "one").await.expect("set");
+        store.set_setting("mode", "two").await.expect("upsert");
+        assert_eq!(
+            store.get_setting("mode").await.unwrap().as_deref(),
+            Some("two")
+        );
+        store.delete_setting("mode").await.expect("delete setting");
+        assert_eq!(store.get_setting("mode").await.unwrap(), None);
+
+        for (backend, ts_ms) in [("a", 100), ("b", 200)] {
+            store
+                .record_backend_metrics(MetricSample {
+                    backend: backend.to_string(),
+                    ts_ms,
+                    data: format!(r#"{{"backend":"{backend}"}}"#),
+                })
+                .await
+                .expect("metric");
+        }
+        let recent = store.backend_metrics_history(150).await.expect("history");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].backend, "b");
+        let bounded = store
+            .backend_metrics_history_limited(0, 1)
+            .await
+            .expect("bounded history");
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].backend, "b", "the newest sample is retained");
+        assert!(
+            store
+                .backend_metrics_history_limited(0, 0)
+                .await
+                .expect("zero limit")
+                .is_empty()
+        );
+        store.prune_backend_metrics(201).await.expect("prune");
+        assert!(store.backend_metrics_history(0).await.unwrap().is_empty());
+
+        let user = store
+            .create_user("alice", "argon2-hash", true, "test")
+            .await
+            .expect("create user");
+        assert_eq!(store.count_users().await.unwrap(), 1);
+        assert_eq!(
+            store
+                .get_user_auth("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash,
+            "argon2-hash"
+        );
+        store
+            .update_user(&user.id, Some("new-hash"), Some(false), "test")
+            .await
+            .expect("update user");
+        let auth = store.get_user_auth("alice").await.unwrap().unwrap();
+        assert_eq!(auth.password_hash, "new-hash");
+        assert!(!auth.is_admin);
+        assert_eq!(store.list_users().await.unwrap().len(), 1);
+        store
+            .delete_user(&user.id, "test")
+            .await
+            .expect("delete user");
+        assert_eq!(store.count_users().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_api_key_is_hashed_in_memory_without_disk_rewrite() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-store-{}.sqlite",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let url = format!("sqlite://{}", path.display());
+        let store = SqlStore::connect_sqlite(&url).await.expect("first connect");
+        let now = now_ms();
+        if let SqlPool::Sqlite(pool) = &store.pool {
+            sqlx::query(
+                "INSERT INTO api_keys (id, secret, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?)",
+            )
+            .bind("legacy")
+            .bind("legacy-plaintext")
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("legacy insert");
+        }
+        store.close().await;
+
+        let reopened = SqlStore::connect_sqlite(&url).await.expect("reconnect");
+        assert_eq!(
+            reopened
+                .verify_api_key("legacy-plaintext")
+                .await
+                .expect("verify")
+                .expect("match")
+                .id,
+            "legacy"
+        );
+        let spec = reopened.api_key_auth_specs().await.unwrap().pop().unwrap();
+        assert_eq!(spec.secret_hash, api_key_digest("legacy-plaintext"));
+        let stored: String = match &reopened.pool {
+            SqlPool::Sqlite(pool) => sqlx::query("SELECT secret FROM api_keys WHERE id = ?")
+                .bind("legacy")
+                .fetch_one(pool)
+                .await
+                .expect("stored legacy row")
+                .try_get(0)
+                .expect("legacy secret"),
+            SqlPool::Postgres(_) => unreachable!(),
+        };
+        assert_eq!(
+            stored, "legacy-plaintext",
+            "startup must remain rollback-safe"
+        );
+        reopened.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn sqlite_pool(store: &SqlStore) -> &sqlx::SqlitePool {
+        match &store.pool {
+            SqlPool::Sqlite(pool) => pool,
+            SqlPool::Postgres(_) => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_operational_document_is_exact_and_takes_database_precedence() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        let document = concat!(
+            "  {\n",
+            "    \"backends\": {\"legacy\": {\"base_url\": ",
+            "\"https://legacy.example/v1\", \"api_key\": \"blob-secret\"}}\n",
+            "  }  \n"
+        );
+        store
+            .set_setting("operational", document)
+            .await
+            .expect("store document");
+
+        // This invalid relational id proves the document wins before relational
+        // decoding; startup will parse/fail the returned document itself.
+        sqlx::query(
+            "INSERT INTO backends \
+             (id, name, base_url, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("not-a-uuid")
+        .bind("shadowed")
+        .bind("https://shadowed.example/v1")
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(sqlite_pool(&store))
+        .await
+        .expect("relational shadow");
+
+        let loaded = store
+            .load_legacy_operational()
+            .await
+            .expect("load")
+            .expect("source");
+        let LegacyOperationalRead::SettingsDocument(loaded_document) = &loaded else {
+            panic!("settings document must take precedence");
+        };
+        assert_eq!(loaded_document, document);
+        assert_eq!(
+            store.get_setting("operational").await.expect("setting"),
+            Some(document.to_string()),
+            "compatibility reads never delete the authoritative blob"
+        );
+        let debug = format!("{loaded:?}");
+        assert!(debug.contains("settings.operational"));
+        assert!(!debug.contains("blob-secret"));
+    }
+
+    #[tokio::test]
+    async fn legacy_relational_operational_preserves_order_scopes_and_safe_secrets() {
+        const B1: &str = "10000000-0000-0000-0000-000000000001";
+        const B2: &str = "10000000-0000-0000-0000-000000000002";
+        const B_DEAD: &str = "10000000-0000-0000-0000-000000000003";
+        const P1: &str = "20000000-0000-0000-0000-000000000001";
+        const P2: &str = "20000000-0000-0000-0000-000000000002";
+        const P_DEAD: &str = "20000000-0000-0000-0000-000000000003";
+        const A1: &str = "30000000-0000-0000-0000-000000000001";
+        const A_DEAD: &str = "30000000-0000-0000-0000-000000000002";
+        const A2: &str = "30000000-0000-0000-0000-000000000003";
+        const K1: &str = "40000000-0000-0000-0000-000000000001";
+        const U1: &str = "50000000-0000-0000-0000-000000000001";
+
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        let pool = sqlite_pool(&store);
+
+        for (id, name, api_key, metrics, created_at, deleted_at) in [
+            (
+                B1,
+                "primary",
+                Some("upstream-secret"),
+                Some(r#"{"preset":"vllm","url":"https://metrics.example"}"#),
+                1_i64,
+                None,
+            ),
+            (B2, "secondary", None, None, 2, None),
+            (B_DEAD, "retired", None, None, 3, Some(99_i64)),
+        ] {
+            sqlx::query(
+                "INSERT INTO backends (id, name, base_url, api_key, enabled, metrics_json, \
+                 created_at_ms, updated_at_ms, deleted_at_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(format!("https://{name}.example/v1"))
+            .bind(api_key)
+            .bind(1_i64)
+            .bind(metrics)
+            .bind(created_at)
+            .bind(created_at)
+            .bind(deleted_at)
+            .execute(pool)
+            .await
+            .expect("backend");
+        }
+
+        for (id, name, kwargs, created_at, deleted_at) in [
+            (
+                P1,
+                "smart",
+                Some(r#"{"temperature":0.2,"chat_template_kwargs":{"x":true}}"#),
+                1_i64,
+                None,
+            ),
+            (P2, "fast", None, 2, None),
+            (P_DEAD, "retired-profile", None, 3, Some(99_i64)),
+        ] {
+            sqlx::query(
+                "INSERT INTO model_profiles (id, name, upstream_model, system_prompt_prefix, \
+                 upstream_chat_kwargs_json, created_at_ms, updated_at_ms, deleted_at_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(Some(format!("upstream-{name}")))
+            .bind(Some(format!("prefix-{name}")))
+            .bind(kwargs)
+            .bind(created_at)
+            .bind(created_at)
+            .bind(deleted_at)
+            .execute(pool)
+            .await
+            .expect("profile");
+        }
+
+        for (id, name, created_at, deleted_at) in [
+            (A1, "public", 1_i64, None),
+            (A_DEAD, "retired-alias", 2, Some(99_i64)),
+            (A2, "private", 3, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO aliases (id, name, created_at_ms, updated_at_ms, deleted_at_ms) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(created_at)
+            .bind(created_at)
+            .bind(deleted_at)
+            .execute(pool)
+            .await
+            .expect("alias");
+        }
+
+        sqlx::query(
+            "INSERT INTO users \
+             (id, username, password_hash, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(U1)
+        .bind("owner")
+        .bind("argon2")
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(pool)
+        .await
+        .expect("user");
+        sqlx::query(
+            "INSERT INTO api_keys \
+             (id, secret, label, user_id, created_at_ms, updated_at_ms) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(K1)
+        .bind("legacy-client-secret")
+        .bind("team")
+        .bind(U1)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(pool)
+        .await
+        .expect("key");
+
+        for (profile, backend, ordinal) in
+            [(P1, B2, 0_i64), (P1, B_DEAD, 1), (P1, B1, 2), (P2, B1, 0)]
+        {
+            sqlx::query(
+                "INSERT INTO profile_backends (profile_id, backend_id, ordinal) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(profile)
+            .bind(backend)
+            .bind(ordinal)
+            .execute(pool)
+            .await
+            .expect("profile backend");
+        }
+        for (alias, profile, ordinal) in
+            [(A1, P2, 0_i64), (A1, P_DEAD, 1), (A1, P1, 2), (A2, P1, 0)]
+        {
+            sqlx::query(
+                "INSERT INTO alias_profiles (alias_id, profile_id, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(alias)
+            .bind(profile)
+            .bind(ordinal)
+            .execute(pool)
+            .await
+            .expect("alias profile");
+        }
+        for alias in [A1, A_DEAD, A2] {
+            sqlx::query("INSERT INTO key_aliases (key_id, alias_id) VALUES (?, ?)")
+                .bind(K1)
+                .bind(alias)
+                .execute(pool)
+                .await
+                .expect("key alias");
+        }
+        store
+            .set_setting("unknown_model_policy", "reject")
+            .await
+            .expect("policy");
+
+        let loaded = store
+            .load_legacy_operational()
+            .await
+            .expect("load")
+            .expect("seeded");
+        let debug = format!("{loaded:?}");
+        assert!(!debug.contains("upstream-secret"));
+        assert!(!debug.contains("legacy-client-secret"));
+        let LegacyOperationalRead::Relational(operational) = loaded else {
+            panic!("expected relational source");
+        };
+
+        assert_eq!(operational.backends.len(), 2);
+        let primary = operational
+            .backends
+            .iter()
+            .find(|backend| backend.id == uuid::Uuid::parse_str(B1).unwrap())
+            .expect("primary backend");
+        assert_eq!(
+            primary.extra.get("metrics"),
+            Some(&serde_json::json!({
+                "preset": "vllm",
+                "url": "https://metrics.example"
+            }))
+        );
+
+        let smart = operational
+            .model_profiles
+            .iter()
+            .find(|profile| profile.id == uuid::Uuid::parse_str(P1).unwrap())
+            .expect("smart profile");
+        assert_eq!(
+            smart.backends,
+            [B2, B1]
+                .map(|id| uuid::Uuid::parse_str(id).unwrap())
+                .to_vec()
+        );
+        assert_eq!(
+            smart.profile.upstream_model.as_deref(),
+            Some("upstream-smart")
+        );
+        assert_eq!(
+            smart.profile.system_prompt_prefix.as_deref(),
+            Some("prefix-smart")
+        );
+        assert_eq!(smart.profile.upstream_chat_kwargs["temperature"], 0.2);
+        assert!(smart.profile.extends.is_empty());
+        assert!(smart.profile.roles.is_none());
+
+        let public = operational
+            .aliases
+            .iter()
+            .find(|alias| alias.id == uuid::Uuid::parse_str(A1).unwrap())
+            .expect("public alias");
+        assert_eq!(
+            public.profiles,
+            [P2, P1]
+                .map(|id| uuid::Uuid::parse_str(id).unwrap())
+                .to_vec()
+        );
+        assert_eq!(operational.keys.len(), 1);
+        assert_eq!(
+            operational.keys[0].key,
+            api_key_digest("legacy-client-secret")
+        );
+        assert_eq!(
+            operational.keys[0].allowed_aliases,
+            [A1, A2]
+                .map(|id| uuid::Uuid::parse_str(id).unwrap())
+                .to_vec()
+        );
+        assert_eq!(
+            operational.keys[0].user_id,
+            Some(uuid::Uuid::parse_str(U1).unwrap())
+        );
+        assert_eq!(
+            operational.unknown_model_policy,
+            crate::control_plane::UnknownModelPolicy::Reject
+        );
+
+        let stored: String = sqlx::query("SELECT secret FROM api_keys WHERE id = ?")
+            .bind(K1)
+            .fetch_one(pool)
+            .await
+            .expect("stored key")
+            .try_get(0)
+            .expect("secret");
+        assert_eq!(stored, "legacy-client-secret");
+    }
+
+    #[tokio::test]
+    async fn legacy_relational_tombstones_signal_seeded_empty() {
+        const TOMBSTONE: &str = "60000000-0000-0000-0000-000000000001";
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        assert_eq!(store.load_legacy_operational().await.expect("fresh"), None);
+        store
+            .set_setting("operational", "  \n")
+            .await
+            .expect("blank document");
+        assert_eq!(
+            store.load_legacy_operational().await.expect("blank"),
+            None,
+            "a blank legacy document is not an operational source"
+        );
+
+        sqlx::query(
+            "INSERT INTO aliases \
+             (id, name, created_at_ms, updated_at_ms, deleted_at_ms) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(TOMBSTONE)
+        .bind("removed")
+        .bind(1_i64)
+        .bind(2_i64)
+        .bind(2_i64)
+        .execute(sqlite_pool(&store))
+        .await
+        .expect("tombstone");
+
+        let Some(LegacyOperationalRead::Relational(operational)) =
+            store.load_legacy_operational().await.expect("load")
+        else {
+            panic!("tombstones must signal an already-seeded database");
+        };
+        assert_eq!(
+            operational,
+            crate::control_plane::OperationalConfig::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_key_scoped_only_to_deleted_alias_fails_closed() {
+        const ALIAS: &str = "70000000-0000-0000-0000-000000000001";
+        const KEY: &str = "70000000-0000-0000-0000-000000000002";
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        let pool = sqlite_pool(&store);
+        sqlx::query(
+            "INSERT INTO aliases (id, name, created_at_ms, updated_at_ms, deleted_at_ms) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(ALIAS)
+        .bind("retired")
+        .bind(1_i64)
+        .bind(2_i64)
+        .bind(2_i64)
+        .execute(pool)
+        .await
+        .expect("alias");
+        sqlx::query(
+            "INSERT INTO api_keys (id, secret, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?)",
+        )
+        .bind(KEY)
+        .bind("secret")
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(pool)
+        .await
+        .expect("key");
+        sqlx::query("INSERT INTO key_aliases (key_id, alias_id) VALUES (?, ?)")
+            .bind(KEY)
+            .bind(ALIAS)
+            .execute(pool)
+            .await
+            .expect("scope");
+
+        let error = store.load_legacy_operational().await.unwrap_err();
+        assert!(error.contains("refusing to widen"));
+        assert!(error.contains(KEY));
+        assert!(!error.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn legacy_relational_ids_are_strict_uuids() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        sqlx::query(
+            "INSERT INTO aliases \
+             (id, name, created_at_ms, updated_at_ms, deleted_at_ms) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("legacy-string-id")
+        .bind("removed")
+        .bind(1_i64)
+        .bind(2_i64)
+        .bind(2_i64)
+        .execute(sqlite_pool(&store))
+        .await
+        .expect("legacy row");
+        let error = store
+            .load_legacy_operational()
+            .await
+            .expect_err("invalid id must fail closed");
+        assert!(error.contains("not a valid UUID"));
+    }
+
+    #[test]
+    fn remote_postgres_rejects_downgrade_capable_default_mode() {
+        let options = PgConnectOptions::new_without_pgpass()
+            .host("db.example.test")
+            .ssl_mode(PgSslMode::Prefer);
+        let error = validate_postgres_transport(&options).expect_err("remote prefer must fail");
+        assert!(error.contains("sslmode=require"));
+        assert!(!error.contains("db.example.test"));
+    }
+
+    #[test]
+    fn remote_postgres_accepts_encrypted_only_modes() {
+        for mode in [
+            PgSslMode::Require,
+            PgSslMode::VerifyCa,
+            PgSslMode::VerifyFull,
+        ] {
+            let options = PgConnectOptions::new_without_pgpass()
+                .host("db.example.test")
+                .ssl_mode(mode);
+            validate_postgres_transport(&options).expect("encrypted-only remote mode");
+        }
+    }
+
+    #[test]
+    fn local_postgres_accepts_developer_default_mode() {
+        for host in ["localhost", "127.0.0.1", "::1"] {
+            let options = PgConnectOptions::new_without_pgpass()
+                .host(host)
+                .ssl_mode(PgSslMode::Prefer);
+            validate_postgres_transport(&options).expect("local PostgreSQL");
+        }
+        let socket = PgConnectOptions::new_without_pgpass()
+            .socket("/tmp")
+            .ssl_mode(PgSslMode::Disable);
+        validate_postgres_transport(&socket).expect("local Unix socket");
+    }
+
+    #[tokio::test]
+    async fn invalid_database_urls_never_echo_credentials() {
+        let postgres = match SqlStore::connect_postgres("postgres://user:super-secret@[").await {
+            Ok(_) => panic!("invalid PostgreSQL URL unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(postgres, "invalid PostgreSQL connection URL");
+        assert!(!postgres.contains("super-secret"));
+
+        let sqlite = match SqlStore::connect_sqlite("sqlite://safe.db?password=super-secret").await
+        {
+            Ok(_) => panic!("invalid SQLite URL unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(sqlite, "invalid SQLite connection URL");
+        assert!(!sqlite.contains("super-secret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonl_writer_tightens_existing_directory_and_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "llmconduit-jsonl-permissions-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).expect("create JSONL directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
+            .expect("loosen directory");
+        for filename in ["requests.jsonl", "events.jsonl"] {
+            let path = dir.join(filename);
+            std::fs::write(&path, b"existing\n").expect("precreate JSONL file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                .expect("loosen file");
+        }
+
+        let writer = JsonlWriter::new(&dir).expect("writer");
+        writer
+            .begin_request(request("private"))
+            .await
+            .expect("request write");
+        writer
+            .append_event(EventRow {
+                request_id: "private".to_string(),
+                seq: 1,
+                ts_ms: 1,
+                hop: "client_in".to_string(),
+                kind: "body".to_string(),
+                payload: None,
+                bytes: None,
+            })
+            .await
+            .expect("event write");
+
+        assert_eq!(
+            std::fs::metadata(&dir)
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for filename in ["requests.jsonl", "events.jsonl"] {
+            let path = dir.join(filename);
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::remove_file(path).expect("remove JSONL file");
+        }
+        std::fs::remove_dir(dir).expect("remove JSONL directory");
+    }
+
+    #[tokio::test]
+    async fn retained_jsonl_writer_uses_gateway_owned_daily_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmconduit-jsonl-daily-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let writer =
+            JsonlWriter::new_with_retention(&dir, NonZeroU64::new(30).unwrap()).expect("writer");
+        writer
+            .begin_request(request("daily"))
+            .await
+            .expect("request write");
+        let expected = dir.join(format!(
+            "requests-{}.jsonl",
+            chrono::Utc::now().format("%Y-%m-%d")
+        ));
+        assert!(expected.is_file());
+        std::fs::remove_file(expected).expect("remove daily file");
+        std::fs::remove_dir(dir).expect("remove JSONL directory");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_file_is_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "llmconduit-sqlite-permissions-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).expect("create SQLite directory");
+        let path = dir.join("control-plane.sqlite");
+        std::fs::write(&path, b"").expect("precreate SQLite database");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("loosen database");
+
+        let store = SqlStore::connect_sqlite(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("database metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let journal_mode: String = sqlx::query("PRAGMA journal_mode")
+            .fetch_one(sqlite_pool(&store))
+            .await
+            .expect("journal mode")
+            .try_get(0)
+            .expect("journal mode value");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        store.close().await;
+        std::fs::remove_file(path).expect("remove database");
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = dir.join(format!("control-plane.sqlite{suffix}"));
+            if let Err(error) = std::fs::remove_file(&sidecar)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                panic!("remove SQLite sidecar {}: {error}", sidecar.display());
+            }
+        }
+        std::fs::remove_dir(dir).expect("remove SQLite directory");
+    }
+
+    #[derive(Default)]
+    struct BlockingWriter {
+        entered: Notify,
+        release: Notify,
+        writes: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl PersistenceWriter for BlockingWriter {
+        async fn begin_request(&self, _row: RequestRow) -> StoreResult<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.writes.lock().unwrap().push("begin");
+            Ok(())
+        }
+
+        async fn append_event(&self, _event: EventRow) -> StoreResult<()> {
+            self.writes.lock().unwrap().push("event");
+            Ok(())
+        }
+
+        async fn finish_request(&self, _id: &str, _finish: RequestFinish) -> StoreResult<()> {
+            self.writes.lock().unwrap().push("finish");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_reports_overflow_without_waiting() {
+        let writer = Arc::new(BlockingWriter::default());
+        let queue = PersistenceQueue::spawn(
+            Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+            NonZeroUsize::new(1).unwrap(),
+        );
+        queue.try_begin(request("one")).expect("first accepted");
+        writer.entered.notified().await;
+
+        queue
+            .try_event(EventRow {
+                request_id: "one".to_string(),
+                seq: 1,
+                ts_ms: 1,
+                hop: "client_in".to_string(),
+                kind: "body".to_string(),
+                payload: None,
+                bytes: None,
+            })
+            .expect("fills queue");
+        assert_eq!(
+            queue.try_finish("one".to_string(), finish()),
+            Err(EnqueueError::Full)
+        );
+        assert_eq!(queue.stats().dropped_full, 1);
+
+        writer.release.notify_waiters();
+        queue.flush().await.expect("flush");
+        assert_eq!(*writer.writes.lock().unwrap(), vec!["begin", "event"]);
+    }
+}

@@ -2,6 +2,8 @@ use crate::config::PersistedConfig;
 use crate::config::default_config_path;
 use crate::config::load_persisted_config;
 use crate::config::write_persisted_config;
+use crate::control_plane::ControlPlaneConfig;
+use crate::control_plane::ControlPlaneSection;
 use clap::Parser;
 use clap::Subcommand;
 use dialoguer::Confirm;
@@ -48,6 +50,13 @@ pub enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Atomically migrate legacy YAML control-plane layout and plaintext keys
+    /// without running the interactive editor.
+    MigrateConfig {
+        /// Path to the YAML config file. Defaults to ~/.config/llmconduit/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Diff consecutive upstream request log entries and highlight unstable prefixes.
     AnalyzeLog {
         /// Path to the config file. Defaults to ~/.config/llmconduit/config.yaml
@@ -62,12 +71,43 @@ pub enum Commands {
     },
 }
 
+pub fn migrate_config_file(path: &std::path::Path) -> Result<bool, String> {
+    if crate::config::path_is_toml(path) {
+        return Err(
+            "TOML configuration is read-only and has no legacy control-plane schema".into(),
+        );
+    }
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let mut document = ControlPlaneConfig::from_yaml_str(&source)?;
+    let migrated = document.migrated_legacy_root() || document.migrate_plaintext_key_digests()?;
+    document.write_to_path(path)?;
+    Ok(migrated)
+}
+
 pub fn resolve_config_path(path: Option<PathBuf>) -> Result<PathBuf, String> {
     path.map(Ok).unwrap_or_else(default_config_path)
 }
 
 pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
-    let existing = load_persisted_config(&path)?;
+    let mut control_plane_document = if !crate::config::path_is_toml(&path) {
+        if path.exists() {
+            let source = std::fs::read_to_string(&path)
+                .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+            Some(ControlPlaneConfig::from_yaml_str(&source)?)
+        } else {
+            Some(ControlPlaneConfig::from_gateway(
+                PersistedConfig::default(),
+                ControlPlaneSection::default(),
+            )?)
+        }
+    } else {
+        None
+    };
+    let existing = match &control_plane_document {
+        Some(document) => document.gateway().clone(),
+        None => load_persisted_config(&path)?,
+    };
     let theme = ColorfulTheme::default();
 
     println!("Configuring llmconduit");
@@ -215,6 +255,65 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         return Err("configuration cancelled".to_string());
     }
 
-    write_persisted_config(&path, &config)?;
+    if let Some(document) = control_plane_document.as_mut() {
+        document.replace_gateway(config.clone())?;
+        document.write_to_path(&path)?;
+    } else {
+        write_persisted_config(&path, &config)?;
+    }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_config_file_atomically_persists_namespaced_digest() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-legacy-config-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &path,
+            "auth:\n  require: true\n  keys:\n    - key: legacy-plaintext\n",
+        )
+        .expect("legacy config");
+        assert!(migrate_config_file(&path).expect("migrate"));
+        let migrated = std::fs::read_to_string(&path).expect("rewritten config");
+        assert!(migrated.contains("control_plane:"));
+        assert!(migrated.contains("sha256:"));
+        assert!(!migrated.contains("legacy-plaintext"));
+        assert!(!migrate_config_file(&path).expect("idempotent rewrite"));
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn migrate_config_file_hashes_plaintext_key_in_namespaced_operational_config() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-namespaced-legacy-key-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &path,
+            "control_plane:\n  operational:\n    keys:\n      - id: 10000000-0000-4000-8000-000000000001\n        key: plaintext-secret\n",
+        )
+        .expect("config");
+
+        assert!(migrate_config_file(&path).expect("migrate"));
+        let migrated = std::fs::read_to_string(&path).expect("rewritten config");
+        assert!(!migrated.contains("plaintext-secret"));
+        assert!(migrated.contains(&crate::client_auth::hash_secret("plaintext-secret")));
+
+        let document = ControlPlaneConfig::from_yaml_str(&migrated).expect("parse migrated");
+        document
+            .control_plane()
+            .operational
+            .as_ref()
+            .expect("operational config")
+            .validate_persisted_key_digests()
+            .expect("migrated key is accepted by fail-closed startup validation");
+        assert!(!migrate_config_file(&path).expect("idempotent rewrite"));
+        std::fs::remove_file(path).expect("cleanup");
+    }
 }

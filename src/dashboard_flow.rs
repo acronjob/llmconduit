@@ -637,8 +637,9 @@ pub struct CapturedHeaders(Vec<(String, String)>);
 
 /// Gap 05 — an upstream RESPONSE/ERROR body that has ALREADY been through the capped +
 /// redacting capture primitive, paired with whether the cap TRUNCATED it. The ONLY way
-/// to mint one is [`capture_response_body`], so (like [`CapturedBody`]) a caller cannot
-/// hand the store an unredacted / over-cap / slice-retaining body. Holds an
+/// to mint one is [`capture_response_body`] (or its transport-truncation-aware
+/// sibling [`capture_response_body_with_truncation`]), so (like [`CapturedBody`])
+/// a caller cannot hand the store an unredacted / over-cap / slice-retaining body. Holds an
 /// `Arc<[u8]>` ≤ `BODY_CAP` with secrets redacted; `truncated` records whether the raw
 /// body exceeded `BODY_CAP` (so the dashboard can flag a partial body honestly rather
 /// than presenting it as complete — don't-lie-with-zeros for bodies).
@@ -2180,7 +2181,17 @@ pub fn capture_body(raw: &[u8]) -> CapturedBody {
 /// independent of that marker, so an over-cap body is flagged truncated even when the
 /// stored bytes are the marker.
 pub fn capture_response_body(raw: &[u8]) -> CapturedResponseBody {
-    let truncated = raw.len() > BODY_CAP;
+    capture_response_body_with_truncation(raw, false)
+}
+
+/// Capture an already transport-capped upstream body while preserving the fact
+/// that bytes existed beyond `raw`. This keeps the dashboard's live-body
+/// metadata truthful even though the HTTP reader deliberately stopped early.
+pub fn capture_response_body_with_truncation(
+    raw: &[u8],
+    externally_truncated: bool,
+) -> CapturedResponseBody {
+    let truncated = externally_truncated || raw.len() > BODY_CAP;
     let bytes = crate::redaction::capture_capped_redacted(raw, BODY_CAP, SCALAR_CAP);
     CapturedResponseBody {
         body: Arc::from(bytes.into_boxed_slice()),
@@ -4130,6 +4141,29 @@ mod tests {
             captured.bytes.len() <= BODY_CAP,
             "retained bytes stay within the cap regardless of raw size"
         );
+    }
+
+    #[test]
+    fn upstream_response_external_transport_cap_is_flagged() {
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        open_simple(&store, "api_1");
+        let retained_prefix = br#"{"error":"provider body prefix"}"#;
+        assert!(retained_prefix.len() < BODY_CAP);
+        store.set_upstream_response(
+            "api_1",
+            Some(capture_response_body_with_truncation(retained_prefix, true)),
+        );
+
+        let record = store.detail("api_1").expect("record");
+        let captured = record
+            .upstream_response
+            .as_ref()
+            .expect("externally capped body captured");
+        assert!(
+            captured.truncated,
+            "a transport-capped prefix must not be presented as a complete body"
+        );
+        assert!(captured.bytes.len() <= BODY_CAP);
     }
 
     #[test]

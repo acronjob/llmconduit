@@ -5916,6 +5916,10 @@ async fn d13_routes_absent_without_debug_ui() {
         "/dashboard/api/topology",
         "/dashboard/api/catalog",
         "/dashboard/api/snapshot",
+        "/dashboard/api/history/requests",
+        "/dashboard/api/history/requests/api_x",
+        "/dashboard/api/history/usage",
+        "/dashboard/api/history/metrics",
     ] {
         let response = app
             .clone()
@@ -5972,6 +5976,18 @@ async fn d13_routes_present_in_dev_open_with_debug_ui() {
         );
         d13_assert_no_store(&response);
     }
+    // The read-only durable-history routes register under the same gate, but
+    // explicitly report that this legacy builder attached no SQL store.
+    for uri in [
+        "/dashboard/api/history/requests",
+        "/dashboard/api/history/requests/api_x",
+        "/dashboard/api/history/usage",
+        "/dashboard/api/history/metrics",
+    ] {
+        let response = d13_get(&app, uri).await;
+        assert_eq!(response.status().as_u16(), 503, "{uri} store disabled");
+        d13_assert_no_store(&response);
+    }
 }
 
 #[tokio::test]
@@ -6006,6 +6022,79 @@ async fn d13_api_requires_session_when_token_configured() {
     let authed = d13_authed_get(&app, &auth, "/dashboard/api/metrics").await;
     assert_eq!(authed.status().as_u16(), 200);
     d13_assert_no_store(&authed);
+
+    // Session authentication runs before the history handler's disabled-store
+    // response, so the endpoint cannot reveal even availability to anonymous
+    // callers.
+    let history_unauthed = d13_get(&app, "/dashboard/api/history/requests").await;
+    assert_eq!(history_unauthed.status().as_u16(), 401);
+    d13_assert_no_store(&history_unauthed);
+    let history_authed = d13_authed_get(&app, &auth, "/dashboard/api/history/requests").await;
+    assert_eq!(history_authed.status().as_u16(), 503);
+    d13_assert_no_store(&history_authed);
+}
+
+#[tokio::test]
+async fn persistent_history_route_reads_sql_without_exposing_key_material() {
+    use llmconduit::control_plane_store::{
+        PersistenceStore, PersistenceWriter, RequestRow, SqlStore,
+    };
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("history store"),
+    );
+    PersistenceWriter::begin_request(
+        store.as_ref(),
+        RequestRow {
+            id: "history-call".to_string(),
+            response_id: None,
+            conversation_id: Some("conversation".to_string()),
+            virtual_key_id: Some("key-id".to_string()),
+            client_protocol: "responses".to_string(),
+            client_model: "public-model".to_string(),
+            alias: Some("public-model".to_string()),
+            backend: None,
+            resolved_model: None,
+            status: "running".to_string(),
+            created_at_ms: 1,
+        },
+    )
+    .await
+    .expect("persist request");
+    PersistenceStore::put_api_key(
+        store.as_ref(),
+        "key-id",
+        "sk-never-return-this",
+        Some("test"),
+        None,
+        "test",
+    )
+    .await
+    .expect("persist key hash");
+
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store);
+    let app = d13_router(Arc::new(gateway));
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/requests?limit=10").await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    d13_assert_no_store(&response);
+    let body = d13_json(response).await;
+    assert_eq!(body["requests"][0]["id"], "history-call");
+    let encoded = body.to_string();
+    assert!(!encoded.contains("sk-never-return-this"));
+    assert!(!encoded.contains("sha256:"));
 }
 
 #[tokio::test]
@@ -6027,6 +6116,7 @@ async fn d13_extractor_rejection_carries_no_store_and_security_headers() {
     for uri in [
         "/dashboard/api/snapshot?at=not-a-number",
         "/dashboard/api/flows?page=not-a-number",
+        "/dashboard/api/history/requests?limit=not-a-number",
     ] {
         let response = app
             .clone()

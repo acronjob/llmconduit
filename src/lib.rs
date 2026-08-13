@@ -1,6 +1,9 @@
 pub mod adapters;
 pub mod cli;
+pub mod client_auth;
 pub mod config;
+pub mod control_plane;
+pub mod control_plane_store;
 pub mod dashboard_api;
 pub mod dashboard_auth;
 pub mod dashboard_flow;
@@ -9,11 +12,13 @@ pub mod dashboard_ws;
 pub mod debug_ui;
 pub mod engine;
 pub mod error;
+pub mod flow_persistence;
 pub mod http;
 pub mod log_rotation;
 pub mod metrics;
 pub mod models;
 pub mod monitor;
+pub mod persistent_history_api;
 pub(crate) mod proxy_headers;
 pub mod raw;
 pub(crate) mod redaction;
@@ -94,6 +99,102 @@ pub fn build_app_with_gateway_and_options(
     raw_output: Option<RawOutput>,
     options: AppOptions,
 ) -> (axum::Router, Arc<Gateway>) {
+    build_app_with_gateway_control_plane(
+        config,
+        raw_output,
+        options,
+        Vec::new(),
+        crate::control_plane::UnknownModelPolicy::Passthrough,
+        None,
+    )
+    .expect("empty control-plane route set is valid")
+}
+
+/// Build with materialized operational routes and client authentication. The
+/// public legacy builders delegate here with empty/open control-plane state.
+pub fn build_app_with_gateway_control_plane(
+    config: Config,
+    raw_output: Option<RawOutput>,
+    options: AppOptions,
+    operational_routes: Vec<crate::control_plane::OperationalRoutePlan>,
+    unknown_model_policy: crate::control_plane::UnknownModelPolicy,
+    client_auth: Option<crate::client_auth::ClientAuth>,
+) -> Result<(axum::Router, Arc<Gateway>), String> {
+    build_app_with_gateway_control_plane_runtime(
+        config,
+        raw_output,
+        options,
+        operational_routes,
+        unknown_model_policy,
+        client_auth,
+        ControlPlaneRuntime::default(),
+    )
+}
+
+/// Runtime-only control-plane handles. Secrets and database connections never
+/// enter the persisted upstream [`Config`].
+#[derive(Clone)]
+pub struct ControlPlaneRuntime {
+    pub persistence_store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
+    pub persistence_queue: Option<crate::control_plane_store::PersistenceQueue>,
+    pub conversation_id_header: String,
+}
+
+impl Default for ControlPlaneRuntime {
+    fn default() -> Self {
+        Self {
+            persistence_store: None,
+            persistence_queue: None,
+            conversation_id_header: crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER
+                .to_string(),
+        }
+    }
+}
+
+/// Full dependency-injection entry point used by the server after it has
+/// connected the configured persistence backend.
+#[allow(clippy::too_many_arguments)]
+pub fn build_app_with_gateway_control_plane_runtime(
+    config: Config,
+    raw_output: Option<RawOutput>,
+    options: AppOptions,
+    operational_routes: Vec<crate::control_plane::OperationalRoutePlan>,
+    unknown_model_policy: crate::control_plane::UnknownModelPolicy,
+    client_auth: Option<crate::client_auth::ClientAuth>,
+    runtime: ControlPlaneRuntime,
+) -> Result<(axum::Router, Arc<Gateway>), String> {
+    let conversation_id_header = runtime.conversation_id_header.trim();
+    let conversation_id_header = if conversation_id_header.is_empty() {
+        crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER
+    } else {
+        conversation_id_header
+    };
+    axum::http::HeaderName::from_bytes(conversation_id_header.as_bytes())
+        .map_err(|_| format!("invalid conversation id header name '{conversation_id_header}'"))?;
+    if crate::control_plane::is_sensitive_conversation_header(conversation_id_header) {
+        return Err(format!(
+            "conversation id header '{conversation_id_header}' is a sensitive credential carrier"
+        ));
+    }
+    let conversation_id_header = conversation_id_header.to_string();
+    let operational_models = operational_routes
+        .iter()
+        .map(|route| (route.name.clone(), route.primary_profile_name.clone()))
+        .collect::<Vec<_>>();
+    for operational in &operational_routes {
+        if let Some(route) = config.model_routes.iter().find(|route| {
+            route.glob.is_none()
+                && route
+                    .name
+                    .trim()
+                    .eq_ignore_ascii_case(operational.name.trim())
+        }) {
+            return Err(format!(
+                "operational route '{}' conflicts with configured model route '{}'",
+                operational.name, route.name
+            ));
+        }
+    }
     let http_client = reqwest::Client::builder()
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
@@ -132,7 +233,9 @@ pub fn build_app_with_gateway_and_options(
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
     // client so route-name/glob matching applies.
-    let routing_mode = !config.upstreams.is_empty() || !config.model_routes.is_empty();
+    let routing_mode = !config.upstreams.is_empty()
+        || !config.model_routes.is_empty()
+        || !operational_routes.is_empty();
     // Per-backend-model finalization policies (effort map, `template_family`
     // override, `upstream_chat_kwargs`), shared (cheap clone) across all leaf
     // clients so each resolves against the FINAL provider model (T1). Built once
@@ -161,7 +264,7 @@ pub fn build_app_with_gateway_and_options(
             .with_flow_store(flow_store.clone())
         };
     let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
-        let providers = config
+        let mut providers: Vec<RoutingUpstreamProvider> = config
             .upstreams
             .iter()
             .map(|provider| {
@@ -197,12 +300,52 @@ pub fn build_app_with_gateway_and_options(
                 )
             })
             .collect();
+        // Operational/ad-hoc routes still need the ordinary top-level provider
+        // as their passthrough/default catalog when no explicit `upstreams` are
+        // configured. Otherwise merely adding one alias makes every unknown
+        // model unroutable despite `unknown_model_policy: passthrough`.
+        if config.upstreams.is_empty()
+            && (!operational_routes.is_empty() || !config.model_routes.is_empty())
+        {
+            let primary_client = make_upstream_client(
+                config.upstream_base_url.clone(),
+                config.upstream_api_key.clone(),
+                config.upstream_request_log_path.clone(),
+            );
+            let fallback_providers = config
+                .fallback_upstreams
+                .iter()
+                .map(|fallback| {
+                    FailoverUpstreamProvider::new(
+                        fallback.name.clone(),
+                        make_upstream_client(
+                            fallback.upstream_base_url.clone(),
+                            fallback.upstream_api_key.clone(),
+                            fallback.upstream_request_log_path.clone(),
+                        ),
+                        fallback.upstream_model.clone(),
+                        fallback.exposed_model.clone(),
+                        fallback.upstream_chat_kwargs.clone(),
+                    )
+                })
+                .collect();
+            providers.push(RoutingUpstreamProvider::new(
+                "primary",
+                primary_client,
+                config.upstream_model.clone(),
+                config.upstream_chat_kwargs.clone(),
+                fallback_providers,
+                Duration::from_secs(config.upstream_failure_cooldown_secs),
+            ));
+        }
         // Build a synthetic provider + spec per ad-hoc route (G7). Each route is
         // a single-upstream client keyed by request-model name/glob; the glob
         // matcher was compiled at config time.
         let cooldown = Duration::from_secs(config.upstream_failure_cooldown_secs);
-        let mut route_providers = Vec::with_capacity(config.model_routes.len());
-        let mut route_specs = Vec::with_capacity(config.model_routes.len());
+        let mut route_providers =
+            Vec::with_capacity(config.model_routes.len() + operational_routes.len());
+        let mut route_specs =
+            Vec::with_capacity(config.model_routes.len() + operational_routes.len());
         for (index, route) in config.model_routes.iter().enumerate() {
             let client = make_upstream_client(
                 route.upstream_base_url.clone(),
@@ -220,6 +363,32 @@ pub fn build_app_with_gateway_and_options(
                 index,
                 route.upstream_model.clone(),
             ));
+        }
+        for route in &operational_routes {
+            let index = route_providers.len();
+            let legs = route
+                .providers
+                .iter()
+                .map(|provider| {
+                    FailoverUpstreamProvider::new(
+                        provider.backend_name.clone(),
+                        make_upstream_client(
+                            provider.base_url.clone(),
+                            provider.api_key.clone(),
+                            provider.request_log_path.clone(),
+                        ),
+                        provider.upstream_model.clone(),
+                        None,
+                        provider.upstream_chat_kwargs.clone(),
+                    )
+                })
+                .collect();
+            route_providers.push(RouteUpstreamProvider::from_failover(
+                format!("alias-{}", route.name),
+                legs,
+                cooldown,
+            )?);
+            route_specs.push(ModelRouteSpec::advertised_exact(route.name.clone(), index));
         }
         Arc::new(RoutingUpstreamClient::with_routes(
             providers,
@@ -292,22 +461,32 @@ pub fn build_app_with_gateway_and_options(
     let snapshot_flow_store = flow_store.clone();
     let snapshot_metrics = metrics.clone();
     let snapshot_monitor = monitor.clone();
-    let gateway = Arc::new(
-        Gateway::new(
-            config,
-            replay_store,
-            upstream,
-            search,
-            vision,
-            image_cache,
-            monitor,
-            raw_output,
-            flow_store,
-        )
-        .with_dashboard_auth(dashboard_auth)
-        .with_metrics(metrics)
-        .with_turn_capture(turn_capture),
-    );
+    let mut gateway = Gateway::new(
+        config,
+        replay_store,
+        upstream,
+        search,
+        vision,
+        image_cache,
+        monitor,
+        raw_output,
+        flow_store,
+    )
+    .with_dashboard_auth(dashboard_auth)
+    .with_metrics(metrics)
+    .with_turn_capture(turn_capture)
+    .with_operational_models(operational_models, unknown_model_policy);
+    if let Some(client_auth) = client_auth {
+        gateway = gateway.with_client_auth(client_auth);
+    }
+    if let Some(queue) = runtime.persistence_queue {
+        gateway = gateway.with_persistence_queue(queue);
+    }
+    if let Some(store) = runtime.persistence_store {
+        gateway = gateway.with_persistence_store(store);
+    }
+    gateway = gateway.with_conversation_id_header(conversation_id_header);
+    let gateway = Arc::new(gateway);
     // D4: spawn the topology-health publication task ONLY when the debug UI is on,
     // so production keeps the zero-overhead path (no 1 s tick). Guard on a live
     // tokio runtime so a non-async embedder that enables the debug UI does not
@@ -330,7 +509,7 @@ pub fn build_app_with_gateway_and_options(
         register_protected_routes,
     };
     let app = build_router(Arc::clone(&gateway), router_options);
-    (app, gateway)
+    Ok((app, gateway))
 }
 
 /// Build the D7 dashboard auth context + the route-registration decision for a

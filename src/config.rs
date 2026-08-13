@@ -1393,11 +1393,21 @@ impl Config {
         path: Option<&Path>,
         route_specs: &[String],
     ) -> Result<Self, String> {
-        let mut persisted = if let Some(path) = path {
+        let persisted = if let Some(path) = path {
             load_persisted_config(path)?
         } else {
             load_default_persisted_config()?
         };
+        Self::from_persisted_env_and_routes(persisted, route_specs)
+    }
+
+    /// Resolve an already-materialized persisted document through the same env
+    /// and CLI route precedence as the normal file loader. Used by the
+    /// namespaced control-plane wrapper after its lossless profile overlay.
+    pub fn from_persisted_env_and_routes(
+        mut persisted: PersistedConfig,
+        route_specs: &[String],
+    ) -> Result<Self, String> {
         apply_env_overrides(&mut persisted);
         for spec in route_specs {
             let (name, route) = parse_model_route_spec(spec)?;
