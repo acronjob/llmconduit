@@ -175,9 +175,11 @@ identifiers it declared: `harness`, `harness_version`, `harness_session_id`,
 `harness_sub_session_id`, `harness_parent_session_id`, and `session_kind`.
 Detection is data-driven. Built-in profiles cover Claude Code (session and
 agent headers, `metadata.user_id`), Codex (`session-id`, `thread-id`,
-`x-codex-parent-thread-id`, `x-openai-subagent`), pi, oh-my-pi, our own
-`x-llm-*` header convention (used by pi-agent), and a generic fallback over
-the common affinity headers. Profiles are evaluated in order; the first match
+`x-codex-parent-thread-id`, `x-openai-subagent`), opencode (user-agent only;
+sessions inferred), pi, oh-my-pi, our own `x-llm-*` header convention (used by
+pi-agent), and a generic fallback over the common affinity headers. Every
+stored request keeps its redacted client headers on the `client_in` event, so
+a detection result can be checked against what the harness actually sent. Profiles are evaluated in order; the first match
 wins. The shipped list is `src/harness_profiles.yaml`; operators add, override
 (same name), reorder, or disable profiles under `control_plane.sessions`:
 

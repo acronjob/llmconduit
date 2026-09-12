@@ -80,6 +80,12 @@ harnesses:
 
   # Upstream pi. Newer builds send their own User-Agent; older ones keep the
   # OpenAI SDK default and are recognized by the affinity headers instead.
+  - name: opencode
+    # opencode (sst) sends no session identifier: sessions are inferred from
+    # the conversation prefix per client key.
+    match: { header: { name: user-agent, regex: '^opencode/' } }
+    version: { header: { name: user-agent, regex: '^opencode/([0-9][^ ]*)' } }
+    sub_sessions: infer
   - name: pi
     match:
       any:

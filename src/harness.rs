@@ -681,6 +681,7 @@ mod tests {
                 "oh-my-pi",
                 "claude-code",
                 "codex",
+                "opencode",
                 "pi",
                 "generic"
             ]
@@ -770,6 +771,24 @@ mod tests {
             identity.session_id.as_deref(),
             Some("44444444-4444-4444-8444-444444444444")
         );
+    }
+
+    #[test]
+    fn opencode_is_recognised_by_its_user_agent() {
+        // Seen live: `opencode/1.2.15 ai-sdk/provider-utils/3.0.20 runtime/bun/1.3.10`,
+        // no session headers, no prompt_cache_key.
+        let detector = HarnessDetector::builtin();
+        let identity = detector.detect(
+            &headers(&[(
+                "user-agent",
+                "opencode/1.2.15 ai-sdk/provider-utils/3.0.20 runtime/bun/1.3.10",
+            )]),
+            None,
+        );
+        assert_eq!(identity.harness, "opencode");
+        assert_eq!(identity.version.as_deref(), Some("1.2.15"));
+        assert_eq!(identity.session_id, None);
+        assert_eq!(identity.sub_sessions, SubSessionPolicy::Infer);
     }
 
     #[test]
@@ -967,6 +986,7 @@ harnesses:
                 "oh-my-pi",
                 "claude-code",
                 "codex",
+                "opencode",
                 "pi",
                 "generic"
             ]

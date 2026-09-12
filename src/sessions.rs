@@ -33,6 +33,14 @@ const MAX_CANDIDATE_CHAINS: usize = 256;
 pub const KIND_DECLARED: &str = "declared";
 pub const KIND_INFERRED: &str = "inferred";
 
+/// Whether two prefix-less item lists are the same conversation with some
+/// items changed (a rewritten system prompt, an edited tool) rather than two
+/// unrelated requests that happen to share an item: at least two items in
+/// common, covering at least half of the smaller request.
+fn overlap_is_a_match(common: usize, head_len: usize, input_len: usize) -> bool {
+    common >= 2 && common * 2 >= head_len.min(input_len)
+}
+
 /// The part of a split item that lineage needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemFingerprint {
@@ -354,7 +362,9 @@ impl SessionLinker {
         // Score = (shared prefix, set overlap): a chain that shares a prefix
         // beats one that only shares items; among prefix-less matches the
         // one with more items in common wins (a changed system prompt keeps
-        // the rest of the conversation). No prefix and no overlap = no match.
+        // the rest of the conversation). An overlap-only match must be
+        // substantial (see [`overlap_is_a_match`]): a side call that shares
+        // one user message with the main conversation is not its rewrite.
         let mut best: Option<(String, (usize, usize))> = None;
         for candidate in &candidates {
             let Some(head) = index
@@ -364,10 +374,12 @@ impl SessionLinker {
             else {
                 continue;
             };
-            let score = (
-                shared_prefix(&head.items, input.items),
-                overlap(&head.items, input.items),
-            );
+            let prefix = shared_prefix(&head.items, input.items);
+            let common = overlap(&head.items, input.items);
+            if prefix == 0 && !overlap_is_a_match(common, head.items.len(), input.items.len()) {
+                continue;
+            }
+            let score = (prefix, common);
             if score != (0, 0) && best.as_ref().is_none_or(|(_, current)| score > *current) {
                 best = Some((candidate.clone(), score));
             }
@@ -881,6 +893,27 @@ mod tests {
             canonical: "{}".into(),
         };
         assert_eq!(ItemFingerprint::from(&item).hash, "identity");
+    }
+
+    #[test]
+    fn a_side_call_sharing_one_message_is_not_a_rewrite_of_the_main_chain() {
+        // opencode's title request reuses the user's message verbatim; with a
+        // different system prompt and no tools it must not be classified as
+        // the main conversation with changed instructions (a false cache bust).
+        let linker = SessionLinker::new(true);
+        let id = identity("opencode", None);
+        let main = link(&linker, "r1", &id, &convo(&["u1", "a1", "u2"]), 10);
+        let side = vec![fp("title-sys", ItemSection::Instructions, None), msg("u1")];
+        let title = link(&linker, "r2", &id, &side, 11);
+        assert_ne!(title.lineage.kind, DivergenceKind::InstructionsChanged);
+        assert!(!title.lineage.cache_bust);
+        // A genuinely rewritten system prompt still matches by overlap.
+        let mut resent = convo(&["u1", "a1", "u2"]);
+        resent[0].hash = "sys-v2".into();
+        let rewrite = link(&linker, "r3", &id, &resent, 12);
+        assert_eq!(rewrite.session_id, main.session_id);
+        assert_eq!(rewrite.lineage.kind, DivergenceKind::InstructionsChanged);
+        assert!(rewrite.lineage.cache_bust);
     }
 
     #[test]

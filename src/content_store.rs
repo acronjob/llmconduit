@@ -79,6 +79,29 @@ pub struct SplitItem {
 /// Keys that carry no conversational content and move between requests.
 const IDENTITY_IGNORED_KEYS: &[&str] = &["cache_control"];
 
+/// Normalize the spellings a client alternates between without changing what
+/// the model sees: `content: [{"type":"text","text":"x"}]` and
+/// `content: "x"` render identically (Claude Code resumes a session with the
+/// string form of messages it first sent as one text block).
+fn normalize_identity_forms(value: &mut Value) -> bool {
+    let Value::Object(map) = value else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(Value::Array(blocks)) = map.get("content")
+        && blocks.len() == 1
+        && let Value::Object(block) = &blocks[0]
+        && block.get("type").and_then(Value::as_str) == Some("text")
+        && block.len() == 2
+        && let Some(Value::String(text)) = block.get("text")
+    {
+        let text = text.clone();
+        map.insert("content".to_string(), Value::String(text));
+        changed = true;
+    }
+    changed
+}
+
 /// Remove [`IDENTITY_IGNORED_KEYS`] anywhere in `value`. Returns whether
 /// anything was removed, so the common case can reuse the storage hash.
 fn strip_identity_ignored_keys(value: &mut Value) -> bool {
@@ -268,7 +291,8 @@ fn push_item(
     let canonical = serde_json::to_string(&item).unwrap_or_else(|_| "null".to_string());
     let hash = hash_canonical(&canonical);
     let mut stripped = item;
-    let identity = if strip_identity_ignored_keys(&mut stripped) {
+    let stripped_keys = strip_identity_ignored_keys(&mut stripped);
+    let identity = if normalize_identity_forms(&mut stripped) | stripped_keys {
         hash_canonical(&serde_json::to_string(&stripped).unwrap_or_else(|_| "null".to_string()))
     } else {
         hash.clone()
@@ -559,9 +583,36 @@ mod tests {
             assert_ne!(a.hash, b.hash, "storage hashes follow the bytes");
             assert_eq!(a.identity, b.identity, "identity ignores cache_control");
         }
-        // Without markers, identity and storage hash coincide.
-        assert_eq!(without.items[1].hash, without.items[1].identity);
+        // Without markers (and no alternate spelling), identity and storage
+        // hash coincide: the tool_result message has neither.
+        assert_eq!(with.items[2].hash, with.items[2].identity);
         assert_ne!(with.items[0].identity, with.items[1].identity);
+    }
+
+    #[test]
+    fn a_single_text_block_has_the_identity_of_the_plain_string() {
+        // Claude Code sends a user turn as one text block (with a cache marker)
+        // and re-sends it as a plain string when the session is resumed.
+        let block = round_trip(
+            PROTOCOL_ANTHROPIC_MESSAGES,
+            json!({"model": "m", "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}
+            ]}),
+        );
+        let plain = round_trip(
+            PROTOCOL_ANTHROPIC_MESSAGES,
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        assert_ne!(block.items[0].hash, plain.items[0].hash);
+        assert_eq!(block.items[0].identity, plain.items[0].identity);
+        // Two blocks, or a block with extra fields, are not the string form.
+        let two = round_trip(
+            PROTOCOL_ANTHROPIC_MESSAGES,
+            json!({"model": "m", "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "text", "text": "!"}]}
+            ]}),
+        );
+        assert_ne!(two.items[0].identity, plain.items[0].identity);
     }
 
     #[test]
