@@ -929,7 +929,11 @@ pub async fn login_response(
             let token = body.token.unwrap_or_default();
             // Once users exist the shared token no longer opens the dashboard
             // (dev-open loopback listeners keep accepting anything).
-            if gateway.is_some_and(|gateway| gateway.users_configured()) && !auth.dev_open() {
+            let users_configured = match gateway {
+                Some(gateway) => crate::accounts_api::auth_mode(gateway, auth).await == "users",
+                None => false,
+            };
+            if users_configured && !auth.dev_open() {
                 return unauthorized("sign in with username and password");
             }
             if !auth.verify_token(&token) {

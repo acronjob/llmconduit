@@ -248,9 +248,9 @@ Create the first administrator either from the environment at startup
 user exists) or with the CLI:
 
 ```bash
-LLMCONDUIT_ADMIN_PW=... ./llmconduit user create --config config.yaml \
+LLMCONDUIT_ADMIN_PW=... ./llmconduit user --config config.yaml create \
     --username koen --admin --password-env LLMCONDUIT_ADMIN_PW
-./llmconduit user list --config config.yaml
+./llmconduit user --config config.yaml list
 ```
 
 Once a user exists the dashboard login form asks for a username and password

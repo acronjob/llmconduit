@@ -97,14 +97,23 @@ pub async fn me(
     let body = MeBody {
         is_admin: is_admin(&session),
         user: session.user,
-        auth_mode: auth_mode(&gateway, &auth),
+        auth_mode: auth_mode(&gateway, &auth).await,
         accounts_enabled: gateway.persistence_store().is_some(),
     };
     json(StatusCode::OK, &body)
 }
 
-/// The dashboard's authentication mode, for the login shell and `/me`.
-pub fn auth_mode(gateway: &Gateway, auth: &DashboardAuth) -> &'static str {
+/// The dashboard's authentication mode, for the login shell and `/me`. Users
+/// created out of band (the CLI, another replica) are noticed here: while the
+/// in-memory flag is off, a cheap `count_users` refreshes it.
+pub async fn auth_mode(gateway: &Gateway, auth: &DashboardAuth) -> &'static str {
+    if !gateway.users_configured()
+        && let Some(store) = gateway.persistence_store()
+        && let Ok(count) = store.count_users().await
+        && count > 0
+    {
+        gateway.set_users_configured(true);
+    }
     if gateway.users_configured() {
         "users"
     } else if auth.dev_open() {

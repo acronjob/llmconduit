@@ -374,7 +374,11 @@ async fn prepare_control_plane_runtime(
                 tracing::info!(username = %user.username, "bootstrapped the first administrator from the environment")
             }
             Ok(None) => {}
-            Err(error) => return Err(format!("bootstrap admin: {error}").into()),
+            Err(error) => {
+                return Err(Box::<dyn std::error::Error>::from(format!(
+                    "bootstrap admin: {error}"
+                )));
+            }
         }
         users_configured = store.count_users().await? > 0;
         let sql_specs = llmconduit::accounts::specs_from_sql(store.api_key_auth_specs().await?);

@@ -69,7 +69,7 @@ pub async fn dashboard_index(
     session: Option<AuthSession>,
 ) -> Response {
     let nonce = new_nonce();
-    let auth_mode = crate::accounts_api::auth_mode(&gateway, &auth);
+    let auth_mode = crate::accounts_api::auth_mode(&gateway, &auth).await;
     match session {
         Some(session) => serve_authenticated_shell(&auth, &nonce, session.user.as_ref(), auth_mode),
         None => serve_login_shell(&nonce, auth_mode),
