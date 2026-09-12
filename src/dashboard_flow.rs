@@ -784,6 +784,67 @@ pub struct FlowRecord {
     /// `UserAgent` fallback is visibly distinguishable from a key-hash / configured-id
     /// attribution downstream. `None` exactly when `client_label` is `None`.
     pub client_source: Option<ClientSource>,
+    /// Harness identity + session-tree linkage computed at the persistence seam
+    /// (see `crate::harness` / `crate::sessions`). Body-free scalar metadata;
+    /// every field absent when persistence is off.
+    pub session: FlowSessionFacts,
+}
+
+/// The per-flow harness/session facts projected onto every live surface
+/// (list row, snapshot summary, detail body, `flow_status` frame). Flattened
+/// onto the wire as sibling scalar fields, each `skip_serializing_if = None`,
+/// so an unknown fact is ABSENT, never a fabricated value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct FlowSessionFacts {
+    /// Detected harness profile name (`claude-code`, `codex`, `pi-agent`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<String>,
+    /// Gateway session node id (`sessions.id`) the flow was linked into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The chain predecessor's `api_call_id`, when the flow extends a chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_parent_request_id: Option<String>,
+    /// `append` | `instructions_changed` | `tools_changed` | `history_rewritten` | `new_chain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergence_kind: Option<String>,
+    /// True when the divergence falls inside the predecessor's items (a
+    /// prefix-cache miss upstream). Absent when lineage was not computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_bust: Option<bool>,
+}
+
+impl FlowSessionFacts {
+    /// Project the seam's detection + link results. Scalars are capped like
+    /// every other retained flow field.
+    pub fn from_parts(
+        identity: Option<&crate::harness::HarnessIdentity>,
+        link: Option<&crate::sessions::SessionLink>,
+    ) -> Self {
+        Self {
+            harness: identity.map(|identity| cap_scalar(identity.harness.clone())),
+            harness_version: identity
+                .and_then(|identity| identity.version.clone())
+                .map(cap_scalar),
+            session_id: link.map(|link| cap_scalar(link.session_id.clone())),
+            chain_parent_request_id: link
+                .and_then(|link| link.chain_parent_request_id.clone())
+                .map(cap_scalar),
+            divergence_kind: link.map(|link| link.lineage.kind.as_str().to_string()),
+            cache_bust: link.map(|link| link.lineage.cache_bust),
+        }
+    }
+
+    fn summary_bytes(&self) -> usize {
+        let opt = |s: &Option<String>| s.as_ref().map(|s| s.len()).unwrap_or(0);
+        opt(&self.harness)
+            + opt(&self.harness_version)
+            + opt(&self.session_id)
+            + opt(&self.chain_parent_request_id)
+            + opt(&self.divergence_kind)
+    }
 }
 
 /// Gap 02 — the per-phase timestamp bundle carried by every [`FlowRecord`] and
@@ -933,6 +994,7 @@ impl FlowRecord {
             + opt(&self.model_served)
             + opt(&self.upstream_target)
             + opt(&self.terminal_reason)
+            + self.session.summary_bytes()
             + opt(&self.client_label)
             + attempts
     }
@@ -1006,6 +1068,9 @@ pub struct SnapshotFlowSummary {
     /// attribution. `None` (absent) exactly when `client_label` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_source: Option<ClientSource>,
+    /// Harness/session facts, flattened as sibling scalar fields (body-free).
+    #[serde(flatten)]
+    pub session: FlowSessionFacts,
 }
 
 impl SnapshotFlowSummary {
@@ -1035,6 +1100,7 @@ impl SnapshotFlowSummary {
             // hash prefix ever existed). `ClientSource` is `Copy`.
             client_label: record.client_label.clone(),
             client_source: record.client_source,
+            session: record.session.clone(),
         }
     }
 }
@@ -1180,6 +1246,30 @@ impl DashboardFlowStore {
         inbound_body: Option<CapturedBody>,
         client: ClientAttribution,
     ) {
+        self.open_with_session(
+            api_call_id,
+            method,
+            uri,
+            headers,
+            inbound_body,
+            client,
+            FlowSessionFacts::default(),
+        );
+    }
+
+    /// [`open`](Self::open) plus the harness/session facts computed at the
+    /// persistence seam (absent when persistence is off).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_session(
+        &self,
+        api_call_id: String,
+        method: String,
+        uri: String,
+        headers: CapturedHeaders,
+        inbound_body: Option<CapturedBody>,
+        client: ClientAttribution,
+        session: FlowSessionFacts,
+    ) {
         if !self.enabled {
             return;
         }
@@ -1228,6 +1318,7 @@ impl DashboardFlowStore {
             // (an unattributed flow renders `—` downstream, never a fabricated id).
             client_label: client.label.map(cap_scalar),
             client_source: client.source,
+            session,
         };
         let mut state = self.lock();
         state.prune_expired(now);

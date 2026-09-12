@@ -143,6 +143,11 @@ pub struct FlowRow {
     /// the CLIENT). `None` ⇒ absent ⇒ renders `—` downstream, NEVER `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_upstream_byte_ms: Option<u128>,
+    /// Harness/session facts (harness, harness_version, session_id,
+    /// chain_parent_request_id, divergence_kind, cache_bust), flattened as
+    /// sibling fields; each absent when unknown.
+    #[serde(flatten)]
+    pub session: crate::dashboard_flow::FlowSessionFacts,
 }
 
 impl FlowRow {
@@ -178,6 +183,7 @@ impl FlowRow {
             phases: record.phases,
             attempts: record.attempts.clone(),
             first_upstream_byte_ms: record.first_upstream_byte_ms,
+            session: record.session.clone(),
         }
     }
 
@@ -216,6 +222,7 @@ impl FlowRow {
             phases: summary.phases,
             attempts: summary.attempts.clone(),
             first_upstream_byte_ms: summary.first_upstream_byte_ms,
+            session: summary.session.clone(),
         }
     }
 }
@@ -359,6 +366,9 @@ pub struct FlowDetailBody {
     /// CLIENT). `None` ⇒ absent ⇒ renders `—`, NEVER `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_upstream_byte_ms: Option<u128>,
+    /// Harness/session facts, flattened (see [`FlowRow::session`]).
+    #[serde(flatten)]
+    pub session: crate::dashboard_flow::FlowSessionFacts,
 }
 
 /// One catalog entry (`GET /dashboard/api/catalog` — a BARE array, no cursor).
@@ -1070,6 +1080,7 @@ pub async fn dashboard_flow_detail(
         phases: record.phases,
         attempts: record.attempts.clone(),
         first_upstream_byte_ms: record.first_upstream_byte_ms,
+        session: record.session.clone(),
     };
     json_no_store(StatusCode::OK, &body)
 }
@@ -1543,6 +1554,7 @@ mod tests {
         let rows = |n: usize| -> Vec<FlowRow> {
             (0..n)
                 .map(|i| FlowRow {
+                    session: Default::default(),
                     api_call_id: format!("api_{i}"),
                     response_id: None,
                     method: "POST".to_string(),
@@ -1582,8 +1594,74 @@ mod tests {
     /// pair OMITS both keys entirely (never `null`/empty-string-as-id). This pins the
     /// `/flows` + `/snapshot` summary wire contract for the new fields.
     #[test]
+    fn flow_session_facts_round_trip_and_project_present_and_absent() {
+        use crate::dashboard_flow::FlowSessionFacts;
+        let facts = FlowSessionFacts {
+            harness: Some("claude-code".to_string()),
+            harness_version: Some("2.1.205".to_string()),
+            session_id: Some("node-1".to_string()),
+            chain_parent_request_id: Some("api_prev".to_string()),
+            divergence_kind: Some("tools_changed".to_string()),
+            cache_bust: Some(true),
+        };
+        // AGENTS.md: every new wire field proves it survives a round trip.
+        let encoded = serde_json::to_string(&facts).unwrap();
+        let decoded: FlowSessionFacts = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, facts);
+
+        let base = || FlowRow {
+            session: Default::default(),
+            api_call_id: "api_x".to_string(),
+            response_id: None,
+            method: "POST".to_string(),
+            uri: "/v1/responses".to_string(),
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: None,
+            status: FlowStatus::Open,
+            started_ms: 0,
+            finished_ms: None,
+            elapsed_ms: None,
+            terminal_reason: None,
+            client_label: None,
+            client_source: None,
+            cost: None,
+            cost_confidence: CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
+        };
+        let mut row = base();
+        row.session = facts;
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(value["harness"], "claude-code");
+        assert_eq!(value["session_id"], "node-1");
+        assert_eq!(value["divergence_kind"], "tools_changed");
+        assert_eq!(value["cache_bust"], true);
+        assert_eq!(value["chain_parent_request_id"], "api_prev");
+        // Absent facts are omitted, never null/false.
+        let value = serde_json::to_value(&base()).unwrap();
+        let object = value.as_object().unwrap();
+        for key in [
+            "harness",
+            "harness_version",
+            "session_id",
+            "chain_parent_request_id",
+            "divergence_kind",
+            "cache_bust",
+        ] {
+            assert!(
+                !object.contains_key(key),
+                "{key} must be absent when unknown"
+            );
+        }
+    }
+
+    #[test]
     fn flow_row_serializes_optional_client_attribution_present_and_absent() {
         let base = || FlowRow {
+            session: Default::default(),
             api_call_id: "api_x".to_string(),
             response_id: None,
             method: "POST".to_string(),
@@ -1643,6 +1721,7 @@ mod tests {
     #[test]
     fn flow_detail_body_upstream_response_round_trips_present_and_absent() {
         let base = || FlowDetailBody {
+            session: Default::default(),
             flow_seq: 7,
             api_call_id: "api_d".to_string(),
             response_id: Some("resp_d".to_string()),
@@ -1769,6 +1848,7 @@ mod tests {
     #[test]
     fn flow_row_projects_spine_fields_present_and_absent() {
         let base = || FlowRow {
+            session: Default::default(),
             api_call_id: "api_s".to_string(),
             response_id: None,
             method: "POST".to_string(),
@@ -1846,6 +1926,7 @@ mod tests {
     #[test]
     fn flow_detail_body_projects_spine_fields_present_and_absent() {
         let base = || FlowDetailBody {
+            session: Default::default(),
             flow_seq: 3,
             api_call_id: "api_sd".to_string(),
             response_id: None,
@@ -1925,6 +2006,7 @@ mod tests {
     #[test]
     fn flow_usage_unreported_class_is_absent_measured_zero_is_present() {
         let row = |cached: Option<i64>, reasoning: Option<i64>| FlowRow {
+            session: Default::default(),
             api_call_id: "api_u".to_string(),
             response_id: None,
             method: "POST".to_string(),

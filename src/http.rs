@@ -764,6 +764,10 @@ async fn log_api_call(
     // disabled. Begin + inbound are queued only after authentication, bounded
     // body collection, and model authorization have all succeeded.
     let persistence_gate = instrument && body_is_json && gateway.persistence_enabled();
+    // Harness + session facts for the live dashboard row; filled inside the
+    // persistence block (they exist only when persistence ran) and consumed by
+    // the flow-store open below.
+    let mut session_facts = crate::dashboard_flow::FlowSessionFacts::default();
     let persistence_capture = if persistence_gate {
         let queue = gateway
             .persistence_queue()
@@ -817,6 +821,12 @@ async fn log_api_call(
                 let _ = queue.try_session(row.clone());
             }
         }
+        session_facts = crate::dashboard_flow::FlowSessionFacts::from_parts(
+            persistence_inbound
+                .as_ref()
+                .and_then(|inbound| inbound.harness.as_ref()),
+            link.as_ref(),
+        );
         let row = crate::flow_persistence::begin_request(
             crate::flow_persistence::BeginPersistenceInput {
                 api_call_id: &api_call_id,
@@ -974,13 +984,14 @@ async fn log_api_call(
             dashboard_client_header().as_deref(),
         );
         let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
-        gateway.flow_store().open(
+        gateway.flow_store().open_with_session(
             api_call_id.clone(),
             method.to_string(),
             uri.path().to_string(),
             headers_redacted,
             inbound_body,
             client,
+            session_facts.clone(),
         );
         gateway.flow_store().middleware_guard(&api_call_id)
     } else {

@@ -305,6 +305,9 @@ pub enum DashboardPayload {
         /// chunk), once measured. `None` ⇒ absent ⇒ renders `—`, never `0`.
         #[serde(skip_serializing_if = "Option::is_none")]
         first_upstream_byte_ms: Option<u128>,
+        /// Harness/session facts, flattened; each absent when unknown.
+        #[serde(flatten)]
+        session: crate::dashboard_flow::FlowSessionFacts,
     },
     /// The provider topology cut (topology domain): nodes (D4 `ProviderHealth`,
     /// `catalog_size` flattened to a non-null count) + gateway→provider edges.
@@ -785,6 +788,7 @@ fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> Da
         phases: record.phases,
         attempts: record.attempts.clone(),
         first_upstream_byte_ms: record.first_upstream_byte_ms,
+        session: record.session.clone(),
     }
 }
 
@@ -2222,6 +2226,7 @@ mod tests {
             domain: Domain::Flow,
             seq: 5,
             batch: vec![DashboardPayload::FlowStatus {
+                session: Default::default(),
                 api_call_id: "api_001".to_string(),
                 response_id: Some("resp_001".to_string()),
                 status: FlowStatus::Completed,
@@ -2301,6 +2306,7 @@ mod tests {
 
         // PRESENT: a live flow that has reached first content + recorded its serving attempt.
         let present = DashboardPayload::FlowStatus {
+            session: Default::default(),
             api_call_id: "api_001".to_string(),
             response_id: Some("resp_001".to_string()),
             status: FlowStatus::Open,
@@ -2339,6 +2345,7 @@ mod tests {
 
         // ABSENT: a freshly-opened flow with no spine measured yet omits every spine key.
         let absent = DashboardPayload::FlowStatus {
+            session: Default::default(),
             api_call_id: "api_002".to_string(),
             response_id: None,
             status: FlowStatus::Open,
