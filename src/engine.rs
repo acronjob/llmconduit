@@ -189,6 +189,8 @@ pub struct Gateway {
     /// `None` keeps persistence at zero overhead. Kept separate from the read/admin
     /// store so an inference request can never await a database operation.
     persistence_queue: Option<crate::control_plane_store::PersistenceQueue>,
+    /// Whether persisted request items keep image/data URIs (content store).
+    persistence_keep_media: bool,
     /// Durable store handle for admin/history reads only. Inference writes use
     /// `persistence_queue` above; request execution never awaits this trait object.
     persistence_store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
@@ -745,6 +747,7 @@ impl Gateway {
             // configured -- independent of `--with-debug-ui`.
             turn_capture: crate::turn_capture::TurnCapture::disabled(),
             persistence_queue: None,
+            persistence_keep_media: true,
             persistence_store: None,
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -918,6 +921,16 @@ impl Gateway {
 
     pub fn persistence_enabled(&self) -> bool {
         self.persistence_queue.is_some()
+    }
+
+    /// Whether image/data URIs survive into persisted request items.
+    pub fn with_persistence_keep_media(mut self, keep_media: bool) -> Self {
+        self.persistence_keep_media = keep_media;
+        self
+    }
+
+    pub fn persistence_keep_media(&self) -> bool {
+        self.persistence_keep_media
     }
 
     /// Attach the read/admin persistence handle. It is intentionally distinct

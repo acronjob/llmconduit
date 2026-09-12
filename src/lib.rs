@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod cli;
 pub mod client_auth;
 pub mod config;
+pub mod content_store;
 pub mod control_plane;
 pub mod control_plane_store;
 pub mod dashboard_api;
@@ -137,6 +138,8 @@ pub fn build_app_with_gateway_control_plane(
 pub struct ControlPlaneRuntime {
     pub persistence_store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
     pub persistence_queue: Option<crate::control_plane_store::PersistenceQueue>,
+    /// Whether persisted request items keep image/data URIs.
+    pub persistence_keep_media: bool,
     pub conversation_id_header: String,
 }
 
@@ -145,6 +148,7 @@ impl Default for ControlPlaneRuntime {
         Self {
             persistence_store: None,
             persistence_queue: None,
+            persistence_keep_media: true,
             conversation_id_header: crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER
                 .to_string(),
         }
@@ -482,6 +486,8 @@ pub fn build_app_with_gateway_control_plane_runtime(
     if let Some(queue) = runtime.persistence_queue {
         gateway = gateway.with_persistence_queue(queue);
     }
+    gateway = gateway.with_persistence_keep_media(runtime.persistence_keep_media);
+    {}
     if let Some(store) = runtime.persistence_store {
         gateway = gateway.with_persistence_store(store);
     }

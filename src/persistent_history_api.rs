@@ -165,6 +165,131 @@ async fn history_request_detail_from(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct HistoryBodyQuery {
+    pub hop: Option<String>,
+}
+
+/// `GET /dashboard/api/history/requests/:id/body?hop=client_in|upstream_out`.
+/// Reassembles the full request body of one hop from its skeleton event and
+/// content-addressed items. The response is the body itself (JSON), not an
+/// envelope. 404 when the request or its hop body is not stored.
+pub async fn history_request_body(
+    State(gateway): State<Arc<Gateway>>,
+    Path(id): Path<String>,
+    Query(query): Query<HistoryBodyQuery>,
+) -> Response {
+    history_request_body_from(gateway.persistence_store(), id, query).await
+}
+
+async fn history_request_body_from(
+    store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
+    id: String,
+    query: HistoryBodyQuery,
+) -> Response {
+    use crate::flow_persistence::PayloadSection;
+
+    let Some(store) = store else {
+        return unavailable();
+    };
+    if id.is_empty() || id.len() > MAX_ID_BYTES {
+        return bad_request("invalid request id");
+    }
+    let section = match query.hop.as_deref().unwrap_or("client_in") {
+        "client_in" => PayloadSection::InboundRequest,
+        "upstream_out" => PayloadSection::UpstreamRequest,
+        _ => return bad_request("hop must be client_in or upstream_out"),
+    };
+    let request = match tokio::time::timeout(HISTORY_QUERY_TIMEOUT, store.get_request(&id)).await {
+        Ok(Ok(Some(request))) => request,
+        Ok(Ok(None)) => {
+            return json_response(StatusCode::NOT_FOUND, &error_body("request not found"));
+        }
+        Ok(Err(error)) => return internal_error("read durable request", &error),
+        Err(_) => return query_timeout(),
+    };
+    let protocol = match section {
+        PayloadSection::InboundRequest => request.client_protocol.clone(),
+        _ => crate::content_store::PROTOCOL_CHAT_COMPLETIONS.to_string(),
+    };
+    let events = match tokio::time::timeout(
+        HISTORY_QUERY_TIMEOUT,
+        store.request_events_limited(&id, MAX_EVENTS),
+    )
+    .await
+    {
+        Ok(Ok(events)) => events,
+        Ok(Err(error)) => return internal_error("read durable request events", &error),
+        Err(_) => return query_timeout(),
+    };
+    let Some(skeleton_event) = events.into_iter().find(|event| event.seq == section.seq()) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            &error_body("request body not stored"),
+        );
+    };
+    let skeleton = match skeleton_event
+        .payload
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|envelope| {
+            envelope
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }) {
+        Some(skeleton) => skeleton,
+        None => {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                &error_body("request body not stored"),
+            );
+        }
+    };
+    let items = match tokio::time::timeout(
+        HISTORY_QUERY_TIMEOUT,
+        store.request_items(&id, section.hop()),
+    )
+    .await
+    {
+        Ok(Ok(items)) => items,
+        Ok(Err(error)) => return internal_error("read durable request items", &error),
+        Err(_) => return query_timeout(),
+    };
+    let hashes = items
+        .iter()
+        .map(|item| item.blob_hash.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let blobs = match tokio::time::timeout(HISTORY_QUERY_TIMEOUT, store.get_blobs(&hashes)).await {
+        Ok(Ok(blobs)) => blobs,
+        Ok(Err(error)) => return internal_error("read durable content blobs", &error),
+        Err(_) => return query_timeout(),
+    };
+    let lookup = blobs
+        .into_iter()
+        .map(|blob| (blob.hash, blob.content))
+        .collect::<std::collections::HashMap<_, _>>();
+    // A body may reference the same blob at several positions, so resolve by
+    // clone rather than by removal.
+    match crate::content_store::assemble(&protocol, &skeleton, |hash| lookup.get(hash).cloned()) {
+        Ok(body) => {
+            let response = (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response();
+            crate::dashboard_auth::no_store(response)
+        }
+        Err(error) => {
+            let error = error.to_string();
+            internal_error("assemble durable request body", &error)
+        }
+    }
+}
+
 /// `GET /dashboard/api/history/usage?virtual_key_id=&since_ms=`. The key filter
 /// is a stable database id, never a presented credential or its digest.
 pub async fn history_usage(
@@ -311,9 +436,11 @@ fn query_timeout() -> Response {
 
 fn internal_error(operation: &'static str, error: &str) -> Response {
     tracing::error!(operation, error, "persistent history read failed");
+    // The operation label is a static string chosen by this module; the
+    // underlying error text stays in the log only.
     json_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        &error_body("persistent history read failed"),
+        &serde_json::json!({ "error": "persistent history read failed", "operation": operation }),
     )
 }
 

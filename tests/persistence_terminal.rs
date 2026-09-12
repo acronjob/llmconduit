@@ -11,7 +11,8 @@ use futures::stream;
 use llmconduit::client_auth::{ClientAuth, VirtualKeySpec, hash_secret};
 use llmconduit::config::{Config, PersistedConfig, PersistedFallbackUpstream};
 use llmconduit::control_plane_store::{
-    EventRow, PersistenceQueue, PersistenceWriter, RequestFinish, RequestRow, StoreResult,
+    BodyWrite, EventRow, PersistenceQueue, PersistenceWriter, RequestFinish, RequestRow,
+    StoreResult,
 };
 use llmconduit::dashboard_flow::{Attempt, AttemptStatus, DashboardFlowStore};
 use llmconduit::engine::Gateway;
@@ -31,7 +32,32 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 struct RecordingWriter {
     begins: Mutex<Vec<RequestRow>>,
     events: Mutex<Vec<EventRow>>,
+    bodies: Mutex<Vec<BodyWrite>>,
     finishes: Mutex<Vec<(String, RequestFinish)>>,
+}
+
+impl RecordingWriter {
+    /// Reassemble the full body of one request-side hop from its skeleton
+    /// event and recorded blobs, the way the history API does.
+    fn assembled_body(&self, seq: i64, protocol: &str) -> serde_json::Value {
+        let bodies = self.bodies.lock().unwrap();
+        let body = bodies
+            .iter()
+            .find(|body| body.event.seq == seq)
+            .expect("hop stored as a split body");
+        let envelope = event_envelope(&body.event);
+        let skeleton = envelope["content"].as_str().expect("skeleton content");
+        let blobs = body
+            .blobs
+            .iter()
+            .map(|blob| (blob.hash.clone(), blob.content.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let assembled = llmconduit::content_store::assemble(protocol, skeleton, |hash| {
+            blobs.get(hash).cloned()
+        })
+        .expect("every referenced blob was written with the body");
+        serde_json::from_str(&assembled).expect("assembled body is JSON")
+    }
 }
 
 #[tokio::test]
@@ -123,11 +149,14 @@ async fn persistence_upstream_hops_follow_the_final_context_shrink_retry() {
     let retry: serde_json::Value = serde_json::from_slice(&posts[1].body).unwrap();
     assert_eq!(retry["max_tokens"], 63_652);
 
-    let events = writer.events.lock().unwrap();
-    let request = event_envelope(events.iter().find(|event| event.seq == 2).unwrap());
-    let request: serde_json::Value =
-        serde_json::from_str(request["content"].as_str().unwrap()).unwrap();
+    let request = writer.assembled_body(2, llmconduit::content_store::PROTOCOL_CHAT_COMPLETIONS);
     assert_eq!(request, retry, "durable request is the final on-wire retry");
+    let events = writer.events.lock().unwrap();
+    let request_event = event_envelope(events.iter().find(|event| event.seq == 2).unwrap());
+    assert_eq!(
+        request_event["items"], 1,
+        "one message item on the upstream hop"
+    );
     let response = event_envelope(events.iter().find(|event| event.seq == 3).unwrap());
     assert!(
         !response["content"]
@@ -205,6 +234,12 @@ impl PersistenceWriter for RecordingWriter {
 
     async fn append_event(&self, event: EventRow) -> StoreResult<()> {
         self.events.lock().unwrap().push(event);
+        Ok(())
+    }
+
+    async fn store_body(&self, body: BodyWrite) -> StoreResult<()> {
+        self.events.lock().unwrap().push(body.event.clone());
+        self.bodies.lock().unwrap().push(body);
         Ok(())
     }
 
@@ -431,7 +466,9 @@ async fn persistence_only_http_records_redacted_final_four_hops_after_failover()
                 [("friendly".to_owned(), "profile-a".to_owned())],
                 llmconduit::control_plane::UnknownModelPolicy::Passthrough,
             )
-            .with_persistence_queue(queue.clone()),
+            .with_persistence_queue(queue.clone())
+            // This test pins the redaction contract, so media is stripped too.
+            .with_persistence_keep_media(false),
     );
     assert!(!gateway.flow_store().is_enabled());
     assert!(!gateway.turn_capture().is_enabled());
@@ -499,6 +536,17 @@ async fn persistence_only_http_records_redacted_final_four_hops_after_failover()
         serde_json::from_str(upstream_request["content"].as_str().unwrap()).unwrap();
     assert_eq!(upstream_request["model"], "served-model");
     assert_eq!(upstream_request["api_key"], "[redacted]");
+    // Items and blobs carry the redaction too, on both request-side hops.
+    let inbound = writer.assembled_body(1, llmconduit::content_store::PROTOCOL_RESPONSES);
+    assert_eq!(inbound["api_key"], "[redacted]");
+    assert_eq!(inbound["input"], "hello");
+    assert!(!inbound["image_url"].as_str().unwrap().contains("IMAGELEAK"));
+    for body in writer.bodies.lock().unwrap().iter() {
+        for blob in &body.blobs {
+            assert!(!blob.content.contains("body-secret"));
+            assert!(!blob.content.contains("IMAGELEAK"));
+        }
+    }
     assert_eq!(event_envelope(&events[2])["partial"], false);
     assert_eq!(event_envelope(&events[3])["partial"], false);
 

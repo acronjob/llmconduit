@@ -64,6 +64,37 @@ pub struct EventRow {
     pub bytes: Option<i64>,
 }
 
+/// One content-addressed item body. `hash` is the lowercase hex SHA-256 of
+/// `content`, which is canonical, secret-redacted JSON text.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlobRow {
+    pub hash: String,
+    pub media: String,
+    pub size: i64,
+    pub content: String,
+    pub created_at_ms: i64,
+}
+
+/// One position of a request body on one hop, referencing a blob by hash.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ItemRow {
+    pub request_id: String,
+    pub hop: String,
+    pub ordinal: i64,
+    pub section: String,
+    pub kind: Option<String>,
+    pub blob_hash: String,
+}
+
+/// A request-side hop body: the skeleton event plus its items and the blobs
+/// they reference. Written as one unit so a body is never half-stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyWrite {
+    pub event: EventRow,
+    pub items: Vec<ItemRow>,
+    pub blobs: Vec<BlobRow>,
+}
+
 /// Authoritative terminal aggregate. `backend` and `resolved_model` are the
 /// winner from the final served attempt, not the configured primary. They stay
 /// `None` for pre-dispatch/all-failed requests.
@@ -229,6 +260,12 @@ pub trait PersistenceWriter: Send + Sync {
     async fn begin_request(&self, row: RequestRow) -> StoreResult<()>;
     async fn append_event(&self, event: EventRow) -> StoreResult<()>;
     async fn finish_request(&self, id: &str, finish: RequestFinish) -> StoreResult<()>;
+    /// Store a split request body: blobs first, then item references, then the
+    /// skeleton event. The default keeps only the skeleton event, for writers
+    /// that have no item storage; the SQL and JSONL writers override it.
+    async fn store_body(&self, body: BodyWrite) -> StoreResult<()> {
+        self.append_event(body.event).await
+    }
 }
 
 #[async_trait]
@@ -248,9 +285,15 @@ pub trait PersistenceStore: PersistenceWriter {
         filter: &UsageFilter,
         limit: usize,
     ) -> StoreResult<Vec<UsageBucket>>;
-    /// Atomically remove requests older than `before_ms` and their event rows.
-    /// A request exactly at the cutoff is retained.
+    /// Atomically remove requests older than `before_ms` and their event and
+    /// item rows. A request exactly at the cutoff is retained.
     async fn prune_request_history(&self, before_ms: i64) -> StoreResult<()>;
+    /// Items of one request hop in body order.
+    async fn request_items(&self, request_id: &str, hop: &str) -> StoreResult<Vec<ItemRow>>;
+    /// Blobs for the given hashes; missing hashes are simply absent.
+    async fn get_blobs(&self, hashes: &[String]) -> StoreResult<Vec<BlobRow>>;
+    /// Remove blobs no `request_items` row references. Returns the count.
+    async fn prune_orphan_blobs(&self) -> StoreResult<u64>;
 
     async fn get_setting(&self, key: &str) -> StoreResult<Option<String>>;
     async fn set_setting(&self, key: &str, value: &str) -> StoreResult<()>;
@@ -474,6 +517,34 @@ impl PersistenceWriter for JsonlWriter {
             object.insert("id".to_string(), serde_json::json!(id));
         }
         self.append("requests", value).await
+    }
+
+    /// JSONL has no cross-record addressing, so the body record carries every
+    /// item inline (no deduplication) alongside the skeleton event.
+    async fn store_body(&self, body: BodyWrite) -> StoreResult<()> {
+        let blobs: std::collections::HashMap<&str, &str> = body
+            .blobs
+            .iter()
+            .map(|blob| (blob.hash.as_str(), blob.content.as_str()))
+            .collect();
+        let items = body
+            .items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "ordinal": item.ordinal,
+                    "section": item.section,
+                    "kind": item.kind,
+                    "hash": item.blob_hash,
+                    "content": blobs.get(item.blob_hash.as_str()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut value = serde_json::to_value(&body.event).map_err(store_error)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("items".to_string(), serde_json::Value::Array(items));
+        }
+        self.append("events", value).await
     }
 }
 
@@ -762,6 +833,40 @@ where
         kind: row.try_get(4).map_err(store_error)?,
         payload: row.try_get(5).map_err(store_error)?,
         bytes: row.try_get(6).map_err(store_error)?,
+    })
+}
+
+fn decode_item<R>(row: &R) -> StoreResult<ItemRow>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(ItemRow {
+        request_id: row.try_get(0).map_err(store_error)?,
+        hop: row.try_get(1).map_err(store_error)?,
+        ordinal: row.try_get(2).map_err(store_error)?,
+        section: row.try_get(3).map_err(store_error)?,
+        kind: row.try_get(4).map_err(store_error)?,
+        blob_hash: row.try_get(5).map_err(store_error)?,
+    })
+}
+
+fn decode_blob<R>(row: &R) -> StoreResult<BlobRow>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(BlobRow {
+        hash: row.try_get(0).map_err(store_error)?,
+        media: row.try_get(1).map_err(store_error)?,
+        size: row.try_get(2).map_err(store_error)?,
+        content: row.try_get(3).map_err(store_error)?,
+        created_at_ms: row.try_get(4).map_err(store_error)?,
     })
 }
 
@@ -1263,6 +1368,80 @@ impl PersistenceWriter for SqlStore {
         Ok(())
     }
 
+    async fn store_body(&self, body: BodyWrite) -> StoreResult<()> {
+        let pg = self.postgres();
+        let insert_blob = format!(
+            "INSERT INTO content_blobs (hash, media, size, content, created_at_ms) \
+             VALUES ({}) ON CONFLICT (hash) DO NOTHING",
+            placeholders(pg, 5)
+        );
+        let insert_item = format!(
+            "INSERT INTO request_items (request_id, hop, ordinal, section, kind, blob_hash) \
+             VALUES ({}) ON CONFLICT (request_id, hop, ordinal) DO UPDATE SET \
+             section = excluded.section, kind = excluded.kind, blob_hash = excluded.blob_hash",
+            placeholders(pg, 6)
+        );
+        let insert_event = format!(
+            "INSERT INTO request_events (request_id, seq, ts_ms, hop, kind, payload, bytes) \
+             VALUES ({}) ON CONFLICT (request_id, seq) DO UPDATE SET \
+             ts_ms = excluded.ts_ms, hop = excluded.hop, kind = excluded.kind, \
+             payload = excluded.payload, bytes = excluded.bytes",
+            placeholders(pg, 7)
+        );
+        let BodyWrite {
+            event,
+            items,
+            blobs,
+        } = body;
+
+        macro_rules! store_in_transaction {
+            ($pool:expr) => {{
+                let mut transaction = $pool.begin().await.map_err(store_error)?;
+                for blob in &blobs {
+                    sqlx::query(&insert_blob)
+                        .bind(&blob.hash)
+                        .bind(&blob.media)
+                        .bind(blob.size)
+                        .bind(&blob.content)
+                        .bind(blob.created_at_ms)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(store_error)?;
+                }
+                for item in &items {
+                    sqlx::query(&insert_item)
+                        .bind(&item.request_id)
+                        .bind(&item.hop)
+                        .bind(item.ordinal)
+                        .bind(&item.section)
+                        .bind(&item.kind)
+                        .bind(&item.blob_hash)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(store_error)?;
+                }
+                sqlx::query(&insert_event)
+                    .bind(&event.request_id)
+                    .bind(event.seq)
+                    .bind(event.ts_ms)
+                    .bind(&event.hop)
+                    .bind(&event.kind)
+                    .bind(&event.payload)
+                    .bind(event.bytes)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(store_error)?;
+                transaction.commit().await.map_err(store_error)?;
+            }};
+        }
+
+        match &self.pool {
+            SqlPool::Sqlite(pool) => store_in_transaction!(pool),
+            SqlPool::Postgres(pool) => store_in_transaction!(pool),
+        }
+        Ok(())
+    }
+
     async fn finish_request(&self, id: &str, finish: RequestFinish) -> StoreResult<()> {
         let pg = self.postgres();
         let sql = format!(
@@ -1542,6 +1721,12 @@ impl PersistenceStore for SqlStore {
              )",
             placeholder(pg, 1)
         );
+        let delete_items = format!(
+            "DELETE FROM request_items WHERE request_id IN (\
+                 SELECT id FROM requests WHERE created_at_ms < {}\
+             )",
+            placeholder(pg, 1)
+        );
         let delete_requests = format!(
             "DELETE FROM requests WHERE created_at_ms < {}",
             placeholder(pg, 1)
@@ -1557,6 +1742,11 @@ impl PersistenceStore for SqlStore {
             ($pool:expr) => {{
                 let mut transaction = $pool.begin().await.map_err(store_error)?;
                 sqlx::query(&delete_events)
+                    .bind(before_ms)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(store_error)?;
+                sqlx::query(&delete_items)
                     .bind(before_ms)
                     .execute(&mut *transaction)
                     .await
@@ -1579,6 +1769,76 @@ impl PersistenceStore for SqlStore {
             SqlPool::Sqlite(pool) => prune_in_transaction!(pool),
             SqlPool::Postgres(pool) => prune_in_transaction!(pool),
         }
+    }
+
+    async fn request_items(&self, request_id: &str, hop: &str) -> StoreResult<Vec<ItemRow>> {
+        let pg = self.postgres();
+        let sql = format!(
+            "SELECT request_id, hop, ordinal, section, kind, blob_hash FROM request_items \
+             WHERE request_id = {} AND hop = {} ORDER BY ordinal",
+            placeholder(pg, 1),
+            placeholder(pg, 2)
+        );
+        Ok(fetch_all_decoded!(
+            self,
+            &sql,
+            [request_id, hop],
+            decode_item
+        ))
+    }
+
+    async fn get_blobs(&self, hashes: &[String]) -> StoreResult<Vec<BlobRow>> {
+        // Stay well under SQLite's bound-parameter limit per statement.
+        const CHUNK: usize = 256;
+        let pg = self.postgres();
+        let mut blobs = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(CHUNK) {
+            let sql = format!(
+                "SELECT hash, media, size, content, created_at_ms FROM content_blobs \
+                 WHERE hash IN ({})",
+                placeholders(pg, chunk.len())
+            );
+            macro_rules! fetch_chunk {
+                ($pool:expr) => {{
+                    let mut query = sqlx::query(&sql);
+                    for hash in chunk {
+                        query = query.bind(hash);
+                    }
+                    query
+                        .fetch_all($pool)
+                        .await
+                        .map_err(store_error)?
+                        .iter()
+                        .map(decode_blob)
+                        .collect::<StoreResult<Vec<BlobRow>>>()?
+                }};
+            }
+            let rows = match &self.pool {
+                SqlPool::Sqlite(pool) => fetch_chunk!(pool),
+                SqlPool::Postgres(pool) => fetch_chunk!(pool),
+            };
+            blobs.extend(rows);
+        }
+        Ok(blobs)
+    }
+
+    async fn prune_orphan_blobs(&self) -> StoreResult<u64> {
+        let sql = "DELETE FROM content_blobs WHERE NOT EXISTS (\
+                       SELECT 1 FROM request_items WHERE request_items.blob_hash = content_blobs.hash\
+                   )";
+        let affected = match &self.pool {
+            SqlPool::Sqlite(pool) => sqlx::query(sql)
+                .execute(pool)
+                .await
+                .map_err(store_error)?
+                .rows_affected(),
+            SqlPool::Postgres(pool) => sqlx::query(sql)
+                .execute(pool)
+                .await
+                .map_err(store_error)?
+                .rows_affected(),
+        };
+        Ok(affected)
     }
 
     async fn get_setting(&self, key: &str) -> StoreResult<Option<String>> {
@@ -1980,6 +2240,7 @@ impl PersistenceStore for SqlStore {
 enum WriteCommand {
     Begin(RequestRow),
     Event(EventRow),
+    Body(Box<BodyWrite>),
     Finish {
         request_id: String,
         finish: RequestFinish,
@@ -2042,6 +2303,7 @@ impl PersistenceQueue {
                 let result = match command {
                     WriteCommand::Begin(row) => store.begin_request(row).await,
                     WriteCommand::Event(event) => store.append_event(event).await,
+                    WriteCommand::Body(body) => store.store_body(*body).await,
                     WriteCommand::Finish { request_id, finish } => {
                         store.finish_request(&request_id, finish).await
                     }
@@ -2085,6 +2347,10 @@ impl PersistenceQueue {
 
     pub fn try_event(&self, event: EventRow) -> Result<(), EnqueueError> {
         self.try_enqueue(WriteCommand::Event(event))
+    }
+
+    pub fn try_body(&self, body: BodyWrite) -> Result<(), EnqueueError> {
+        self.try_enqueue(WriteCommand::Body(Box::new(body)))
     }
 
     pub fn try_finish(
@@ -2240,7 +2506,7 @@ mod tests {
             .collect(),
             SqlPool::Postgres(_) => unreachable!(),
         };
-        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7]);
         let request_indexes: Vec<String> = match &store.pool {
             SqlPool::Sqlite(pool) => sqlx::query(
                 "SELECT name FROM sqlite_master WHERE type = 'index' \
@@ -2262,6 +2528,204 @@ mod tests {
                 "idx_requests_virtual_key_created_at_ms".to_string(),
             ]
         );
+    }
+
+    fn blob(hash: &str, content: &str) -> BlobRow {
+        BlobRow {
+            hash: hash.to_string(),
+            media: "json".to_string(),
+            size: content.len() as i64,
+            content: content.to_string(),
+            created_at_ms: 100,
+        }
+    }
+
+    fn item(request_id: &str, hop: &str, ordinal: i64, hash: &str) -> ItemRow {
+        ItemRow {
+            request_id: request_id.to_string(),
+            hop: hop.to_string(),
+            ordinal,
+            section: "message".to_string(),
+            kind: Some("user".to_string()),
+            blob_hash: hash.to_string(),
+        }
+    }
+
+    fn skeleton_event(request_id: &str, seq: i64, ts_ms: i64) -> EventRow {
+        EventRow {
+            request_id: request_id.to_string(),
+            seq,
+            ts_ms,
+            hop: if seq == 1 {
+                "client_in"
+            } else {
+                "upstream_out"
+            }
+            .to_string(),
+            kind: "request".to_string(),
+            payload: Some(r#"{"content":"{}"}"#.to_string()),
+            bytes: Some(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_body_store_dedups_blobs_and_reads_items_in_order() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        store.begin_request(request("req-1")).await.expect("begin");
+        store
+            .store_body(BodyWrite {
+                event: skeleton_event("req-1", 1, 150),
+                items: vec![
+                    item("req-1", "client_in", 0, "aa"),
+                    item("req-1", "client_in", 1, "bb"),
+                    item("req-1", "client_in", 2, "aa"),
+                ],
+                blobs: vec![blob("aa", "\"same\""), blob("bb", "\"other\"")],
+            })
+            .await
+            .expect("store body");
+        // A second request sharing blob `aa` must not fail on the existing row.
+        store.begin_request(request("req-2")).await.expect("begin");
+        store
+            .store_body(BodyWrite {
+                event: skeleton_event("req-2", 1, 160),
+                items: vec![item("req-2", "client_in", 0, "aa")],
+                blobs: vec![blob("aa", "\"same\"")],
+            })
+            .await
+            .expect("store body again");
+
+        let items = store
+            .request_items("req-1", "client_in")
+            .await
+            .expect("items");
+        assert_eq!(
+            items.iter().map(|item| item.ordinal).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(items[2].blob_hash, "aa");
+        assert!(
+            store
+                .request_items("req-1", "upstream_out")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut blobs = store
+            .get_blobs(&["aa".to_string(), "bb".to_string(), "zz".to_string()])
+            .await
+            .expect("blobs");
+        blobs.sort_by(|left, right| left.hash.cmp(&right.hash));
+        assert_eq!(
+            blobs
+                .iter()
+                .map(|blob| (blob.hash.as_str(), blob.content.as_str()))
+                .collect::<Vec<_>>(),
+            [("aa", "\"same\""), ("bb", "\"other\"")]
+        );
+        // The skeleton event landed in request_events with the same seq contract.
+        let events = store.request_events("req-1").await.expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[0].hop, "client_in");
+    }
+
+    #[tokio::test]
+    async fn sqlite_body_store_replaces_a_re_staged_hop_and_prunes_orphans() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        store.begin_request(request("req-1")).await.expect("begin");
+        store
+            .store_body(BodyWrite {
+                event: skeleton_event("req-1", 2, 150),
+                items: vec![item("req-1", "upstream_out", 0, "old")],
+                blobs: vec![blob("old", "1")],
+            })
+            .await
+            .unwrap();
+        // Final-attempt-wins: the same (request, hop, ordinal) is overwritten.
+        store
+            .store_body(BodyWrite {
+                event: skeleton_event("req-1", 2, 151),
+                items: vec![item("req-1", "upstream_out", 0, "new")],
+                blobs: vec![blob("new", "2")],
+            })
+            .await
+            .unwrap();
+        let items = store.request_items("req-1", "upstream_out").await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].blob_hash, "new");
+        // `old` is now unreferenced and pruned; `new` survives.
+        assert_eq!(store.prune_orphan_blobs().await.unwrap(), 1);
+        let remaining = store
+            .get_blobs(&["old".to_string(), "new".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].hash, "new");
+        assert_eq!(store.prune_orphan_blobs().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_history_pruning_removes_items_and_frees_their_blobs() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        let mut old = request("old");
+        old.created_at_ms = 100;
+        let mut recent = request("recent");
+        recent.created_at_ms = 500;
+        store.begin_request(old).await.unwrap();
+        store.begin_request(recent).await.unwrap();
+        store
+            .store_body(BodyWrite {
+                event: skeleton_event("old", 1, 100),
+                items: vec![
+                    item("old", "client_in", 0, "shared"),
+                    item("old", "client_in", 1, "only-old"),
+                ],
+                blobs: vec![blob("shared", "s"), blob("only-old", "o")],
+            })
+            .await
+            .unwrap();
+        store
+            .store_body(BodyWrite {
+                event: skeleton_event("recent", 1, 500),
+                items: vec![item("recent", "client_in", 0, "shared")],
+                blobs: vec![blob("shared", "s")],
+            })
+            .await
+            .unwrap();
+        store.prune_request_history(300).await.unwrap();
+        assert!(
+            store
+                .request_items("old", "client_in")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .request_items("recent", "client_in")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.prune_orphan_blobs().await.unwrap(),
+            1,
+            "only-old is freed"
+        );
+        let blobs = store
+            .get_blobs(&["shared".to_string(), "only-old".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].hash, "shared");
     }
 
     #[tokio::test]

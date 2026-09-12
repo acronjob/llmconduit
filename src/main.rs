@@ -363,6 +363,7 @@ async fn prepare_control_plane_runtime(
     let runtime = ControlPlaneRuntime {
         persistence_store,
         persistence_queue: persistence_queue.clone(),
+        persistence_keep_media: loaded.storage.keep_media,
         conversation_id_header: loaded.conversation_id_header.clone(),
     };
     Ok((runtime, client_auth, persistence_queue))
@@ -499,6 +500,15 @@ fn spawn_sql_retention(store: Arc<dyn PersistenceStore>, retention_days: NonZero
                 .saturating_sub(i64::try_from(age_ms).unwrap_or(i64::MAX));
             if let Err(error) = store.prune_request_history(cutoff).await {
                 tracing::warn!(error = %error, "failed to prune durable request history");
+            }
+            match store.prune_orphan_blobs().await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "pruned unreferenced content blobs");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to prune unreferenced content blobs");
+                }
             }
             if let Err(error) = store.prune_backend_metrics(cutoff).await {
                 tracing::warn!(error = %error, "failed to prune durable backend metrics");

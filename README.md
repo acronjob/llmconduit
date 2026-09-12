@@ -185,9 +185,21 @@ Postgres store is opened; migration files do not need to be mounted into the
 runtime container. SQLite needs a writable parent directory for the database plus
 its WAL/SHM files. The Docker image and Compose file therefore reserve the
 nonroot-writable `/data` volume. SQL storage exposes durable request summaries,
-bounded event history, retention-windowed usage rollups, and minute-level
+event history, retention-windowed usage rollups, and minute-level
 provider health/counter samples through the
-session-authenticated `/dashboard/api/history/*` reads. `none` and JSONL are not
+session-authenticated `/dashboard/api/history/*` reads.
+
+Request bodies are stored in full through a content-addressed store. Each
+inbound and upstream request is split into items (the instructions/system
+block, every tool definition, every message), each item is secret-redacted,
+canonicalized, and hashed, and identical items are stored once in
+`content_blobs`. The hop's event row keeps the skeleton: the body with each
+item replaced by a hash reference. `GET
+/dashboard/api/history/requests/{id}/body?hop=client_in|upstream_out`
+reassembles the full body. Image and `data:` URIs are kept in stored items
+by default; set `control_plane.storage.keep_media: false` to strip them.
+Response events (upstream and served) are retained up to 16 MiB each.
+Unreferenced blobs are removed by the hourly retention pass. `none` and JSONL are not
 queryable and those endpoints return 503. SQL-backed API-key rows are snapshotted
 at startup; there is no live database-key reload. For compatibility with the old
 control plane, a seeded legacy `settings.operational` document or relational

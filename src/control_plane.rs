@@ -467,6 +467,11 @@ pub struct StorageBootstrap {
     /// JSONL output is rotated daily; zero is rejected at startup.
     #[serde(default = "default_persistence_retention_days")]
     pub retention_days: u64,
+    /// Whether persisted request items keep image/data URIs. Secrets are
+    /// always redacted; this only controls media payloads, which dedupe like
+    /// any other item in the content store.
+    #[serde(default = "default_persistence_keep_media")]
+    pub keep_media: bool,
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, YamlValue>,
 }
@@ -480,6 +485,7 @@ impl fmt::Debug for StorageBootstrap {
             .field("jsonl_dir", &self.jsonl_dir)
             .field("queue_capacity", &self.queue_capacity)
             .field("retention_days", &self.retention_days)
+            .field("keep_media", &self.keep_media)
             .field("extra", &self.extra)
             .finish()
     }
@@ -493,6 +499,7 @@ impl Default for StorageBootstrap {
             jsonl_dir: None,
             queue_capacity: default_persistence_queue_capacity(),
             retention_days: default_persistence_retention_days(),
+            keep_media: default_persistence_keep_media(),
             extra: BTreeMap::new(),
         }
     }
@@ -506,6 +513,10 @@ impl StorageBootstrap {
 
 const fn default_persistence_queue_capacity() -> usize {
     1024
+}
+
+const fn default_persistence_keep_media() -> bool {
+    true
 }
 
 const fn default_persistence_retention_days() -> u64 {

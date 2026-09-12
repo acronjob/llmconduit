@@ -12,7 +12,10 @@
 //! it finishes. [`finish_from_flow_record`] is provided for retained-record/admin
 //! import paths and tests, not as the engine's terminal authority.
 
-use crate::control_plane_store::{EventRow, PersistenceQueue, RequestFinish, RequestRow};
+use crate::content_store::{self, PROTOCOL_CHAT_COMPLETIONS, SplitBody};
+use crate::control_plane_store::{
+    BlobRow, BodyWrite, EventRow, ItemRow, PersistenceQueue, RequestFinish, RequestRow,
+};
 use crate::dashboard_flow::{
     Attempt, AttemptStatus, ClientSource, FlowRecord, PhaseTimings, TerminalMetricsInputs,
 };
@@ -26,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// The writer queue is bounded by command count; this second bound prevents one
 /// command from smuggling an arbitrarily large allocation through that queue.
-pub const EVENT_PAYLOAD_CAP_BYTES: usize = 128 * 1024;
+pub const EVENT_PAYLOAD_CAP_BYTES: usize = 16 * 1024 * 1024;
 const EVENT_SCALAR_CAP_BYTES: usize = 4 * 1024;
 
 /// Typed terminal outcome from `run_turn`'s single completion choke point.
@@ -521,10 +524,15 @@ enum CaptureCompletion {
 }
 
 #[derive(Debug)]
+enum CapturedRequestBody {
+    Split(SplitBody),
+    Marker(Vec<u8>),
+}
+
+#[derive(Debug)]
 struct CapturedRequest {
-    bytes: Vec<u8>,
+    body: CapturedRequestBody,
     original_bytes: u64,
-    truncated: bool,
     ts_ms: u128,
     partial: bool,
 }
@@ -545,6 +553,7 @@ struct UpstreamPayloads {
 pub struct PersistenceCapture {
     queue: PersistenceQueue,
     api_call_id: String,
+    keep_media: bool,
     owner: AtomicU8,
     upstream_emitted: AtomicBool,
     served_emitted: AtomicBool,
@@ -563,9 +572,19 @@ impl std::fmt::Debug for PersistenceCapture {
 
 impl PersistenceCapture {
     pub fn new(queue: PersistenceQueue, api_call_id: impl Into<String>) -> Arc<Self> {
+        Self::with_options(queue, api_call_id, true)
+    }
+
+    /// `keep_media` controls whether image/data URIs survive into stored items.
+    pub fn with_options(
+        queue: PersistenceQueue,
+        api_call_id: impl Into<String>,
+        keep_media: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             queue,
             api_call_id: api_call_id.into(),
+            keep_media,
             owner: AtomicU8::new(OWNER_UNCLAIMED),
             upstream_emitted: AtomicBool::new(false),
             served_emitted: AtomicBool::new(false),
@@ -590,10 +609,11 @@ impl PersistenceCapture {
     }
 
     /// Replace the staged on-wire request and reset the raw response for this
-    /// send. Serialization counts every byte but retains only a bounded prefix;
-    /// the retained preview is passed through the shared secret/image redactor.
+    /// send. The request is split into content-addressed items (secrets
+    /// redacted per item) so the upstream hop shares storage with the inbound
+    /// hop and with every other request in the same conversation.
     pub fn stage_upstream_request<T: Serialize>(&self, request: &T) {
-        let captured = captured_request_value(request);
+        let captured = captured_request_value(request, self.keep_media);
         let mut upstream = self
             .upstream
             .lock()
@@ -727,30 +747,7 @@ impl PersistenceCapture {
             .upstream
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let request = upstream.request.take().map_or_else(
-            || {
-                payload_event(
-                    &self.api_call_id,
-                    PayloadSection::UpstreamRequest,
-                    now_epoch_ms(),
-                    0,
-                    &[],
-                    false,
-                    true,
-                )
-            },
-            |request| {
-                payload_event(
-                    &self.api_call_id,
-                    PayloadSection::UpstreamRequest,
-                    request.ts_ms,
-                    request.original_bytes,
-                    &request.bytes,
-                    request.truncated,
-                    request.partial,
-                )
-            },
-        );
+        let request = upstream.request.take();
         let partial = upstream.response_completion != CaptureCompletion::Complete;
         let response = std::mem::take(&mut upstream.response).into_event(
             &self.api_call_id,
@@ -759,84 +756,170 @@ impl PersistenceCapture {
             partial,
         );
         drop(upstream);
-        let _ = self.queue.try_event(request);
+        match request {
+            None => {
+                let _ = self.queue.try_event(payload_event(
+                    &self.api_call_id,
+                    PayloadSection::UpstreamRequest,
+                    now_epoch_ms(),
+                    0,
+                    &[],
+                    false,
+                    true,
+                ));
+            }
+            Some(CapturedRequest {
+                body: CapturedRequestBody::Split(split),
+                original_bytes,
+                ts_ms,
+                partial,
+            }) => {
+                let _ = self.queue.try_body(body_write(
+                    &self.api_call_id,
+                    PayloadSection::UpstreamRequest,
+                    ts_ms,
+                    original_bytes,
+                    split,
+                    partial,
+                ));
+            }
+            Some(CapturedRequest {
+                body: CapturedRequestBody::Marker(bytes),
+                original_bytes,
+                ts_ms,
+                partial,
+            }) => {
+                let _ = self.queue.try_event(payload_event(
+                    &self.api_call_id,
+                    PayloadSection::UpstreamRequest,
+                    ts_ms,
+                    original_bytes,
+                    &bytes,
+                    true,
+                    partial,
+                ));
+            }
+        }
         let _ = self.queue.try_event(response);
     }
 }
 
-#[derive(Debug)]
-struct StoppingCappedWriter {
-    bytes: Vec<u8>,
-    cap: usize,
-    stopped: bool,
-}
-
-impl StoppingCappedWriter {
-    fn new(cap: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(cap.min(8 * 1024)),
-            cap,
-            stopped: false,
-        }
-    }
-}
-
-impl std::io::Write for StoppingCappedWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.stopped {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "persistence request preview is full",
-            ));
-        }
-        let remaining = self.cap.saturating_sub(self.bytes.len());
-        if bytes.len() <= remaining {
-            self.bytes.extend_from_slice(bytes);
-            if self.bytes.len() == self.cap {
-                self.stopped = true;
-            }
-            return Ok(bytes.len());
-        }
-        self.bytes.extend_from_slice(&bytes[..remaining]);
-        self.stopped = true;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::WriteZero,
-            "persistence request preview is full",
-        ))
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn captured_request_value<T: Serialize>(request: &T) -> CapturedRequest {
-    // Redaction can expand a scalar, so retain 2x headroom before applying the
-    // final event cap. The writer deliberately errors at that bound, which makes
-    // serde stop walking the remaining normalized request immediately.
-    let mut writer = StoppingCappedWriter::new(EVENT_PAYLOAD_CAP_BYTES.saturating_mul(2));
-    let serialized = serde_json::to_writer(&mut writer, request).is_ok();
-    let bytes = if serialized {
-        crate::redaction::capture_capped_redacted(
-            &writer.bytes,
-            EVENT_PAYLOAD_CAP_BYTES,
-            EVENT_SCALAR_CAP_BYTES,
-        )
-    } else {
-        b"[redacted: failed to serialize upstream request]".to_vec()
+/// Serialize the finalized upstream request and split it into items. The
+/// upstream body is always a Chat Completions request. A serialization failure
+/// stores a fixed marker containing none of the request bytes.
+fn captured_request_value<T: Serialize>(request: &T, keep_media: bool) -> CapturedRequest {
+    let ts_ms = now_epoch_ms();
+    let serialized = serde_json::to_value(request);
+    let Ok(value) = serialized else {
+        return CapturedRequest {
+            body: CapturedRequestBody::Marker(
+                b"[redacted: failed to serialize upstream request]".to_vec(),
+            ),
+            original_bytes: 0,
+            ts_ms,
+            partial: true,
+        };
     };
-    let truncated = writer.stopped || bytes.len() >= EVENT_PAYLOAD_CAP_BYTES;
-    CapturedRequest {
-        bytes,
-        // Reqwest owns the exact final serialization, but exposing its byte
-        // count would require walking the arbitrarily large structure again.
-        // Report the measured preview lower bound and `truncated:true` instead.
-        original_bytes: u64::try_from(writer.bytes.len()).unwrap_or(u64::MAX),
-        truncated,
-        ts_ms: now_epoch_ms(),
-        // Until response headers arrive, the transport cannot prove the whole
-        // serialized request crossed the wire.
-        partial: true,
+    // Measure the on-wire size before splitting moves the items out.
+    let original_bytes = serialized_len(&value);
+    match content_store::split_value(PROTOCOL_CHAT_COMPLETIONS, value, keep_media) {
+        Ok(split) => CapturedRequest {
+            body: CapturedRequestBody::Split(split),
+            original_bytes,
+            ts_ms,
+            // Until response headers arrive, the transport cannot prove the
+            // whole serialized request crossed the wire.
+            partial: true,
+        },
+        Err(error) => CapturedRequest {
+            body: CapturedRequestBody::Marker(
+                format!("[redacted: upstream request not splittable: {error}]").into_bytes(),
+            ),
+            original_bytes,
+            ts_ms,
+            partial: true,
+        },
+    }
+}
+
+/// Byte length of a value's compact serialization, without retaining it.
+fn serialized_len(value: &serde_json::Value) -> u64 {
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len() as u64);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// Build the durable write for a split request-side hop: the skeleton event
+/// (fixed sequence, envelope contract unchanged) plus item and blob rows.
+pub fn body_write(
+    api_call_id: &str,
+    section: PayloadSection,
+    ts_ms: u128,
+    original_bytes: u64,
+    split: SplitBody,
+    partial: bool,
+) -> BodyWrite {
+    debug_assert!(matches!(
+        section,
+        PayloadSection::InboundRequest | PayloadSection::UpstreamRequest
+    ));
+    let created_at_ms = i64::try_from(ts_ms).unwrap_or(i64::MAX);
+    let mut seen = std::collections::HashSet::new();
+    let mut blobs = Vec::new();
+    let mut items = Vec::with_capacity(split.items.len());
+    for item in split.items {
+        if seen.insert(item.hash.clone()) {
+            blobs.push(BlobRow {
+                hash: item.hash.clone(),
+                media: content_store::MEDIA_JSON.to_string(),
+                size: i64::try_from(item.canonical.len()).unwrap_or(i64::MAX),
+                content: item.canonical,
+                created_at_ms,
+            });
+        }
+        items.push(ItemRow {
+            request_id: api_call_id.to_string(),
+            hop: section.hop().to_string(),
+            ordinal: item.ordinal,
+            section: item.section.as_str().to_string(),
+            kind: item.kind,
+            blob_hash: item.hash,
+        });
+    }
+    let mut event = payload_event(
+        api_call_id,
+        section,
+        ts_ms,
+        original_bytes,
+        split.skeleton.as_bytes(),
+        false,
+        partial,
+    );
+    // Record the item count in the envelope so a reader knows the payload is a
+    // skeleton even before it looks for references.
+    if let Some(payload) = event.payload.as_mut()
+        && let Ok(mut envelope) = serde_json::from_str::<serde_json::Value>(payload)
+        && let Some(object) = envelope.as_object_mut()
+    {
+        object.insert("items".to_string(), serde_json::json!(items.len()));
+        if let Ok(rendered) = serde_json::to_string(&envelope) {
+            *payload = rendered;
+        }
+    }
+    BodyWrite {
+        event,
+        items,
+        blobs,
     }
 }
 
@@ -1394,35 +1477,105 @@ mod tests {
     }
 
     #[test]
-    fn upstream_request_capture_stops_serializing_after_the_preview_cap() {
-        use serde::ser::SerializeSeq as _;
+    fn upstream_request_capture_splits_items_and_redacts_secrets() {
+        let request = serde_json::json!({
+            "model": "served-model",
+            "api_key": "sk-upstream-secret",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi", "x-api-key": "sk-inline"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        });
+        let captured = captured_request_value(&request, true);
+        assert!(
+            captured.partial,
+            "partial until the transport proves dispatch"
+        );
+        assert_eq!(
+            captured.original_bytes,
+            serde_json::to_vec(&request).unwrap().len() as u64
+        );
+        let CapturedRequestBody::Split(split) = captured.body else {
+            panic!("upstream request must split into items");
+        };
+        assert_eq!(split.items.len(), 3);
+        assert!(!split.skeleton.contains("sk-upstream-secret"));
+        assert!(
+            split
+                .items
+                .iter()
+                .all(|item| !item.canonical.contains("sk-inline"))
+        );
 
-        struct CountedSequence<'a> {
-            visited: &'a std::sync::atomic::AtomicUsize,
-        }
+        let write = body_write(
+            "api-call-1",
+            PayloadSection::UpstreamRequest,
+            1_000,
+            captured.original_bytes,
+            split,
+            captured.partial,
+        );
+        assert_eq!(write.event.seq, PayloadSection::UpstreamRequest.seq());
+        assert_eq!(write.event.hop, "upstream_out");
+        assert_eq!(write.items.len(), 3);
+        assert_eq!(write.blobs.len(), 3);
+        assert!(write.items.iter().all(|item| item.hop == "upstream_out"));
+        let envelope: serde_json::Value =
+            serde_json::from_str(write.event.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(envelope["items"], 3);
+        assert_eq!(envelope["truncated"], false);
+        assert_eq!(envelope["partial"], true);
+    }
 
-        impl Serialize for CountedSequence<'_> {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    #[test]
+    fn upstream_request_capture_serialization_failure_stores_only_a_marker() {
+        struct Broken;
+        impl Serialize for Broken {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: serde::Serializer,
             {
-                let mut sequence = serializer.serialize_seq(Some(1_000_000))?;
-                let item = "x".repeat(4096);
-                for _ in 0..1_000_000 {
-                    self.visited.fetch_add(1, Ordering::Relaxed);
-                    sequence.serialize_element(&item)?;
-                }
-                sequence.end()
+                Err(serde::ser::Error::custom("nope"))
             }
         }
+        let captured = captured_request_value(&Broken, true);
+        let CapturedRequestBody::Marker(bytes) = captured.body else {
+            panic!("a failed serialization must not produce items");
+        };
+        assert_eq!(bytes, b"[redacted: failed to serialize upstream request]");
+        assert!(captured.partial);
+    }
 
-        let visited = std::sync::atomic::AtomicUsize::new(0);
-        let captured = captured_request_value(&CountedSequence { visited: &visited });
-        assert!(captured.truncated);
-        assert!(captured.bytes.len() <= EVENT_PAYLOAD_CAP_BYTES);
-        assert!(
-            visited.load(Ordering::Relaxed) < 1000,
-            "bounded writer stops the serializer instead of walking the full value"
+    #[test]
+    fn body_write_stores_each_distinct_item_once() {
+        let request = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "same"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "same"}
+            ]
+        });
+        let split = crate::content_store::split_value(
+            crate::content_store::PROTOCOL_CHAT_COMPLETIONS,
+            request,
+            true,
+        )
+        .unwrap();
+        let write = body_write(
+            "api-call-2",
+            PayloadSection::InboundRequest,
+            5,
+            10,
+            split,
+            false,
         );
+        assert_eq!(write.items.len(), 3);
+        assert_eq!(write.blobs.len(), 2, "duplicate item shares one blob");
+        assert_eq!(write.items[0].blob_hash, write.items[2].blob_hash);
+        assert_eq!(write.items[0].ordinal, 0);
+        assert_eq!(write.items[2].ordinal, 2);
+        assert!(write.blobs.iter().all(|blob| blob.created_at_ms == 5));
     }
 }

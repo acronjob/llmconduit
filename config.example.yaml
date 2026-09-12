@@ -18,6 +18,9 @@ control_plane:
     queue_capacity: 1024
     # SQL history and daily JSONL files older than this are pruned.
     retention_days: 30
+    # Request bodies are stored in full, split into content-addressed items.
+    # Secrets are always redacted; this keeps or strips image/data URIs.
+    keep_media: true
 
   # Client inference auth is separate from /dashboard session auth. With no
   # operational keys and require:false, /v1 inference endpoints remain open.

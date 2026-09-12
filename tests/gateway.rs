@@ -5918,6 +5918,7 @@ async fn d13_routes_absent_without_debug_ui() {
         "/dashboard/api/snapshot",
         "/dashboard/api/history/requests",
         "/dashboard/api/history/requests/api_x",
+        "/dashboard/api/history/requests/api_x/body",
         "/dashboard/api/history/usage",
         "/dashboard/api/history/metrics",
     ] {
@@ -5981,6 +5982,7 @@ async fn d13_routes_present_in_dev_open_with_debug_ui() {
     for uri in [
         "/dashboard/api/history/requests",
         "/dashboard/api/history/requests/api_x",
+        "/dashboard/api/history/requests/api_x/body",
         "/dashboard/api/history/usage",
         "/dashboard/api/history/metrics",
     ] {
@@ -6032,6 +6034,141 @@ async fn d13_api_requires_session_when_token_configured() {
     let history_authed = d13_authed_get(&app, &auth, "/dashboard/api/history/requests").await;
     assert_eq!(history_authed.status().as_u16(), 503);
     d13_assert_no_store(&history_authed);
+}
+
+#[tokio::test]
+async fn persistent_history_body_route_reassembles_full_bodies_per_hop() {
+    use llmconduit::content_store::{PROTOCOL_CHAT_COMPLETIONS, PROTOCOL_RESPONSES, split_value};
+    use llmconduit::control_plane_store::{PersistenceWriter, RequestRow, SqlStore};
+    use llmconduit::flow_persistence::{PayloadSection, body_write};
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("history store"),
+    );
+    PersistenceWriter::begin_request(
+        store.as_ref(),
+        RequestRow {
+            id: "body-call".to_string(),
+            response_id: None,
+            conversation_id: None,
+            virtual_key_id: None,
+            client_protocol: PROTOCOL_RESPONSES.to_string(),
+            client_model: "public-model".to_string(),
+            alias: None,
+            backend: None,
+            resolved_model: None,
+            status: "running".to_string(),
+            created_at_ms: 1,
+        },
+    )
+    .await
+    .expect("persist request");
+    let inbound = serde_json::json!({
+        "model": "public-model",
+        "instructions": "be brief",
+        "tools": [{"type": "function", "name": "read_file", "parameters": {"$ref": "#/defs/x"}}],
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "message", "role": "user", "content": "hi"}
+        ],
+        "api_key": "sk-never"
+    });
+    let split = split_value(PROTOCOL_RESPONSES, inbound.clone(), true).unwrap();
+    PersistenceWriter::store_body(
+        store.as_ref(),
+        body_write(
+            "body-call",
+            PayloadSection::InboundRequest,
+            5,
+            100,
+            split,
+            false,
+        ),
+    )
+    .await
+    .expect("store inbound body");
+    let upstream = serde_json::json!({
+        "model": "served-model",
+        "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]
+    });
+    let split = split_value(PROTOCOL_CHAT_COMPLETIONS, upstream.clone(), true).unwrap();
+    PersistenceWriter::store_body(
+        store.as_ref(),
+        body_write(
+            "body-call",
+            PayloadSection::UpstreamRequest,
+            6,
+            100,
+            split,
+            false,
+        ),
+    )
+    .await
+    .expect("store upstream body");
+
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store);
+    let app = d13_router(Arc::new(gateway));
+
+    // Default hop is the inbound body; secrets are redacted, everything else is whole.
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/requests/body-call/body",
+    )
+    .await;
+    let status = response.status();
+    d13_assert_no_store(&response);
+    let body = d13_json(response).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
+    let mut expected = inbound.clone();
+    expected["api_key"] = serde_json::json!("[redacted]");
+    assert_eq!(body, expected);
+
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/requests/body-call/body?hop=upstream_out",
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(d13_json(response).await, upstream);
+
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/requests/body-call/body?hop=nope",
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    let response =
+        d13_authed_get(&app, &auth, "/dashboard/api/history/requests/missing/body").await;
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // The event list still shows the skeleton, with the item count in its envelope.
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/requests/body-call").await;
+    let detail = d13_json(response).await;
+    let envelope: serde_json::Value =
+        serde_json::from_str(detail["events"][0]["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(envelope["items"], 4);
+    assert!(
+        envelope["content"]
+            .as_str()
+            .unwrap()
+            .contains("$llmconduit_blob")
+    );
 }
 
 #[tokio::test]

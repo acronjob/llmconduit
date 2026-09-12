@@ -205,6 +205,10 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
             "/dashboard/api/history/requests/{id}",
             get(history_request_detail),
         )
+        .route(
+            "/dashboard/api/history/requests/{id}/body",
+            get(crate::persistent_history_api::history_request_body),
+        )
         .route("/dashboard/api/history/usage", get(history_usage))
         .route("/dashboard/api/history/metrics", get(history_metrics))
         .route_layer(middleware::map_response(dashboard_api_no_store));
@@ -672,7 +676,7 @@ async fn log_api_call(
     // `Content-Encoding` (already decoded) and fix `Content-Length` so the
     // axum extractors and any downstream reader see the true decoded size.
     parts.headers.remove(header::CONTENT_ENCODING);
-    if let Some(len) = HeaderValue::from_str(&body_bytes.len().to_string()).ok() {
+    if let Ok(len) = HeaderValue::from_str(&body_bytes.len().to_string()) {
         parts.headers.insert(header::CONTENT_LENGTH, len);
     }
 
@@ -682,8 +686,17 @@ async fn log_api_call(
     // never adds another 10 MiB scan on the Tokio worker.
     let instrument = is_flow_capture_request(&method, uri.path());
     let persistence_requested = instrument && gateway.persistence_enabled();
-    let persistence_inbound = if persistence_requested {
-        Some(offload_persistence_inbound(body_bytes.clone()).await)
+    let mut persistence_inbound = if persistence_requested {
+        let protocol = crate::flow_persistence::client_protocol_for_path(uri.path())
+            .expect("instrumented paths have a protocol");
+        Some(
+            offload_persistence_inbound(
+                body_bytes.clone(),
+                protocol,
+                gateway.persistence_keep_media(),
+            )
+            .await,
+        )
     } else {
         None
     };
@@ -769,18 +782,35 @@ async fn log_api_call(
         );
         let _ = queue.try_begin(row);
         let inbound = persistence_inbound
-            .as_ref()
+            .take()
             .expect("persistence gate has inbound capture");
-        let inbound = crate::flow_persistence::redacted_request_payload_event(
+        match inbound.split {
+            Some(split) => {
+                let _ = queue.try_body(crate::flow_persistence::body_write(
+                    &api_call_id,
+                    crate::flow_persistence::PayloadSection::InboundRequest,
+                    epoch_millis(),
+                    u64::try_from(body_bytes.len()).unwrap_or(u64::MAX),
+                    split,
+                    inbound.partial,
+                ));
+            }
+            None => {
+                let _ = queue.try_event(crate::flow_persistence::redacted_request_payload_event(
+                    &api_call_id,
+                    crate::flow_persistence::PayloadSection::InboundRequest,
+                    epoch_millis(),
+                    body_bytes.len(),
+                    &inbound.redacted,
+                    inbound.partial,
+                ));
+            }
+        }
+        let capture = crate::flow_persistence::PersistenceCapture::with_options(
+            queue,
             &api_call_id,
-            crate::flow_persistence::PayloadSection::InboundRequest,
-            epoch_millis(),
-            body_bytes.len(),
-            &inbound.redacted,
-            inbound.partial,
+            gateway.persistence_keep_media(),
         );
-        let _ = queue.try_event(inbound);
-        let capture = crate::flow_persistence::PersistenceCapture::new(queue, &api_call_id);
         parts.extensions.insert(Arc::clone(&capture));
         Some(capture)
     } else {
@@ -1186,69 +1216,81 @@ async fn offload_redacted_inbound_section(body: Bytes) -> (Option<String>, Vec<u
     }
 }
 
+/// The inbound capture handed from the middleware to the persistence seam.
+/// `split` is the content-addressed body (present whenever the body parsed as a
+/// JSON object); `redacted` is the bounded fallback marker used otherwise.
 struct PersistenceInbound {
     valid_json: bool,
     model: Option<String>,
+    split: Option<crate::content_store::SplitBody>,
     redacted: Vec<u8>,
     partial: bool,
 }
 
-/// Persistence ingress shares the turn-capture redactor, but hard-caps the
-/// retained section. Large bodies are copied into a right-sized `Vec` and parsed
-/// on the blocking pool; no `Bytes` clone can pin the middleware allocation.
-async fn offload_persistence_inbound(body: Bytes) -> PersistenceInbound {
-    if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
-        let valid_json = serde_json::from_slice::<Value>(&body).is_ok();
-        let (model, mut redacted) = redacted_inbound_section(&body);
-        redacted.truncate(crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES);
-        return PersistenceInbound {
-            valid_json,
-            model,
-            redacted,
-            partial: false,
-        };
-    }
-
-    let owned = body.to_vec();
-    drop(body);
-    match tokio::task::spawn_blocking(move || {
-        // Establish validity and extract `model` in one parse. The durable body
-        // preview then uses the shared streaming redactor directly over the owned
-        // bytes: it retains at most the event cap and never materializes a second
-        // full redacted `Value`/serialization. Both O(body) scans stay off Tokio.
-        let parsed = serde_json::from_slice::<Value>(&owned);
-        let (valid_json, model) = match parsed {
+/// Parse the inbound body once, extract `model`, and split it into
+/// content-addressed items. The split retains the whole body (that is the
+/// point: full bodies are stored, deduplicated per item), so large bodies do
+/// the parse + hash work on the blocking pool rather than a Tokio worker.
+async fn offload_persistence_inbound(
+    body: Bytes,
+    protocol: &'static str,
+    keep_media: bool,
+) -> PersistenceInbound {
+    fn split_inbound(raw: &[u8], protocol: &str, keep_media: bool) -> PersistenceInbound {
+        match serde_json::from_slice::<Value>(raw) {
             Ok(value) => {
                 let model = value
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                (true, model)
+                match crate::content_store::split_value(protocol, value, keep_media) {
+                    Ok(split) => PersistenceInbound {
+                        valid_json: true,
+                        model,
+                        split: Some(split),
+                        redacted: Vec::new(),
+                        partial: false,
+                    },
+                    Err(error) => PersistenceInbound {
+                        valid_json: true,
+                        model,
+                        split: None,
+                        redacted: format!("[redacted: body not splittable: {error}]").into_bytes(),
+                        partial: false,
+                    },
+                }
             }
-            Err(_) => (false, None),
-        };
-        let redacted = crate::redaction::capture_capped_redacted(
-            &owned,
-            crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
-            4 * 1024,
-        );
-        PersistenceInbound {
-            valid_json,
-            model,
-            redacted,
-            partial: false,
+            Err(_) => PersistenceInbound {
+                valid_json: false,
+                model: None,
+                split: None,
+                // Malformed input has no trustworthy key boundaries; the shared
+                // redactor stores a fixed marker with none of the source bytes.
+                redacted: crate::redaction::capture_capped_redacted(
+                    raw,
+                    crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
+                    4 * 1024,
+                ),
+                partial: false,
+            },
         }
-    })
-    .await
-    {
+    }
+
+    if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
+        return split_inbound(&body, protocol, keep_media);
+    }
+    let owned = body.to_vec();
+    drop(body);
+    match tokio::task::spawn_blocking(move || split_inbound(&owned, protocol, keep_media)).await {
         Ok(capture) => capture,
         Err(err) => {
-            tracing::warn!(error = %err, "persistence inbound redaction task failed");
+            tracing::warn!(error = %err, "persistence inbound split task failed");
             PersistenceInbound {
                 // A detached/panicked parse cannot establish valid JSON. Do not
                 // open a durable row that the typed extractor may never claim.
                 valid_json: false,
                 model: None,
+                split: None,
                 redacted: b"[redacted: persistence inbound task failed]".to_vec(),
                 partial: true,
             }
@@ -2942,26 +2984,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistence_inbound_large_body_is_bounded_and_does_not_pin_bytes() {
+    async fn persistence_inbound_large_body_is_split_in_full_and_does_not_pin_bytes() {
+        let filler = "x".repeat(2 * 1024 * 1024);
         let body = Bytes::from(format!(
-            r#"{{"model":"large-model","api_key":"sk-large-secret","input":"{}"}}"#,
-            "x".repeat(2 * 1024 * 1024)
+            r#"{{"model":"large-model","api_key":"sk-large-secret","input":"{filler}"}}"#
         ));
         let observer = body.clone();
-        let capture = super::offload_persistence_inbound(body).await;
+        let capture = super::offload_persistence_inbound(
+            body,
+            crate::content_store::PROTOCOL_RESPONSES,
+            true,
+        )
+        .await;
         assert!(capture.valid_json);
         assert_eq!(capture.model.as_deref(), Some("large-model"));
         assert!(!capture.partial);
+        let split = capture.split.expect("a JSON object body splits");
+        assert_eq!(split.items.len(), 1, "string `input` is one message item");
         assert!(
-            capture.redacted.len() <= crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
-            "persistence retains only the configured preview cap"
+            split.items[0].canonical.len() >= filler.len(),
+            "the full body is retained, not a capped preview"
         );
-        let text = String::from_utf8(capture.redacted).unwrap();
-        assert!(!text.contains("sk-large-secret"));
+        assert!(!split.skeleton.contains("sk-large-secret"));
+        assert!(split.skeleton.contains("[redacted]"));
         assert!(
             observer.try_into_mut().is_ok(),
             "offload pins no Bytes clone"
         );
+    }
+
+    #[tokio::test]
+    async fn persistence_inbound_malformed_body_opens_no_row_and_keeps_no_bytes() {
+        let body = Bytes::from_static(br#"{"api_key":"super-secret-without-a-close"#);
+        let capture = super::offload_persistence_inbound(
+            body,
+            crate::content_store::PROTOCOL_RESPONSES,
+            true,
+        )
+        .await;
+        assert!(!capture.valid_json);
+        assert!(capture.split.is_none());
+        let marker = String::from_utf8(capture.redacted).unwrap();
+        assert!(!marker.contains("super-secret"));
     }
 
     #[test]
