@@ -12140,6 +12140,68 @@ async fn root_endpoint_returns_ok() {
 }
 
 #[tokio::test]
+async fn root_redirects_browsers_to_the_dashboard_when_enabled() {
+    // A person opening the bare host in a browser should land on the
+    // dashboard, not on the JSON status probe. API clients (no `text/html`
+    // Accept) and dashboard-less deployments keep the JSON status.
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 303);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/dashboard")
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    assert_eq!(body["status"], "ok");
+
+    // Without the dashboard there is nowhere to redirect: JSON for everyone.
+    let response = llmconduit::build_app(test_config())
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("accept", "text/html")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+}
+
+#[tokio::test]
 async fn sse_responses_include_connection_keep_alive() {
     let upstream = MockUpstream::default();
     upstream

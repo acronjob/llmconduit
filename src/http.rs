@@ -128,7 +128,10 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         .route("/v1/completions", post(post_completions))
         .route("/v1/models", get(get_models))
         .route("/health", get(get_health))
-        .route("/", get(get_root));
+        .route("/", {
+            let dashboard = options.with_debug_ui && options.register_protected_routes;
+            get(move |headers: HeaderMap| get_root(headers, dashboard))
+        });
 
     // D7: the debug UI + dashboard routes register only when `--with-debug-ui`
     // is set AND the startup decision permits it AND the env-built auth context
@@ -1149,7 +1152,17 @@ async fn get_health() -> Response {
         .into_response()
 }
 
-async fn get_root() -> Response {
+/// Root: the JSON status probe. When the dashboard is registered, a browser
+/// (an `Accept` naming `text/html`) is sent to `/dashboard` instead; every
+/// other client keeps the JSON so scripted probes of `/` are unchanged.
+async fn get_root(headers: HeaderMap, dashboard: bool) -> Response {
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"));
+    if dashboard && wants_html {
+        return axum::response::Redirect::to("/dashboard").into_response();
+    }
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 
