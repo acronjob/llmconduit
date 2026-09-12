@@ -195,6 +195,29 @@ control_plane:
         sub_sessions: declared   # declared | infer | none
 ```
 
+#### Session tree and cache-bust detection
+
+Requests are linked into a session tree. A **declared** node is a session or
+sub-session id the harness put on the wire; an **inferred** node is created
+when a request starts a new conversation inside its parent (a Claude Code
+sub-agent that reuses the session id, a pi sub-process with no parent header,
+or any client without session ids, which gets one bucket per client key).
+Each node owns a chain: the requests that each extend the previous one's item
+list (system block, tools, messages, as stored by the content store). Per
+request the gateway records `session_id`, `chain_parent_request_id`,
+`item_count`, `shared_prefix_items`, `divergence_kind` (`append`,
+`instructions_changed`, `tools_changed`, `history_rewritten`, `new_chain`),
+`divergence_index`, and `cache_bust`, which is true whenever the difference
+falls inside the predecessor's items, the condition that invalidates an
+upstream prefix cache. `GET /dashboard/api/history/sessions` lists recent
+root nodes (`roots=false` for all), and `GET
+/dashboard/api/history/sessions/{id}` returns a node with its ancestors,
+children, and newest requests. The index is in memory and bounded; sessions
+not seen since startup are warmed from SQL on first touch, with a short
+timeout after which the request links cold. `infer_sub_sessions: false`
+keeps every request of a declared session on that session's chain and reports
+divergences there instead of opening inferred sub-sessions.
+
 Matchers are `header`, `body` (JSON pointer), `all`, `any`, `not`, and
 `always`. Extractors are `header`, `body`, `json_string` (parse a string
 field as JSON, then read a pointer), `first_of`, and `const`; a `regex` on

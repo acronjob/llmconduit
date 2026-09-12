@@ -170,6 +170,157 @@ pub struct HistoryBodyQuery {
     pub hop: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct HistorySessionsQuery {
+    pub since_ms: Option<i64>,
+    pub limit: Option<usize>,
+    /// `true` (default) lists only top-level nodes.
+    pub roots: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct HistorySessionQuery {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionsBody {
+    sessions: Vec<crate::sessions::SessionRow>,
+    since_ms: i64,
+    limit: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionDetailBody {
+    session: crate::sessions::SessionRow,
+    ancestors: Vec<crate::sessions::SessionRow>,
+    children: Vec<crate::sessions::SessionRow>,
+    requests: Vec<RequestSummary>,
+    requests_truncated: bool,
+}
+
+/// Default lookback for the sessions list.
+const DEFAULT_SESSIONS_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+const DEFAULT_SESSIONS_LIMIT: usize = 100;
+const MAX_SESSIONS_LIMIT: usize = 500;
+const DEFAULT_SESSION_REQUESTS: usize = 200;
+const MAX_SESSION_REQUESTS: usize = 1_000;
+const MAX_ANCESTORS: usize = 32;
+
+/// `GET /dashboard/api/history/sessions?since_ms=&limit=&roots=`. The most
+/// recently active session nodes; top-level only unless `roots=false`.
+pub async fn history_sessions(
+    State(gateway): State<Arc<Gateway>>,
+    Query(query): Query<HistorySessionsQuery>,
+) -> Response {
+    history_sessions_from(gateway.persistence_store(), query).await
+}
+
+async fn history_sessions_from(
+    store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
+    query: HistorySessionsQuery,
+) -> Response {
+    let Some(store) = store else {
+        return unavailable();
+    };
+    let since_ms = match query.since_ms {
+        Some(value) if value < 0 => return bad_request("since_ms must not be negative"),
+        Some(value) => value,
+        None => now_ms().saturating_sub(DEFAULT_SESSIONS_WINDOW_MS),
+    };
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SESSIONS_LIMIT)
+        .clamp(1, MAX_SESSIONS_LIMIT);
+    let roots_only = query.roots.unwrap_or(true);
+    match tokio::time::timeout(
+        HISTORY_QUERY_TIMEOUT,
+        store.list_sessions(since_ms, roots_only, limit.saturating_add(1)),
+    )
+    .await
+    {
+        Ok(Ok(mut sessions)) => {
+            let truncated = sessions.len() > limit;
+            sessions.truncate(limit);
+            json_response(
+                StatusCode::OK,
+                &SessionsBody {
+                    sessions,
+                    since_ms,
+                    limit,
+                    truncated,
+                },
+            )
+        }
+        Ok(Err(error)) => internal_error("read durable sessions", &error),
+        Err(_) => query_timeout(),
+    }
+}
+
+/// `GET /dashboard/api/history/sessions/:id?limit=`. One node with its
+/// ancestors (nearest first), direct children, and newest requests.
+pub async fn history_session_detail(
+    State(gateway): State<Arc<Gateway>>,
+    Path(id): Path<String>,
+    Query(query): Query<HistorySessionQuery>,
+) -> Response {
+    history_session_detail_from(gateway.persistence_store(), id, query).await
+}
+
+async fn history_session_detail_from(
+    store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
+    id: String,
+    query: HistorySessionQuery,
+) -> Response {
+    let Some(store) = store else {
+        return unavailable();
+    };
+    if id.is_empty() || id.len() > MAX_ID_BYTES {
+        return bad_request("invalid session id");
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SESSION_REQUESTS)
+        .clamp(1, MAX_SESSION_REQUESTS);
+    let detail = async {
+        let Some(session) = store.get_session(&id).await? else {
+            return Ok::<_, String>(None);
+        };
+        let mut ancestors = Vec::new();
+        let mut cursor = session.parent_id.clone();
+        while let Some(parent_id) = cursor.take() {
+            if ancestors.len() >= MAX_ANCESTORS {
+                break;
+            }
+            let Some(parent) = store.get_session(&parent_id).await? else {
+                break;
+            };
+            cursor = parent.parent_id.clone();
+            ancestors.push(parent);
+        }
+        let children = store.session_children(&id).await?;
+        let mut requests = store.session_requests(&id, limit.saturating_add(1)).await?;
+        let requests_truncated = requests.len() > limit;
+        if requests_truncated {
+            requests.drain(..requests.len() - limit);
+        }
+        Ok(Some(SessionDetailBody {
+            session,
+            ancestors,
+            children,
+            requests,
+            requests_truncated,
+        }))
+    };
+    match tokio::time::timeout(HISTORY_QUERY_TIMEOUT, detail).await {
+        Ok(Ok(Some(body))) => json_response(StatusCode::OK, &body),
+        Ok(Ok(None)) => json_response(StatusCode::NOT_FOUND, &error_body("session not found")),
+        Ok(Err(error)) => internal_error("read durable session", &error),
+        Err(_) => query_timeout(),
+    }
+}
+
 /// `GET /dashboard/api/history/requests/:id/body?hop=client_in|upstream_out`.
 /// Reassembles the full request body of one hop from its skeleton event and
 /// content-addressed items. The response is the body itself (JSON), not an

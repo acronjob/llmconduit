@@ -193,6 +193,8 @@ pub struct Gateway {
     persistence_keep_media: bool,
     /// Harness/session detection, run once per instrumented request.
     harness_detector: Arc<crate::harness::HarnessDetector>,
+    /// Session tree + lineage index (see `crate::sessions`).
+    session_linker: Arc<crate::sessions::SessionLinker>,
     /// Durable store handle for admin/history reads only. Inference writes use
     /// `persistence_queue` above; request execution never awaits this trait object.
     persistence_store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
@@ -751,6 +753,7 @@ impl Gateway {
             persistence_queue: None,
             persistence_keep_media: true,
             harness_detector: Arc::new(crate::harness::HarnessDetector::builtin()),
+            session_linker: Arc::new(crate::sessions::SessionLinker::new(true)),
             persistence_store: None,
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -943,6 +946,15 @@ impl Gateway {
 
     pub fn harness_detector(&self) -> &Arc<crate::harness::HarnessDetector> {
         &self.harness_detector
+    }
+
+    pub fn with_session_linker(mut self, linker: Arc<crate::sessions::SessionLinker>) -> Self {
+        self.session_linker = linker;
+        self
+    }
+
+    pub fn session_linker(&self) -> &Arc<crate::sessions::SessionLinker> {
+        &self.session_linker
     }
 
     /// Attach the read/admin persistence handle. It is intentionally distinct

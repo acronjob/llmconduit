@@ -27,6 +27,7 @@ pub(crate) mod redaction;
 pub mod replay;
 pub mod request_log;
 pub mod search;
+pub mod sessions;
 pub(crate) mod sse_guard;
 /// Crate-internal, test-only peak-allocation probe (the crate's single
 /// `#[global_allocator]`), shared by the `sse_guard` reject-path and
@@ -144,6 +145,8 @@ pub struct ControlPlaneRuntime {
     pub conversation_id_header: String,
     /// Compiled harness/session detection profiles.
     pub harness_detector: Arc<crate::harness::HarnessDetector>,
+    /// In-memory session tree used to link requests into chains.
+    pub session_linker: Arc<crate::sessions::SessionLinker>,
 }
 
 impl Default for ControlPlaneRuntime {
@@ -155,6 +158,7 @@ impl Default for ControlPlaneRuntime {
             conversation_id_header: crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER
                 .to_string(),
             harness_detector: Arc::new(crate::harness::HarnessDetector::builtin()),
+            session_linker: Arc::new(crate::sessions::SessionLinker::new(true)),
         }
     }
 }
@@ -492,7 +496,8 @@ pub fn build_app_with_gateway_control_plane_runtime(
     }
     gateway = gateway
         .with_persistence_keep_media(runtime.persistence_keep_media)
-        .with_harness_detector(runtime.harness_detector);
+        .with_harness_detector(runtime.harness_detector)
+        .with_session_linker(runtime.session_linker);
     {}
     if let Some(store) = runtime.persistence_store {
         gateway = gateway.with_persistence_store(store);

@@ -209,6 +209,14 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
             "/dashboard/api/history/requests/{id}/body",
             get(crate::persistent_history_api::history_request_body),
         )
+        .route(
+            "/dashboard/api/history/sessions",
+            get(crate::persistent_history_api::history_sessions),
+        )
+        .route(
+            "/dashboard/api/history/sessions/{id}",
+            get(crate::persistent_history_api::history_session_detail),
+        )
         .route("/dashboard/api/history/usage", get(history_usage))
         .route("/dashboard/api/history/metrics", get(history_metrics))
         .route_layer(middleware::map_response(dashboard_api_no_store));
@@ -767,21 +775,64 @@ async fn log_api_call(
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        // Client attribution is derived here, while the raw key is readable,
+        // so the durable row carries it from ingress on.
+        let attribution = crate::dashboard_flow::ClientAttribution::derive(
+            &headers,
+            dashboard_client_header().as_deref(),
+        );
+        let client_source = attribution
+            .source
+            .map(crate::flow_persistence::client_source_name);
+        let virtual_key_id = client_identity
+            .as_ref()
+            .map(|identity| identity.key_id.as_str());
+        let now_ms = epoch_millis();
+        // Session-tree linkage: warm the in-memory index from durable rows
+        // for a session we have not seen since startup, then link.
+        let link = match persistence_inbound.as_ref() {
+            Some(inbound) => match (&inbound.harness, &inbound.split) {
+                (Some(identity), Some(split)) => {
+                    warm_session_index(&gateway, identity, attribution.label.as_deref()).await;
+                    let items = split
+                        .items
+                        .iter()
+                        .map(crate::sessions::ItemFingerprint::from)
+                        .collect::<Vec<_>>();
+                    Some(gateway.session_linker().link(crate::sessions::LinkInput {
+                        api_call_id: &api_call_id,
+                        identity,
+                        client_label: attribution.label.as_deref(),
+                        virtual_key_id,
+                        items: &items,
+                        now_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    }))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some(link) = &link {
+            for row in &link.upserts {
+                let _ = queue.try_session(row.clone());
+            }
+        }
         let row = crate::flow_persistence::begin_request(
             crate::flow_persistence::BeginPersistenceInput {
                 api_call_id: &api_call_id,
                 conversation_id,
-                virtual_key_id: client_identity
-                    .as_ref()
-                    .map(|identity| identity.key_id.as_str()),
+                virtual_key_id,
                 client_protocol: crate::flow_persistence::client_protocol_for_path(uri.path())
                     .expect("instrumented paths have a protocol"),
                 client_model,
                 alias: gateway.operational_alias(client_model),
-                created_at_ms: epoch_millis(),
+                created_at_ms: now_ms,
                 harness: persistence_inbound
                     .as_ref()
                     .and_then(|inbound| inbound.harness.as_ref()),
+                link: link.as_ref(),
+                client_label: attribution.label.as_deref(),
+                client_source,
             },
         );
         let _ = queue.try_begin(row);
@@ -1216,6 +1267,66 @@ async fn offload_redacted_inbound_section(body: Bytes) -> (Option<String>, Vec<u
                 b"<turn-capture: inbound redaction task failed>".to_vec(),
                 true,
             )
+        }
+    }
+}
+
+/// Upper bound on the time a cold-session warm-up may spend reading durable
+/// rows on the request path. On timeout the request links cold (a fresh node).
+const SESSION_WARM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Upper bound on descendants warmed for one session.
+const SESSION_WARM_DESCENDANTS: usize = 64;
+
+/// Seed the in-memory session index from the durable store for a session the
+/// process has not seen since startup. Declared sessions are looked up by
+/// `(harness, session_id)`; requests without a session id warm their
+/// per-client bucket. Failures and timeouts are logged and ignored.
+async fn warm_session_index(
+    gateway: &Gateway,
+    identity: &crate::harness::HarnessIdentity,
+    client_label: Option<&str>,
+) {
+    let Some(store) = gateway.persistence_store() else {
+        return;
+    };
+    let linker = gateway.session_linker();
+    let external_id = identity.session_id.as_deref();
+    if let Some(external_id) = external_id
+        && linker.knows_declared(&identity.harness, external_id)
+    {
+        return;
+    }
+    if external_id.is_none() && linker.knows_anonymous(&identity.harness, client_label) {
+        return;
+    }
+    let warm = async {
+        let Some(root) = store
+            .find_session(&identity.harness, external_id, client_label)
+            .await?
+        else {
+            return Ok::<_, String>(());
+        };
+        let mut nodes = vec![root.clone()];
+        nodes.extend(
+            store
+                .session_descendants(&root.id, SESSION_WARM_DESCENDANTS)
+                .await?,
+        );
+        let mut seeded = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let head = store.chain_head(&node.id).await?;
+            seeded.push((node, head));
+        }
+        linker.seed(seeded);
+        Ok(())
+    };
+    match tokio::time::timeout(SESSION_WARM_TIMEOUT, warm).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, harness = %identity.harness, "session warm-up read failed");
+        }
+        Err(_) => {
+            tracing::warn!(harness = %identity.harness, "session warm-up timed out; linking cold");
         }
     }
 }

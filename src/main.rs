@@ -373,12 +373,16 @@ async fn prepare_control_plane_runtime(
         infer_sub_sessions = harness_detector.infer_sub_sessions(),
         "harness detection profiles compiled"
     );
+    let session_linker = Arc::new(llmconduit::sessions::SessionLinker::new(
+        harness_detector.infer_sub_sessions(),
+    ));
     let runtime = ControlPlaneRuntime {
         persistence_store,
         persistence_queue: persistence_queue.clone(),
         persistence_keep_media: loaded.storage.keep_media,
         conversation_id_header: loaded.conversation_id_header.clone(),
         harness_detector: Arc::new(harness_detector),
+        session_linker,
     };
     Ok((runtime, client_auth, persistence_queue))
 }

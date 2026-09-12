@@ -33,6 +33,7 @@ struct RecordingWriter {
     begins: Mutex<Vec<RequestRow>>,
     events: Mutex<Vec<EventRow>>,
     bodies: Mutex<Vec<BodyWrite>>,
+    sessions: Mutex<Vec<llmconduit::sessions::SessionRow>>,
     finishes: Mutex<Vec<(String, RequestFinish)>>,
 }
 
@@ -324,6 +325,155 @@ async fn persistence_begin_row_carries_the_detected_harness_identity() {
     assert_eq!(begin.session_kind, None);
 }
 
+#[tokio::test]
+async fn persistence_links_requests_into_sessions_and_flags_cache_busts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "served-model"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse(&[
+                    serde_json::json!({
+                        "id": "chat-1",
+                        "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": null}]
+                    }),
+                    serde_json::json!({
+                        "id": "chat-1",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }),
+                ])),
+        )
+        .mount(&server)
+        .await;
+    let config = Config::from_persisted(&PersistedConfig {
+        upstream_base_url: format!("{}/v1", server.uri()),
+        ..PersistedConfig::default()
+    })
+    .unwrap();
+    let (_unused, gateway) = llmconduit::build_app_with_gateway(config);
+    let writer = Arc::new(RecordingWriter::default());
+    let queue = PersistenceQueue::spawn(
+        Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+        NonZeroUsize::new(64).unwrap(),
+    );
+    let gateway = Arc::new(
+        gateway
+            .as_ref()
+            .clone()
+            .with_persistence_queue(queue.clone()),
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let send = |messages: serde_json::Value, tools: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let body = serde_json::json!({
+                "model": "served-model",
+                "messages": messages,
+                "tools": tools,
+                "stream": false
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .header("user-agent", "codex_cli_rs/0.104.0 (linux)")
+                        .header("originator", "codex_cli_rs")
+                        .header("session-id", "codex-session-1")
+                        .header("thread-id", "codex-session-1")
+                        .header("authorization", "Bearer client-key-xyz")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+        }
+    };
+    let tools =
+        serde_json::json!([{"type": "function", "function": {"name": "read", "parameters": {}}}]);
+    let sys = serde_json::json!({"role": "system", "content": "be brief"});
+    let u1 = serde_json::json!({"role": "user", "content": "hi"});
+    let a1 = serde_json::json!({"role": "assistant", "content": "ok"});
+    let u2 = serde_json::json!({"role": "user", "content": "more"});
+    // Turn 1, turn 2 (pure append), turn 3 with a changed tool list (cache bust).
+    send(serde_json::json!([sys, u1]), tools.clone()).await;
+    send(serde_json::json!([sys, u1, a1, u2]), tools.clone()).await;
+    let changed_tools =
+        serde_json::json!([{"type": "function", "function": {"name": "write", "parameters": {}}}]);
+    send(serde_json::json!([sys, u1, a1, u2, a1, u1]), changed_tools).await;
+    queue.flush().await.unwrap();
+
+    let begins = writer.begins.lock().unwrap();
+    assert_eq!(begins.len(), 3);
+    let session_id = begins[0]
+        .session_id
+        .clone()
+        .expect("linked to a session node");
+    assert!(
+        begins
+            .iter()
+            .all(|row| row.session_id.as_deref() == Some(session_id.as_str()))
+    );
+    assert_eq!(begins[0].divergence_kind.as_deref(), Some("new_chain"));
+    assert_eq!(begins[0].chain_parent_request_id, None);
+    assert_eq!(begins[0].item_count, Some(3));
+    assert_eq!(begins[0].cache_bust, Some(false));
+    assert_eq!(begins[0].harness.as_deref(), Some("codex"));
+    assert_eq!(
+        begins[0]
+            .client_label
+            .as_deref()
+            .map(|l| l.starts_with("key-")),
+        Some(true)
+    );
+    assert_eq!(begins[0].client_source.as_deref(), Some("key_hash"));
+
+    assert_eq!(begins[1].divergence_kind.as_deref(), Some("append"));
+    assert_eq!(
+        begins[1].chain_parent_request_id.as_deref(),
+        Some(begins[0].id.as_str())
+    );
+    assert_eq!(begins[1].shared_prefix_items, Some(3));
+    assert_eq!(begins[1].cache_bust, Some(false));
+
+    assert_eq!(begins[2].divergence_kind.as_deref(), Some("tools_changed"));
+    assert_eq!(
+        begins[2].chain_parent_request_id.as_deref(),
+        Some(begins[1].id.as_str())
+    );
+    assert_eq!(
+        begins[2].divergence_index,
+        Some(0),
+        "tools precede messages in item order"
+    );
+    assert_eq!(begins[2].cache_bust, Some(true));
+
+    let sessions = writer.sessions.lock().unwrap();
+    assert!(!sessions.is_empty());
+    let last = sessions.last().unwrap();
+    assert_eq!(last.id, session_id);
+    assert_eq!(last.kind, "declared");
+    assert_eq!(last.harness, "codex");
+    assert_eq!(last.external_id.as_deref(), Some("codex-session-1"));
+    assert_eq!(last.request_count, 3);
+    assert_eq!(last.root_request_id.as_deref(), Some(begins[0].id.as_str()));
+    assert_eq!(last.depth, 0);
+}
+
 #[async_trait]
 impl PersistenceWriter for RecordingWriter {
     async fn begin_request(&self, row: RequestRow) -> StoreResult<()> {
@@ -339,6 +489,11 @@ impl PersistenceWriter for RecordingWriter {
     async fn store_body(&self, body: BodyWrite) -> StoreResult<()> {
         self.events.lock().unwrap().push(body.event.clone());
         self.bodies.lock().unwrap().push(body);
+        Ok(())
+    }
+
+    async fn upsert_session(&self, row: llmconduit::sessions::SessionRow) -> StoreResult<()> {
+        self.sessions.lock().unwrap().push(row);
         Ok(())
     }
 

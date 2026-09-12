@@ -330,6 +330,10 @@ pub struct BeginPersistenceInput<'a> {
     pub created_at_ms: u128,
     /// Detected harness identity; `None` when detection did not run.
     pub harness: Option<&'a crate::harness::HarnessIdentity>,
+    /// Session-tree linkage; `None` when the body could not be split.
+    pub link: Option<&'a crate::sessions::SessionLink>,
+    pub client_label: Option<&'a str>,
+    pub client_source: Option<&'a str>,
 }
 
 pub fn begin_request(input: BeginPersistenceInput<'_>) -> RequestRow {
@@ -370,6 +374,26 @@ pub fn begin_request(input: BeginPersistenceInput<'_>) -> RequestRow {
             .harness
             .and_then(|identity| identity.session_kind.as_deref())
             .map(bounded_scalar),
+        session_id: input.link.map(|link| link.session_id.clone()),
+        chain_parent_request_id: input
+            .link
+            .and_then(|link| link.chain_parent_request_id.clone()),
+        item_count: input
+            .link
+            .map(|link| i64::try_from(link.item_count).unwrap_or(i64::MAX)),
+        shared_prefix_items: input
+            .link
+            .map(|link| i64::try_from(link.lineage.shared_prefix).unwrap_or(i64::MAX)),
+        divergence_kind: input
+            .link
+            .map(|link| link.lineage.kind.as_str().to_string()),
+        divergence_index: input
+            .link
+            .and_then(|link| link.lineage.index)
+            .map(|index| i64::try_from(index).unwrap_or(i64::MAX)),
+        cache_bust: input.link.map(|link| link.lineage.cache_bust),
+        client_label: input.client_label.map(bounded_scalar),
+        client_source: input.client_source.map(bounded_scalar),
     }
 }
 
@@ -501,7 +525,7 @@ pub fn finish_from_flow_record(
     })
 }
 
-const fn client_source_name(source: ClientSource) -> &'static str {
+pub const fn client_source_name(source: ClientSource) -> &'static str {
     match source {
         ClientSource::KeyHash => "key_hash",
         ClientSource::ConfiguredHeader => "configured_header",
@@ -1367,7 +1391,29 @@ mod tests {
                 session_kind: None,
                 sub_sessions: crate::harness::SubSessionPolicy::Declared,
             }),
+            link: Some(&crate::sessions::SessionLink {
+                session_id: "node-1".to_string(),
+                chain_parent_request_id: Some("api_0".to_string()),
+                lineage: crate::sessions::Lineage {
+                    kind: crate::sessions::DivergenceKind::ToolsChanged,
+                    shared_prefix: 3,
+                    index: Some(3),
+                    cache_bust: true,
+                },
+                item_count: 7,
+                upserts: Vec::new(),
+            }),
+            client_label: Some("key-abc"),
+            client_source: Some("key_hash"),
         });
+        assert_eq!(row.session_id.as_deref(), Some("node-1"));
+        assert_eq!(row.chain_parent_request_id.as_deref(), Some("api_0"));
+        assert_eq!(row.divergence_kind.as_deref(), Some("tools_changed"));
+        assert_eq!(row.divergence_index, Some(3));
+        assert_eq!(row.shared_prefix_items, Some(3));
+        assert_eq!(row.item_count, Some(7));
+        assert_eq!(row.cache_bust, Some(true));
+        assert_eq!(row.client_label.as_deref(), Some("key-abc"));
         assert_eq!(row.id, "api_1");
         assert_eq!(row.harness.as_deref(), Some("claude-code"));
         assert_eq!(row.harness_version.as_deref(), Some("2.1.0"));

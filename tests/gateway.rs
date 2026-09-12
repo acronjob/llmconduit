@@ -5919,6 +5919,8 @@ async fn d13_routes_absent_without_debug_ui() {
         "/dashboard/api/history/requests",
         "/dashboard/api/history/requests/api_x",
         "/dashboard/api/history/requests/api_x/body",
+        "/dashboard/api/history/sessions",
+        "/dashboard/api/history/sessions/s_x",
         "/dashboard/api/history/usage",
         "/dashboard/api/history/metrics",
     ] {
@@ -5983,6 +5985,8 @@ async fn d13_routes_present_in_dev_open_with_debug_ui() {
         "/dashboard/api/history/requests",
         "/dashboard/api/history/requests/api_x",
         "/dashboard/api/history/requests/api_x/body",
+        "/dashboard/api/history/sessions",
+        "/dashboard/api/history/sessions/s_x",
         "/dashboard/api/history/usage",
         "/dashboard/api/history/metrics",
     ] {
@@ -6170,6 +6174,114 @@ async fn persistent_history_body_route_reassembles_full_bodies_per_hop() {
             .unwrap()
             .contains("$llmconduit_blob")
     );
+}
+
+#[tokio::test]
+async fn persistent_history_session_routes_list_tree_and_requests() {
+    use llmconduit::control_plane_store::{PersistenceWriter, RequestRow, SqlStore};
+    use llmconduit::sessions::SessionRow;
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("history store"),
+    );
+    let node = |id: &str, parent: Option<&str>, seen: i64| SessionRow {
+        id: id.to_string(),
+        parent_id: parent.map(str::to_string),
+        kind: "declared".to_string(),
+        harness: "claude-code".to_string(),
+        harness_version: Some("2.1.0".to_string()),
+        external_id: Some(format!("ext-{id}")),
+        session_kind: None,
+        client_label: Some("key-abc".to_string()),
+        virtual_key_id: None,
+        depth: i64::from(parent.is_some()),
+        root_request_id: None,
+        spawned_by_request_id: None,
+        first_seen_ms: seen,
+        last_seen_ms: seen,
+        request_count: 1,
+    };
+    PersistenceWriter::upsert_session(store.as_ref(), node("root", None, 1_000))
+        .await
+        .unwrap();
+    PersistenceWriter::upsert_session(store.as_ref(), node("child", Some("root"), 2_000))
+        .await
+        .unwrap();
+    PersistenceWriter::begin_request(
+        store.as_ref(),
+        RequestRow {
+            id: "req-in-child".to_string(),
+            client_protocol: "anthropic_messages".to_string(),
+            client_model: "m".to_string(),
+            status: "running".to_string(),
+            created_at_ms: 2_000,
+            session_id: Some("child".to_string()),
+            divergence_kind: Some("new_chain".to_string()),
+            cache_bust: Some(false),
+            ..RequestRow::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store);
+    let app = d13_router(Arc::new(gateway));
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions?since_ms=0").await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    d13_assert_no_store(&response);
+    let body = d13_json(response).await;
+    assert_eq!(
+        body["sessions"].as_array().unwrap().len(),
+        1,
+        "roots only by default"
+    );
+    assert_eq!(body["sessions"][0]["id"], "root");
+    assert_eq!(body["truncated"], false);
+
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/sessions?since_ms=0&roots=false",
+    )
+    .await;
+    let body = d13_json(response).await;
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(body["sessions"][0]["id"], "child", "most recent first");
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions/child").await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = d13_json(response).await;
+    assert_eq!(body["session"]["id"], "child");
+    assert_eq!(body["session"]["parent_id"], "root");
+    assert_eq!(body["ancestors"][0]["id"], "root");
+    assert_eq!(body["children"].as_array().unwrap().len(), 0);
+    assert_eq!(body["requests"][0]["id"], "req-in-child");
+    assert_eq!(body["requests"][0]["divergence_kind"], "new_chain");
+    assert_eq!(body["requests"][0]["cache_bust"], false);
+    assert_eq!(body["requests_truncated"], false);
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions/root").await;
+    let body = d13_json(response).await;
+    assert_eq!(body["children"][0]["id"], "child");
+    assert!(body["ancestors"].as_array().unwrap().is_empty());
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions/nope").await;
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions?since_ms=-1").await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

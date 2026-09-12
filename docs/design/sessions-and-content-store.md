@@ -275,9 +275,18 @@ in the same session that was still streaming when it arrived, if any.
 ## Status
 
 - Phase 1 (content store) landed in commit a9bd689.
-- Phase 2 (harness detection) is implemented: `crate::harness`, the shipped
-  profiles in `src/harness_profiles.yaml`, `control_plane.sessions`, and the
-  six `requests` columns from migration 0008 written at request begin.
+- Phase 2 (harness detection) landed in commit bf53cae: `crate::harness`,
+  the shipped profiles in `src/harness_profiles.yaml`,
+  `control_plane.sessions`, and the six `requests` columns from migration
+  0008 written at request begin.
+- Phase 3 (session tree and lineage) is implemented: `crate::sessions`
+  (classifier + bounded in-memory linker with durable warm-up), migration
+  0009 (`sessions` table, lineage columns on `requests`), linking at the
+  HTTP persistence seam, and the `/dashboard/api/history/sessions*` reads.
+  Deviations from the design above: one chain per node (an inferred
+  sub-session *is* the chain), `spawned_by_request_id` is the parent chain's
+  latest request rather than an in-flight lookup, and ingress now also
+  writes `client_label`/`client_source` on the request row.
 
 ## Phases
 

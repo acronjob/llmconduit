@@ -54,6 +54,17 @@ pub struct RequestRow {
     pub harness_sub_session_id: Option<String>,
     pub harness_parent_session_id: Option<String>,
     pub session_kind: Option<String>,
+    /// Session-tree linkage (see `crate::sessions`), known at ingress.
+    pub session_id: Option<String>,
+    pub chain_parent_request_id: Option<String>,
+    pub item_count: Option<i64>,
+    pub shared_prefix_items: Option<i64>,
+    pub divergence_kind: Option<String>,
+    pub divergence_index: Option<i64>,
+    pub cache_bust: Option<bool>,
+    /// Client attribution, also known at ingress (the terminal upsert keeps it).
+    pub client_label: Option<String>,
+    pub client_source: Option<String>,
 }
 
 /// One bounded/redacted hop event. Callers must use the existing turn-capture
@@ -176,6 +187,13 @@ pub struct RequestSummary {
     pub harness_sub_session_id: Option<String>,
     pub harness_parent_session_id: Option<String>,
     pub session_kind: Option<String>,
+    pub session_id: Option<String>,
+    pub chain_parent_request_id: Option<String>,
+    pub item_count: Option<i64>,
+    pub shared_prefix_items: Option<i64>,
+    pub divergence_kind: Option<String>,
+    pub divergence_index: Option<i64>,
+    pub cache_bust: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -279,6 +297,11 @@ pub trait PersistenceWriter: Send + Sync {
     async fn store_body(&self, body: BodyWrite) -> StoreResult<()> {
         self.append_event(body.event).await
     }
+    /// Create or refresh a session node. Writers without session storage may
+    /// keep the default no-op.
+    async fn upsert_session(&self, _row: crate::sessions::SessionRow) -> StoreResult<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -307,6 +330,44 @@ pub trait PersistenceStore: PersistenceWriter {
     async fn get_blobs(&self, hashes: &[String]) -> StoreResult<Vec<BlobRow>>;
     /// Remove blobs no `request_items` row references. Returns the count.
     async fn prune_orphan_blobs(&self) -> StoreResult<u64>;
+
+    async fn get_session(&self, id: &str) -> StoreResult<Option<crate::sessions::SessionRow>>;
+    /// A declared node by `(harness, external_id)`, or the anonymous bucket
+    /// for `(harness, client_label)` when `external_id` is `None`.
+    async fn find_session(
+        &self,
+        harness: &str,
+        external_id: Option<&str>,
+        client_label: Option<&str>,
+    ) -> StoreResult<Option<crate::sessions::SessionRow>>;
+    /// Most recently active nodes at/after `since_ms`; `roots_only` limits to
+    /// nodes without a parent.
+    async fn list_sessions(
+        &self,
+        since_ms: i64,
+        roots_only: bool,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::sessions::SessionRow>>;
+    /// Direct children of a node, oldest first.
+    async fn session_children(
+        &self,
+        parent_id: &str,
+    ) -> StoreResult<Vec<crate::sessions::SessionRow>>;
+    /// All descendants of a node, breadth-first, at most `limit`.
+    async fn session_descendants(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::sessions::SessionRow>>;
+    /// Newest `limit` requests of one node, oldest first.
+    async fn session_requests(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<RequestSummary>>;
+    /// The latest request of a node's chain with its inbound items.
+    async fn chain_head(&self, session_id: &str)
+    -> StoreResult<Option<crate::sessions::ChainHead>>;
 
     async fn get_setting(&self, key: &str) -> StoreResult<Option<String>>;
     async fn set_setting(&self, key: &str, value: &str) -> StoreResult<()>;
@@ -559,6 +620,14 @@ impl PersistenceWriter for JsonlWriter {
         }
         self.append("events", value).await
     }
+
+    async fn upsert_session(&self, row: crate::sessions::SessionRow) -> StoreResult<()> {
+        let mut value = serde_json::to_value(row).map_err(store_error)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("event".to_string(), serde_json::json!("session"));
+        }
+        self.append("requests", value).await
+    }
 }
 
 #[derive(Clone)]
@@ -792,7 +861,8 @@ const REQUEST_COLUMNS: &str = "SELECT id, response_id, conversation_id, virtual_
     completed_at_ms, first_token_at_ms, input_tokens, output_tokens, cached_tokens, \
     reasoning_tokens, error, terminal_reason, attempts_json, timings_json, client_label, \
     client_source, harness, harness_version, harness_session_id, harness_sub_session_id, \
-    harness_parent_session_id, session_kind FROM requests";
+    harness_parent_session_id, session_kind, session_id, chain_parent_request_id, item_count, \
+    shared_prefix_items, divergence_kind, divergence_index, cache_bust FROM requests";
 
 fn decode_request<R>(row: &R) -> StoreResult<RequestSummary>
 where
@@ -833,6 +903,47 @@ where
         harness_sub_session_id: row.try_get(26).map_err(store_error)?,
         harness_parent_session_id: row.try_get(27).map_err(store_error)?,
         session_kind: row.try_get(28).map_err(store_error)?,
+        session_id: row.try_get(29).map_err(store_error)?,
+        chain_parent_request_id: row.try_get(30).map_err(store_error)?,
+        item_count: row.try_get(31).map_err(store_error)?,
+        shared_prefix_items: row.try_get(32).map_err(store_error)?,
+        divergence_kind: row.try_get(33).map_err(store_error)?,
+        divergence_index: row.try_get(34).map_err(store_error)?,
+        cache_bust: row
+            .try_get::<Option<i64>, _>(35)
+            .map_err(store_error)?
+            .map(|flag| flag != 0),
+    })
+}
+
+const SESSION_COLUMNS: &str = "SELECT id, parent_id, kind, harness, harness_version, external_id, \
+    session_kind, client_label, virtual_key_id, depth, root_request_id, spawned_by_request_id, \
+    first_seen_ms, last_seen_ms, request_count FROM sessions";
+
+fn decode_session<R>(row: &R) -> StoreResult<crate::sessions::SessionRow>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(crate::sessions::SessionRow {
+        id: row.try_get(0).map_err(store_error)?,
+        parent_id: row.try_get(1).map_err(store_error)?,
+        kind: row.try_get(2).map_err(store_error)?,
+        harness: row.try_get(3).map_err(store_error)?,
+        harness_version: row.try_get(4).map_err(store_error)?,
+        external_id: row.try_get(5).map_err(store_error)?,
+        session_kind: row.try_get(6).map_err(store_error)?,
+        client_label: row.try_get(7).map_err(store_error)?,
+        virtual_key_id: row.try_get(8).map_err(store_error)?,
+        depth: row.try_get(9).map_err(store_error)?,
+        root_request_id: row.try_get(10).map_err(store_error)?,
+        spawned_by_request_id: row.try_get(11).map_err(store_error)?,
+        first_seen_ms: row.try_get(12).map_err(store_error)?,
+        last_seen_ms: row.try_get(13).map_err(store_error)?,
+        request_count: row.try_get(14).map_err(store_error)?,
     })
 }
 
@@ -1346,8 +1457,10 @@ impl PersistenceWriter for SqlStore {
             "INSERT INTO requests (id, response_id, conversation_id, virtual_key_id, \
              client_protocol, client_model, alias, backend, resolved_model, status, created_at_ms, \
              harness, harness_version, harness_session_id, harness_sub_session_id, \
-             harness_parent_session_id, session_kind) VALUES ({})",
-            placeholders(self.postgres(), 17)
+             harness_parent_session_id, session_kind, session_id, chain_parent_request_id, \
+             item_count, shared_prefix_items, divergence_kind, divergence_index, cache_bust, \
+             client_label, client_source) VALUES ({})",
+            placeholders(self.postgres(), 26)
         );
         execute!(
             self,
@@ -1369,6 +1482,15 @@ impl PersistenceWriter for SqlStore {
             row.harness_sub_session_id,
             row.harness_parent_session_id,
             row.session_kind,
+            row.session_id,
+            row.chain_parent_request_id,
+            row.item_count,
+            row.shared_prefix_items,
+            row.divergence_kind,
+            row.divergence_index,
+            row.cache_bust.map(i64::from),
+            row.client_label,
+            row.client_source,
         );
         Ok(())
     }
@@ -1469,6 +1591,50 @@ impl PersistenceWriter for SqlStore {
         Ok(())
     }
 
+    async fn upsert_session(&self, row: crate::sessions::SessionRow) -> StoreResult<()> {
+        let pg = self.postgres();
+        // SQLite's multi-argument MAX is Postgres' GREATEST.
+        let greatest = if pg { "GREATEST" } else { "MAX" };
+        let sql = format!(
+            "INSERT INTO sessions (id, parent_id, kind, harness, harness_version, external_id, \
+             session_kind, client_label, virtual_key_id, depth, root_request_id, \
+             spawned_by_request_id, first_seen_ms, last_seen_ms, request_count) VALUES ({}) \
+             ON CONFLICT (id) DO UPDATE SET \
+             parent_id = COALESCE(excluded.parent_id, sessions.parent_id), \
+             harness_version = COALESCE(excluded.harness_version, sessions.harness_version), \
+             session_kind = COALESCE(excluded.session_kind, sessions.session_kind), \
+             client_label = COALESCE(sessions.client_label, excluded.client_label), \
+             virtual_key_id = COALESCE(sessions.virtual_key_id, excluded.virtual_key_id), \
+             depth = excluded.depth, \
+             root_request_id = COALESCE(sessions.root_request_id, excluded.root_request_id), \
+             spawned_by_request_id = COALESCE(sessions.spawned_by_request_id, \
+                 excluded.spawned_by_request_id), \
+             last_seen_ms = {greatest}(sessions.last_seen_ms, excluded.last_seen_ms), \
+             request_count = {greatest}(sessions.request_count, excluded.request_count)",
+            placeholders(pg, 15)
+        );
+        execute!(
+            self,
+            &sql,
+            row.id,
+            row.parent_id,
+            row.kind,
+            row.harness,
+            row.harness_version,
+            row.external_id,
+            row.session_kind,
+            row.client_label,
+            row.virtual_key_id,
+            row.depth,
+            row.root_request_id,
+            row.spawned_by_request_id,
+            row.first_seen_ms,
+            row.last_seen_ms,
+            row.request_count,
+        );
+        Ok(())
+    }
+
     async fn finish_request(&self, id: &str, finish: RequestFinish) -> StoreResult<()> {
         let pg = self.postgres();
         let sql = format!(
@@ -1484,8 +1650,9 @@ impl PersistenceWriter for SqlStore {
              reasoning_tokens = excluded.reasoning_tokens, error = excluded.error, \
              terminal_reason = excluded.terminal_reason, backend = excluded.backend, \
              resolved_model = excluded.resolved_model, attempts_json = excluded.attempts_json, \
-             timings_json = excluded.timings_json, client_label = excluded.client_label, \
-             client_source = excluded.client_source",
+             timings_json = excluded.timings_json, \
+             client_label = COALESCE(excluded.client_label, requests.client_label), \
+             client_source = COALESCE(excluded.client_source, requests.client_source)",
             placeholder(pg, 1),
             placeholder(pg, 2),
             placeholder(pg, 3),
@@ -1866,6 +2033,149 @@ impl PersistenceStore for SqlStore {
                 .rows_affected(),
         };
         Ok(affected)
+    }
+
+    async fn get_session(&self, id: &str) -> StoreResult<Option<crate::sessions::SessionRow>> {
+        let sql = format!(
+            "{SESSION_COLUMNS} WHERE id = {}",
+            placeholder(self.postgres(), 1)
+        );
+        let rows: Vec<crate::sessions::SessionRow> =
+            fetch_all_decoded!(self, &sql, [id], decode_session);
+        Ok(rows.into_iter().next())
+    }
+
+    async fn find_session(
+        &self,
+        harness: &str,
+        external_id: Option<&str>,
+        client_label: Option<&str>,
+    ) -> StoreResult<Option<crate::sessions::SessionRow>> {
+        let pg = self.postgres();
+        let rows: Vec<crate::sessions::SessionRow> = match external_id {
+            Some(external_id) => {
+                let sql = format!(
+                    "{SESSION_COLUMNS} WHERE harness = {} AND external_id = {} \
+                     ORDER BY last_seen_ms DESC LIMIT 1",
+                    placeholder(pg, 1),
+                    placeholder(pg, 2)
+                );
+                fetch_all_decoded!(self, &sql, [harness, external_id], decode_session)
+            }
+            None => {
+                let sql = format!(
+                    "{SESSION_COLUMNS} WHERE harness = {} AND external_id IS NULL \
+                     AND parent_id IS NULL AND kind = 'inferred' \
+                     AND COALESCE(client_label, '') = {} ORDER BY last_seen_ms DESC LIMIT 1",
+                    placeholder(pg, 1),
+                    placeholder(pg, 2)
+                );
+                let label = client_label.unwrap_or_default();
+                fetch_all_decoded!(self, &sql, [harness, label], decode_session)
+            }
+        };
+        Ok(rows.into_iter().next())
+    }
+
+    async fn list_sessions(
+        &self,
+        since_ms: i64,
+        roots_only: bool,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::sessions::SessionRow>> {
+        let pg = self.postgres();
+        let roots = if roots_only {
+            " AND parent_id IS NULL"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "{SESSION_COLUMNS} WHERE last_seen_ms >= {}{roots} \
+             ORDER BY last_seen_ms DESC, id LIMIT {}",
+            placeholder(pg, 1),
+            placeholder(pg, 2)
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(fetch_all_decoded!(
+            self,
+            &sql,
+            [since_ms, limit],
+            decode_session
+        ))
+    }
+
+    async fn session_children(
+        &self,
+        parent_id: &str,
+    ) -> StoreResult<Vec<crate::sessions::SessionRow>> {
+        let sql = format!(
+            "{SESSION_COLUMNS} WHERE parent_id = {} ORDER BY first_seen_ms, id",
+            placeholder(self.postgres(), 1)
+        );
+        Ok(fetch_all_decoded!(self, &sql, [parent_id], decode_session))
+    }
+
+    async fn session_descendants(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::sessions::SessionRow>> {
+        let mut out = Vec::new();
+        let mut frontier = vec![id.to_string()];
+        while let Some(parent) = frontier.first().cloned() {
+            frontier.remove(0);
+            for child in self.session_children(&parent).await? {
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+                frontier.push(child.id.clone());
+                out.push(child);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn session_requests(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<RequestSummary>> {
+        let pg = self.postgres();
+        let sql = format!(
+            "{REQUEST_COLUMNS} WHERE session_id = {} ORDER BY created_at_ms DESC, id LIMIT {}",
+            placeholder(pg, 1),
+            placeholder(pg, 2)
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut rows: Vec<RequestSummary> =
+            fetch_all_decoded!(self, &sql, [session_id, limit], decode_request);
+        rows.reverse();
+        Ok(rows)
+    }
+
+    async fn chain_head(
+        &self,
+        session_id: &str,
+    ) -> StoreResult<Option<crate::sessions::ChainHead>> {
+        let latest = self.session_requests(session_id, 1).await?;
+        let Some(request) = latest.into_iter().next() else {
+            return Ok(None);
+        };
+        let items = self
+            .request_items(&request.id, "client_in")
+            .await?
+            .into_iter()
+            .map(|item| crate::sessions::ItemFingerprint {
+                hash: item.blob_hash,
+                section: crate::content_store::ItemSection::parse(&item.section)
+                    .unwrap_or(crate::content_store::ItemSection::Message),
+                kind: item.kind,
+            })
+            .collect();
+        Ok(Some(crate::sessions::ChainHead {
+            request_id: request.id,
+            items,
+        }))
     }
 
     async fn get_setting(&self, key: &str) -> StoreResult<Option<String>> {
@@ -2265,12 +2575,13 @@ impl PersistenceStore for SqlStore {
 
 #[derive(Debug)]
 enum WriteCommand {
-    Begin(RequestRow),
+    Begin(Box<RequestRow>),
     Event(EventRow),
     Body(Box<BodyWrite>),
+    Session(Box<crate::sessions::SessionRow>),
     Finish {
         request_id: String,
-        finish: RequestFinish,
+        finish: Box<RequestFinish>,
     },
     Flush(oneshot::Sender<()>),
 }
@@ -2328,11 +2639,12 @@ impl PersistenceQueue {
             let mut suppressed_failures = 0_u64;
             while let Some(command) = receiver.recv().await {
                 let result = match command {
-                    WriteCommand::Begin(row) => store.begin_request(row).await,
+                    WriteCommand::Begin(row) => store.begin_request(*row).await,
                     WriteCommand::Event(event) => store.append_event(event).await,
                     WriteCommand::Body(body) => store.store_body(*body).await,
+                    WriteCommand::Session(row) => store.upsert_session(*row).await,
                     WriteCommand::Finish { request_id, finish } => {
-                        store.finish_request(&request_id, finish).await
+                        store.finish_request(&request_id, *finish).await
                     }
                     WriteCommand::Flush(done) => {
                         let _ = done.send(());
@@ -2369,7 +2681,7 @@ impl PersistenceQueue {
     }
 
     pub fn try_begin(&self, row: RequestRow) -> Result<(), EnqueueError> {
-        self.try_enqueue(WriteCommand::Begin(row))
+        self.try_enqueue(WriteCommand::Begin(Box::new(row)))
     }
 
     pub fn try_event(&self, event: EventRow) -> Result<(), EnqueueError> {
@@ -2380,12 +2692,19 @@ impl PersistenceQueue {
         self.try_enqueue(WriteCommand::Body(Box::new(body)))
     }
 
+    pub fn try_session(&self, row: crate::sessions::SessionRow) -> Result<(), EnqueueError> {
+        self.try_enqueue(WriteCommand::Session(Box::new(row)))
+    }
+
     pub fn try_finish(
         &self,
         request_id: String,
         finish: RequestFinish,
     ) -> Result<(), EnqueueError> {
-        self.try_enqueue(WriteCommand::Finish { request_id, finish })
+        self.try_enqueue(WriteCommand::Finish {
+            request_id,
+            finish: Box::new(finish),
+        })
     }
 
     fn try_enqueue(&self, command: WriteCommand) -> Result<(), EnqueueError> {
@@ -2534,7 +2853,7 @@ mod tests {
             .collect(),
             SqlPool::Postgres(_) => unreachable!(),
         };
-        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let request_indexes: Vec<String> = match &store.pool {
             SqlPool::Sqlite(pool) => sqlx::query(
                 "SELECT name FROM sqlite_master WHERE type = 'index' \
@@ -2594,6 +2913,186 @@ mod tests {
             payload: Some(r#"{"content":"{}"}"#.to_string()),
             bytes: Some(2),
         }
+    }
+
+    fn session(
+        id: &str,
+        parent: Option<&str>,
+        external: Option<&str>,
+        seen: i64,
+    ) -> crate::sessions::SessionRow {
+        crate::sessions::SessionRow {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            kind: if external.is_some() {
+                "declared"
+            } else {
+                "inferred"
+            }
+            .to_string(),
+            harness: "claude-code".to_string(),
+            harness_version: None,
+            external_id: external.map(str::to_string),
+            session_kind: None,
+            client_label: Some("key-abc".to_string()),
+            virtual_key_id: None,
+            depth: i64::from(parent.is_some()),
+            root_request_id: None,
+            spawned_by_request_id: None,
+            first_seen_ms: seen,
+            last_seen_ms: seen,
+            request_count: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_sessions_upsert_list_children_requests_and_chain_head() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        store
+            .upsert_session(session("root", None, Some("s-1"), 100))
+            .await
+            .unwrap();
+        store
+            .upsert_session(session("child", Some("root"), None, 110))
+            .await
+            .unwrap();
+        store
+            .upsert_session(session("grand", Some("child"), Some("t-3"), 120))
+            .await
+            .unwrap();
+        // Re-upserting keeps the first-seen root request and takes the greater counters.
+        let mut again = session("root", None, Some("s-1"), 90);
+        again.request_count = 3;
+        again.root_request_id = Some("r-first".to_string());
+        store.upsert_session(again).await.unwrap();
+        let mut later = session("root", None, Some("s-1"), 200);
+        later.request_count = 2;
+        later.root_request_id = Some("r-other".to_string());
+        store.upsert_session(later).await.unwrap();
+        let root = store.get_session("root").await.unwrap().unwrap();
+        assert_eq!(root.request_count, 3);
+        assert_eq!(root.last_seen_ms, 200);
+        assert_eq!(root.root_request_id.as_deref(), Some("r-first"));
+
+        assert_eq!(
+            store
+                .find_session("claude-code", Some("s-1"), None)
+                .await
+                .unwrap()
+                .map(|row| row.id),
+            Some("root".to_string())
+        );
+        assert!(
+            store
+                .find_session("claude-code", Some("nope"), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .upsert_session(session("bucket", None, None, 130))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_session("claude-code", None, Some("key-abc"))
+                .await
+                .unwrap()
+                .map(|row| row.id),
+            Some("bucket".to_string())
+        );
+
+        let roots = store.list_sessions(0, true, 10).await.unwrap();
+        assert_eq!(
+            roots.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["root", "bucket"]
+        );
+        let all = store.list_sessions(115, false, 10).await.unwrap();
+        assert_eq!(
+            all.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["root", "bucket", "grand"]
+        );
+        let children = store.session_children("root").await.unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, "child");
+        let descendants = store.session_descendants("root", 10).await.unwrap();
+        assert_eq!(
+            descendants
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["child", "grand"]
+        );
+
+        // Requests of a node, and the chain head built from the newest one.
+        let mut first = request("req-1");
+        first.session_id = Some("root".to_string());
+        first.created_at_ms = 100;
+        let mut second = request("req-2");
+        second.session_id = Some("root".to_string());
+        second.created_at_ms = 200;
+        second.chain_parent_request_id = Some("req-1".to_string());
+        second.divergence_kind = Some("append".to_string());
+        second.cache_bust = Some(false);
+        second.item_count = Some(2);
+        store.begin_request(first).await.unwrap();
+        store.begin_request(second).await.unwrap();
+        store
+            .store_body(BodyWrite {
+                event: skeleton_event("req-2", 1, 200),
+                items: vec![
+                    item("req-2", "client_in", 0, "aa"),
+                    item("req-2", "client_in", 1, "bb"),
+                ],
+                blobs: vec![blob("aa", "1"), blob("bb", "2")],
+            })
+            .await
+            .unwrap();
+        let requests = store.session_requests("root", 10).await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["req-1", "req-2"]
+        );
+        assert_eq!(
+            requests[1].chain_parent_request_id.as_deref(),
+            Some("req-1")
+        );
+        assert_eq!(requests[1].divergence_kind.as_deref(), Some("append"));
+        assert_eq!(requests[1].cache_bust, Some(false));
+        let head = store.chain_head("root").await.unwrap().unwrap();
+        assert_eq!(head.request_id, "req-2");
+        assert_eq!(
+            head.items
+                .iter()
+                .map(|item| item.hash.as_str())
+                .collect::<Vec<_>>(),
+            ["aa", "bb"]
+        );
+        assert!(store.chain_head("child").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_keeps_ingress_client_attribution() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        let mut row = request("req-1");
+        row.client_label = Some("key-ingress".to_string());
+        row.client_source = Some("key_hash".to_string());
+        store.begin_request(row).await.unwrap();
+        let mut done = finish();
+        done.client_label = None;
+        done.client_source = None;
+        store.finish_request("req-1", done).await.unwrap();
+        let summary = store.get_request("req-1").await.unwrap().unwrap();
+        assert_eq!(summary.client_label.as_deref(), Some("key-ingress"));
+        assert_eq!(summary.client_source.as_deref(), Some("key_hash"));
+        assert_eq!(summary.status, "completed");
     }
 
     #[tokio::test]
