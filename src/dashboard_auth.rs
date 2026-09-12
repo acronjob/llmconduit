@@ -450,26 +450,42 @@ impl DashboardAuth {
 
     // -- session cookie sign/verify ---------------------------------------
 
-    /// Mint a signed session-cookie value with `exp = now + SESSION_TTL_SECS`.
-    /// Returns `(cookie_value, exp_unix_secs)`.
+    /// Mint a signed session-cookie value with `exp = now + SESSION_TTL_SECS`
+    /// for a token/dev-open login (no user). Returns `(cookie_value, exp)`.
     pub fn issue_session(&self) -> (String, u64) {
         let exp = now_unix().saturating_add(SESSION_TTL_SECS);
-        (self.sign_session(exp), exp)
+        (self.sign_session(exp, None), exp)
     }
 
-    /// Sign a `{exp}:{nonce}` payload, returning the full cookie value
-    /// `base64url(mac).{exp}:{nonce}`.
-    fn sign_session(&self, exp: u64) -> String {
+    /// Mint a signed session for a user login. The user is embedded in the
+    /// signed payload so every request knows who acts without a lookup.
+    pub fn issue_session_for(&self, user: &crate::accounts::SessionUser) -> (String, u64) {
+        let exp = now_unix().saturating_add(SESSION_TTL_SECS);
+        (self.sign_session(exp, Some(user)), exp)
+    }
+
+    /// Sign a `{exp}:{nonce}[:{base64url(user json)}]` payload, returning the
+    /// full cookie value `base64url(mac).{payload}`.
+    fn sign_session(&self, exp: u64, user: Option<&crate::accounts::SessionUser>) -> String {
         let nonce = Uuid::new_v4().simple().to_string();
-        let payload = format!("{exp}:{nonce}");
+        let mut payload = format!("{exp}:{nonce}");
+        if let Some(user) = user
+            && let Ok(encoded) = serde_json::to_vec(user)
+        {
+            payload.push(':');
+            payload.push_str(&URL_SAFE_NO_PAD.encode(encoded));
+        }
         let mac = self.mac(payload.as_bytes());
         format!("{}.{payload}", URL_SAFE_NO_PAD.encode(mac))
     }
 
     /// Verify a session-cookie value: split on the FIRST `.`, recompute the MAC
     /// over the payload, compare in constant time, then confirm `exp` is in the
-    /// future. Returns the cookie `exp` (unix secs) on success.
-    pub fn verify_session(&self, cookie_value: &str) -> Option<u64> {
+    /// future. Returns the cookie `exp` (unix secs) and the embedded user.
+    pub fn verify_session(
+        &self,
+        cookie_value: &str,
+    ) -> Option<(u64, Option<crate::accounts::SessionUser>)> {
         let (mac_b64, payload) = cookie_value.split_once('.')?;
         let presented_mac = URL_SAFE_NO_PAD.decode(mac_b64).ok()?;
         let expected_mac = self.mac(payload.as_bytes());
@@ -478,11 +494,19 @@ impl DashboardAuth {
         if !bool::from(presented_mac.ct_eq_padded(&expected_mac)) {
             return None;
         }
-        let exp: u64 = payload.split(':').next()?.parse().ok()?;
+        let mut parts = payload.splitn(3, ':');
+        let exp: u64 = parts.next()?.parse().ok()?;
+        let _nonce = parts.next()?;
         if exp <= now_unix() {
             return None;
         }
-        Some(exp)
+        // The MAC already authenticated the payload; a decode failure here can
+        // only come from a session minted by an incompatible build.
+        let user = parts
+            .next()
+            .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        Some((exp, user))
     }
 
     fn mac(&self, message: &[u8]) -> Vec<u8> {
@@ -501,24 +525,31 @@ impl DashboardAuth {
         !self.has_token
     }
 
-    /// Authenticate an HTTP request from its headers: dev-open mode (no token
-    /// configured → always authenticated), a valid signed session cookie, OR
-    /// (non-browser fallback) a constant-time `Authorization: Bearer` token
-    /// match. Returns the session `exp` (cookie path) or `u64::MAX` (dev-open /
-    /// bearer path — neither has a cookie expiry to track).
-    pub fn authenticate(&self, headers: &HeaderMap) -> Option<u64> {
-        if self.dev_open() {
-            return Some(u64::MAX);
-        }
+    /// Authenticate an HTTP request from its headers: a valid signed session
+    /// cookie (user or token login), dev-open mode (no token configured →
+    /// always authenticated), OR (non-browser fallback) a constant-time
+    /// `Authorization: Bearer` token match. The cookie is checked FIRST so a
+    /// user login is attributed even on a dev-open listener. Returns the
+    /// session with its `exp` (`u64::MAX` for the dev-open / bearer paths).
+    pub fn authenticate(&self, headers: &HeaderMap) -> Option<AuthSession> {
         if let Some(value) = cookie_value(headers, SESSION_COOKIE)
-            && let Some(exp) = self.verify_session(&value)
+            && let Some((exp, user)) = self.verify_session(&value)
         {
-            return Some(exp);
+            return Some(AuthSession { exp, user });
+        }
+        if self.dev_open() {
+            return Some(AuthSession {
+                exp: u64::MAX,
+                user: None,
+            });
         }
         if let Some(token) = bearer_token(headers)
             && self.verify_token(&token)
         {
-            return Some(u64::MAX);
+            return Some(AuthSession {
+                exp: u64::MAX,
+                user: None,
+            });
         }
         None
     }
@@ -540,7 +571,9 @@ impl DashboardAuth {
             // No cookie to expire → no per-connection close timer.
             return Some(u64::MAX);
         }
-        cookie_value(headers, SESSION_COOKIE).and_then(|value| self.verify_session(&value))
+        cookie_value(headers, SESSION_COOKIE)
+            .and_then(|value| self.verify_session(&value))
+            .map(|(exp, _user)| exp)
     }
 
     /// Whether the request's `Origin` is allowed for a WS upgrade. A request
@@ -819,41 +852,104 @@ fn has_valid_session_key(env: &DashboardEnv) -> bool {
 // Login / logout handlers
 // ---------------------------------------------------------------------------
 
+/// Either a dashboard token or a username + password.
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
-    pub token: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
-/// `POST /dashboard/login` — constant-time token check; on success set the
-/// signed `HttpOnly; SameSite=Strict[; Secure]; Path=/; Max-Age=86400` session
-/// cookie plus the non-`HttpOnly` double-submit CSRF cookie. Response is always
-/// `no-store`.
+/// `POST /dashboard/login` — a username/password login is verified against
+/// the SQL `users` table (Argon2id); otherwise the constant-time token check
+/// applies. On success set the signed `HttpOnly; SameSite=Strict[; Secure];
+/// Path=/; Max-Age=86400` session cookie plus the non-`HttpOnly` double-submit
+/// CSRF cookie. Response is always `no-store`.
 pub async fn dashboard_login(
+    axum::extract::State(gateway): axum::extract::State<Arc<crate::engine::Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
     payload: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let token = match payload {
-        Ok(Json(body)) => body.token,
-        Err(_) => String::new(),
+    let body = match payload {
+        Ok(Json(body)) => body,
+        Err(_) => LoginRequest {
+            token: None,
+            username: None,
+            password: None,
+        },
     };
-    if !auth.verify_token(&token) {
-        return no_store(
+    login_response(Some(gateway.as_ref()), &auth, body).await
+}
+
+/// The login decision, separated from the axum extractors for tests. `gateway`
+/// supplies the SQL store for user logins; `None` means token-only.
+pub async fn login_response(
+    gateway: Option<&crate::engine::Gateway>,
+    auth: &DashboardAuth,
+    body: LoginRequest,
+) -> Response {
+    let unauthorized = |message: &str| {
+        no_store(
             (
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "invalid token"})),
+                Json(serde_json::json!({"error": message})),
             )
                 .into_response(),
-        );
-    }
+        )
+    };
+    let session_user = match (body.username.as_deref(), body.password.as_deref()) {
+        (Some(username), Some(password)) => {
+            let Some(store) = gateway.and_then(|gateway| gateway.persistence_store()) else {
+                return unauthorized("user login needs a SQL store");
+            };
+            let Ok(username) = crate::accounts::validate_username(username) else {
+                return unauthorized("invalid username or password");
+            };
+            match store.get_user_auth(username).await {
+                Ok(Some(user))
+                    if crate::accounts::verify_password(&user.password_hash, password) =>
+                {
+                    Some(crate::accounts::SessionUser {
+                        id: user.id,
+                        username: user.username,
+                        is_admin: user.is_admin,
+                    })
+                }
+                Ok(_) => return unauthorized("invalid username or password"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "user login lookup failed");
+                    return unauthorized("invalid username or password");
+                }
+            }
+        }
+        _ => {
+            let token = body.token.unwrap_or_default();
+            // Once users exist the shared token no longer opens the dashboard
+            // (dev-open loopback listeners keep accepting anything).
+            if gateway.is_some_and(|gateway| gateway.users_configured()) && !auth.dev_open() {
+                return unauthorized("sign in with username and password");
+            }
+            if !auth.verify_token(&token) {
+                return unauthorized("invalid token");
+            }
+            None
+        }
+    };
 
-    let (session_value, _exp) = auth.issue_session();
+    let (session_value, _exp) = match &session_user {
+        Some(user) => auth.issue_session_for(user),
+        None => auth.issue_session(),
+    };
     let csrf = auth.issue_csrf_token();
     let secure = auth.secure_cookies();
 
     let mut response = no_store(
         (
             StatusCode::OK,
-            Json(serde_json::json!({"authenticated": true})),
+            Json(serde_json::json!({"authenticated": true, "user": session_user})),
         )
             .into_response(),
     );
@@ -879,12 +975,14 @@ pub async fn dashboard_logout(Extension(auth): Extension<Arc<DashboardAuth>>) ->
 // ---------------------------------------------------------------------------
 
 /// A successful authentication, attached to the request so handlers can read
-/// the session `exp` without re-validating.
-#[derive(Debug, Clone, Copy)]
+/// the session `exp` and user without re-validating.
+#[derive(Debug, Clone)]
 pub struct AuthSession {
     /// Session expiry (unix secs); `u64::MAX` for a bearer-authenticated
     /// (non-browser) request.
     pub exp: u64,
+    /// The user behind a username/password login; `None` for token/dev-open.
+    pub user: Option<crate::accounts::SessionUser>,
 }
 
 /// `axum` middleware enforcing a valid session on the protected HTTP routes
@@ -899,8 +997,8 @@ pub async fn require_session(mut request: axum::extract::Request, next: Next) ->
         return unauthorized();
     };
     match auth.authenticate(request.headers()) {
-        Some(exp) => {
-            request.extensions_mut().insert(AuthSession { exp });
+        Some(session) => {
+            request.extensions_mut().insert(session);
             next.run(request).await
         }
         None => unauthorized(),
@@ -920,16 +1018,14 @@ where
         // Prefer an extension inserted by `require_session` (avoids re-verifying
         // the HMAC); fall back to validating the headers directly.
         if let Some(session) = parts.extensions.get::<AuthSession>() {
-            return Ok(*session);
+            return Ok(session.clone());
         }
         let auth = parts
             .extensions
             .get::<Arc<DashboardAuth>>()
             .cloned()
             .ok_or_else(unauthorized)?;
-        auth.authenticate(&parts.headers)
-            .map(|exp| AuthSession { exp })
-            .ok_or_else(unauthorized)
+        auth.authenticate(&parts.headers).ok_or_else(unauthorized)
     }
 }
 
@@ -947,14 +1043,12 @@ where
         _state: &S,
     ) -> Result<Option<Self>, Self::Rejection> {
         if let Some(session) = parts.extensions.get::<AuthSession>() {
-            return Ok(Some(*session));
+            return Ok(Some(session.clone()));
         }
         let Some(auth) = parts.extensions.get::<Arc<DashboardAuth>>().cloned() else {
             return Ok(None);
         };
-        Ok(auth
-            .authenticate(&parts.headers)
-            .map(|exp| AuthSession { exp }))
+        Ok(auth.authenticate(&parts.headers))
     }
 }
 
@@ -1372,7 +1466,10 @@ mod tests {
 
         let auth = build(public_bind(), &env);
         assert!(auth.dev_open());
-        assert_eq!(auth.authenticate(&HeaderMap::new()), Some(u64::MAX));
+        assert_eq!(
+            auth.authenticate(&HeaderMap::new()).map(|s| s.exp),
+            Some(u64::MAX)
+        );
 
         let same_origin = headers_with(&[
             ("origin", "http://192.168.1.10:4000"),
@@ -1679,7 +1776,39 @@ mod tests {
         let auth = build(public_bind(), &env_with_token());
         let (cookie, exp) = auth.issue_session();
         let verified = auth.verify_session(&cookie).expect("valid cookie verifies");
-        assert_eq!(verified, exp);
+        assert_eq!(verified, (exp, None));
+    }
+
+    #[test]
+    fn user_session_roundtrips_the_embedded_user() {
+        let auth = build(public_bind(), &env_with_token());
+        let user = crate::accounts::SessionUser {
+            id: "u-1".to_string(),
+            username: "koen".to_string(),
+            is_admin: true,
+        };
+        let (cookie, exp) = auth.issue_session_for(&user);
+        let (verified_exp, verified_user) = auth.verify_session(&cookie).expect("valid");
+        assert_eq!(verified_exp, exp);
+        assert_eq!(verified_user, Some(user));
+        // Tampering with the embedded user (swapping the signed segment for an
+        // admin "root") breaks the MAC.
+        let (mac, payload) = cookie.split_once('.').unwrap();
+        let mut parts = payload.splitn(3, ':');
+        let (exp_text, nonce) = (parts.next().unwrap(), parts.next().unwrap());
+        let root = crate::accounts::SessionUser {
+            id: "u-0".to_string(),
+            username: "root".to_string(),
+            is_admin: true,
+        };
+        let forged_user = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&root).unwrap());
+        let forged = format!("{mac}.{exp_text}:{nonce}:{forged_user}");
+        assert!(auth.verify_session(&forged).is_none());
+        let headers = headers_with(&[("cookie", &format!("{SESSION_COOKIE}={cookie}"))]);
+        assert_eq!(
+            auth.authenticate(&headers).unwrap().user.unwrap().username,
+            "koen"
+        );
     }
 
     #[test]
@@ -1708,7 +1837,7 @@ mod tests {
     fn expired_session_is_rejected() {
         let auth = build(public_bind(), &env_with_token());
         // Sign with an exp in the past.
-        let cookie = auth.sign_session(now_unix().saturating_sub(10));
+        let cookie = auth.sign_session(now_unix().saturating_sub(10), None);
         assert!(auth.verify_session(&cookie).is_none());
     }
 
@@ -1728,7 +1857,7 @@ mod tests {
         let auth = build(public_bind(), &env_with_token());
         let (cookie, exp) = auth.issue_session();
         let headers = headers_with(&[("cookie", &format!("{SESSION_COOKIE}={cookie}"))]);
-        assert_eq!(auth.authenticate(&headers), Some(exp));
+        assert_eq!(auth.authenticate(&headers).map(|s| s.exp), Some(exp));
     }
 
     #[test]
@@ -1741,7 +1870,7 @@ mod tests {
     fn bearer_fallback_authenticates_with_configured_token() {
         let auth = build(public_bind(), &env_with_token());
         let headers = headers_with(&[("authorization", "Bearer s3cret-token")]);
-        assert_eq!(auth.authenticate(&headers), Some(u64::MAX));
+        assert_eq!(auth.authenticate(&headers).map(|s| s.exp), Some(u64::MAX));
         let bad = headers_with(&[("authorization", "Bearer nope")]);
         assert!(auth.authenticate(&bad).is_none());
     }
@@ -2227,11 +2356,14 @@ mod tests {
     async fn login_response_carries_security_headers() {
         // The successful login response must carry the headers AND its cookies.
         let auth = build(public_bind(), &env_with_token());
-        let resp = dashboard_login(
-            Extension(Arc::clone(&auth)),
-            Ok(Json(LoginRequest {
-                token: "s3cret-token".to_string(),
-            })),
+        let resp = login_response(
+            None,
+            &auth,
+            LoginRequest {
+                token: Some("s3cret-token".to_string()),
+                username: None,
+                password: None,
+            },
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);

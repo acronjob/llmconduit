@@ -57,6 +57,14 @@ pub enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Manage dashboard user accounts (needs a SQL store in the config).
+    User {
+        /// Path to the config file. Defaults to ~/.config/llmconduit/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: UserCommand,
+    },
     /// Diff consecutive upstream request log entries and highlight unstable prefixes.
     AnalyzeLog {
         /// Path to the config file. Defaults to ~/.config/llmconduit/config.yaml
@@ -68,6 +76,36 @@ pub enum Commands {
         /// Maximum number of consecutive pairs to report.
         #[arg(long, default_value_t = 10)]
         pairs: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// Create a user. The password is read from `--password-env` (an
+    /// environment variable name) or, when absent, from stdin.
+    Create {
+        #[arg(long)]
+        username: String,
+        /// Grant the administrator role.
+        #[arg(long, default_value_t = false)]
+        admin: bool,
+        /// Name of an environment variable holding the password.
+        #[arg(long)]
+        password_env: Option<String>,
+    },
+    /// List users.
+    List,
+    /// Reset a user's password (same password sources as `create`).
+    SetPassword {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password_env: Option<String>,
+    },
+    /// Delete a user and revoke their keys.
+    Delete {
+        #[arg(long)]
+        username: String,
     },
 }
 

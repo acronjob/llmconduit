@@ -5922,6 +5922,10 @@ async fn d13_routes_absent_without_debug_ui() {
         "/dashboard/api/history/sessions",
         "/dashboard/api/history/sessions/s_x",
         "/dashboard/api/history/throughput",
+        "/dashboard/api/history/activity",
+        "/dashboard/api/me",
+        "/dashboard/api/users",
+        "/dashboard/api/keys",
         "/dashboard/api/history/usage",
         "/dashboard/api/history/metrics",
     ] {
@@ -5989,6 +5993,7 @@ async fn d13_routes_present_in_dev_open_with_debug_ui() {
         "/dashboard/api/history/sessions",
         "/dashboard/api/history/sessions/s_x",
         "/dashboard/api/history/throughput",
+        "/dashboard/api/history/activity",
         "/dashboard/api/history/usage",
         "/dashboard/api/history/metrics",
     ] {
@@ -6269,6 +6274,310 @@ async fn persistent_history_throughput_route_buckets_requests_and_validates_inpu
     }
 }
 
+/// Cookie pair from a login response: (session cookie value, csrf cookie value).
+fn login_cookies(headers: &axum::http::HeaderMap) -> (String, String) {
+    let cookies = set_cookie_values(headers);
+    let value = |name: &str| {
+        cookies
+            .iter()
+            .find(|c| c.starts_with(name))
+            .map(|c| {
+                c.split(';')
+                    .next()
+                    .unwrap()
+                    .split_once('=')
+                    .unwrap()
+                    .1
+                    .to_string()
+            })
+            .unwrap_or_else(|| panic!("{name} cookie set"))
+    };
+    (value("llmconduit_session="), value("llmconduit_csrf="))
+}
+
+async fn accounts_request(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    session: &str,
+    csrf: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri).header(
+        axum::http::header::COOKIE,
+        match csrf {
+            Some(csrf) => format!("llmconduit_session={session}; llmconduit_csrf={csrf}"),
+            None => format!("llmconduit_session={session}"),
+        },
+    );
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
+    }
+    let body = match body {
+        Some(json) => {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+            Body::from(json.to_string())
+        }
+        None => Body::empty(),
+    };
+    app.clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn accounts_password_login_keys_live_reload_and_role_gating() {
+    use llmconduit::control_plane_store::{PersistenceStore, SqlStore};
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("store"),
+    );
+    let admin_hash = llmconduit::accounts::hash_password("admin-password-1").unwrap();
+    let admin = PersistenceStore::create_user(store.as_ref(), "admin", &admin_hash, true, "test")
+        .await
+        .unwrap();
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store.clone());
+    gateway.set_users_configured(true);
+    let app = d13_router(Arc::new(gateway));
+
+    // With users configured (and a real token, non-loopback) the shared token no longer logs in.
+    let token_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"token":"d13-token"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(token_login.status().as_u16(), 401);
+
+    // Wrong password → 401; right password → session with the embedded user.
+    let bad = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"username":"admin","password":"nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad.status().as_u16(), 401);
+    let ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"admin-password-1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+    let (session, csrf) = login_cookies(ok.headers());
+
+    let me = accounts_request(&app, "GET", "/dashboard/api/me", &session, None, None).await;
+    assert_eq!(me.status().as_u16(), 200);
+    let me = d13_json(me).await;
+    assert_eq!(me["user"]["username"], "admin");
+    assert_eq!(me["is_admin"], true);
+    assert_eq!(me["auth_mode"], "users");
+    assert_eq!(me["accounts_enabled"], true);
+
+    // Before any key exists the /v1 routes are open.
+    let models = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // (The mock upstream's model listing itself answers 500; only the auth gate says 401.)
+    assert_ne!(models.status().as_u16(), 401, "no keys yet: /v1 is open");
+
+    // Creating a key needs CSRF; with it the plaintext is returned once and the
+    // live registry now enforces keys on /v1 without a restart.
+    let denied = accounts_request(
+        &app,
+        "POST",
+        "/dashboard/api/keys",
+        &session,
+        None,
+        Some(serde_json::json!({"label": "laptop"})),
+    )
+    .await;
+    assert_eq!(denied.status().as_u16(), 403);
+    let created = accounts_request(
+        &app,
+        "POST",
+        "/dashboard/api/keys",
+        &session,
+        Some(&csrf),
+        Some(serde_json::json!({"label": "laptop", "allowed_models": ["glm-5.1"]})),
+    )
+    .await;
+    assert_eq!(created.status().as_u16(), 201);
+    let created = d13_json(created).await;
+    let secret = created["secret"].as_str().unwrap().to_string();
+    assert!(secret.starts_with("llmc_"));
+    let key_id = created["key"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["key"]["user_id"], admin.id);
+    assert_eq!(created["key"]["allowed_models"][0], "glm-5.1");
+    assert_eq!(created["registered_keys"], 1);
+
+    let unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status().as_u16(), 401, "keys now enforced");
+    let with_key = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", format!("Bearer {secret}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(with_key.status().as_u16(), 401, "new key accepted live");
+
+    // Listing shows the key without any secret material.
+    let keys = accounts_request(&app, "GET", "/dashboard/api/keys", &session, None, None).await;
+    let keys = d13_json(keys).await;
+    assert_eq!(keys["keys"].as_array().unwrap().len(), 1);
+    assert!(!keys.to_string().contains(&secret));
+
+    // Admin creates a non-admin user; that user sees only their own keys and cannot manage users.
+    let created_user = accounts_request(
+        &app,
+        "POST",
+        "/dashboard/api/users",
+        &session,
+        Some(&csrf),
+        Some(
+            serde_json::json!({"username": "dev", "password": "dev-password-1", "is_admin": false}),
+        ),
+    )
+    .await;
+    assert_eq!(created_user.status().as_u16(), 201);
+    let dev_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"dev","password":"dev-password-1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dev_login.status().as_u16(), 200);
+    let (dev_session, dev_csrf) = login_cookies(dev_login.headers());
+    let forbidden = accounts_request(
+        &app,
+        "GET",
+        "/dashboard/api/users",
+        &dev_session,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(forbidden.status().as_u16(), 403);
+    let dev_keys =
+        accounts_request(&app, "GET", "/dashboard/api/keys", &dev_session, None, None).await;
+    assert_eq!(
+        d13_json(dev_keys).await["keys"].as_array().unwrap().len(),
+        0
+    );
+    let not_yours = accounts_request(
+        &app,
+        "DELETE",
+        &format!("/dashboard/api/keys/{key_id}"),
+        &dev_session,
+        Some(&dev_csrf),
+        None,
+    )
+    .await;
+    assert_eq!(not_yours.status().as_u16(), 403);
+
+    // The admin revokes the key: it stops working immediately and /v1 stays enforced
+    // by the (now empty) SQL set only if YAML keys exist — here none, so it reopens.
+    let revoked = accounts_request(
+        &app,
+        "DELETE",
+        &format!("/dashboard/api/keys/{key_id}"),
+        &session,
+        Some(&csrf),
+        None,
+    )
+    .await;
+    assert_eq!(revoked.status().as_u16(), 200);
+    let after = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", format!("Bearer {secret}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // No keys left ⇒ the registry is open again (require:false); the revoked key is not "wrong",
+    // there is simply nothing to check. The point is it no longer identifies anyone.
+    assert_ne!(after.status().as_u16(), 401);
+    let listed = d13_json(
+        accounts_request(
+            &app,
+            "GET",
+            "/dashboard/api/keys?user_id=all",
+            &session,
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(listed["keys"].as_array().unwrap().len(), 0);
+}
+
 #[tokio::test]
 async fn persistent_history_session_routes_list_tree_and_requests() {
     use llmconduit::control_plane_store::{PersistenceWriter, RequestRow, SqlStore};
@@ -6413,6 +6722,7 @@ async fn persistent_history_route_reads_sql_without_exposing_key_material() {
         "sk-never-return-this",
         Some("test"),
         None,
+        &[],
         "test",
     )
     .await

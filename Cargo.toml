@@ -18,6 +18,7 @@ hex = "0.4"
 # `sha2`), constant-time comparison of tokens/MACs (`subtle`), and base64url
 # cookie encoding (`base64`). Secrets are read from the environment in the auth
 # layer and never stored on the persisted `Config`.
+argon2 = "0.5"
 base64 = "0.22"
 hmac = "0.12"
 subtle = "2"

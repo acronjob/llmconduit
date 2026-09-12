@@ -223,6 +223,28 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         )
         .route("/dashboard/api/history/usage", get(history_usage))
         .route("/dashboard/api/history/metrics", get(history_metrics))
+        .route(
+            "/dashboard/api/history/activity",
+            get(crate::persistent_history_api::history_activity),
+        )
+        .route("/dashboard/api/me", get(crate::accounts_api::me))
+        .route(
+            "/dashboard/api/users",
+            get(crate::accounts_api::list_users).post(crate::accounts_api::create_user),
+        )
+        .route(
+            "/dashboard/api/users/{id}",
+            axum::routing::patch(crate::accounts_api::update_user)
+                .delete(crate::accounts_api::delete_user),
+        )
+        .route(
+            "/dashboard/api/keys",
+            get(crate::accounts_api::list_keys).post(crate::accounts_api::create_key),
+        )
+        .route(
+            "/dashboard/api/keys/{id}",
+            axum::routing::delete(crate::accounts_api::delete_key),
+        )
         .route_layer(middleware::map_response(dashboard_api_no_store));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
@@ -847,6 +869,9 @@ async fn log_api_call(
                 link: link.as_ref(),
                 client_label: attribution.label.as_deref(),
                 client_source,
+                user_id: client_identity
+                    .as_ref()
+                    .and_then(|identity| identity.owner_id.as_deref()),
             },
         );
         let _ = queue.try_begin(row);

@@ -65,6 +65,8 @@ pub struct RequestRow {
     /// Client attribution, also known at ingress (the terminal upsert keeps it).
     pub client_label: Option<String>,
     pub client_source: Option<String>,
+    /// Owner of the authenticating virtual key, when known.
+    pub user_id: Option<String>,
 }
 
 /// One bounded/redacted hop event. Callers must use the existing turn-capture
@@ -140,11 +142,13 @@ pub struct RequestFinish {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageFilter {
     pub virtual_key_id: Option<String>,
+    pub user_id: Option<String>,
     pub since_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UsageBucket {
+    pub user_id: Option<String>,
     pub virtual_key_id: Option<String>,
     pub alias: Option<String>,
     pub resolved_model: Option<String>,
@@ -194,6 +198,20 @@ pub struct RequestSummary {
     pub divergence_kind: Option<String>,
     pub divergence_index: Option<i64>,
     pub cache_bust: Option<bool>,
+    pub user_id: Option<String>,
+}
+
+/// One (bucket, user, key) cell of the activity series.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ActivityBucket {
+    pub bucket_ms: i64,
+    pub user_id: Option<String>,
+    pub virtual_key_id: Option<String>,
+    pub requests: i64,
+    pub failed: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
 }
 
 /// One (bucket, model, backend) cell of the gateway-side throughput series.
@@ -251,6 +269,9 @@ pub struct ApiKeyRecord {
     pub id: String,
     pub label: Option<String>,
     pub user_id: Option<String>,
+    /// Client-facing model/alias names the key may request; empty = any.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -264,6 +285,7 @@ pub struct ApiKeyAuthSpec {
     pub label: Option<String>,
     pub user_id: Option<String>,
     pub secret_hash: String,
+    pub allowed_models: Vec<String>,
 }
 
 /// Read-only recovery result for databases written by the pre-upstream
@@ -444,10 +466,20 @@ pub trait PersistenceStore: PersistenceWriter {
         plaintext: &str,
         label: Option<&str>,
         user_id: Option<&str>,
+        allowed_models: &[String],
         actor: &str,
     ) -> StoreResult<ApiKeyRecord>;
     async fn verify_api_key(&self, plaintext: &str) -> StoreResult<Option<ApiKeyRecord>>;
     async fn delete_api_key(&self, id: &str, actor: &str) -> StoreResult<()>;
+    async fn get_user(&self, id: &str) -> StoreResult<Option<UserRecord>>;
+    async fn list_api_keys_for_user(&self, user_id: &str) -> StoreResult<Vec<ApiKeyRecord>>;
+    /// Per-user/key activity: requests bucketed by `bucket_ms` since `since_ms`.
+    async fn activity_series(
+        &self,
+        since_ms: i64,
+        bucket_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<ActivityBucket>>;
 }
 
 /// Append-only, log-only persistence for installations that do not need the
@@ -895,7 +927,7 @@ const REQUEST_COLUMNS: &str = "SELECT id, response_id, conversation_id, virtual_
     reasoning_tokens, error, terminal_reason, attempts_json, timings_json, client_label, \
     client_source, harness, harness_version, harness_session_id, harness_sub_session_id, \
     harness_parent_session_id, session_kind, session_id, chain_parent_request_id, item_count, \
-    shared_prefix_items, divergence_kind, divergence_index, cache_bust FROM requests";
+    shared_prefix_items, divergence_kind, divergence_index, cache_bust, user_id FROM requests";
 
 fn decode_request<R>(row: &R) -> StoreResult<RequestSummary>
 where
@@ -946,6 +978,7 @@ where
             .try_get::<Option<i64>, _>(35)
             .map_err(store_error)?
             .map(|flag| flag != 0),
+        user_id: row.try_get(36).map_err(store_error)?,
     })
 }
 
@@ -1060,6 +1093,25 @@ where
     })
 }
 
+fn decode_activity<R>(row: &R) -> StoreResult<ActivityBucket>
+where
+    R: Row,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(ActivityBucket {
+        bucket_ms: row.try_get(0).map_err(store_error)?,
+        user_id: row.try_get(1).map_err(store_error)?,
+        virtual_key_id: row.try_get(2).map_err(store_error)?,
+        requests: row.try_get(3).map_err(store_error)?,
+        failed: row.try_get(4).map_err(store_error)?,
+        input_tokens: row.try_get(5).map_err(store_error)?,
+        output_tokens: row.try_get(6).map_err(store_error)?,
+        cached_tokens: row.try_get(7).map_err(store_error)?,
+    })
+}
+
 fn decode_metric<R>(row: &R) -> StoreResult<MetricSample>
 where
     R: Row,
@@ -1104,7 +1156,24 @@ where
         user_id: row.try_get(2).map_err(store_error)?,
         created_at_ms: row.try_get(3).map_err(store_error)?,
         updated_at_ms: row.try_get(4).map_err(store_error)?,
+        allowed_models: parse_allowed_models(
+            row.try_get::<Option<String>, _>(5).map_err(store_error)?,
+        ),
     })
+}
+
+/// `allowed_models_json` is a JSON array of names; anything else reads as "any".
+fn parse_allowed_models(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn encode_allowed_models(models: &[String]) -> Option<String> {
+    if models.is_empty() {
+        None
+    } else {
+        serde_json::to_string(models).ok()
+    }
 }
 
 fn decode_key_auth<R>(row: &R) -> StoreResult<ApiKeyAuthSpec>
@@ -1119,6 +1188,9 @@ where
         id: row.try_get(0).map_err(store_error)?,
         label: row.try_get(1).map_err(store_error)?,
         user_id: row.try_get(2).map_err(store_error)?,
+        allowed_models: parse_allowed_models(
+            row.try_get::<Option<String>, _>(4).map_err(store_error)?,
+        ),
         // Legacy plaintext remains untouched on disk, but never crosses this
         // authentication boundary in plaintext.
         secret_hash: canonical_api_key_digest(&stored),
@@ -1518,8 +1590,8 @@ impl PersistenceWriter for SqlStore {
              harness, harness_version, harness_session_id, harness_sub_session_id, \
              harness_parent_session_id, session_kind, session_id, chain_parent_request_id, \
              item_count, shared_prefix_items, divergence_kind, divergence_index, cache_bust, \
-             client_label, client_source) VALUES ({})",
-            placeholders(self.postgres(), 26)
+             client_label, client_source, user_id) VALUES ({})",
+            placeholders(self.postgres(), 27)
         );
         execute!(
             self,
@@ -1550,6 +1622,7 @@ impl PersistenceWriter for SqlStore {
             row.cache_bust.map(i64::from),
             row.client_label,
             row.client_source,
+            row.user_id,
         );
         Ok(())
     }
@@ -1829,7 +1902,7 @@ impl PersistenceStore for SqlStore {
     async fn usage_summary(&self, filter: &UsageFilter) -> StoreResult<Vec<UsageBucket>> {
         let pg = self.postgres();
         let mut sql = String::from(
-            "SELECT virtual_key_id, alias, resolved_model, backend, \
+            "SELECT user_id, virtual_key_id, alias, resolved_model, backend, \
              CAST(COUNT(*) AS BIGINT), CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
              CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
              CAST(COALESCE(SUM(cached_tokens), 0) AS BIGINT), \
@@ -1842,6 +1915,9 @@ impl PersistenceStore for SqlStore {
                 placeholder(pg, clauses.len() + 1)
             ));
         }
+        if filter.user_id.is_some() {
+            clauses.push(format!("user_id = {}", placeholder(pg, clauses.len() + 1)));
+        }
         if filter.since_ms.is_some() {
             clauses.push(format!(
                 "created_at_ms >= {}",
@@ -1852,13 +1928,16 @@ impl PersistenceStore for SqlStore {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
-        sql.push_str(" GROUP BY virtual_key_id, alias, resolved_model, backend");
+        sql.push_str(" GROUP BY user_id, virtual_key_id, alias, resolved_model, backend");
 
         macro_rules! query_usage {
             ($pool:expr) => {{
                 let mut query = sqlx::query(&sql);
                 if let Some(key) = filter.virtual_key_id.as_deref() {
                     query = query.bind(key);
+                }
+                if let Some(user) = filter.user_id.as_deref() {
+                    query = query.bind(user);
                 }
                 if let Some(since) = filter.since_ms {
                     query = query.bind(since);
@@ -1870,15 +1949,16 @@ impl PersistenceStore for SqlStore {
                     .into_iter()
                     .map(|row| {
                         Ok(UsageBucket {
-                            virtual_key_id: row.try_get(0).map_err(store_error)?,
-                            alias: row.try_get(1).map_err(store_error)?,
-                            resolved_model: row.try_get(2).map_err(store_error)?,
-                            backend: row.try_get(3).map_err(store_error)?,
-                            requests: row.try_get(4).map_err(store_error)?,
-                            input_tokens: row.try_get(5).map_err(store_error)?,
-                            output_tokens: row.try_get(6).map_err(store_error)?,
-                            cached_tokens: row.try_get(7).map_err(store_error)?,
-                            reasoning_tokens: row.try_get(8).map_err(store_error)?,
+                            user_id: row.try_get(0).map_err(store_error)?,
+                            virtual_key_id: row.try_get(1).map_err(store_error)?,
+                            alias: row.try_get(2).map_err(store_error)?,
+                            resolved_model: row.try_get(3).map_err(store_error)?,
+                            backend: row.try_get(4).map_err(store_error)?,
+                            requests: row.try_get(5).map_err(store_error)?,
+                            input_tokens: row.try_get(6).map_err(store_error)?,
+                            output_tokens: row.try_get(7).map_err(store_error)?,
+                            cached_tokens: row.try_get(8).map_err(store_error)?,
+                            reasoning_tokens: row.try_get(9).map_err(store_error)?,
                         })
                     })
                     .collect::<StoreResult<Vec<_>>>()
@@ -1900,7 +1980,7 @@ impl PersistenceStore for SqlStore {
         }
         let pg = self.postgres();
         let mut sql = String::from(
-            "SELECT virtual_key_id, alias, resolved_model, backend, \
+            "SELECT user_id, virtual_key_id, alias, resolved_model, backend, \
              CAST(COUNT(*) AS BIGINT) AS request_count, \
              CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
              CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
@@ -1914,6 +1994,9 @@ impl PersistenceStore for SqlStore {
                 placeholder(pg, clauses.len() + 1)
             ));
         }
+        if filter.user_id.is_some() {
+            clauses.push(format!("user_id = {}", placeholder(pg, clauses.len() + 1)));
+        }
         if filter.since_ms.is_some() {
             clauses.push(format!(
                 "created_at_ms >= {}",
@@ -1924,7 +2007,7 @@ impl PersistenceStore for SqlStore {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
-        sql.push_str(" GROUP BY virtual_key_id, alias, resolved_model, backend");
+        sql.push_str(" GROUP BY user_id, virtual_key_id, alias, resolved_model, backend");
         sql.push_str(" ORDER BY request_count DESC LIMIT ");
         sql.push_str(&placeholder(pg, clauses.len() + 1));
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -1934,6 +2017,9 @@ impl PersistenceStore for SqlStore {
                 let mut query = sqlx::query(&sql);
                 if let Some(key) = filter.virtual_key_id.as_deref() {
                     query = query.bind(key);
+                }
+                if let Some(user) = filter.user_id.as_deref() {
+                    query = query.bind(user);
                 }
                 if let Some(since) = filter.since_ms {
                     query = query.bind(since);
@@ -1946,15 +2032,16 @@ impl PersistenceStore for SqlStore {
                     .into_iter()
                     .map(|row| {
                         Ok(UsageBucket {
-                            virtual_key_id: row.try_get(0).map_err(store_error)?,
-                            alias: row.try_get(1).map_err(store_error)?,
-                            resolved_model: row.try_get(2).map_err(store_error)?,
-                            backend: row.try_get(3).map_err(store_error)?,
-                            requests: row.try_get(4).map_err(store_error)?,
-                            input_tokens: row.try_get(5).map_err(store_error)?,
-                            output_tokens: row.try_get(6).map_err(store_error)?,
-                            cached_tokens: row.try_get(7).map_err(store_error)?,
-                            reasoning_tokens: row.try_get(8).map_err(store_error)?,
+                            user_id: row.try_get(0).map_err(store_error)?,
+                            virtual_key_id: row.try_get(1).map_err(store_error)?,
+                            alias: row.try_get(2).map_err(store_error)?,
+                            resolved_model: row.try_get(3).map_err(store_error)?,
+                            backend: row.try_get(4).map_err(store_error)?,
+                            requests: row.try_get(5).map_err(store_error)?,
+                            input_tokens: row.try_get(6).map_err(store_error)?,
+                            output_tokens: row.try_get(7).map_err(store_error)?,
+                            cached_tokens: row.try_get(8).map_err(store_error)?,
+                            reasoning_tokens: row.try_get(9).map_err(store_error)?,
                         })
                     })
                     .collect::<StoreResult<Vec<_>>>()
@@ -2541,17 +2628,67 @@ impl PersistenceStore for SqlStore {
     async fn list_api_keys(&self) -> StoreResult<Vec<ApiKeyRecord>> {
         Ok(fetch_all_decoded!(
             self,
-            "SELECT id, label, user_id, created_at_ms, updated_at_ms FROM api_keys \
-             WHERE deleted_at_ms IS NULL ORDER BY created_at_ms",
+            "SELECT id, label, user_id, created_at_ms, updated_at_ms, allowed_models_json \
+             FROM api_keys WHERE deleted_at_ms IS NULL ORDER BY created_at_ms",
             [],
             decode_key
+        ))
+    }
+
+    async fn list_api_keys_for_user(&self, user_id: &str) -> StoreResult<Vec<ApiKeyRecord>> {
+        let sql = format!(
+            "SELECT id, label, user_id, created_at_ms, updated_at_ms, allowed_models_json \
+             FROM api_keys WHERE deleted_at_ms IS NULL AND user_id = {} ORDER BY created_at_ms",
+            placeholder(self.postgres(), 1)
+        );
+        Ok(fetch_all_decoded!(self, &sql, [user_id], decode_key))
+    }
+
+    async fn get_user(&self, id: &str) -> StoreResult<Option<UserRecord>> {
+        let sql = format!(
+            "SELECT id, username, is_admin, created_at_ms, updated_at_ms FROM users \
+             WHERE id = {} AND deleted_at_ms IS NULL",
+            placeholder(self.postgres(), 1)
+        );
+        let rows: Vec<UserRecord> = fetch_all_decoded!(self, &sql, [id], decode_user);
+        Ok(rows.into_iter().next())
+    }
+
+    async fn activity_series(
+        &self,
+        since_ms: i64,
+        bucket_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<ActivityBucket>> {
+        let pg = self.postgres();
+        let bucket_ms = bucket_ms.max(1);
+        let sql = format!(
+            "SELECT (created_at_ms / {b1}) * {b2} AS bucket_ms, user_id, virtual_key_id, \
+             CAST(COUNT(*) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(cached_tokens), 0) AS BIGINT) \
+             FROM requests WHERE created_at_ms >= {since} \
+             GROUP BY 1, 2, 3 ORDER BY 1, 2, 3 LIMIT {limit}",
+            b1 = placeholder(pg, 1),
+            b2 = placeholder(pg, 2),
+            since = placeholder(pg, 3),
+            limit = placeholder(pg, 4)
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(fetch_all_decoded!(
+            self,
+            &sql,
+            [bucket_ms, bucket_ms, since_ms, limit],
+            decode_activity
         ))
     }
 
     async fn api_key_auth_specs(&self) -> StoreResult<Vec<ApiKeyAuthSpec>> {
         Ok(fetch_all_decoded!(
             self,
-            "SELECT id, label, user_id, secret FROM api_keys \
+            "SELECT id, label, user_id, secret, allowed_models_json FROM api_keys \
              WHERE deleted_at_ms IS NULL ORDER BY created_at_ms",
             [],
             decode_key_auth
@@ -2564,6 +2701,7 @@ impl PersistenceStore for SqlStore {
         plaintext: &str,
         label: Option<&str>,
         user_id: Option<&str>,
+        allowed_models: &[String],
         actor: &str,
     ) -> StoreResult<ApiKeyRecord> {
         if plaintext.is_empty() {
@@ -2571,14 +2709,16 @@ impl PersistenceStore for SqlStore {
         }
         let now = now_ms();
         let digest = api_key_digest(plaintext);
+        let allowed_json = encode_allowed_models(allowed_models);
         let pg = self.postgres();
         let sql = format!(
             "INSERT INTO api_keys (id, secret, label, user_id, created_at_ms, created_by, \
-             updated_at_ms, updated_by, deleted_at_ms) VALUES ({}) \
+             updated_at_ms, updated_by, deleted_at_ms, allowed_models_json) VALUES ({}) \
              ON CONFLICT (id) DO UPDATE SET secret = excluded.secret, label = excluded.label, \
              user_id = excluded.user_id, updated_at_ms = excluded.updated_at_ms, \
-             updated_by = excluded.updated_by, deleted_at_ms = NULL",
-            placeholders(pg, 9)
+             updated_by = excluded.updated_by, deleted_at_ms = NULL, \
+             allowed_models_json = excluded.allowed_models_json",
+            placeholders(pg, 10)
         );
         execute!(
             self,
@@ -2591,7 +2731,8 @@ impl PersistenceStore for SqlStore {
             actor,
             now,
             actor,
-            Option::<i64>::None
+            Option::<i64>::None,
+            allowed_json
         );
         let created_at_ms = match &self.pool {
             SqlPool::Sqlite(pool) => sqlx::query("SELECT created_at_ms FROM api_keys WHERE id = ?")
@@ -2615,6 +2756,7 @@ impl PersistenceStore for SqlStore {
             id: id.to_string(),
             label: label.map(str::to_string),
             user_id: user_id.map(str::to_string),
+            allowed_models: allowed_models.to_vec(),
             created_at_ms,
             updated_at_ms: now,
         })
@@ -2627,8 +2769,8 @@ impl PersistenceStore for SqlStore {
         macro_rules! scan {
             ($pool:expr) => {{
                 let rows = sqlx::query(
-                    "SELECT id, secret, label, user_id, created_at_ms, updated_at_ms FROM api_keys \
-                     WHERE deleted_at_ms IS NULL",
+                    "SELECT id, secret, label, user_id, created_at_ms, updated_at_ms, \
+                     allowed_models_json FROM api_keys WHERE deleted_at_ms IS NULL",
                 )
                 .fetch_all($pool)
                 .await
@@ -2643,6 +2785,9 @@ impl PersistenceStore for SqlStore {
                             user_id: row.try_get(3).map_err(store_error)?,
                             created_at_ms: row.try_get(4).map_err(store_error)?,
                             updated_at_ms: row.try_get(5).map_err(store_error)?,
+                            allowed_models: parse_allowed_models(
+                                row.try_get::<Option<String>, _>(6).map_err(store_error)?,
+                            ),
                         });
                     }
                 }
@@ -2954,7 +3099,7 @@ mod tests {
             .collect(),
             SqlPool::Postgres(_) => unreachable!(),
         };
-        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let request_indexes: Vec<String> = match &store.pool {
             SqlPool::Sqlite(pool) => sqlx::query(
                 "SELECT name FROM sqlite_master WHERE type = 'index' \
@@ -3279,6 +3424,133 @@ mod tests {
         assert_eq!(
             store.throughput_series(0, 60_000, 1).await.unwrap().len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_carry_allowed_models_and_owner_and_list_per_user() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        let user = store
+            .create_user("koen", "$argon2id$hash", true, "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_user(&user.id).await.unwrap().unwrap().username,
+            "koen"
+        );
+        assert!(store.get_user("nope").await.unwrap().is_none());
+        store
+            .put_api_key(
+                "k-scoped",
+                "llmc_a",
+                Some("laptop"),
+                Some(&user.id),
+                &["local".to_string(), "fast".to_string()],
+                "test",
+            )
+            .await
+            .unwrap();
+        store
+            .put_api_key("k-any", "llmc_b", None, None, &[], "test")
+            .await
+            .unwrap();
+        let mine = store.list_api_keys_for_user(&user.id).await.unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].allowed_models, ["local", "fast"]);
+        let specs = store.api_key_auth_specs().await.unwrap();
+        let scoped = specs.iter().find(|s| s.id == "k-scoped").unwrap();
+        assert_eq!(scoped.allowed_models, ["local", "fast"]);
+        assert_eq!(scoped.user_id.as_deref(), Some(user.id.as_str()));
+        assert!(
+            specs
+                .iter()
+                .find(|s| s.id == "k-any")
+                .unwrap()
+                .allowed_models
+                .is_empty()
+        );
+        let verified = store.verify_api_key("llmc_a").await.unwrap().unwrap();
+        assert_eq!(verified.allowed_models, ["local", "fast"]);
+        store.delete_api_key("k-scoped", "test").await.unwrap();
+        assert!(
+            store
+                .list_api_keys_for_user(&user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_carry_user_id_and_activity_buckets_per_user_and_key() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        for (id, user, key, created, status, input) in [
+            ("a", Some("u1"), Some("k1"), 1_000, "completed", Some(100)),
+            ("b", Some("u1"), Some("k1"), 2_000, "failed", Some(50)),
+            ("c", Some("u2"), Some("k2"), 61_000, "completed", None),
+            ("d", None, None, 61_500, "completed", Some(10)),
+        ] {
+            let mut row = request(id);
+            row.user_id = user.map(str::to_string);
+            row.virtual_key_id = key.map(str::to_string);
+            row.created_at_ms = created;
+            row.status = status.to_string();
+            store.begin_request(row).await.unwrap();
+            if let Some(input) = input {
+                let mut done = finish();
+                done.status = status.to_string();
+                done.input_tokens = Some(input);
+                done.output_tokens = Some(5);
+                done.cached_tokens = None;
+                store.finish_request(id, done).await.unwrap();
+            }
+        }
+        assert_eq!(
+            store
+                .get_request("a")
+                .await
+                .unwrap()
+                .unwrap()
+                .user_id
+                .as_deref(),
+            Some("u1")
+        );
+        let usage = store
+            .usage_summary(&UsageFilter {
+                user_id: Some("u1".to_string()),
+                ..UsageFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].user_id.as_deref(), Some("u1"));
+        assert_eq!(usage[0].requests, 2);
+        let series = store.activity_series(0, 60_000, 100).await.unwrap();
+        assert_eq!(
+            series
+                .iter()
+                .map(|b| (
+                    b.bucket_ms,
+                    b.user_id.as_deref(),
+                    b.virtual_key_id.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (0, Some("u1"), Some("k1")),
+                (60_000, None, None),
+                (60_000, Some("u2"), Some("k2"))
+            ]
+        );
+        assert_eq!(series[0].requests, 2);
+        assert_eq!(series[0].failed, 1);
+        assert_eq!(series[0].input_tokens, 150);
+        assert_eq!(
+            series[2].input_tokens, 0,
+            "unreported input sums to 0 with 1 request"
         );
     }
 
@@ -3651,7 +3923,7 @@ mod tests {
             .await
             .expect("connect");
         store
-            .put_api_key("key-1", "sk-super-secret", Some("team"), None, "test")
+            .put_api_key("key-1", "sk-super-secret", Some("team"), None, &[], "test")
             .await
             .expect("put");
 

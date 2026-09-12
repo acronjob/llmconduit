@@ -47,6 +47,7 @@ pub struct HistoryRequestsQuery {
 #[derive(Debug, Default, Deserialize)]
 pub struct HistoryUsageQuery {
     pub virtual_key_id: Option<String>,
+    pub user_id: Option<String>,
     pub since_ms: Option<i64>,
     pub limit: Option<usize>,
 }
@@ -244,6 +245,70 @@ async fn history_throughput_from(
             )
         }
         Ok(Err(error)) => internal_error("read durable throughput series", &error),
+        Err(_) => query_timeout(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ActivityBody {
+    buckets: Vec<crate::control_plane_store::ActivityBucket>,
+    since_ms: i64,
+    bucket_ms: i64,
+    limit: usize,
+    truncated: bool,
+}
+
+/// `GET /dashboard/api/history/activity?since_ms=&bucket_secs=&limit=`.
+/// Per-user / per-key request and token series (the activity dashboard).
+pub async fn history_activity(
+    State(gateway): State<Arc<Gateway>>,
+    Query(query): Query<HistoryThroughputQuery>,
+) -> Response {
+    history_activity_from(gateway.persistence_store(), query).await
+}
+
+async fn history_activity_from(
+    store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
+    query: HistoryThroughputQuery,
+) -> Response {
+    let Some(store) = store else {
+        return unavailable();
+    };
+    let since_ms = match query.since_ms {
+        Some(value) if value < 0 => return bad_request("since_ms must not be negative"),
+        Some(value) => value,
+        None => now_ms().saturating_sub(DEFAULT_THROUGHPUT_WINDOW_MS),
+    };
+    let bucket_secs = query.bucket_secs.unwrap_or(DEFAULT_THROUGHPUT_BUCKET_SECS);
+    if !(1..=MAX_THROUGHPUT_BUCKET_SECS).contains(&bucket_secs) {
+        return bad_request("bucket_secs must be between 1 and 86400");
+    }
+    let bucket_ms = bucket_secs * 1_000;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_THROUGHPUT_LIMIT)
+        .clamp(1, MAX_THROUGHPUT_LIMIT);
+    match tokio::time::timeout(
+        HISTORY_QUERY_TIMEOUT,
+        store.activity_series(since_ms, bucket_ms, limit.saturating_add(1)),
+    )
+    .await
+    {
+        Ok(Ok(mut buckets)) => {
+            let truncated = buckets.len() > limit;
+            buckets.truncate(limit);
+            json_response(
+                StatusCode::OK,
+                &ActivityBody {
+                    buckets,
+                    since_ms,
+                    bucket_ms,
+                    limit,
+                    truncated,
+                },
+            )
+        }
+        Ok(Err(error)) => internal_error("read durable activity series", &error),
         Err(_) => query_timeout(),
     }
 }
@@ -560,6 +625,12 @@ async fn history_usage_from(
         store.usage_summary_limited(
             &UsageFilter {
                 virtual_key_id,
+                user_id: query
+                    .user_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
                 since_ms: Some(since_ms),
             },
             limit.saturating_add(1),
@@ -815,6 +886,7 @@ mod tests {
             Some(Arc::clone(&store)),
             HistoryUsageQuery {
                 virtual_key_id: Some(too_long),
+                user_id: None,
                 since_ms: None,
                 limit: None,
             },
@@ -826,6 +898,7 @@ mod tests {
             Some(store),
             HistoryUsageQuery {
                 virtual_key_id: None,
+                user_id: None,
                 since_ms: Some(-1),
                 limit: None,
             },

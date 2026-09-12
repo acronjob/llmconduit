@@ -64,21 +64,27 @@ const LOGIN_SHELL_TEMPLATE: &str = include_str!("dashboard_login.html");
 /// login shell. Always carries the dashboard CSP + security headers + `no-store`
 /// (transcripts/credentials must not be cached).
 pub async fn dashboard_index(
+    axum::extract::State(gateway): axum::extract::State<Arc<crate::engine::Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
     session: Option<AuthSession>,
 ) -> Response {
     let nonce = new_nonce();
-    if session.is_some() {
-        serve_authenticated_shell(&auth, &nonce)
-    } else {
-        serve_login_shell(&nonce)
+    let auth_mode = crate::accounts_api::auth_mode(&gateway, &auth);
+    match session {
+        Some(session) => serve_authenticated_shell(&auth, &nonce, session.user.as_ref(), auth_mode),
+        None => serve_login_shell(&nonce, auth_mode),
     }
 }
 
 /// Build the authenticated SPA response: inject the bootstrap script into
 /// `index.html`, set a fresh `llmconduit_csrf` cookie, and stamp the CSP +
 /// headers.
-fn serve_authenticated_shell(auth: &DashboardAuth, nonce: &str) -> Response {
+fn serve_authenticated_shell(
+    auth: &DashboardAuth,
+    nonce: &str,
+    user: Option<&crate::accounts::SessionUser>,
+    auth_mode: &str,
+) -> Response {
     let Some(file) = DASHBOARD_DIST.get_file("index.html") else {
         return security_headers(
             (
@@ -90,11 +96,14 @@ fn serve_authenticated_shell(auth: &DashboardAuth, nonce: &str) -> Response {
         );
     };
     let csrf = auth.issue_csrf_token();
+    let user_json = serde_json::to_string(&user).unwrap_or_else(|_| "null".to_string());
     let bootstrap = format!(
         "<script nonce=\"{nonce}\">window.__LLMCONDUIT_DASHBOARD__={{\"authenticated\":true,\
-         \"csrf_token\":{csrf},\"mutations_enabled\":{mutations}}};</script>",
+         \"csrf_token\":{csrf},\"mutations_enabled\":{mutations},\"user\":{user_json},\
+         \"auth_mode\":{mode}}};</script>",
         csrf = json_string(&csrf),
         mutations = auth.mutations_enabled(),
+        mode = json_string(auth_mode),
     );
     let html = inject_before_head_close(&String::from_utf8_lossy(file.contents()), &bootstrap);
 
@@ -107,8 +116,10 @@ fn serve_authenticated_shell(auth: &DashboardAuth, nonce: &str) -> Response {
 }
 
 /// Build the login-shell response (unauthenticated `/dashboard`).
-fn serve_login_shell(nonce: &str) -> Response {
-    let html = LOGIN_SHELL_TEMPLATE.replace("{NONCE}", nonce);
+fn serve_login_shell(nonce: &str, auth_mode: &str) -> Response {
+    let html = LOGIN_SHELL_TEMPLATE
+        .replace("{NONCE}", nonce)
+        .replace("{AUTH_MODE}", auth_mode);
     let response = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
     security_headers(response, Some(nonce))
 }

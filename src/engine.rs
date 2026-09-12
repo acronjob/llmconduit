@@ -195,6 +195,12 @@ pub struct Gateway {
     harness_detector: Arc<crate::harness::HarnessDetector>,
     /// Session tree + lineage index (see `crate::sessions`).
     session_linker: Arc<crate::sessions::SessionLinker>,
+    /// YAML-configured keys + the configured `require` flag, kept so the live
+    /// registry can be rebuilt as YAML ∪ SQL (see `crate::accounts`).
+    yaml_key_specs: Vec<crate::client_auth::VirtualKeySpec>,
+    client_auth_required: bool,
+    /// Whether at least one user account exists (drives the login mode).
+    users_configured: Arc<std::sync::atomic::AtomicBool>,
     /// Durable store handle for admin/history reads only. Inference writes use
     /// `persistence_queue` above; request execution never awaits this trait object.
     persistence_store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
@@ -754,6 +760,9 @@ impl Gateway {
             persistence_keep_media: true,
             harness_detector: Arc::new(crate::harness::HarnessDetector::builtin()),
             session_linker: Arc::new(crate::sessions::SessionLinker::new(true)),
+            yaml_key_specs: Vec::new(),
+            client_auth_required: false,
+            users_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persistence_store: None,
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -955,6 +964,34 @@ impl Gateway {
 
     pub fn session_linker(&self) -> &Arc<crate::sessions::SessionLinker> {
         &self.session_linker
+    }
+
+    pub fn with_key_registry_source(
+        mut self,
+        yaml_key_specs: Vec<crate::client_auth::VirtualKeySpec>,
+        client_auth_required: bool,
+    ) -> Self {
+        self.yaml_key_specs = yaml_key_specs;
+        self.client_auth_required = client_auth_required;
+        self
+    }
+
+    pub fn yaml_key_specs(&self) -> &[crate::client_auth::VirtualKeySpec] {
+        &self.yaml_key_specs
+    }
+
+    pub fn client_auth_required(&self) -> bool {
+        self.client_auth_required
+    }
+
+    pub fn users_configured(&self) -> bool {
+        self.users_configured
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_users_configured(&self, configured: bool) {
+        self.users_configured
+            .store(configured, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Attach the read/admin persistence handle. It is intentionally distinct

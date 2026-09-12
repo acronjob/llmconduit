@@ -63,6 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+        Some(Commands::User { config, action }) => {
+            let path = resolve_config_path(config)?;
+            run_user_command(&path, action).await
+        }
         Some(Commands::AnalyzeLog {
             config,
             path,
@@ -360,10 +364,32 @@ async fn prepare_control_plane_runtime(
             Some(PersistenceQueue::spawn(writer, capacity))
         }
     };
-    let client_auth = if loaded.client_auth_required || !loaded.client_auth_specs.is_empty() {
+    // Accounts: bootstrap the first admin from the environment, merge the SQL
+    // keys into the live registry (YAML ∪ SQL), and note whether users exist.
+    let mut users_configured = false;
+    let mut all_key_specs = loaded.client_auth_specs.clone();
+    if let Some(store) = persistence_store.as_ref() {
+        match llmconduit::accounts::bootstrap_admin_from_env(store).await {
+            Ok(Some(user)) => {
+                tracing::info!(username = %user.username, "bootstrapped the first administrator from the environment")
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("bootstrap admin: {error}").into()),
+        }
+        users_configured = store.count_users().await? > 0;
+        let sql_specs = llmconduit::accounts::specs_from_sql(store.api_key_auth_specs().await?);
+        if !sql_specs.is_empty() {
+            tracing::info!(
+                keys = sql_specs.len(),
+                "loaded SQL-managed API keys into the live registry"
+            );
+        }
+        all_key_specs.extend(sql_specs);
+    }
+    let client_auth = if loaded.client_auth_required || !all_key_specs.is_empty() {
         Some(llmconduit::client_auth::ClientAuth::from_specs(
             loaded.client_auth_required,
-            loaded.client_auth_specs.clone(),
+            all_key_specs,
         )?)
     } else {
         None
@@ -388,6 +414,9 @@ async fn prepare_control_plane_runtime(
         conversation_id_header: loaded.conversation_id_header.clone(),
         harness_detector: Arc::new(harness_detector),
         session_linker,
+        yaml_key_specs: loaded.client_auth_specs.clone(),
+        client_auth_required: loaded.client_auth_required,
+        users_configured,
     };
     Ok((runtime, client_auth, persistence_queue))
 }
@@ -579,6 +608,103 @@ fn spawn_persistent_backend_metrics(gateway: Arc<llmconduit::engine::Gateway>) {
             }
         }
     });
+}
+
+/// `llmconduit user …`: connect the configured SQL store and manage accounts.
+async fn run_user_command(
+    path: &std::path::Path,
+    action: llmconduit::cli::UserCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use llmconduit::cli::UserCommand;
+    let loaded = load_runtime_config(path, &[])?;
+    let url = loaded
+        .storage
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("user management needs control_plane.storage sqlite or postgres with a url")?;
+    let store: Arc<dyn PersistenceStore> = Arc::new(match loaded.storage.backend {
+        StorageBackend::Sqlite => SqlStore::connect_sqlite(url).await?,
+        StorageBackend::Postgres => SqlStore::connect_postgres(url).await?,
+        StorageBackend::None | StorageBackend::Jsonl => {
+            return Err("user management needs control_plane.storage sqlite or postgres".into());
+        }
+    });
+    let read_password =
+        |password_env: Option<String>| -> Result<String, Box<dyn std::error::Error>> {
+            if let Some(name) = password_env {
+                return Ok(std::env::var(&name)
+                    .map_err(|_| format!("environment variable {name} is not set"))?);
+            }
+            eprint!("Password: ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            Ok(line.trim_end_matches(['\n', '\r']).to_string())
+        };
+    match action {
+        UserCommand::Create {
+            username,
+            admin,
+            password_env,
+        } => {
+            let username = llmconduit::accounts::validate_username(&username)?.to_string();
+            if store.get_user_auth(&username).await?.is_some() {
+                return Err(format!("user '{username}' already exists").into());
+            }
+            let hash = llmconduit::accounts::hash_password(&read_password(password_env)?)?;
+            let user = store.create_user(&username, &hash, admin, "cli").await?;
+            println!(
+                "Created user {} ({}){}",
+                user.username,
+                user.id,
+                if admin { " [admin]" } else { "" }
+            );
+        }
+        UserCommand::List => {
+            for user in store.list_users().await? {
+                let keys = store.list_api_keys_for_user(&user.id).await?.len();
+                println!(
+                    "{}\t{}\t{}\t{} key(s)",
+                    user.username,
+                    if user.is_admin { "admin" } else { "user" },
+                    user.id,
+                    keys
+                );
+            }
+        }
+        UserCommand::SetPassword {
+            username,
+            password_env,
+        } => {
+            let user = store
+                .get_user_auth(username.trim())
+                .await?
+                .ok_or_else(|| format!("user '{username}' not found"))?;
+            let hash = llmconduit::accounts::hash_password(&read_password(password_env)?)?;
+            store
+                .update_user(&user.id, Some(&hash), None, "cli")
+                .await?;
+            println!("Password updated for {}", user.username);
+        }
+        UserCommand::Delete { username } => {
+            let user = store
+                .get_user_auth(username.trim())
+                .await?
+                .ok_or_else(|| format!("user '{username}' not found"))?;
+            let keys = store.list_api_keys_for_user(&user.id).await?;
+            for key in &keys {
+                store.delete_api_key(&key.id, "cli").await?;
+            }
+            store.delete_user(&user.id, "cli").await?;
+            println!(
+                "Deleted user {} and revoked {} key(s)",
+                user.username,
+                keys.len()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Scrape every backend's Prometheus `/metrics` (vLLM / SGLang) on the

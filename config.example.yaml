@@ -24,6 +24,9 @@ control_plane:
 
   # Client inference auth is separate from /dashboard session auth. With no
   # operational keys and require:false, /v1 inference endpoints remain open.
+  # Dashboard users and their API keys live in the SQL store; bootstrap the
+  # first admin with LLMCONDUIT_ADMIN_USERNAME/LLMCONDUIT_ADMIN_PASSWORD or
+  # `llmconduit user create`. SQL keys join the YAML keys below live.
   auth:
     require: false
     conversation_id_header: "x-conversation-id"

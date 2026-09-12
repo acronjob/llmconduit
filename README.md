@@ -233,6 +233,39 @@ harness can opt in to exact attribution by sending `x-llm-harness`
 (`name/version`), `x-llm-session-id`, `x-llm-parent-session-id`, and
 `x-llm-session-kind`.
 
+### Users and API keys
+
+With a SQL store, the dashboard has user accounts and per-user API keys.
+Create the first administrator either from the environment at startup
+(`LLMCONDUIT_ADMIN_USERNAME` + `LLMCONDUIT_ADMIN_PASSWORD`, used only while no
+user exists) or with the CLI:
+
+```bash
+LLMCONDUIT_ADMIN_PW=... ./llmconduit user create --config config.yaml \
+    --username koen --admin --password-env LLMCONDUIT_ADMIN_PW
+./llmconduit user list --config config.yaml
+```
+
+Once a user exists the dashboard login form asks for a username and password
+(Argon2id hashes in the `users` table); the shared `LLMCONDUIT_DASHBOARD_TOKEN`
+no longer opens the dashboard except on a dev-open loopback listener. The
+session cookie carries the signed user identity.
+
+Keys are managed in the dashboard (Account tab) or through the API:
+`GET/POST /dashboard/api/keys`, `DELETE /dashboard/api/keys/{id}`,
+`GET/POST /dashboard/api/users`, `PATCH/DELETE /dashboard/api/users/{id}`,
+`GET /dashboard/api/me`. Every user can create and revoke their own keys;
+administrators manage users and everyone's keys. Mutations need the
+double-submit CSRF token like the kill route, but not
+`LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS`. A created key's plaintext
+(`llmc_…`) is returned exactly once; only its SHA-256 digest is stored. The
+live key registry is the union of the YAML `keys` and the SQL keys and is
+rebuilt on every change, so a new or revoked key takes effect without a
+restart. Requests record the key's owner in `requests.user_id`, and
+`GET /dashboard/api/history/usage?user_id=` and
+`GET /dashboard/api/history/activity?since_ms=&bucket_secs=` roll usage up
+per user and key.
+
 ### Upstream engine metrics and throughput
 
 With a SQL store, llmconduit scrapes every backend's Prometheus `/metrics`

@@ -1,3 +1,5 @@
+pub mod accounts;
+pub mod accounts_api;
 pub mod adapters;
 pub mod cli;
 pub mod client_auth;
@@ -148,6 +150,12 @@ pub struct ControlPlaneRuntime {
     pub harness_detector: Arc<crate::harness::HarnessDetector>,
     /// In-memory session tree used to link requests into chains.
     pub session_linker: Arc<crate::sessions::SessionLinker>,
+    /// YAML-configured virtual keys, retained so the live registry can be
+    /// rebuilt (YAML ∪ SQL) after a key change.
+    pub yaml_key_specs: Vec<crate::client_auth::VirtualKeySpec>,
+    pub client_auth_required: bool,
+    /// Whether at least one user account exists at startup.
+    pub users_configured: bool,
 }
 
 impl Default for ControlPlaneRuntime {
@@ -160,6 +168,9 @@ impl Default for ControlPlaneRuntime {
                 .to_string(),
             harness_detector: Arc::new(crate::harness::HarnessDetector::builtin()),
             session_linker: Arc::new(crate::sessions::SessionLinker::new(true)),
+            yaml_key_specs: Vec::new(),
+            client_auth_required: false,
+            users_configured: false,
         }
     }
 }
@@ -498,7 +509,9 @@ pub fn build_app_with_gateway_control_plane_runtime(
     gateway = gateway
         .with_persistence_keep_media(runtime.persistence_keep_media)
         .with_harness_detector(runtime.harness_detector)
-        .with_session_linker(runtime.session_linker);
+        .with_session_linker(runtime.session_linker)
+        .with_key_registry_source(runtime.yaml_key_specs, runtime.client_auth_required);
+    gateway.set_users_configured(runtime.users_configured);
     {}
     if let Some(store) = runtime.persistence_store {
         gateway = gateway.with_persistence_store(store);
