@@ -44,7 +44,7 @@ pub struct ItemFingerprint {
 impl From<&SplitItem> for ItemFingerprint {
     fn from(item: &SplitItem) -> Self {
         Self {
-            hash: item.hash.clone(),
+            hash: item.identity.clone(),
             section: item.section,
             kind: item.kind.clone(),
         }
@@ -395,7 +395,13 @@ impl SessionLinker {
                     .cloned();
                 match anchor_head {
                     None => (anchor.clone(), new_chain(), None),
-                    Some(head) if inference_allowed => {
+                    // An unrelated conversation is a sub-session only when it
+                    // is smaller than the chain it appears next to: a
+                    // sub-agent starts from a fresh, shorter prompt while its
+                    // parent has grown through tool round-trips. A larger
+                    // conversation arriving after a short side call (a title
+                    // request, a summary) is the session's real chain.
+                    Some(head) if inference_allowed && head.items.len() > input.items.len() => {
                         let child = index.inferred_child(
                             &anchor,
                             identity,
@@ -865,10 +871,46 @@ mod tests {
     }
 
     #[test]
+    fn fingerprints_use_the_identity_hash_not_the_storage_hash() {
+        let item = crate::content_store::SplitItem {
+            ordinal: 0,
+            section: ItemSection::Message,
+            kind: Some("user".into()),
+            hash: "storage".into(),
+            identity: "identity".into(),
+            canonical: "{}".into(),
+        };
+        assert_eq!(ItemFingerprint::from(&item).hash, "identity");
+    }
+
+    #[test]
+    fn a_larger_conversation_is_not_a_sub_session_of_a_side_call() {
+        // Claude Code fires a two-item "title" request alongside the first real
+        // turn. The real conversation (many more items) must stay the session's
+        // own chain, not become an inferred child of the side call.
+        let linker = SessionLinker::new(true);
+        let id = identity("claude-code", Some("s-1"));
+        let mut side = vec![fp("title-sys", ItemSection::Instructions, None)];
+        side.push(msg("title-prompt"));
+        let title = link(&linker, "r1", &id, &side, 10);
+        let main = link(&linker, "r2", &id, &convo(&["u1"]), 11);
+        assert_eq!(main.session_id, title.session_id);
+        assert_eq!(main.lineage.kind, DivergenceKind::NewChain);
+        assert!(!main.lineage.cache_bust);
+        assert_eq!(linker.node_count(), 1);
+        // The conversation then continues as a plain append on the same chain.
+        let next = link(&linker, "r3", &id, &convo(&["u1", "a1", "u2"]), 12);
+        assert_eq!(next.session_id, title.session_id);
+        assert_eq!(next.lineage.kind, DivergenceKind::Append);
+        assert_eq!(next.chain_parent_request_id.as_deref(), Some("r2"));
+    }
+
+    #[test]
     fn a_new_conversation_inside_a_session_becomes_an_inferred_sub_session() {
         let linker = SessionLinker::new(true);
         let id = identity("claude-code", Some("s-1"));
-        let main = link(&linker, "r1", &id, &convo(&["u1"]), 10);
+        // The main chain has already made a tool round-trip when it spawns.
+        let main = link(&linker, "r1", &id, &convo(&["u1", "a1", "u2"]), 10);
         // A sub-agent shares the session id but starts from a different prompt.
         let mut agent_items = convo(&["agent-task"]);
         agent_items[0].hash = "agent-sys".into();
@@ -903,7 +945,13 @@ mod tests {
         assert_eq!(sub_next.chain_parent_request_id.as_deref(), Some("r2"));
 
         // And the main thread continues on its own chain afterwards.
-        let main_next = link(&linker, "r4", &id, &convo(&["u1", "a1", "u2"]), 13);
+        let main_next = link(
+            &linker,
+            "r4",
+            &id,
+            &convo(&["u1", "a1", "u2", "a2", "u3"]),
+            13,
+        );
         assert_eq!(main_next.session_id, main.session_id);
         assert_eq!(main_next.chain_parent_request_id.as_deref(), Some("r1"));
         assert_eq!(linker.node_count(), 2);

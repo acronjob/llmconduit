@@ -946,6 +946,7 @@ pub fn body_write(
             section: item.section.as_str().to_string(),
             kind: item.kind,
             blob_hash: item.hash,
+            identity_hash: Some(item.identity),
         });
     }
     let mut event = payload_event(

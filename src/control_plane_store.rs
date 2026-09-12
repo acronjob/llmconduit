@@ -110,6 +110,10 @@ pub struct ItemRow {
     pub section: String,
     pub kind: Option<String>,
     pub blob_hash: String,
+    /// Lineage identity of the item (see `SplitItem::identity`); `None` for
+    /// rows written before the column existed, which then fall back to the
+    /// storage hash.
+    pub identity_hash: Option<String>,
 }
 
 /// A request-side hop body: the skeleton event plus its items and the blobs
@@ -1072,6 +1076,7 @@ where
         section: row.try_get(3).map_err(store_error)?,
         kind: row.try_get(4).map_err(store_error)?,
         blob_hash: row.try_get(5).map_err(store_error)?,
+        identity_hash: row.try_get(6).map_err(store_error)?,
     })
 }
 
@@ -1680,10 +1685,12 @@ impl PersistenceWriter for SqlStore {
             placeholders(pg, 5)
         );
         let insert_item = format!(
-            "INSERT INTO request_items (request_id, hop, ordinal, section, kind, blob_hash) \
+            "INSERT INTO request_items (request_id, hop, ordinal, section, kind, blob_hash, \
+             identity_hash) \
              VALUES ({}) ON CONFLICT (request_id, hop, ordinal) DO UPDATE SET \
-             section = excluded.section, kind = excluded.kind, blob_hash = excluded.blob_hash",
-            placeholders(pg, 6)
+             section = excluded.section, kind = excluded.kind, blob_hash = excluded.blob_hash, \
+             identity_hash = excluded.identity_hash",
+            placeholders(pg, 7)
         );
         let insert_event = format!(
             "INSERT INTO request_events (request_id, seq, ts_ms, hop, kind, payload, bytes) \
@@ -1720,6 +1727,7 @@ impl PersistenceWriter for SqlStore {
                         .bind(&item.section)
                         .bind(&item.kind)
                         .bind(&item.blob_hash)
+                        .bind(&item.identity_hash)
                         .execute(&mut *transaction)
                         .await
                         .map_err(store_error)?;
@@ -2137,7 +2145,8 @@ impl PersistenceStore for SqlStore {
     async fn request_items(&self, request_id: &str, hop: &str) -> StoreResult<Vec<ItemRow>> {
         let pg = self.postgres();
         let sql = format!(
-            "SELECT request_id, hop, ordinal, section, kind, blob_hash FROM request_items \
+            "SELECT request_id, hop, ordinal, section, kind, blob_hash, identity_hash \
+             FROM request_items \
              WHERE request_id = {} AND hop = {} ORDER BY ordinal",
             placeholder(pg, 1),
             placeholder(pg, 2)
@@ -2335,7 +2344,7 @@ impl PersistenceStore for SqlStore {
             .await?
             .into_iter()
             .map(|item| crate::sessions::ItemFingerprint {
-                hash: item.blob_hash,
+                hash: item.identity_hash.unwrap_or(item.blob_hash),
                 section: crate::content_store::ItemSection::parse(&item.section)
                     .unwrap_or(crate::content_store::ItemSection::Message),
                 kind: item.kind,
@@ -3122,7 +3131,7 @@ mod tests {
             .collect(),
             SqlPool::Postgres(_) => unreachable!(),
         };
-        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         let request_indexes: Vec<String> = match &store.pool {
             SqlPool::Sqlite(pool) => sqlx::query(
                 "SELECT name FROM sqlite_master WHERE type = 'index' \
@@ -3158,6 +3167,7 @@ mod tests {
 
     fn item(request_id: &str, hop: &str, ordinal: i64, hash: &str) -> ItemRow {
         ItemRow {
+            identity_hash: None,
             request_id: request_id.to_string(),
             hop: hop.to_string(),
             ordinal,

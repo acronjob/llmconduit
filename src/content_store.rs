@@ -65,10 +65,39 @@ pub struct SplitItem {
     pub section: ItemSection,
     /// `role`/`type` for messages, the function name for tools, absent for instructions.
     pub kind: Option<String>,
-    /// Lowercase hex SHA-256 of `canonical`.
+    /// Lowercase hex SHA-256 of `canonical`: the storage address.
     pub hash: String,
+    /// Lowercase hex SHA-256 of `canonical` with the volatile, non-semantic
+    /// markers removed (`cache_control`, which Anthropic clients move to the
+    /// newest block on every request). Session lineage compares items by this
+    /// so a moved marker is not reported as a rewritten history.
+    pub identity: String,
     /// Canonical JSON (sorted keys, no whitespace) of the redacted item.
     pub canonical: String,
+}
+
+/// Keys that carry no conversational content and move between requests.
+const IDENTITY_IGNORED_KEYS: &[&str] = &["cache_control"];
+
+/// Remove [`IDENTITY_IGNORED_KEYS`] anywhere in `value`. Returns whether
+/// anything was removed, so the common case can reuse the storage hash.
+fn strip_identity_ignored_keys(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut removed = false;
+            for key in IDENTITY_IGNORED_KEYS {
+                removed |= map.remove(*key).is_some();
+            }
+            for nested in map.values_mut() {
+                removed |= strip_identity_ignored_keys(nested);
+            }
+            removed
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |acc, item| strip_identity_ignored_keys(item) | acc),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,12 +267,19 @@ fn push_item(
     // feature), so `to_string` already yields sorted keys without whitespace.
     let canonical = serde_json::to_string(&item).unwrap_or_else(|_| "null".to_string());
     let hash = hash_canonical(&canonical);
+    let mut stripped = item;
+    let identity = if strip_identity_ignored_keys(&mut stripped) {
+        hash_canonical(&serde_json::to_string(&stripped).unwrap_or_else(|_| "null".to_string()))
+    } else {
+        hash.clone()
+    };
     let marker = reference(&hash);
     items.push(SplitItem {
         ordinal: i64::try_from(items.len()).unwrap_or(i64::MAX),
         section,
         kind,
         hash,
+        identity,
         canonical,
     });
     marker
@@ -491,6 +527,41 @@ mod tests {
         assert_eq!(split.items[1].kind.as_deref(), Some("bash"));
         let skeleton: Value = serde_json::from_str(&split.skeleton).unwrap();
         assert_eq!(skeleton["metadata"]["user_id"], "user_x_session_y");
+    }
+
+    #[test]
+    fn cache_control_markers_do_not_change_item_identity() {
+        // Anthropic clients move `cache_control` to the newest block on every
+        // request; the storage hash follows the bytes, the identity must not.
+        let with = round_trip(
+            PROTOCOL_ANTHROPIC_MESSAGES,
+            json!({
+                "model": "m",
+                "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "1"}]}
+                ]
+            }),
+        );
+        let without = round_trip(
+            PROTOCOL_ANTHROPIC_MESSAGES,
+            json!({
+                "model": "m",
+                "system": [{"type": "text", "text": "sys"}],
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "1", "cache_control": {"type": "ephemeral"}}]}
+                ]
+            }),
+        );
+        for (a, b) in with.items.iter().zip(&without.items) {
+            assert_ne!(a.hash, b.hash, "storage hashes follow the bytes");
+            assert_eq!(a.identity, b.identity, "identity ignores cache_control");
+        }
+        // Without markers, identity and storage hash coincide.
+        assert_eq!(without.items[1].hash, without.items[1].identity);
+        assert_ne!(with.items[0].identity, with.items[1].identity);
     }
 
     #[test]
