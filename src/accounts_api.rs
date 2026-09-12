@@ -6,6 +6,10 @@
 //! login / dev-open) is treated as admin; a user session may manage its own
 //! keys; user management and other users' keys need `is_admin`.
 
+// Helpers return the ready-to-send axum `Response` as their error so handlers
+// can `return denied;` directly; boxing it would only add noise.
+#![allow(clippy::result_large_err)]
+
 use crate::accounts::{self, SessionUser};
 use crate::control_plane_store::{ApiKeyRecord, PersistenceStore, UserRecord};
 use crate::dashboard_auth::{AuthSession, DashboardAuth, no_store};
