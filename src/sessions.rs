@@ -136,15 +136,27 @@ pub fn classify(predecessor: &[ItemFingerprint], current: &[ItemFingerprint]) ->
             cache_bust: false,
         };
     }
-    let changed = &predecessor[shared];
-    let kind = match changed.section {
-        ItemSection::Instructions => DivergenceKind::InstructionsChanged,
-        ItemSection::Tool => DivergenceKind::ToolsChanged,
-        ItemSection::Message => match changed.kind.as_deref() {
-            Some("system") | Some("developer") => DivergenceKind::InstructionsChanged,
-            _ => DivergenceKind::HistoryRewritten,
-        },
-    };
+    // Look at BOTH sides of the divergence point: an item inserted into the
+    // current request (a tool appended to the list) shows up on the current
+    // side while the predecessor's item there is the first shifted message.
+    let kind = [predecessor.get(shared), current.get(shared)]
+        .into_iter()
+        .flatten()
+        .map(|item| match item.section {
+            ItemSection::Instructions => DivergenceKind::InstructionsChanged,
+            ItemSection::Tool => DivergenceKind::ToolsChanged,
+            ItemSection::Message => match item.kind.as_deref() {
+                Some("system") | Some("developer") => DivergenceKind::InstructionsChanged,
+                _ => DivergenceKind::HistoryRewritten,
+            },
+        })
+        // Instructions and tools outrank a history rewrite when either side says so.
+        .min_by_key(|kind| match kind {
+            DivergenceKind::InstructionsChanged => 0,
+            DivergenceKind::ToolsChanged => 1,
+            _ => 2,
+        })
+        .unwrap_or(DivergenceKind::HistoryRewritten);
     Lineage {
         kind,
         shared_prefix: shared,
@@ -757,6 +769,24 @@ mod tests {
         let lineage = classify(&base, &new_tools);
         assert_eq!(lineage.kind, DivergenceKind::ToolsChanged);
         assert_eq!(lineage.index, Some(1));
+
+        // A tool APPENDED to the list shifts every message by one: the
+        // predecessor's item at the divergence is a message, the current
+        // side's is the new tool. That is a tools change (smoke test 2026-09-12).
+        let mut added_tool = appended.clone();
+        added_tool.insert(2, fp("tool-b", ItemSection::Tool, Some("b")));
+        let lineage = classify(&base, &added_tool);
+        assert_eq!(lineage.kind, DivergenceKind::ToolsChanged);
+        assert_eq!(lineage.index, Some(2));
+        assert_eq!(lineage.shared_prefix, 2);
+        assert!(lineage.cache_bust);
+        // A tool REMOVED from the list: the predecessor side holds the tool.
+        let mut removed_tool = base.clone();
+        removed_tool.remove(1);
+        assert_eq!(
+            classify(&base, &removed_tool).kind,
+            DivergenceKind::ToolsChanged
+        );
 
         let mut rewritten = appended.clone();
         rewritten[2].hash = "u1-edited".into();
