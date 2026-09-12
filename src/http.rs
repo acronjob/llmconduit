@@ -694,6 +694,7 @@ async fn log_api_call(
                 body_bytes.clone(),
                 protocol,
                 gateway.persistence_keep_media(),
+                Some((Arc::clone(gateway.harness_detector()), headers.clone())),
             )
             .await,
         )
@@ -778,6 +779,9 @@ async fn log_api_call(
                 client_model,
                 alias: gateway.operational_alias(client_model),
                 created_at_ms: epoch_millis(),
+                harness: persistence_inbound
+                    .as_ref()
+                    .and_then(|inbound| inbound.harness.as_ref()),
             },
         );
         let _ = queue.try_begin(row);
@@ -1225,6 +1229,8 @@ struct PersistenceInbound {
     split: Option<crate::content_store::SplitBody>,
     redacted: Vec<u8>,
     partial: bool,
+    /// Harness/session identity, detected from headers + parsed body.
+    harness: Option<crate::harness::HarnessIdentity>,
 }
 
 /// Parse the inbound body once, extract `model`, and split it into
@@ -1235,14 +1241,24 @@ async fn offload_persistence_inbound(
     body: Bytes,
     protocol: &'static str,
     keep_media: bool,
+    detection: Option<(Arc<crate::harness::HarnessDetector>, HeaderMap)>,
 ) -> PersistenceInbound {
-    fn split_inbound(raw: &[u8], protocol: &str, keep_media: bool) -> PersistenceInbound {
+    fn split_inbound(
+        raw: &[u8],
+        protocol: &str,
+        keep_media: bool,
+        detection: Option<&(Arc<crate::harness::HarnessDetector>, HeaderMap)>,
+    ) -> PersistenceInbound {
         match serde_json::from_slice::<Value>(raw) {
             Ok(value) => {
                 let model = value
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                // Detect while the parsed body is still whole (before splitting
+                // moves the items out); headers are the middleware's clone.
+                let harness =
+                    detection.map(|(detector, headers)| detector.detect(headers, Some(&value)));
                 match crate::content_store::split_value(protocol, value, keep_media) {
                     Ok(split) => PersistenceInbound {
                         valid_json: true,
@@ -1250,6 +1266,7 @@ async fn offload_persistence_inbound(
                         split: Some(split),
                         redacted: Vec::new(),
                         partial: false,
+                        harness,
                     },
                     Err(error) => PersistenceInbound {
                         valid_json: true,
@@ -1257,6 +1274,7 @@ async fn offload_persistence_inbound(
                         split: None,
                         redacted: format!("[redacted: body not splittable: {error}]").into_bytes(),
                         partial: false,
+                        harness,
                     },
                 }
             }
@@ -1272,16 +1290,21 @@ async fn offload_persistence_inbound(
                     4 * 1024,
                 ),
                 partial: false,
+                harness: None,
             },
         }
     }
 
     if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
-        return split_inbound(&body, protocol, keep_media);
+        return split_inbound(&body, protocol, keep_media, detection.as_ref());
     }
     let owned = body.to_vec();
     drop(body);
-    match tokio::task::spawn_blocking(move || split_inbound(&owned, protocol, keep_media)).await {
+    match tokio::task::spawn_blocking(move || {
+        split_inbound(&owned, protocol, keep_media, detection.as_ref())
+    })
+    .await
+    {
         Ok(capture) => capture,
         Err(err) => {
             tracing::warn!(error = %err, "persistence inbound split task failed");
@@ -1293,6 +1316,7 @@ async fn offload_persistence_inbound(
                 split: None,
                 redacted: b"[redacted: persistence inbound task failed]".to_vec(),
                 partial: true,
+                harness: None,
             }
         }
     }
@@ -2994,6 +3018,7 @@ mod tests {
             body,
             crate::content_store::PROTOCOL_RESPONSES,
             true,
+            None,
         )
         .await;
         assert!(capture.valid_json);
@@ -3020,6 +3045,7 @@ mod tests {
             body,
             crate::content_store::PROTOCOL_RESPONSES,
             true,
+            None,
         )
         .await;
         assert!(!capture.valid_json);

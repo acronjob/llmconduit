@@ -28,6 +28,14 @@ control_plane:
     require: false
     conversation_id_header: "x-conversation-id"
 
+  # Harness/session detection. Built-in profiles cover Claude Code, Codex, pi,
+  # oh-my-pi, pi-agent (x-llm-* headers) and a generic fallback; list your own
+  # here to extend or override them (same name replaces the built-in).
+  sessions:
+    infer_sub_sessions: true
+    builtin: extend
+    harnesses: []
+
   operational:
     backends:
       - id: "10000000-0000-4000-8000-000000000001"

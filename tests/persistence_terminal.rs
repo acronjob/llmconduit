@@ -225,6 +225,105 @@ async fn extractor_rejection_records_absent_upstream_hops_as_partial() {
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn persistence_begin_row_carries_the_detected_harness_identity() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "served-model"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse(&[
+                    serde_json::json!({
+                        "id": "chat-1",
+                        "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": null}]
+                    }),
+                    serde_json::json!({
+                        "id": "chat-1",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }),
+                ])),
+        )
+        .mount(&server)
+        .await;
+    let config = Config::from_persisted(&PersistedConfig {
+        upstream_base_url: format!("{}/v1", server.uri()),
+        ..PersistedConfig::default()
+    })
+    .unwrap();
+    let (_unused, gateway) = llmconduit::build_app_with_gateway(config);
+    let writer = Arc::new(RecordingWriter::default());
+    let queue = PersistenceQueue::spawn(
+        Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+        NonZeroUsize::new(32).unwrap(),
+    );
+    let gateway = Arc::new(
+        gateway
+            .as_ref()
+            .clone()
+            .with_persistence_queue(queue.clone()),
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    // A Claude Code sub-agent request on the Anthropic route: session header,
+    // agent id on top, and the JSON-string metadata.user_id.
+    let user_id = serde_json::json!({
+        "device_id": "dev",
+        "account_uuid": "0f0f0f0f-0000-4000-8000-000000000001",
+        "session_id": "11111111-1111-4111-8111-111111111111"
+    })
+    .to_string();
+    let body = serde_json::json!({
+        "model": "served-model",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "hello"}],
+        "metadata": {"user_id": user_id}
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("user-agent", "claude-cli/2.1.205 (external, cli)")
+                .header(
+                    "x-claude-code-session-id",
+                    "11111111-1111-4111-8111-111111111111",
+                )
+                .header("x-claude-code-agent-id", "agent-7")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    queue.flush().await.unwrap();
+
+    let begins = writer.begins.lock().unwrap();
+    assert_eq!(begins.len(), 1);
+    let begin = &begins[0];
+    assert_eq!(begin.client_protocol, "anthropic_messages");
+    assert_eq!(begin.harness.as_deref(), Some("claude-code"));
+    assert_eq!(begin.harness_version.as_deref(), Some("2.1.205"));
+    assert_eq!(
+        begin.harness_session_id.as_deref(),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+    assert_eq!(begin.harness_sub_session_id.as_deref(), Some("agent-7"));
+    assert_eq!(begin.harness_parent_session_id, None);
+    assert_eq!(begin.session_kind, None);
+}
+
 #[async_trait]
 impl PersistenceWriter for RecordingWriter {
     async fn begin_request(&self, row: RequestRow) -> StoreResult<()> {

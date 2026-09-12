@@ -14,6 +14,7 @@ pub mod debug_ui;
 pub mod engine;
 pub mod error;
 pub mod flow_persistence;
+pub mod harness;
 pub mod http;
 pub mod log_rotation;
 pub mod metrics;
@@ -141,6 +142,8 @@ pub struct ControlPlaneRuntime {
     /// Whether persisted request items keep image/data URIs.
     pub persistence_keep_media: bool,
     pub conversation_id_header: String,
+    /// Compiled harness/session detection profiles.
+    pub harness_detector: Arc<crate::harness::HarnessDetector>,
 }
 
 impl Default for ControlPlaneRuntime {
@@ -151,6 +154,7 @@ impl Default for ControlPlaneRuntime {
             persistence_keep_media: true,
             conversation_id_header: crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER
                 .to_string(),
+            harness_detector: Arc::new(crate::harness::HarnessDetector::builtin()),
         }
     }
 }
@@ -486,7 +490,9 @@ pub fn build_app_with_gateway_control_plane_runtime(
     if let Some(queue) = runtime.persistence_queue {
         gateway = gateway.with_persistence_queue(queue);
     }
-    gateway = gateway.with_persistence_keep_media(runtime.persistence_keep_media);
+    gateway = gateway
+        .with_persistence_keep_media(runtime.persistence_keep_media)
+        .with_harness_detector(runtime.harness_detector);
     {}
     if let Some(store) = runtime.persistence_store {
         gateway = gateway.with_persistence_store(store);

@@ -397,6 +397,7 @@ fn migrate_legacy_root_control_plane(value: YamlValue) -> Result<(YamlValue, boo
         auth,
         operational: Some(operational),
         extra: BTreeMap::new(),
+        sessions: crate::harness::SessionsBootstrap::default(),
     };
     root.insert(
         control_key,
@@ -430,6 +431,12 @@ pub struct ControlPlaneSection {
     pub storage: StorageBootstrap,
     #[serde(default, skip_serializing_if = "AuthBootstrap::is_default")]
     pub auth: AuthBootstrap,
+    /// Harness/session detection profiles (see `crate::harness`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::harness::SessionsBootstrap::is_default"
+    )]
+    pub sessions: crate::harness::SessionsBootstrap,
     /// `None` means "use the upstream YAML unchanged". `Some(empty)` is an
     /// explicit operational configuration and may intentionally clear profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]

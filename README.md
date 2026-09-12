@@ -168,6 +168,42 @@ covers `/v1` data routes, including models, token counting, and raw completions
 key verification so requests can be attributed; leave `keys: []` with
 `require: false` for an open development gateway.
 
+### Harness and session detection
+
+Every persisted request records which harness sent it and the session
+identifiers it declared: `harness`, `harness_version`, `harness_session_id`,
+`harness_sub_session_id`, `harness_parent_session_id`, and `session_kind`.
+Detection is data-driven. Built-in profiles cover Claude Code (session and
+agent headers, `metadata.user_id`), Codex (`session-id`, `thread-id`,
+`x-codex-parent-thread-id`, `x-openai-subagent`), pi, oh-my-pi, our own
+`x-llm-*` header convention (used by pi-agent), and a generic fallback over
+the common affinity headers. Profiles are evaluated in order; the first match
+wins. The shipped list is `src/harness_profiles.yaml`; operators add, override
+(same name), reorder, or disable profiles under `control_plane.sessions`:
+
+```yaml
+control_plane:
+  sessions:
+    infer_sub_sessions: true     # lineage inference when nothing is declared
+    builtin: extend              # extend | replace | disable
+    harnesses:
+      - name: my-tool
+        match: { header: { name: user-agent, regex: '^my-tool/' } }
+        version: { header: { name: user-agent, regex: '^my-tool/(\S+)' } }
+        session_id: { first_of: [ { header: x-my-session }, { body: { path: /user } } ] }
+        parent_session_id: { header: x-my-parent-session }
+        sub_sessions: declared   # declared | infer | none
+```
+
+Matchers are `header`, `body` (JSON pointer), `all`, `any`, `not`, and
+`always`. Extractors are `header`, `body`, `json_string` (parse a string
+field as JSON, then read a pointer), `first_of`, and `const`; a `regex` on
+`header`/`body` reduces the value to its first capture group. The header name
+`${conversation_id_header}` resolves to `auth.conversation_id_header`. Any
+harness can opt in to exact attribution by sending `x-llm-harness`
+(`name/version`), `x-llm-session-id`, `x-llm-parent-session-id`, and
+`x-llm-session-kind`.
+
 Storage backends are `none` (disabled), `jsonl` (write-only diagnostic records;
 requires `jsonl_dir`), `sqlite`, and `postgres` (both require `url`).
 Remote PostgreSQL URLs must select encrypted transport with `sslmode=require`,

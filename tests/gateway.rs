@@ -6061,6 +6061,7 @@ async fn persistent_history_body_route_reassembles_full_bodies_per_hop() {
             resolved_model: None,
             status: "running".to_string(),
             created_at_ms: 1,
+            ..RequestRow::default()
         },
     )
     .await
@@ -6196,6 +6197,7 @@ async fn persistent_history_route_reads_sql_without_exposing_key_material() {
             resolved_model: None,
             status: "running".to_string(),
             created_at_ms: 1,
+            ..RequestRow::default()
         },
     )
     .await

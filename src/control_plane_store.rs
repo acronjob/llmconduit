@@ -34,7 +34,7 @@ const API_KEY_HASH_PREFIX: &str = "sha256:";
 
 /// Lifecycle row created at the HTTP ingress seam. `id` is the stable
 /// `api_call_id`; the response id and actual winning backend are unknown here.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct RequestRow {
     pub id: String,
     pub response_id: Option<String>,
@@ -47,6 +47,13 @@ pub struct RequestRow {
     pub resolved_model: Option<String>,
     pub status: String,
     pub created_at_ms: i64,
+    /// Detected harness identity (see `crate::harness`), known at ingress.
+    pub harness: Option<String>,
+    pub harness_version: Option<String>,
+    pub harness_session_id: Option<String>,
+    pub harness_sub_session_id: Option<String>,
+    pub harness_parent_session_id: Option<String>,
+    pub session_kind: Option<String>,
 }
 
 /// One bounded/redacted hop event. Callers must use the existing turn-capture
@@ -163,6 +170,12 @@ pub struct RequestSummary {
     pub timings_json: Option<String>,
     pub client_label: Option<String>,
     pub client_source: Option<String>,
+    pub harness: Option<String>,
+    pub harness_version: Option<String>,
+    pub harness_session_id: Option<String>,
+    pub harness_sub_session_id: Option<String>,
+    pub harness_parent_session_id: Option<String>,
+    pub session_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -778,7 +791,8 @@ const REQUEST_COLUMNS: &str = "SELECT id, response_id, conversation_id, virtual_
     client_protocol, client_model, alias, backend, resolved_model, status, created_at_ms, \
     completed_at_ms, first_token_at_ms, input_tokens, output_tokens, cached_tokens, \
     reasoning_tokens, error, terminal_reason, attempts_json, timings_json, client_label, \
-    client_source FROM requests";
+    client_source, harness, harness_version, harness_session_id, harness_sub_session_id, \
+    harness_parent_session_id, session_kind FROM requests";
 
 fn decode_request<R>(row: &R) -> StoreResult<RequestSummary>
 where
@@ -813,6 +827,12 @@ where
         timings_json: row.try_get(20).map_err(store_error)?,
         client_label: row.try_get(21).map_err(store_error)?,
         client_source: row.try_get(22).map_err(store_error)?,
+        harness: row.try_get(23).map_err(store_error)?,
+        harness_version: row.try_get(24).map_err(store_error)?,
+        harness_session_id: row.try_get(25).map_err(store_error)?,
+        harness_sub_session_id: row.try_get(26).map_err(store_error)?,
+        harness_parent_session_id: row.try_get(27).map_err(store_error)?,
+        session_kind: row.try_get(28).map_err(store_error)?,
     })
 }
 
@@ -1324,9 +1344,10 @@ impl PersistenceWriter for SqlStore {
     async fn begin_request(&self, row: RequestRow) -> StoreResult<()> {
         let sql = format!(
             "INSERT INTO requests (id, response_id, conversation_id, virtual_key_id, \
-             client_protocol, client_model, alias, backend, resolved_model, status, created_at_ms) \
-             VALUES ({})",
-            placeholders(self.postgres(), 11)
+             client_protocol, client_model, alias, backend, resolved_model, status, created_at_ms, \
+             harness, harness_version, harness_session_id, harness_sub_session_id, \
+             harness_parent_session_id, session_kind) VALUES ({})",
+            placeholders(self.postgres(), 17)
         );
         execute!(
             self,
@@ -1342,6 +1363,12 @@ impl PersistenceWriter for SqlStore {
             row.resolved_model,
             row.status,
             row.created_at_ms,
+            row.harness,
+            row.harness_version,
+            row.harness_session_id,
+            row.harness_sub_session_id,
+            row.harness_parent_session_id,
+            row.session_kind,
         );
         Ok(())
     }
@@ -2420,6 +2447,7 @@ mod tests {
             resolved_model: None,
             status: "running".to_string(),
             created_at_ms: 100,
+            ..RequestRow::default()
         }
     }
 
@@ -2506,7 +2534,7 @@ mod tests {
             .collect(),
             SqlPool::Postgres(_) => unreachable!(),
         };
-        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let request_indexes: Vec<String> = match &store.pool {
             SqlPool::Sqlite(pool) => sqlx::query(
                 "SELECT name FROM sqlite_master WHERE type = 'index' \

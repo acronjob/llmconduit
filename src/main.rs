@@ -110,6 +110,7 @@ struct LoadedRuntimeConfig {
     client_auth_specs: Vec<llmconduit::client_auth::VirtualKeySpec>,
     storage: StorageBootstrap,
     conversation_id_header: String,
+    sessions: llmconduit::harness::SessionsBootstrap,
 }
 
 /// Load the namespaced YAML control plane without changing TOML's upstream
@@ -140,6 +141,7 @@ fn load_runtime_config(
             client_auth_specs: Vec::new(),
             storage,
             conversation_id_header,
+            sessions: llmconduit::harness::SessionsBootstrap::default(),
         });
     }
 
@@ -189,6 +191,7 @@ fn load_runtime_config(
         client_auth_specs,
         storage,
         conversation_id_header,
+        sessions: section.sessions.clone(),
     })
 }
 
@@ -360,11 +363,22 @@ async fn prepare_control_plane_runtime(
     } else {
         None
     };
+    let harness_detector = llmconduit::harness::HarnessDetector::from_config(
+        &loaded.sessions,
+        &loaded.conversation_id_header,
+    )
+    .map_err(|error| error.to_string())?;
+    tracing::info!(
+        profiles = ?harness_detector.profile_names(),
+        infer_sub_sessions = harness_detector.infer_sub_sessions(),
+        "harness detection profiles compiled"
+    );
     let runtime = ControlPlaneRuntime {
         persistence_store,
         persistence_queue: persistence_queue.clone(),
         persistence_keep_media: loaded.storage.keep_media,
         conversation_id_header: loaded.conversation_id_header.clone(),
+        harness_detector: Arc::new(harness_detector),
     };
     Ok((runtime, client_auth, persistence_queue))
 }

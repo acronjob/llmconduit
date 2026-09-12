@@ -328,6 +328,8 @@ pub struct BeginPersistenceInput<'a> {
     pub client_model: &'a str,
     pub alias: Option<&'a str>,
     pub created_at_ms: u128,
+    /// Detected harness identity; `None` when detection did not run.
+    pub harness: Option<&'a crate::harness::HarnessIdentity>,
 }
 
 pub fn begin_request(input: BeginPersistenceInput<'_>) -> RequestRow {
@@ -345,6 +347,29 @@ pub fn begin_request(input: BeginPersistenceInput<'_>) -> RequestRow {
         resolved_model: None,
         status: "running".to_owned(),
         created_at_ms: epoch_ms(input.created_at_ms),
+        harness: input
+            .harness
+            .map(|identity| bounded_scalar(&identity.harness)),
+        harness_version: input
+            .harness
+            .and_then(|identity| identity.version.as_deref())
+            .map(bounded_scalar),
+        harness_session_id: input
+            .harness
+            .and_then(|identity| identity.session_id.as_deref())
+            .map(bounded_scalar),
+        harness_sub_session_id: input
+            .harness
+            .and_then(|identity| identity.sub_session_id.as_deref())
+            .map(bounded_scalar),
+        harness_parent_session_id: input
+            .harness
+            .and_then(|identity| identity.parent_session_id.as_deref())
+            .map(bounded_scalar),
+        session_kind: input
+            .harness
+            .and_then(|identity| identity.session_kind.as_deref())
+            .map(bounded_scalar),
     }
 }
 
@@ -1333,8 +1358,22 @@ mod tests {
             client_model: "small",
             alias: Some("small"),
             created_at_ms: 123,
+            harness: Some(&crate::harness::HarnessIdentity {
+                harness: "claude-code".to_string(),
+                version: Some("2.1.0".to_string()),
+                session_id: Some("s-1".to_string()),
+                sub_session_id: Some("agent-1".to_string()),
+                parent_session_id: None,
+                session_kind: None,
+                sub_sessions: crate::harness::SubSessionPolicy::Declared,
+            }),
         });
         assert_eq!(row.id, "api_1");
+        assert_eq!(row.harness.as_deref(), Some("claude-code"));
+        assert_eq!(row.harness_version.as_deref(), Some("2.1.0"));
+        assert_eq!(row.harness_session_id.as_deref(), Some("s-1"));
+        assert_eq!(row.harness_sub_session_id.as_deref(), Some("agent-1"));
+        assert_eq!(row.harness_parent_session_id, None);
         assert_eq!(row.response_id, None);
         assert_eq!(row.backend, None);
         assert_eq!(row.resolved_model, None);

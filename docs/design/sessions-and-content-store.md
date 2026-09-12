@@ -272,6 +272,13 @@ in the same session that was still streaming when it arrived, if any.
 - Inspector: a "vs previous in chain" tab that renders the structural diff of
   the two reconstructed bodies, anchored at the divergence index.
 
+## Status
+
+- Phase 1 (content store) landed in commit a9bd689.
+- Phase 2 (harness detection) is implemented: `crate::harness`, the shipped
+  profiles in `src/harness_profiles.yaml`, `control_plane.sessions`, and the
+  six `requests` columns from migration 0008 written at request begin.
+
 ## Phases
 
 1. Content store: item splitting, blob store, skeleton events, reconstruction

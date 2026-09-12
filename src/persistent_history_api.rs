@@ -481,6 +481,7 @@ mod tests {
             resolved_model: None,
             status: "running".to_string(),
             created_at_ms,
+            ..RequestRow::default()
         }
     }
 
