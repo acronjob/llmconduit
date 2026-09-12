@@ -5921,6 +5921,7 @@ async fn d13_routes_absent_without_debug_ui() {
         "/dashboard/api/history/requests/api_x/body",
         "/dashboard/api/history/sessions",
         "/dashboard/api/history/sessions/s_x",
+        "/dashboard/api/history/throughput",
         "/dashboard/api/history/usage",
         "/dashboard/api/history/metrics",
     ] {
@@ -5987,6 +5988,7 @@ async fn d13_routes_present_in_dev_open_with_debug_ui() {
         "/dashboard/api/history/requests/api_x/body",
         "/dashboard/api/history/sessions",
         "/dashboard/api/history/sessions/s_x",
+        "/dashboard/api/history/throughput",
         "/dashboard/api/history/usage",
         "/dashboard/api/history/metrics",
     ] {
@@ -6174,6 +6176,97 @@ async fn persistent_history_body_route_reassembles_full_bodies_per_hop() {
             .unwrap()
             .contains("$llmconduit_blob")
     );
+}
+
+#[tokio::test]
+async fn persistent_history_throughput_route_buckets_requests_and_validates_input() {
+    use llmconduit::control_plane_store::{PersistenceWriter, RequestFinish, RequestRow, SqlStore};
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("history store"),
+    );
+    PersistenceWriter::begin_request(
+        store.as_ref(),
+        RequestRow {
+            id: "tp-1".to_string(),
+            client_protocol: "responses".to_string(),
+            client_model: "public-model".to_string(),
+            status: "running".to_string(),
+            created_at_ms: 1_000,
+            ..RequestRow::default()
+        },
+    )
+    .await
+    .unwrap();
+    PersistenceWriter::finish_request(
+        store.as_ref(),
+        "tp-1",
+        RequestFinish {
+            status: "completed".to_string(),
+            completed_at_ms: 3_000,
+            first_token_at_ms: Some(1_500),
+            input_tokens: Some(900),
+            output_tokens: Some(150),
+            cached_tokens: Some(600),
+            backend: Some("vllm-a".to_string()),
+            resolved_model: Some("served-model".to_string()),
+            ..RequestFinish::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store);
+    let app = d13_router(Arc::new(gateway));
+
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/throughput?since_ms=0&bucket_secs=60",
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    d13_assert_no_store(&response);
+    let body = d13_json(response).await;
+    assert_eq!(body["bucket_ms"], 60_000);
+    assert_eq!(body["truncated"], false);
+    let bucket = &body["buckets"][0];
+    assert_eq!(bucket["bucket_ms"], 0);
+    assert_eq!(bucket["model"], "served-model");
+    assert_eq!(bucket["backend"], "vllm-a");
+    assert_eq!(bucket["requests"], 1);
+    assert_eq!(bucket["completed"], 1);
+    assert_eq!(bucket["input_tokens"], 900);
+    assert_eq!(bucket["cached_tokens"], 600);
+    assert_eq!(bucket["ttft_ms_sum"], 500);
+    assert_eq!(bucket["prefill_tokens"], 900);
+    assert_eq!(bucket["decode_ms_sum"], 1_500);
+    assert_eq!(bucket["decode_tokens"], 150);
+
+    for bad in [
+        "/dashboard/api/history/throughput?bucket_secs=0",
+        "/dashboard/api/history/throughput?bucket_secs=100000",
+        "/dashboard/api/history/throughput?since_ms=-5",
+    ] {
+        let response = d13_authed_get(&app, &auth, bad).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
 }
 
 #[tokio::test]

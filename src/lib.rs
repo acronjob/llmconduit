@@ -37,6 +37,7 @@ pub(crate) mod test_alloc_probe;
 pub(crate) mod tool_delta_gate;
 pub mod turn_capture;
 pub mod upstream;
+pub mod upstream_metrics;
 pub mod vision;
 
 /// Build provenance, embedded at compile time by `build.rs`: git short commit,

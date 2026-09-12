@@ -210,6 +210,10 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
             get(crate::persistent_history_api::history_request_body),
         )
         .route(
+            "/dashboard/api/history/throughput",
+            get(crate::persistent_history_api::history_throughput),
+        )
+        .route(
             "/dashboard/api/history/sessions",
             get(crate::persistent_history_api::history_sessions),
         )

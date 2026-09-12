@@ -111,6 +111,7 @@ struct LoadedRuntimeConfig {
     storage: StorageBootstrap,
     conversation_id_header: String,
     sessions: llmconduit::harness::SessionsBootstrap,
+    metrics: llmconduit::upstream_metrics::MetricsBootstrap,
 }
 
 /// Load the namespaced YAML control plane without changing TOML's upstream
@@ -142,6 +143,7 @@ fn load_runtime_config(
             storage,
             conversation_id_header,
             sessions: llmconduit::harness::SessionsBootstrap::default(),
+            metrics: llmconduit::upstream_metrics::MetricsBootstrap::default(),
         });
     }
 
@@ -192,6 +194,7 @@ fn load_runtime_config(
         storage,
         conversation_id_header,
         sessions: section.sessions.clone(),
+        metrics: section.metrics.clone(),
     })
 }
 
@@ -204,6 +207,7 @@ async fn run_server(
     let mut loaded = loaded;
     let (runtime, client_auth, flush_queue) = prepare_control_plane_runtime(&mut loaded).await?;
     let bind_addr = loaded.config.bind_addr;
+    let metrics_config = loaded.metrics.clone();
     run_debug_log_cleanup(&loaded.config, &loaded.routes).await;
     let (app, gateway) = build_app_with_gateway_control_plane_runtime(
         loaded.config,
@@ -215,6 +219,7 @@ async fn run_server(
         runtime,
     )?;
     spawn_persistent_backend_metrics(Arc::clone(&gateway));
+    spawn_upstream_metrics_scraper(Arc::clone(&gateway), metrics_config);
     let listener = TcpListener::bind(bind_addr).await?;
     log_listening(bind_addr);
     log_debug_ui_status(&gateway, app_options, bind_addr);
@@ -551,6 +556,7 @@ fn spawn_persistent_backend_metrics(gateway: Arc<llmconduit::engine::Gateway>) {
                 // Persist operational counters/status only. Base URLs and raw
                 // provider errors may contain credentials or response content.
                 let data = serde_json::json!({
+                    "kind": "health",
                     "name": provider.name,
                     "route": provider.route,
                     "status": provider.status,
@@ -569,6 +575,121 @@ fn spawn_persistent_backend_metrics(gateway: Arc<llmconduit::engine::Gateway>) {
                 if let Err(error) = store.record_backend_metrics(sample).await {
                     tracing::warn!(error = %error, "failed to persist backend health sample");
                     break;
+                }
+            }
+        }
+    });
+}
+
+/// Scrape every backend's Prometheus `/metrics` (vLLM / SGLang) on the
+/// configured interval and persist a per-model sample per backend. Backends
+/// that do not answer are retried with backoff; the request path is never
+/// touched. Requires a SQL store (samples share the health-sample table).
+fn spawn_upstream_metrics_scraper(
+    gateway: Arc<llmconduit::engine::Gateway>,
+    config: llmconduit::upstream_metrics::MetricsBootstrap,
+) {
+    if !config.enabled {
+        tracing::info!("upstream metrics scraping disabled by configuration");
+        return;
+    }
+    let Some(store) = gateway.persistence_store() else {
+        tracing::info!("upstream metrics scraping needs a SQL store; skipping");
+        return;
+    };
+    let interval_secs = config.scrape_interval_secs.max(1);
+    tokio::spawn(async move {
+        /// Skip a backend for this many intervals after repeated failures.
+        const BACKOFF_INTERVALS: u32 = 20;
+        const FAILURES_BEFORE_BACKOFF: u32 = 3;
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(error = %error, "upstream metrics scraper could not build an HTTP client");
+                return;
+            }
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut failures: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut skip_until: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        let mut tick: u64 = 0;
+        loop {
+            interval.tick().await;
+            tick += 1;
+            for provider in gateway.upstream_health() {
+                let override_cfg = config.backends.get(&provider.name);
+                if override_cfg.and_then(|cfg| cfg.enabled) == Some(false) {
+                    continue;
+                }
+                if skip_until
+                    .get(&provider.id)
+                    .is_some_and(|until| *until > tick)
+                {
+                    continue;
+                }
+                let url = match override_cfg.and_then(|cfg| cfg.url.clone()) {
+                    Some(url) => url,
+                    None => {
+                        match llmconduit::upstream_metrics::derive_metrics_url(&provider.base_url) {
+                            Some(url) => url,
+                            None => continue,
+                        }
+                    }
+                };
+                let scraped_at_ms = chrono::Utc::now().timestamp_millis();
+                let outcome = async {
+                    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+                    if !response.status().is_success() {
+                        return Err(format!("status {}", response.status()));
+                    }
+                    let text = response.text().await.map_err(|e| e.to_string())?;
+                    llmconduit::upstream_metrics::parse_exposition(
+                        &provider.id,
+                        &text,
+                        scraped_at_ms,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                .await;
+                match outcome {
+                    Ok(sample) => {
+                        failures.remove(&provider.id);
+                        let data = match serde_json::to_string(&sample) {
+                            Ok(data) => data,
+                            Err(error) => {
+                                tracing::warn!(error = %error, backend = %provider.id, "could not encode upstream metrics sample");
+                                continue;
+                            }
+                        };
+                        if let Err(error) = store
+                            .record_backend_metrics(llmconduit::control_plane_store::MetricSample {
+                                backend: provider.id.clone(),
+                                ts_ms: scraped_at_ms,
+                                data,
+                            })
+                            .await
+                        {
+                            tracing::warn!(error = %error, backend = %provider.id, "failed to persist upstream metrics sample");
+                        }
+                    }
+                    Err(error) => {
+                        let count = failures.entry(provider.id.clone()).or_insert(0);
+                        *count += 1;
+                        if *count == 1 {
+                            tracing::info!(backend = %provider.id, %url, error = %error, "upstream metrics scrape failed");
+                        }
+                        if *count >= FAILURES_BEFORE_BACKOFF {
+                            skip_until
+                                .insert(provider.id.clone(), tick + u64::from(BACKOFF_INTERVALS));
+                            *count = 0;
+                            tracing::info!(backend = %provider.id, "upstream metrics scrape backing off");
+                        }
+                    }
                 }
             }
         }

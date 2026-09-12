@@ -233,6 +233,29 @@ harness can opt in to exact attribution by sending `x-llm-harness`
 (`name/version`), `x-llm-session-id`, `x-llm-parent-session-id`, and
 `x-llm-session-kind`.
 
+### Upstream engine metrics and throughput
+
+With a SQL store, llmconduit scrapes every backend's Prometheus `/metrics`
+endpoint (derived from its base URL by stripping `/v1`; override or disable per
+backend under `control_plane.metrics.backends`) every
+`control_plane.metrics.scrape_interval_secs` seconds. vLLM V1 and SGLang
+families are recognised (running/waiting requests, KV-cache usage, prompt,
+generation and cached prompt tokens, prefix-cache hits/queries, TTFT,
+inter-token and end-to-end latency sums and counts, prefill/decode time,
+finished requests by reason, preemptions, SGLang decode throughput and
+realtime prefill/decode token counters) and folded per `model_name`. Samples
+are stored in `backend_metrics` tagged `"kind": "upstream"` next to the
+gateway health samples (`"kind": "health"`), and served by
+`GET /dashboard/api/history/metrics`. Backends without a metrics endpoint are
+retried with backoff and never affect the request path.
+
+Independently of upstream metrics, `GET
+/dashboard/api/history/throughput?since_ms=&bucket_secs=` returns the
+gateway-side per-model/backend series computed from persisted requests:
+requests, completed, input/output/cached tokens, and the TTFT and decode-time
+sums with their counts, from which prefill and decode throughput are derived.
+This works for every backend, including ones that expose no metrics.
+
 Storage backends are `none` (disabled), `jsonl` (write-only diagnostic records;
 requires `jsonl_dir`), `sqlite`, and `postgres` (both require `url`).
 Remote PostgreSQL URLs must select encrypted transport with `sslmode=require`,

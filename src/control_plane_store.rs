@@ -196,6 +196,31 @@ pub struct RequestSummary {
     pub cache_bust: Option<bool>,
 }
 
+/// One (bucket, model, backend) cell of the gateway-side throughput series.
+/// Sums cover only rows that reported the class; the `*_count` companions say
+/// how many rows contributed so a consumer can derive means without lying.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ThroughputBucket {
+    pub bucket_ms: i64,
+    pub model: String,
+    pub backend: Option<String>,
+    pub requests: i64,
+    pub completed: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    /// Sum of (first token − request start) over rows with a first token.
+    pub ttft_ms_sum: i64,
+    pub ttft_count: i64,
+    /// Input tokens of rows with a first token (the prefill throughput numerator).
+    pub prefill_tokens: i64,
+    /// Sum of (completed − first token) over rows with both and reported output.
+    pub decode_ms_sum: i64,
+    /// Output tokens of those rows (the decode throughput numerator).
+    pub decode_tokens: i64,
+    pub decode_count: i64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MetricSample {
     pub backend: String,
@@ -368,6 +393,14 @@ pub trait PersistenceStore: PersistenceWriter {
     /// The latest request of a node's chain with its inbound items.
     async fn chain_head(&self, session_id: &str)
     -> StoreResult<Option<crate::sessions::ChainHead>>;
+    /// Gateway-side per-model throughput: requests bucketed by `bucket_ms`
+    /// since `since_ms`, grouped by served model and backend. Oldest first.
+    async fn throughput_series(
+        &self,
+        since_ms: i64,
+        bucket_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<ThroughputBucket>>;
 
     async fn get_setting(&self, key: &str) -> StoreResult<Option<String>>;
     async fn set_setting(&self, key: &str, value: &str) -> StoreResult<()>;
@@ -998,6 +1031,32 @@ where
         size: row.try_get(2).map_err(store_error)?,
         content: row.try_get(3).map_err(store_error)?,
         created_at_ms: row.try_get(4).map_err(store_error)?,
+    })
+}
+
+fn decode_throughput<R>(row: &R) -> StoreResult<ThroughputBucket>
+where
+    R: Row,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    usize: sqlx::ColumnIndex<R>,
+{
+    Ok(ThroughputBucket {
+        bucket_ms: row.try_get(0).map_err(store_error)?,
+        model: row.try_get(1).map_err(store_error)?,
+        backend: row.try_get(2).map_err(store_error)?,
+        requests: row.try_get(3).map_err(store_error)?,
+        completed: row.try_get(4).map_err(store_error)?,
+        input_tokens: row.try_get(5).map_err(store_error)?,
+        output_tokens: row.try_get(6).map_err(store_error)?,
+        cached_tokens: row.try_get(7).map_err(store_error)?,
+        ttft_ms_sum: row.try_get(8).map_err(store_error)?,
+        ttft_count: row.try_get(9).map_err(store_error)?,
+        prefill_tokens: row.try_get(10).map_err(store_error)?,
+        decode_ms_sum: row.try_get(11).map_err(store_error)?,
+        decode_tokens: row.try_get(12).map_err(store_error)?,
+        decode_count: row.try_get(13).map_err(store_error)?,
     })
 }
 
@@ -2178,6 +2237,48 @@ impl PersistenceStore for SqlStore {
         }))
     }
 
+    async fn throughput_series(
+        &self,
+        since_ms: i64,
+        bucket_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<ThroughputBucket>> {
+        let pg = self.postgres();
+        let bucket_ms = bucket_ms.max(1);
+        let sql = format!(
+            "SELECT (created_at_ms / {b1}) * {b2} AS bucket_ms, \
+             COALESCE(resolved_model, client_model) AS model, backend, \
+             CAST(COUNT(*) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(cached_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN first_token_at_ms IS NOT NULL \
+                 THEN first_token_at_ms - created_at_ms END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN first_token_at_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN first_token_at_ms IS NOT NULL THEN input_tokens END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN first_token_at_ms IS NOT NULL AND completed_at_ms IS NOT NULL \
+                 AND output_tokens IS NOT NULL THEN completed_at_ms - first_token_at_ms END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN first_token_at_ms IS NOT NULL AND completed_at_ms IS NOT NULL \
+                 AND output_tokens IS NOT NULL THEN output_tokens END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN first_token_at_ms IS NOT NULL AND completed_at_ms IS NOT NULL \
+                 AND output_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT) \
+             FROM requests WHERE created_at_ms >= {since} \
+             GROUP BY 1, 2, 3 ORDER BY 1, 2, 3 LIMIT {limit}",
+            b1 = placeholder(pg, 1),
+            b2 = placeholder(pg, 2),
+            since = placeholder(pg, 3),
+            limit = placeholder(pg, 4)
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(fetch_all_decoded!(
+            self,
+            &sql,
+            [bucket_ms, bucket_ms, since_ms, limit],
+            decode_throughput
+        ))
+    }
+
     async fn get_setting(&self, key: &str) -> StoreResult<Option<String>> {
         let sql = format!(
             "SELECT value FROM settings WHERE key = {}",
@@ -3074,6 +3175,111 @@ mod tests {
             ["aa", "bb"]
         );
         assert!(store.chain_head("child").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn throughput_series_buckets_per_model_and_only_counts_reported_classes() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        let mut rows = Vec::new();
+        for (id, model, created, first, done, input, output, cached) in [
+            (
+                "a",
+                "m1",
+                1_000,
+                Some(1_400),
+                Some(3_400),
+                Some(1_000),
+                Some(200),
+                Some(800),
+            ),
+            (
+                "b",
+                "m1",
+                2_000,
+                Some(2_200),
+                Some(2_700),
+                Some(500),
+                Some(50),
+                None,
+            ),
+            ("c", "m1", 61_000, None, None, Some(100), None, None), // running, no first token
+            (
+                "d",
+                "m2",
+                61_500,
+                Some(61_600),
+                Some(62_600),
+                None,
+                Some(400),
+                None,
+            ),
+        ] {
+            let mut row = request(id);
+            row.client_model = model.to_string();
+            row.created_at_ms = created;
+            rows.push((row, first, done, input, output, cached));
+        }
+        for (row, first, done, input, output, cached) in rows {
+            let id = row.id.clone();
+            store.begin_request(row).await.unwrap();
+            if let Some(done) = done {
+                let mut done_row = finish();
+                done_row.first_token_at_ms = first;
+                done_row.completed_at_ms = done;
+                done_row.input_tokens = input;
+                done_row.output_tokens = output;
+                done_row.cached_tokens = cached;
+                done_row.resolved_model = None;
+                done_row.backend = Some("vllm-a".to_string());
+                store.finish_request(&id, done_row).await.unwrap();
+            }
+        }
+        let series = store.throughput_series(0, 60_000, 100).await.unwrap();
+        assert_eq!(
+            series
+                .iter()
+                .map(|b| (b.bucket_ms, b.model.as_str(), b.backend.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "m1", Some("vllm-a")),
+                (60_000, "m1", None),
+                (60_000, "m2", Some("vllm-a"))
+            ]
+        );
+        let first = &series[0];
+        assert_eq!(first.requests, 2);
+        assert_eq!(first.completed, 2);
+        assert_eq!(first.input_tokens, 1_500);
+        assert_eq!(first.output_tokens, 250);
+        assert_eq!(first.cached_tokens, 800);
+        assert_eq!(first.ttft_ms_sum, 400 + 200);
+        assert_eq!(first.ttft_count, 2);
+        assert_eq!(first.prefill_tokens, 1_500);
+        assert_eq!(first.decode_ms_sum, 2_000 + 500);
+        assert_eq!(first.decode_tokens, 250);
+        assert_eq!(first.decode_count, 2);
+        // The running request contributes no latency figures.
+        let running = &series[1];
+        assert_eq!(running.requests, 1);
+        assert_eq!(running.ttft_count, 0);
+        assert_eq!(running.decode_count, 0);
+        // A row without input tokens adds nothing to prefill even with a first token.
+        let m2 = &series[2];
+        assert_eq!(m2.prefill_tokens, 0);
+        assert_eq!(m2.decode_tokens, 400);
+        assert!(
+            store
+                .throughput_series(100_000, 60_000, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.throughput_series(0, 60_000, 1).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

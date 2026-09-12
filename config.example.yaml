@@ -36,6 +36,17 @@ control_plane:
     builtin: extend
     harnesses: []
 
+  # Upstream engine metrics: every backend's Prometheus /metrics (vLLM, SGLang)
+  # is scraped and stored per model next to the gateway's own health samples.
+  # The URL is derived from the backend base_url (…/v1 -> …/metrics); override
+  # or disable per backend name.
+  metrics:
+    enabled: true
+    scrape_interval_secs: 15
+    backends: {}
+    #  local: { url: "http://host.docker.internal:8000/metrics" }
+    #  openrouter: { enabled: false }
+
   operational:
     backends:
       - id: "10000000-0000-4000-8000-000000000001"

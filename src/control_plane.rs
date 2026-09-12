@@ -398,6 +398,7 @@ fn migrate_legacy_root_control_plane(value: YamlValue) -> Result<(YamlValue, boo
         operational: Some(operational),
         extra: BTreeMap::new(),
         sessions: crate::harness::SessionsBootstrap::default(),
+        metrics: crate::upstream_metrics::MetricsBootstrap::default(),
     };
     root.insert(
         control_key,
@@ -437,6 +438,12 @@ pub struct ControlPlaneSection {
         skip_serializing_if = "crate::harness::SessionsBootstrap::is_default"
     )]
     pub sessions: crate::harness::SessionsBootstrap,
+    /// Upstream engine metrics scraping (see `crate::upstream_metrics`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::upstream_metrics::MetricsBootstrap::is_default"
+    )]
+    pub metrics: crate::upstream_metrics::MetricsBootstrap,
     /// `None` means "use the upstream YAML unchanged". `Some(empty)` is an
     /// explicit operational configuration and may intentionally clear profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
