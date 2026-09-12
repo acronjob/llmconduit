@@ -28,10 +28,12 @@ pub const ENV_ADMIN_USERNAME: &str = "LLMCONDUIT_ADMIN_USERNAME";
 pub const ENV_ADMIN_PASSWORD: &str = "LLMCONDUIT_ADMIN_PASSWORD";
 
 /// The user behind a dashboard session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SessionUser {
+    /// Opaque user id (UUID string).
     pub id: String,
     pub username: String,
+    /// Whether the user may manage users and other users' keys.
     pub is_admin: bool,
 }
 

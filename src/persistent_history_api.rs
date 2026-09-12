@@ -39,56 +39,105 @@ const _: () = {
     assert!(DEFAULT_USAGE_WINDOW_MS > 0);
 };
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryRequestsQuery {
+    /// Maximum rows to return; clamped to 1..=500, default 100.
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryUsageQuery {
+    /// Restrict to one virtual key by its stable database id (never the credential or its digest); trimmed, 1..=256 bytes.
     pub virtual_key_id: Option<String>,
+    /// Restrict to one user id; trimmed, blank means no filter.
     pub user_id: Option<String>,
+    /// Window start (epoch ms, must not be negative); default now − 30 days.
     pub since_ms: Option<i64>,
+    /// Maximum buckets to return; clamped to 1..=500, default 100.
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryMetricsQuery {
+    /// Window start (epoch ms, must not be negative); default now − 24 hours.
     pub since_ms: Option<i64>,
+    /// Maximum samples to return; clamped to 1..=5000, default 1000.
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
-struct RequestsBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct RequestsBody {
+    /// Newest first.
     requests: Vec<RequestSummary>,
+    /// The effective (clamped) limit that bounded the query.
     limit: i64,
 }
 
-#[derive(Debug, Serialize)]
-struct RequestDetailBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct RequestDetailBody {
     request: RequestSummary,
+    /// Bounded/redacted hop events, at most 64 (the newest are kept).
     events: Vec<EventRow>,
+    /// `true` when more than 64 events exist and older ones were dropped.
     events_truncated: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct UsageBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct UsageBody {
     usage: Vec<UsageBucket>,
+    /// Effective window start (epoch ms).
     since_ms: i64,
+    /// The effective (clamped) limit.
     limit: usize,
+    /// `true` when more buckets matched than `limit`.
     truncated: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct MetricsBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct MetricsBody {
+    /// The newest `limit` samples in the window, in chronological order.
     samples: Vec<MetricSample>,
+    /// Effective window start (epoch ms).
     since_ms: i64,
+    /// The effective (clamped) limit.
     limit: usize,
+    /// `true` when more samples existed in the window than `limit`.
     truncated: bool,
+}
+
+/// Body of every history 500: `{"error": "persistent history read failed",
+/// "operation": "<static label of the failed store operation>"}`.
+// Documentation-only mirror of the literal built by `internal_error`, which
+// still serializes `serde_json::json!` unchanged; keep the two in step.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct HistoryReadFailed {
+    /// Always `"persistent history read failed"`; the underlying error text stays in the log.
+    error: String,
+    /// Static label of the store operation that failed, e.g. `"list durable requests"`.
+    operation: String,
 }
 
 /// `GET /dashboard/api/history/requests?limit=`. Newest first; the SQL query is
 /// bounded before execution, rather than loading an unbounded result and slicing.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/requests",
+    tag = "history",
+    operation_id = "history_requests",
+    params(HistoryRequestsQuery),
+    responses(
+        (status = 200, description = "The newest requests, bounded by the clamped `limit`.", body = RequestsBody),
+        (status = 400, description = "Malformed query string (e.g. a non-integer `limit`), rejected by the query extractor; plain-text body.", body = String, content_type = "text/plain"),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 500, description = "Store read failed; `operation` is `list durable requests`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "The store query exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_requests(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<HistoryRequestsQuery>,
@@ -116,6 +165,22 @@ async fn history_requests_from(
 
 /// `GET /dashboard/api/history/requests/:id`. Both the terminal aggregate and
 /// its bounded/redacted four-hop event records are returned. Unknown ids are 404.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/requests/{id}",
+    tag = "history",
+    operation_id = "history_request_detail",
+    params(("id" = String, Path, description = "Request id (the stable `api_call_id`); 1..=256 bytes.")),
+    responses(
+        (status = 200, description = "The terminal aggregate plus its newest events (at most 64).", body = RequestDetailBody),
+        (status = 400, description = "`invalid request id` (empty or longer than 256 bytes).", body = crate::openapi::DashboardError),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 404, description = "`request not found`.", body = crate::openapi::DashboardError),
+        (status = 500, description = "Store read failed; `operation` is `read durable request` or `read durable request events`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "The store query exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_request_detail(
     State(gateway): State<Arc<Gateway>>,
     Path(id): Path<String>,
@@ -166,24 +231,34 @@ async fn history_request_detail_from(
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryBodyQuery {
+    /// Which hop's request body to reassemble: `client_in` (default) or `upstream_out`.
     pub hop: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryThroughputQuery {
+    /// Window start (epoch ms, must not be negative); default now − 1 hour.
     pub since_ms: Option<i64>,
+    /// Bucket width in seconds, 1..=86400; default 60.
     pub bucket_secs: Option<i64>,
+    /// Maximum buckets to return; clamped to 1..=10000, default 2000.
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
-struct ThroughputBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ThroughputBody {
     buckets: Vec<crate::control_plane_store::ThroughputBucket>,
+    /// Effective window start (epoch ms).
     since_ms: i64,
+    /// Bucket width in milliseconds (`bucket_secs * 1000`).
     bucket_ms: i64,
+    /// The effective (clamped) limit.
     limit: usize,
+    /// `true` when more buckets matched than `limit`.
     truncated: bool,
 }
 
@@ -196,6 +271,21 @@ const MAX_THROUGHPUT_LIMIT: usize = 10_000;
 /// `GET /dashboard/api/history/throughput?since_ms=&bucket_secs=&limit=`.
 /// Gateway-side per-model/backend request + token series with the TTFT and
 /// decode-time sums a consumer needs for prefill/decode throughput.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/throughput",
+    tag = "history",
+    operation_id = "history_throughput",
+    params(HistoryThroughputQuery),
+    responses(
+        (status = 200, description = "Per-(bucket, model, backend) request and token series.", body = ThroughputBody),
+        (status = 400, description = "`since_ms must not be negative` or `bucket_secs must be between 1 and 86400` (JSON); or a malformed query string rejected by the query extractor (plain text).", body = crate::openapi::DashboardError),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 500, description = "Store read failed; `operation` is `read durable throughput series`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "The store query exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_throughput(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<HistoryThroughputQuery>,
@@ -249,17 +339,36 @@ async fn history_throughput_from(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ActivityBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ActivityBody {
     buckets: Vec<crate::control_plane_store::ActivityBucket>,
+    /// Effective window start (epoch ms).
     since_ms: i64,
+    /// Bucket width in milliseconds (`bucket_secs * 1000`).
     bucket_ms: i64,
+    /// The effective (clamped) limit.
     limit: usize,
+    /// `true` when more buckets matched than `limit`.
     truncated: bool,
 }
 
 /// `GET /dashboard/api/history/activity?since_ms=&bucket_secs=&limit=`.
 /// Per-user / per-key request and token series (the activity dashboard).
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/activity",
+    tag = "history",
+    operation_id = "history_activity",
+    params(HistoryThroughputQuery),
+    responses(
+        (status = 200, description = "Per-(bucket, user, virtual key) request and token series.", body = ActivityBody),
+        (status = 400, description = "`since_ms must not be negative` or `bucket_secs must be between 1 and 86400` (JSON); or a malformed query string rejected by the query extractor (plain text).", body = crate::openapi::DashboardError),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 500, description = "Store read failed; `operation` is `read durable activity series`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "The store query exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_activity(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<HistoryThroughputQuery>,
@@ -313,33 +422,46 @@ async fn history_activity_from(
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistorySessionsQuery {
+    /// Window start on `last_seen_ms` (epoch ms, must not be negative); default now − 7 days.
     pub since_ms: Option<i64>,
+    /// Maximum sessions to return; clamped to 1..=500, default 100.
     pub limit: Option<usize>,
     /// `true` (default) lists only top-level nodes.
     pub roots: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistorySessionQuery {
+    /// Maximum requests to include; clamped to 1..=1000, default 200.
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
-struct SessionsBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct SessionsBody {
+    /// Most recently active first.
     sessions: Vec<crate::sessions::SessionRow>,
+    /// Effective window start (epoch ms).
     since_ms: i64,
+    /// The effective (clamped) limit.
     limit: usize,
+    /// `true` when more sessions matched than `limit`.
     truncated: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct SessionDetailBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct SessionDetailBody {
     session: crate::sessions::SessionRow,
+    /// Parent chain, nearest first; at most 32 entries.
     ancestors: Vec<crate::sessions::SessionRow>,
+    /// Direct child nodes.
     children: Vec<crate::sessions::SessionRow>,
+    /// The newest requests of this node, at most `limit`.
     requests: Vec<RequestSummary>,
+    /// `true` when more than `limit` requests exist and older ones were dropped.
     requests_truncated: bool,
 }
 
@@ -353,6 +475,21 @@ const MAX_ANCESTORS: usize = 32;
 
 /// `GET /dashboard/api/history/sessions?since_ms=&limit=&roots=`. The most
 /// recently active session nodes; top-level only unless `roots=false`.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/sessions",
+    tag = "history",
+    operation_id = "history_sessions",
+    params(HistorySessionsQuery),
+    responses(
+        (status = 200, description = "The most recently active session nodes in the window.", body = SessionsBody),
+        (status = 400, description = "`since_ms must not be negative` (JSON); or a malformed query string rejected by the query extractor (plain text).", body = crate::openapi::DashboardError),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 500, description = "Store read failed; `operation` is `read durable sessions`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "The store query exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_sessions(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<HistorySessionsQuery>,
@@ -403,6 +540,25 @@ async fn history_sessions_from(
 
 /// `GET /dashboard/api/history/sessions/:id?limit=`. One node with its
 /// ancestors (nearest first), direct children, and newest requests.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/sessions/{id}",
+    tag = "history",
+    operation_id = "history_session_detail",
+    params(
+        ("id" = String, Path, description = "Session node id; 1..=256 bytes."),
+        HistorySessionQuery,
+    ),
+    responses(
+        (status = 200, description = "The node with its ancestors (nearest first, at most 32), direct children, and newest requests.", body = SessionDetailBody),
+        (status = 400, description = "`invalid session id` (empty or longer than 256 bytes) (JSON); or a malformed query string rejected by the query extractor (plain text).", body = crate::openapi::DashboardError),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 404, description = "`session not found`.", body = crate::openapi::DashboardError),
+        (status = 500, description = "Store read failed; `operation` is `read durable session`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "The combined store reads exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_session_detail(
     State(gateway): State<Arc<Gateway>>,
     Path(id): Path<String>,
@@ -468,6 +624,25 @@ async fn history_session_detail_from(
 /// Reassembles the full request body of one hop from its skeleton event and
 /// content-addressed items. The response is the body itself (JSON), not an
 /// envelope. 404 when the request or its hop body is not stored.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/requests/{id}/body",
+    tag = "history",
+    operation_id = "history_request_body",
+    params(
+        ("id" = String, Path, description = "Request id (the stable `api_call_id`); 1..=256 bytes."),
+        HistoryBodyQuery,
+    ),
+    responses(
+        (status = 200, description = "The reassembled (secret-redacted) request body of the selected hop, not an envelope. Its shape is the client protocol's request for `client_in` and a chat-completions request for `upstream_out`.", body = serde_json::Value, content_type = "application/json"),
+        (status = 400, description = "`invalid request id` (empty or longer than 256 bytes) or `hop must be client_in or upstream_out` (JSON); or a malformed query string rejected by the query extractor (plain text).", body = crate::openapi::DashboardError),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 404, description = "`request not found`, or `request body not stored` when the hop's skeleton event is missing or has no content.", body = crate::openapi::DashboardError),
+        (status = 500, description = "Store read or reassembly failed; `operation` is one of `read durable request`, `read durable request events`, `read durable request items`, `read durable content blobs`, `assemble durable request body`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "A store query exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_request_body(
     State(gateway): State<Arc<Gateway>>,
     Path(id): Path<String>,
@@ -586,6 +761,21 @@ async fn history_request_body_from(
 
 /// `GET /dashboard/api/history/usage?virtual_key_id=&since_ms=`. The key filter
 /// is a stable database id, never a presented credential or its digest.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/usage",
+    tag = "history",
+    operation_id = "history_usage",
+    params(HistoryUsageQuery),
+    responses(
+        (status = 200, description = "Usage buckets grouped by user, virtual key, alias, resolved model and backend within the window.", body = UsageBody),
+        (status = 400, description = "`invalid virtual_key_id` (blank after trimming or longer than 256 bytes) or `since_ms must not be negative` (JSON); or a malformed query string rejected by the query extractor (plain text).", body = crate::openapi::DashboardError),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 500, description = "Store read failed; `operation` is `read durable usage`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "The store query exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_usage(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<HistoryUsageQuery>,
@@ -659,6 +849,21 @@ async fn history_usage_from(
 /// `GET /dashboard/api/history/metrics?since_ms=&limit=`. The store query is
 /// time-bounded and the response is row-bounded. The newest `limit` samples in
 /// the selected window are returned in chronological order.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/history/metrics",
+    tag = "history",
+    operation_id = "history_metrics",
+    params(HistoryMetricsQuery),
+    responses(
+        (status = 200, description = "The newest `limit` backend metric samples in the window, in chronological order.", body = MetricsBody),
+        (status = 400, description = "`since_ms must not be negative` (JSON); or a malformed query string rejected by the query extractor (plain text).", body = crate::openapi::DashboardError),
+        (status = 401, description = "No valid dashboard session; plain-text body `unauthorized`.", body = String, content_type = "text/plain"),
+        (status = 500, description = "Store read failed; `operation` is `read durable metric history`.", body = HistoryReadFailed),
+        (status = 503, description = "Persistent history is disabled (no SQL store configured).", body = crate::openapi::DashboardError),
+        (status = 504, description = "The store query exceeded the 5 s history timeout.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn history_metrics(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<HistoryMetricsQuery>,

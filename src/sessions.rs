@@ -166,7 +166,7 @@ pub fn classify(predecessor: &[ItemFingerprint], current: &[ItemFingerprint]) ->
 }
 
 /// Durable shape of a session node (table `sessions`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SessionRow {
     pub id: String,
     pub parent_id: Option<String>,

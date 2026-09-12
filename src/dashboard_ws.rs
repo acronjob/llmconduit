@@ -81,6 +81,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
+use utoipa::ToSchema;
 
 /// The explicit WS close code the dashboard SPA recognizes as a SESSION EXPIRY /
 /// auth failure (`dashboard-frontend/src/api/ws.ts` `WS_AUTH_CLOSE`): on `4401` the
@@ -134,28 +135,41 @@ pub struct DashboardFrame {
 /// `{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup
 /// baseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes
 /// snake_case to the frozen `SeqCursors` contract.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SeqCursors {
+    /// FlowStore domain cursor.
     pub flow_seq: u64,
+    /// Metrics domain cursor.
     pub metrics_seq: u64,
+    /// Topology domain cursor.
     pub topology_seq: u64,
+    /// Monitor (debug transcript) domain cursor.
     pub monitor_seq: u64,
 }
 
 /// The full `/api/metrics`-shaped snapshot body (the flat tile + the three
 /// windows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live
 /// [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MetricsSnapshot {
+    /// Metrics domain cursor.
     pub metrics_seq: u64,
+    /// Headline (`m1`) requests per second (terminal flows ÷ window seconds).
     pub reqs_per_sec: f64,
+    /// Count of currently open flows (on `/snapshot`: open flows in the frozen cut).
     pub active_streams: u64,
+    /// Headline (`m1`) percentage of terminal flows in the error status class.
     pub error_pct: f64,
+    /// Headline (`m1`) p50 latency in ms.
     pub p50: f64,
+    /// Headline (`m1`) p95 latency in ms.
     pub p95: f64,
+    /// Headline (`m1`) p99 latency in ms.
     pub p99: f64,
+    /// Headline (`m1`) reported tokens per second.
     pub tokens_per_sec: f64,
+    /// Headline (`m1`) priced USD per minute.
     pub cost_per_min: f64,
     /// Terminal-flow sample count of the headline (`m1`) window — the
     /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
@@ -170,6 +184,7 @@ pub struct MetricsSnapshot {
     /// `windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated
     /// when any priced bucket bills cached at the default `0.0`.
     pub cost_confidence: crate::dashboard_api::CostConfidence,
+    /// The `m1`/`m5`/`h1` window tiles.
     pub windows: MetricWindows,
 }
 
@@ -177,11 +192,15 @@ pub struct MetricsSnapshot {
 /// PLUS its `topology_seq` cursor. Mirrors the frontend `TopologyResponse`. The
 /// price table is empty until D13 wires the price config; an empty map satisfies
 /// the frontend `isPriceTable` guard (vacuously every value is a finite price).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TopologySnapshot {
+    /// Topology domain cursor (the provider-health snapshot version).
     pub topology_seq: u64,
+    /// One node per published provider.
     pub nodes: Vec<TopologyNode>,
+    /// One `gateway` → provider edge per provider.
     pub edges: Vec<TopologyEdge>,
+    /// Configured per-model prices keyed by served model id (empty when none configured).
     pub price_table: std::collections::BTreeMap<String, ModelPrice>,
 }
 
@@ -351,10 +370,13 @@ pub struct MetricTick {
 }
 
 /// The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MetricWindows {
+    /// Last 60 seconds.
     pub m1: MetricWindow,
+    /// Last 5 minutes.
     pub m5: MetricWindow,
+    /// Last hour.
     pub h1: MetricWindow,
 }
 
@@ -367,15 +389,23 @@ pub struct MetricWindows {
 /// so the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)
 /// and `active_streams` (live open-flow count) stay numeric. The field is a finite
 /// `u64`, so it never violates the frozen finite-number wire contract.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct MetricWindow {
+    /// Requests per second (terminal flows in the window ÷ window seconds).
     pub reqs_per_sec: f64,
+    /// Count of currently open flows (identical across the three windows).
     pub active_streams: u64,
+    /// Percentage of terminal flows in the window in the error status class.
     pub error_pct: f64,
+    /// p50 latency in ms.
     pub p50: f64,
+    /// p95 latency in ms.
     pub p95: f64,
+    /// p99 latency in ms.
     pub p99: f64,
+    /// Reported tokens per second over the window.
     pub tokens_per_sec: f64,
+    /// Priced USD per minute over the window.
     pub cost_per_min: f64,
     /// Terminal-flow sample count in this window (the measured/unavailable signal for
     /// latency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they
@@ -409,18 +439,29 @@ pub struct MetricWindow {
 /// (NOT nullable), unlike the other `Option` fields which serde emits as `null`.
 /// Every other field mirrors `ProviderHealth` exactly (keys always present, the
 /// nullable ones as JSON `null`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TopologyNode {
+    /// Stable provider identifier (the configured provider/route name).
     pub id: String,
+    /// Human-readable provider name (currently identical to `id`).
     pub name: String,
+    /// The routing-provider name that owns this entry; `null` for a bare/failover provider.
     pub route: Option<String>,
+    /// The upstream base URL this provider POSTs to.
     pub base_url: String,
+    /// Serving status.
     pub status: crate::upstream::ProviderStatus,
+    /// Epoch-ms the failure cooldown ends; `null` when not cooling.
     pub cooling_until_ms: Option<u64>,
+    /// The most recent failure message recorded for this provider; `null` when none.
     pub last_error: Option<String>,
+    /// Cumulative count of flows this provider served.
     pub served_count: u64,
+    /// Cumulative count of times this provider was failed over FROM.
     pub failover_count: u64,
+    /// Consecutive failures since the last success.
     pub consecutive_failures: u32,
+    /// Epoch-ms this provider's `/v1/models` catalog was last fetched; `null` until the first refresh.
     pub catalog_fetched_ms: Option<u64>,
     /// Flattened from `ProviderHealth::catalog_size: Option<u64>` to a required
     /// non-null count (`None → 0`) per the frozen contract.
@@ -488,12 +529,17 @@ impl TopologyNode {
 /// they serialize as `0.0` (the contract requires the keys present + finite, not
 /// a specific value), so the byte-shape is exact while the rich values land in
 /// D13.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TopologyEdge {
+    /// Always `gateway`.
     pub from: String,
+    /// The provider id this edge feeds.
     pub to: String,
+    /// Requests per second to this provider over the `m1` window.
     pub throughput: f64,
+    /// Reported tokens per second to this provider over the `m1` window.
     pub tokens_per_sec: f64,
+    /// Priced USD per second to this provider over the `m1` window.
     pub cost_per_sec: f64,
 }
 
@@ -963,6 +1009,18 @@ fn snapshot_message(
 /// that fails cookie+Origin is rejected `401 no-store` BEFORE the upgrade. The
 /// bearer fallback is intentionally NOT honored for WS (browsers can't set
 /// `Authorization` on a `WebSocket`).
+#[utoipa::path(
+    get,
+    path = "/dashboard/ws",
+    tag = "ui",
+    operation_id = "dashboard_ws",
+    responses(
+        (status = 101, description = "WebSocket upgrade accepted; JSON text frames, server → client only (inbound text/binary is ignored; a peer Close/EOF tears the socket down). The FIRST message is always the snapshot `{\"type\":\"snapshot\", cursors: {flow_seq, metrics_seq, topology_seq, monitor_seq}, flows: [SnapshotFlowSummary…], metrics: MetricsSnapshot|null, topology: TopologySnapshot|null}` (the SPA buffers everything until it lands). Every later message is a batched `DashboardFrame` `{domain, seq, batch: [payload…]}` with `domain` ∈ `flow` | `metrics` | `topology` | `monitor` and a per-domain monotonic `seq` (the client drops a whole frame when `seq <= last_seq[domain]`). Each payload is `type`-tagged: `monitor` {message: DebugWsMessage} (one per retained/live monitor message; the transcript is replayed first), `usage` {api_call_id, response_id?, prompt, completion, total, cached?, reasoning?}, `flow_status` {api_call_id, response_id?, status, model_requested?, model_served?, upstream_target?, usage, started_ms, elapsed_ms?, phase timestamps, attempts?, first_upstream_byte_ms?, session facts}, `metric_tick` (the `/dashboard/api/metrics` tile, emitted periodically when it changes), `topology_update` {nodes, edges} (polled every 2 s, emitted when the version advances). At the session cookie's `exp` the server sends Close code 4401 `session expired`; a dev-open listener never expires."),
+        (status = 400, description = "Not a WebSocket upgrade: the `WebSocketUpgrade` extractor rejects a plain GET (missing `Connection: upgrade` / `Upgrade: websocket` / `Sec-WebSocket-Key`, or `Sec-WebSocket-Version` not `13`) BEFORE the handler runs, so this precedes the auth check. Plain text reason from axum.", content_type = "text/plain", body = String),
+        (status = 401, description = "The upgrade request failed the WS auth: no valid signed `llmconduit_session` cookie, or an `Origin` header not on the allow-list (the configured public origin, else same-origin as `Host` on loopback/insecure dev-open listeners). The bearer-token fallback is NOT honored here. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 426, description = "The connection cannot be upgraded (e.g. HTTP/1.0); axum's `WebSocketUpgrade` rejection.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn dashboard_ws(
     State(gateway): State<Arc<Gateway>>,
     headers: HeaderMap,

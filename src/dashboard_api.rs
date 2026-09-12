@@ -58,6 +58,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use utoipa::IntoParams;
+use utoipa::ToSchema;
 
 /// Window lengths in SECONDS (the divisor for the per-window rate fields). Must
 /// match the MetricsLayer ring spans (1m/5m/1h at 1 s resolution).
@@ -76,26 +78,39 @@ const WINDOW_1H_SECS: f64 = 3600.0;
 /// to match the frontend's optional-key validators, EXCEPT `usage` (serialized as
 /// `null` when absent — the frontend accepts absent/null/usage) and `cost`
 /// (`null`-not-absent when the served model has no configured price).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowRow {
+    /// The gateway's per-request id (the flow's primary key).
     pub api_call_id: String,
+    /// The engine response id the flow is linked to, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    /// Inbound HTTP method.
     pub method: String,
+    /// Inbound request URI.
     pub uri: String,
+    /// Model id the client asked for, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_requested: Option<String>,
+    /// Model id that actually served the flow, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_served: Option<String>,
+    /// The upstream (URL or provider name) that served the flow, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_target: Option<String>,
+    /// Token usage reported by the upstream; `null` until reported.
     pub usage: Option<FlowUsage>,
+    /// Lifecycle status.
     pub status: FlowStatus,
+    /// Epoch-ms the flow opened.
     pub started_ms: u128,
+    /// Epoch-ms the flow reached its terminal state, when terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_ms: Option<u128>,
+    /// Monotonic wall-clock duration in ms from open to terminal, when terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u128>,
+    /// Reason recorded at finalize, when one was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
     /// Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash `key-<hex>`
@@ -229,22 +244,31 @@ impl FlowRow {
 
 /// `GET /dashboard/api/flows` — the paged flow list + total + the FlowStore
 /// domain cursor. Matches the frozen `FlowsResponse`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowsResponse {
+    /// The requested page of rows, newest first.
     pub flows: Vec<FlowRow>,
     /// Total rows AFTER filtering but BEFORE paging (so the SPA can page).
     pub total: usize,
+    /// FlowStore domain cursor at the time of the read.
     pub flow_seq: u64,
 }
 
 /// Query params for `GET /dashboard/api/flows`. All optional; `status`/`model`/
 /// `upstream` filter, `page`/`limit` page (1-based page; absent ⇒ all rows).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct FlowsQuery {
+    /// Filter by lifecycle status: `open`, `completed`, `failed` or `cancelled`
+    /// (an unrecognized value is ignored, not an error).
     pub status: Option<String>,
+    /// Case-insensitive substring match on the served OR requested model id.
     pub model: Option<String>,
+    /// Case-insensitive substring match on the upstream target.
     pub upstream: Option<String>,
+    /// 1-based page number (default 1); only applies together with `limit`.
     pub page: Option<usize>,
+    /// Rows per page; absent or `0` returns every filtered row.
     pub limit: Option<usize>,
 }
 
@@ -253,12 +277,17 @@ pub struct FlowsQuery {
 /// `{sequence, kind, payload?, ts_ms?}`. `payload` is the heterogeneous delta body
 /// (a segment text, an event summary, a status, …); the SPA narrows at the use
 /// site. `sequence` is a per-flow ordinal (the replay order), NOT a domain cursor.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowDelta {
+    /// Per-flow replay ordinal (0-based, monitor order) — NOT a domain cursor.
     pub sequence: u64,
+    /// `segment.<output|reasoning|tool>`, `event.<kind>` or `status`.
     pub kind: String,
+    /// Kind-specific body: `{text}` for a segment, `{summary, payload_preview}` for
+    /// an event, `{status, error}` for a status delta.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+    /// Epoch-ms of the delta, when the monitor recorded one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts_ms: Option<u128>,
 }
@@ -278,7 +307,7 @@ pub struct FlowDelta {
 /// enclosing [`FlowDetailBody`] stays serialize-only (it is only ever a response), so the
 /// round-trip is pinned on THIS self-contained sub-DTO. Consumed by gap 14 (failure
 /// taxonomy).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FlowUpstreamResponse {
     /// The redacted, capped upstream response/error body, parsed to JSON (or a string
     /// `Value` for a non-JSON / marker body). An EMPTY captured body parses to a string
@@ -295,16 +324,20 @@ pub struct FlowUpstreamResponse {
 /// headers, the replayed deltas, usage, the terminal, and cost. Mirrors the frozen
 /// `FlowDetail` (`:id == api_call_id`). The three bodies, headers, and deltas are
 /// the additive detail fields over a [`FlowRow`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowDetailBody {
+    /// The record's OWN FlowStore cursor (frozen at its last mutation).
     pub flow_seq: u64,
+    /// The gateway's per-request id (the flow's primary key).
     pub api_call_id: String,
+    /// The engine response id the flow is linked to, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
     /// The captured INBOUND request body (parsed JSON). Absent when evicted by the
     /// D1 summary-byte quota; parsed back to a `Value` so the SPA renders the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_body: Option<serde_json::Value>,
+    /// Captured inbound request headers; absent when none were retained.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_headers: Option<BTreeMap<String, String>>,
     /// The captured CANONICAL/normalized body (D2), parsed. Absent when evicted.
@@ -325,22 +358,34 @@ pub struct FlowDetailBody {
     /// key. Consumed by gap 14 (failure taxonomy); the React app ignores it until then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_response: Option<FlowUpstreamResponse>,
+    /// Model id the client asked for, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_requested: Option<String>,
+    /// Model id that actually served the flow, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_served: Option<String>,
+    /// The upstream (URL or provider name) that served the flow, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_target: Option<String>,
+    /// Token usage reported by the upstream; `null` until reported.
     pub usage: Option<FlowUsage>,
+    /// Lifecycle status.
     pub status: FlowStatus,
+    /// The streamed deltas replayed from the monitor, in monitor order.
     pub deltas: Vec<FlowDelta>,
+    /// Reason recorded at finalize, when one was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
+    /// Epoch-ms the flow opened.
     pub started_ms: u128,
+    /// Epoch-ms the flow reached its terminal state, when terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_ms: Option<u128>,
+    /// Monotonic wall-clock duration in ms from open to terminal, when terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u128>,
+    /// USD cost of the flow (usage × the served model's price); `null` when the
+    /// served model has no configured price.
     pub cost: Option<f64>,
     /// Gap 07 — the [`CostConfidence`] of `cost` (confident/estimated/unavailable),
     /// mirroring the flow-row tag so the inspector labels an `estimated` figure.
@@ -384,8 +429,9 @@ pub struct FlowDetailBody {
 /// The frontend renders `—` on `null`, NEVER `0`. Derives `Deserialize` alongside
 /// `Serialize` so the changed wire field round-trips in a test (AGENTS.md: no
 /// changed wire field without a deserialize-then-serialize proof).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CatalogEntry {
+    /// Model id as advertised by the upstream `/v1/models` catalog.
     pub id: String,
     /// The per-model max-context window (tokens), or `null`/absent when the
     /// upstream advertises none. `skip_serializing_if` so an unavailable window
@@ -400,12 +446,17 @@ pub struct CatalogEntry {
 /// the frozen `SnapshotResponse`: the per-domain `cursors`, the cut instant, the
 /// body-free flow summaries (priced), and the metrics/topology cuts reshaped into
 /// their REST bodies (`null` when the cut is empty for that domain).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SnapshotResponse {
+    /// The cut's per-domain cursors (all zero when no cut exists).
     pub cursors: SeqCursors,
+    /// Epoch-ms the cut was taken (the requested `at`, or `0`, when no cut exists).
     pub at_ms: u128,
+    /// The cut's body-free flow summaries, priced (empty when no cut exists).
     pub summaries: Vec<FlowRow>,
+    /// The cut's metrics in the `/metrics` shape; `null` when no cut exists.
     pub metrics: Option<MetricsSnapshot>,
+    /// The cut's topology in the `/topology` shape; `null` when no cut exists.
     pub topology: Option<TopologySnapshot>,
 }
 
@@ -413,8 +464,11 @@ pub struct SnapshotResponse {
 /// ms) to time-travel to. Absent ⇒ the latest cut. Typed `u64` (NOT `u128`): the
 /// axum/serde QUERY deserializer does not support `u128`, and unix-ms fits `u64`
 /// for ~580 million years; the handler widens it to the `u128` `snapshot_at` key.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SnapshotQuery {
+    /// Unix-ms instant to time-travel to (the nearest cut at or before it);
+    /// absent ⇒ the latest cut.
     pub at: Option<u64>,
 }
 
@@ -457,7 +511,7 @@ pub fn cost_for_usage(usage: FlowUsage, price: ModelPrice) -> f64 {
 /// every flow row + detail (and aggregated onto the metrics windows). Serializes
 /// snake_case to mirror the data-quality vocabulary the frontend already uses
 /// (`measured`/`derived`/`estimated`/`unavailable`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CostConfidence {
     /// The model is priced AND every billed token class has a known rate: the prompt
@@ -965,6 +1019,32 @@ fn parse_captured_body(body: &Arc<[u8]>) -> serde_json::Value {
 /// table. Lists newest-first from the FlowStore (D1), filters by status/model/
 /// upstream, pages, and stamps the FlowStore domain `flow_seq`. Each row carries
 /// its `cost` (usage × served-model price).
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/flows",
+    tag = "dashboard",
+    operation_id = "dashboard_flows",
+    params(FlowsQuery),
+    responses(
+        (
+            status = 200,
+            description = "The filtered, paged flow rows plus the FlowStore domain cursor.",
+            body = FlowsResponse
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_flows(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<FlowsQuery>,
@@ -1010,6 +1090,43 @@ pub async fn dashboard_flows(
 /// on-wire bodies (absent, not error, when evicted), the inbound headers, the
 /// replayed deltas (MonitorHub snapshot filtered by `response_id`), usage, the
 /// terminal, timing, the served identity, and the `cost`. `404` for an unknown id.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/flows/{id}",
+    tag = "dashboard",
+    operation_id = "dashboard_flow_detail",
+    params(
+        (
+            "id" = String,
+            Path,
+            description = "The flow's `api_call_id`; a linked `response_id` also resolves via the FlowStore link index."
+        )
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The inspector detail body for the flow.",
+            body = FlowDetailBody
+        ),
+        (
+            status = 404,
+            description = "No live flow for that id (also when the flow store is disabled). Body: `{\"error\": \"no flow for that id\"}`.",
+            body = crate::openapi::DashboardError
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_flow_detail(
     State(gateway): State<Arc<Gateway>>,
     Path(id): Path<String>,
@@ -1090,6 +1207,31 @@ pub async fn dashboard_flow_detail(
 /// `cost_per_min`. Per-window TRUE per-second rates (D13 divides by the window
 /// seconds). The view + its cursor are captured in ONE metrics-lock hold so the
 /// body and `metrics_seq` are consistent.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/metrics",
+    tag = "dashboard",
+    operation_id = "dashboard_metrics",
+    responses(
+        (
+            status = 200,
+            description = "The live metrics tiles (headline `m1` + all three windows) and the metrics domain cursor.",
+            body = MetricsSnapshot
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response {
     let (view, metrics_seq) = gateway.metrics().view_with_seq();
     let active = active_stream_count(gateway.as_ref());
@@ -1100,6 +1242,31 @@ pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response 
 /// `GET /dashboard/api/topology` — the provider topology (D4 nodes + edges) + the
 /// price table + the topology domain `topology_seq`. Edges carry per-upstream
 /// per-second request/token/cost rates rolled up from the live `m1` metrics window.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/topology",
+    tag = "dashboard",
+    operation_id = "dashboard_topology",
+    responses(
+        (
+            status = 200,
+            description = "Provider nodes, gateway→provider edges, the price table and the topology domain cursor.",
+            body = TopologySnapshot
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response {
     let snapshot = gateway.provider_health_publisher().latest();
     let view = gateway.metrics().view();
@@ -1121,6 +1288,31 @@ pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response
 ///
 /// An upstream catalog-fetch failure yields an empty array (the dashboard simply
 /// shows no catalog) rather than a 5xx that would blank the whole view.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/catalog",
+    tag = "dashboard",
+    operation_id = "dashboard_catalog",
+    responses(
+        (
+            status = 200,
+            description = "Bare array of catalog entries; an empty array when the upstream catalog fetch fails.",
+            body = Vec<CatalogEntry>
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response {
     let entries = match gateway.upstream_client().supported_model_catalog().await {
         Ok(catalog) => catalog
@@ -1144,6 +1336,32 @@ pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response 
 /// ([`ProviderHealthSnapshot`]) into their REST bodies and prices the body-free
 /// summaries. `200` with empty summaries + `null` metrics/topology + zero cursors
 /// when no cut has been taken yet (rather than a 404 the SPA would treat as fatal).
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/snapshot",
+    tag = "dashboard",
+    operation_id = "dashboard_snapshot",
+    params(SnapshotQuery),
+    responses(
+        (
+            status = 200,
+            description = "The frozen cut nearest at-or-before `at` (or the latest). When no cut exists: empty `summaries`, `null` `metrics`/`topology`, zero `cursors`.",
+            body = SnapshotResponse
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_snapshot(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<SnapshotQuery>,

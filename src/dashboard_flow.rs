@@ -45,6 +45,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio_util::sync::CancellationToken;
+use utoipa::ToSchema;
 
 /// Record cap: reuse the monitor's `REQUEST_EVENT_LIMIT` (512) so the dashboard
 /// store does not invent a second retention dial (D1 constraint).
@@ -201,12 +202,16 @@ impl Default for AbortHub {
 
 /// Lifecycle status of a flow. `Open` at creation; D3 moves it to a terminal
 /// state. Serializes snake_case for the dashboard REST/WS surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowStatus {
+    /// Not yet terminal (the request is still in flight / streaming).
     Open,
+    /// Finished successfully.
     Completed,
+    /// Ended in an error.
     Failed,
+    /// Aborted before completion.
     Cancelled,
 }
 
@@ -223,10 +228,13 @@ pub enum FlowStatus {
 /// distinction is load-bearing for cost confidence: a `cached` charge against a
 /// model with no configured cache rate (or an unreported `cached`) is `estimated`,
 /// not `confident`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
 pub struct FlowUsage {
+    /// Prompt (input) tokens.
     pub prompt: i64,
+    /// Completion (output) tokens.
     pub completion: i64,
+    /// Total tokens as reported by the upstream.
     pub total: i64,
     /// Cache-read prompt tokens. `Some(n)` measured (incl. a reported `0`); `None`
     /// when the upstream did not report a cached breakdown (UNAVAILABLE, not `0`).
@@ -249,7 +257,7 @@ pub struct FlowUsage {
 /// `KeyHash` → `ConfiguredHeader` → `UserAgent`. There is NO proxy auth-principal
 /// source today (the proxy forwards keys, it does not authenticate a principal), so
 /// one is deliberately absent until such a seam exists (spec 04 / Codex review).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientSource {
     /// Derived from a non-reversible SHA-256 digest of the inbound API key (the raw
@@ -459,7 +467,7 @@ fn key_hash_label(raw_key: &str) -> String {
 /// Gap 03 — the outcome of one upstream dispatch attempt. Snake_case on the wire so
 /// the body-free [`SnapshotFlowSummary`] carries it to the failover/attempt-trace UI
 /// (spec 11) and the per-provider metrics aggregation (spec 12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
     /// This attempt produced the first chunk on the wire — it is the SERVING attempt.
@@ -474,7 +482,7 @@ pub enum AttemptStatus {
 /// is a fixed enum so the body-free summary can never become a backdoor for an
 /// unbounded/secret-bearing upstream error body. `error_class` is `None` on the served
 /// attempt (don't-lie-with-zeros for the success case). Serializes snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptErrorClass {
     /// The upstream connection or request transport failed before any response.
@@ -498,7 +506,7 @@ pub enum AttemptErrorClass {
 /// to the next provider. Like [`AttemptErrorClass`], this is a fixed enum — never raw
 /// upstream text — so it is safe on the body-free summary. `None` on the served attempt
 /// (it did not fail over). Serializes snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptFailoverReason {
     /// The provider failed before the first chunk and failover moved to the next.
@@ -524,7 +532,7 @@ pub enum AttemptFailoverReason {
 /// (never raw upstream text) on a failed attempt — they ride the body-free summary, so
 /// raw error bodies stay behind spec 05's gated seam. Snake_case + `skip_serializing_if`
 /// so a `None` field is absent on the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 pub struct Attempt {
     /// The provider name this attempt dispatched to (the failover provider's name, the
     /// routing route's name, or the synthetic `"primary"` for a bare single upstream).
@@ -794,11 +802,12 @@ pub struct FlowRecord {
 /// (list row, snapshot summary, detail body, `flow_status` frame). Flattened
 /// onto the wire as sibling scalar fields, each `skip_serializing_if = None`,
 /// so an unknown fact is ABSENT, never a fabricated value.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 pub struct FlowSessionFacts {
     /// Detected harness profile name (`claude-code`, `codex`, `pi-agent`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    /// Detected harness version, when the harness reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_version: Option<String>,
     /// Gateway session node id (`sessions.id`) the flow was linked into.
@@ -855,7 +864,7 @@ impl FlowSessionFacts {
 /// OPTIONAL measured epoch-ms timestamp; `None` ⇒ the phase did not occur ⇒
 /// serialized absent (the `skip_serializing_if` below) so the don't-lie-with-zeros
 /// rule holds: a missing phase is NEVER coerced to `0`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 pub struct PhaseTimings {
     /// Request ingress — when the FlowStore first `open`ed the record (≈ `started_ms`).
     /// Always `Some` once a record exists; the explicit phase value the waterfall

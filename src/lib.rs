@@ -22,6 +22,7 @@ pub mod log_rotation;
 pub mod metrics;
 pub mod models;
 pub mod monitor;
+pub mod openapi;
 pub mod persistent_history_api;
 pub(crate) mod proxy_headers;
 pub mod raw;

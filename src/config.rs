@@ -655,7 +655,7 @@ pub struct Config {
 /// `estimated`. The flag is serialized additively (the frontend `isModelPrice`
 /// accepts it); `cached_per_1k` stays `number` so the topology/Sankey price table is
 /// NOT a second contract migration (spec 07 item 3).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, utoipa::ToSchema)]
 pub struct ModelPrice {
     /// USD per 1k PROMPT (input) tokens.
     pub input_per_1k: f64,

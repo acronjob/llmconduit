@@ -853,14 +853,29 @@ fn has_valid_session_key(env: &DashboardEnv) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Either a dashboard token or a username + password.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct LoginRequest {
+    /// The dashboard token (`LLMCONDUIT_DASHBOARD_TOKEN`); used only when
+    /// `username` + `password` are not both present.
     #[serde(default)]
     pub token: Option<String>,
+    /// Username of a SQL `users` account; takes the password path together
+    /// with `password`.
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+}
+
+/// `POST /dashboard/login` success body (documentation of the handler's
+/// inline JSON; the handler itself builds it with `json!`).
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct LoginResponse {
+    /// Always `true`.
+    authenticated: bool,
+    /// The signed-in user for a username/password login; `null` for a token login.
+    user: Option<crate::accounts::SessionUser>,
 }
 
 /// `POST /dashboard/login` — a username/password login is verified against
@@ -868,6 +883,17 @@ pub struct LoginRequest {
 /// applies. On success set the signed `HttpOnly; SameSite=Strict[; Secure];
 /// Path=/; Max-Age=86400` session cookie plus the non-`HttpOnly` double-submit
 /// CSRF cookie. Response is always `no-store`.
+#[utoipa::path(
+    post,
+    path = "/dashboard/login",
+    tag = "dashboard-auth",
+    operation_id = "dashboard_login",
+    request_body(content = Option<LoginRequest>, description = "`{username, password}` (verified against the SQL `users` table, Argon2id) when both are present; otherwise `{token}` (constant-time match against the dashboard token). A missing or unparsable JSON body is treated as an empty token login."),
+    responses(
+        (status = 200, description = "Signed in. Sets two cookies: `llmconduit_session` (HMAC-signed, `HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`) and the double-submit CSRF cookie `llmconduit_csrf` (same attributes but NOT `HttpOnly`, so the SPA can echo it in `x-csrf-token`); both add `Secure` when a public https origin is configured. `Cache-Control: no-store`.", body = LoginResponse),
+        (status = 401, description = "Rejected, `Cache-Control: no-store`. Messages: `invalid username or password`; `user login needs a SQL store` (username/password given but no SQL store is configured); `sign in with username and password` (a token login once user accounts exist, unless the listener is dev-open); `invalid token`.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn dashboard_login(
     axum::extract::State(gateway): axum::extract::State<Arc<crate::engine::Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -965,6 +991,15 @@ pub async fn login_response(
 
 /// `POST /dashboard/logout` — clear both cookies (stateless; a copied session
 /// cookie remains valid until its `exp`).
+#[utoipa::path(
+    post,
+    path = "/dashboard/logout",
+    tag = "dashboard-auth",
+    operation_id = "dashboard_logout",
+    responses(
+        (status = 204, description = "Always. Expires both cookies (`llmconduit_session=; Max-Age=0; HttpOnly` and `llmconduit_csrf=; Max-Age=0`, `SameSite=Strict; Path=/`, plus `Secure` when configured). No session is required; sessions are stateless, so a copied session cookie stays valid until its `exp`. `Cache-Control: no-store`."),
+    )
+)]
 pub async fn dashboard_logout(Extension(auth): Extension<Arc<DashboardAuth>>) -> Response {
     let secure = auth.secure_cookies();
     let mut response = no_store(StatusCode::NO_CONTENT.into_response());

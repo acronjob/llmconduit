@@ -63,6 +63,16 @@ const LOGIN_SHELL_TEMPLATE: &str = include_str!("dashboard_login.html");
 /// injected bootstrap script + a refreshed CSRF cookie. Unauthenticated → the
 /// login shell. Always carries the dashboard CSP + security headers + `no-store`
 /// (transcripts/credentials must not be cached).
+#[utoipa::path(
+    get,
+    path = "/dashboard",
+    tag = "ui",
+    operation_id = "dashboard_index",
+    responses(
+        (status = 200, description = "HTML. With a valid session (`llmconduit_session` cookie, bearer token, or dev-open): the embedded SPA `index.html` with a nonce-bearing bootstrap script element setting `window.__LLMCONDUIT_DASHBOARD__ = {authenticated: true, csrf_token, mutations_enabled, user, auth_mode}` and a freshly issued `llmconduit_csrf` cookie. Without one: the login shell (token/username form posting to `/dashboard/login`) — never a 401. Both carry the dashboard CSP (per-response `script-src` nonce), `X-Frame-Options: DENY`, `nosniff`, `no-referrer` and `Cache-Control: no-store`.", content_type = "text/html", body = String),
+        (status = 500, description = "Authenticated, but the embedded dashboard build has no `index.html`. Plain text `dashboard index.html missing from embedded build`.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn dashboard_index(
     axum::extract::State(gateway): axum::extract::State<Arc<crate::engine::Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -130,6 +140,19 @@ fn serve_login_shell(nonce: &str, auth_mode: &str) -> Response {
 /// headers (no CSP needed on a sub-resource, but `nosniff`/`no-referrer`/
 /// frame-deny still apply) but NOT `no-store` — hashed Vite assets are
 /// immutable and may be cached.
+#[utoipa::path(
+    get,
+    path = "/dashboard/assets/{path}",
+    tag = "ui",
+    operation_id = "dashboard_asset",
+    params(
+        ("path" = String, Path, description = "Wildcard (axum `{*path}`): the file path below the embedded `assets/` directory, e.g. `index-DEADBEEF.js`; may contain `/`."),
+    ),
+    responses(
+        (status = 200, description = "The embedded file bytes. `Content-Type` is derived from the extension (html, js/mjs, css, json/map, svg, png, jpg/jpeg, gif, webp, ico, woff2, woff, ttf, txt, wasm; anything else `application/octet-stream`). No session required; `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, but no `Cache-Control: no-store` (hashed assets are immutable)."),
+        (status = 404, description = "No embedded file at that path. Plain text `asset not found`.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn dashboard_asset(Path(path): Path<String>) -> Response {
     let asset_path = format!("assets/{path}");
     match DASHBOARD_DIST.get_file(&asset_path) {

@@ -309,19 +309,27 @@ impl Histogram {
 /// per-class `0` here is honest (that class did not occur); the don't-lie-with-zeros
 /// rule lives at the PROVIDER level (a provider with NO samples in the window is absent
 /// from the per-provider report entirely, never a fabricated all-zero distribution).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(default)]
 pub struct ProviderErrorDistribution {
+    /// Failed attempts whose class was `connect` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub connect: u64,
+    /// Failed attempts whose class was `http_status` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub http_status: u64,
+    /// Failed attempts whose class was `timeout` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub timeout: u64,
+    /// Failed attempts whose class was `stream` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub stream: u64,
+    /// Failed attempts whose class was `terminal` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub terminal: u64,
+    /// Failed attempts whose class was `other`, including an unclassed failure (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub other: u64,
 }
@@ -697,9 +705,10 @@ fn finite_ms(value: f64) -> f64 {
 /// ABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is
 /// always a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to
 /// match the cross-cutting DQ-tag contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMetricQuality {
+    /// Computed from the provider's own attempt-latency histogram.
     Derived,
 }
 
@@ -710,7 +719,7 @@ pub enum ProviderMetricQuality {
 /// is the percentage of the provider's attempts that FAILED. A provider with zero
 /// in-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has
 /// `samples >= 1`. All floats are finite (the frozen finite-number wire contract).
-#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ProviderLatency {
     /// The provider label these metrics are for (the bounded provider/route id, or the
     /// `__other__` overflow bucket once the per-slot provider cap is exceeded).

@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
+use utoipa::ToSchema;
 
 pub type StoreResult<T> = Result<T, String>;
 
@@ -73,13 +74,18 @@ pub struct RequestRow {
 /// redactor before populating `payload`; this module never accepts raw headers.
 /// SQL persistence treats `(request_id, seq)` as last-writer-wins. JSONL is
 /// append-only, so readers of that format must likewise keep the last duplicate.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct EventRow {
     pub request_id: String,
+    /// Event order within the request; the four body skeletons use 1..=4 (see `PayloadSection::seq`).
     pub seq: i64,
+    /// Epoch milliseconds.
     pub ts_ms: i64,
+    /// Hop label, e.g. `client_in`, `upstream_out`, `upstream_in`, `client_out`.
     pub hop: String,
+    /// Event kind, e.g. `request`, `response`, `attempt`, `terminal_attempt`.
     pub kind: String,
+    /// Bounded, secret-redacted JSON envelope text, when stored.
     pub payload: Option<String>,
     pub bytes: Option<i64>,
 }
@@ -146,7 +152,7 @@ pub struct UsageFilter {
     pub since_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct UsageBucket {
     pub user_id: Option<String>,
     pub virtual_key_id: Option<String>,
@@ -160,7 +166,7 @@ pub struct UsageBucket {
     pub reasoning_tokens: i64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct RequestSummary {
     pub id: String,
     pub response_id: Option<String>,
@@ -171,9 +177,13 @@ pub struct RequestSummary {
     pub alias: Option<String>,
     pub backend: Option<String>,
     pub resolved_model: Option<String>,
+    /// `running`, `completed` or `failed`.
     pub status: String,
+    /// Epoch milliseconds.
     pub created_at_ms: i64,
+    /// Epoch milliseconds; `None` while still running.
     pub completed_at_ms: Option<i64>,
+    /// Epoch milliseconds of the first content delta, when one was observed.
     pub first_token_at_ms: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -202,7 +212,7 @@ pub struct RequestSummary {
 }
 
 /// One (bucket, user, key) cell of the activity series.
-#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct ActivityBucket {
     pub bucket_ms: i64,
     pub user_id: Option<String>,
@@ -217,7 +227,7 @@ pub struct ActivityBucket {
 /// One (bucket, model, backend) cell of the gateway-side throughput series.
 /// Sums cover only rows that reported the class; the `*_count` companions say
 /// how many rows contributed so a consumer can derive means without lying.
-#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct ThroughputBucket {
     pub bucket_ms: i64,
     pub model: String,
@@ -239,19 +249,26 @@ pub struct ThroughputBucket {
     pub decode_count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct MetricSample {
     pub backend: String,
+    /// Epoch milliseconds at which the sample was taken.
     pub ts_ms: i64,
+    /// The sample as JSON text (backend health or scraped upstream metrics).
     pub data: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// A dashboard user account (never carries the password hash).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 pub struct UserRecord {
+    /// Opaque user id (UUID string); the `{id}` in `/dashboard/api/users/{id}`.
     pub id: String,
     pub username: String,
+    /// Whether the user may manage users and other users' keys.
     pub is_admin: bool,
+    /// Creation time, unix milliseconds.
     pub created_at_ms: i64,
+    /// Last password/role change, unix milliseconds.
     pub updated_at_ms: i64,
 }
 
@@ -264,15 +281,22 @@ pub struct UserAuth {
 }
 
 /// API-key metadata. The secret (or its digest) is intentionally never exposed.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 pub struct ApiKeyRecord {
+    /// Opaque key id (UUID string); the `{id}` in `/dashboard/api/keys/{id}`.
     pub id: String,
+    /// Optional human label (trimmed, at most 128 characters).
     pub label: Option<String>,
+    /// Owning user id; `null` for a key created by a token/dev-open session without `user_id`.
     pub user_id: Option<String>,
     /// Client-facing model/alias names the key may request; empty = any.
+    /// Always present on the wire (`serde(default)` only covers reads).
     #[serde(default)]
+    #[schema(required)]
     pub allowed_models: Vec<String>,
+    /// Creation time, unix milliseconds.
     pub created_at_ms: i64,
+    /// Last change, unix milliseconds.
     pub updated_at_ms: i64,
 }
 

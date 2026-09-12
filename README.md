@@ -742,15 +742,23 @@ one-way short hash, never verbatim.
 | `POST /v1/completions` | Legacy completions passthrough |
 | `GET /v1/models` | Proxied model list |
 | `GET /health` | Health check (`{"status":"healthy"}`) |
-| `GET /` | Process check (`{"status":"ok"}`) |
+| `GET /` | Process check (`{"status":"ok"}`); browsers are redirected to `/dashboard` when it is registered |
+| `GET /openapi.json` | OpenAPI 3.1 document describing every route above and below, generated from the handler annotations at compile time (`src/openapi.rs`); `tests/openapi.rs` fails the build when a registered route is missing from it or a described route is not served |
 | `GET /debug` | Debug UI when started with `--with-debug-ui` |
 | `GET /dashboard` | Embedded Argus dashboard when started with `--with-debug-ui` and its env-only auth gate permits registration |
 | `GET /dashboard/api/*` | Authenticated Argus flow, metrics, topology, catalog, and snapshot APIs |
 | `GET /dashboard/api/history/requests` | Authenticated durable request summaries (SQL storage) |
 | `GET /dashboard/api/history/requests/:id` | Authenticated durable request and event detail (SQL storage) |
+| `GET /dashboard/api/history/requests/:id/body` | Authenticated full request body of one hop (`client_in`/`upstream_out`), reassembled from the content store |
+| `GET /dashboard/api/history/sessions[/:id]` | Authenticated session tree (harness sessions, sub-sessions, chain divergence, cache busts) |
+| `GET /dashboard/api/history/throughput` | Authenticated per-model/backend throughput buckets (tokens, TTFT, decode) |
+| `GET /dashboard/api/history/activity` | Authenticated per-user/key request, failure and token buckets |
 | `GET /dashboard/api/history/usage` | Authenticated durable usage rollups (SQL storage) |
 | `GET /dashboard/api/history/metrics` | Authenticated durable minute-level provider health/counter history (SQL storage) |
 | `POST /dashboard/api/flows/:id/kill` | Abort a live flow when dashboard mutations are enabled; requires a session and CSRF token |
+| `GET /dashboard/api/me`, `/users`, `/keys` (+ `POST`/`PATCH`/`DELETE`) | Authenticated accounts API: the current user, user administration, API keys |
+| `POST /dashboard/login`, `POST /dashboard/logout` | Dashboard session (username/password or access token; cookie + CSRF token) |
+| `GET /dashboard/ws`, `GET /debug/ws` | Authenticated WebSocket feeds behind the dashboard and debug UI |
 
 ## Environment
 

@@ -14,12 +14,14 @@ use crate::accounts::{self, SessionUser};
 use crate::control_plane_store::{ApiKeyRecord, PersistenceStore, UserRecord};
 use crate::dashboard_auth::{AuthSession, DashboardAuth, no_store};
 use crate::engine::Gateway;
+use crate::openapi::DashboardError;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::{IntoParams, ToSchema};
 
 const MAX_LABEL_LEN: usize = 128;
 const MAX_ALLOWED_MODELS: usize = 64;
@@ -76,10 +78,13 @@ fn require_csrf(auth: &DashboardAuth, headers: &HeaderMap) -> Result<(), Respons
 // /me
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-struct MeBody {
-    /// `None` for a token/dev-open session.
+/// `GET /dashboard/api/me` body.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct MeBody {
+    /// `null` for a token/dev-open session.
     user: Option<SessionUser>,
+    /// `true` for an admin user, and for any session without a user
+    /// (token login / dev-open), which is treated as admin.
     is_admin: bool,
     /// `users` when at least one account exists, `token` when only the env
     /// token gates the dashboard, `open` when nothing does (loopback dev).
@@ -89,6 +94,16 @@ struct MeBody {
 }
 
 /// `GET /dashboard/api/me`
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/me",
+    tag = "accounts",
+    operation_id = "me",
+    responses(
+        (status = 200, description = "The calling session: its user (`null` for a token/dev-open session), whether it counts as admin, the dashboard auth mode, and whether accounts can be managed.", body = MeBody),
+        (status = 401, description = "No valid session (missing/expired/invalid `llmconduit_session` cookie and no matching bearer token). Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn me(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -127,28 +142,72 @@ pub async fn auth_mode(gateway: &Gateway, auth: &DashboardAuth) -> &'static str 
 // /users
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateUserRequest {
+    /// Validated before use; an invalid username is rejected with 400.
     pub username: String,
+    /// Stored as an Argon2id hash; a password the hasher rejects is a 400.
     pub password: String,
+    /// Grant the administrator role (default `false`).
     #[serde(default)]
     pub is_admin: bool,
 }
 
-#[derive(Debug, Deserialize)]
+/// Both fields optional; omit a field to leave it unchanged.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateUserRequest {
+    /// New password (stored as an Argon2id hash).
     #[serde(default)]
     pub password: Option<String>,
+    /// New administrator flag. An admin cannot set `false` on themselves.
     #[serde(default)]
     pub is_admin: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
-struct UsersBody {
+/// `GET /dashboard/api/users` body.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct UsersBody {
     users: Vec<UserRecord>,
 }
 
+/// `PATCH /dashboard/api/users/{id}` success body (documentation of the
+/// handler's inline JSON; the handler itself builds it with `json!`).
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct UserUpdatedBody {
+    /// The `{id}` path parameter, echoed.
+    id: String,
+    /// Always `true`.
+    updated: bool,
+}
+
+/// `DELETE /dashboard/api/users/{id}` success body (documentation of the
+/// handler's inline JSON; the handler itself builds it with `json!`).
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct UserDeletedBody {
+    /// The `{id}` path parameter, echoed.
+    id: String,
+    /// Always `true`.
+    deleted: bool,
+    /// Number of the user's API keys that were revoked along with the account.
+    keys_revoked: usize,
+}
+
 /// `GET /dashboard/api/users` (admin)
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/users",
+    tag = "accounts",
+    operation_id = "list_users",
+    responses(
+        (status = 200, description = "All (non-deleted) user accounts.", body = UsersBody),
+        (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 403, description = "The session user is not an administrator (`administrator role required`). Sessions without a user (token login / dev-open) count as admin.", body = DashboardError),
+        (status = 500, description = "SQL store failure (`list users: …`).", body = DashboardError),
+        (status = 503, description = "No SQL store configured (`control_plane.storage` sqlite or postgres); user and key management is unavailable.", body = DashboardError),
+    )
+)]
 pub async fn list_users(State(gateway): State<Arc<Gateway>>, session: AuthSession) -> Response {
     if let Err(denied) = require_admin(&session) {
         return denied;
@@ -167,6 +226,25 @@ pub async fn list_users(State(gateway): State<Arc<Gateway>>, session: AuthSessio
 }
 
 /// `POST /dashboard/api/users` (admin, CSRF)
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/users",
+    tag = "accounts",
+    operation_id = "create_user",
+    params(
+        ("x-csrf-token" = String, Header, description = "Double-submit CSRF token: must equal the `llmconduit_csrf` cookie (issued by `POST /dashboard/login`, refreshed by `GET /dashboard`). Missing, empty, or mismatched → 403."),
+    ),
+    request_body(content = CreateUserRequest, description = "`{username, password, is_admin?}`"),
+    responses(
+        (status = 201, description = "The created user.", body = UserRecord),
+        (status = 400, description = "Body is not `{username, password, is_admin?}` (`expected {username, password, is_admin?}`), the username fails validation, or the password cannot be hashed (message from the validator).", body = DashboardError),
+        (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 403, description = "`administrator role required` (checked first), or `missing or invalid CSRF token`.", body = DashboardError),
+        (status = 409, description = "`username already exists`.", body = DashboardError),
+        (status = 500, description = "SQL store failure (`lookup user: …` / `create user: …`).", body = DashboardError),
+        (status = 503, description = "No SQL store configured; user and key management is unavailable.", body = DashboardError),
+    )
+)]
 pub async fn create_user(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -221,6 +299,26 @@ pub async fn create_user(
 }
 
 /// `PATCH /dashboard/api/users/{id}` (admin, CSRF): reset password and/or role.
+#[utoipa::path(
+    patch,
+    path = "/dashboard/api/users/{id}",
+    tag = "accounts",
+    operation_id = "update_user",
+    params(
+        ("id" = String, Path, description = "User id (`UserRecord.id`)."),
+        ("x-csrf-token" = String, Header, description = "Double-submit CSRF token: must equal the `llmconduit_csrf` cookie. Missing, empty, or mismatched → 403."),
+    ),
+    request_body(content = UpdateUserRequest, description = "`{password?, is_admin?}` — reset the password and/or change the role."),
+    responses(
+        (status = 200, description = "Updated.", body = UserUpdatedBody),
+        (status = 400, description = "Body is not `{password?, is_admin?}` (`expected {password?, is_admin?}`), `you cannot remove your own administrator role` (`is_admin: false` on the caller's own account), or the new password cannot be hashed.", body = DashboardError),
+        (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 403, description = "`administrator role required` (checked first), or `missing or invalid CSRF token`.", body = DashboardError),
+        (status = 404, description = "`user not found`.", body = DashboardError),
+        (status = 500, description = "SQL store failure (`lookup user: …` / `update user: …`).", body = DashboardError),
+        (status = 503, description = "No SQL store configured; user and key management is unavailable.", body = DashboardError),
+    )
+)]
 pub async fn update_user(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -280,6 +378,25 @@ pub async fn update_user(
 
 /// `DELETE /dashboard/api/users/{id}` (admin, CSRF): soft-deletes the user and
 /// revokes their keys (the registry reloads immediately).
+#[utoipa::path(
+    delete,
+    path = "/dashboard/api/users/{id}",
+    tag = "accounts",
+    operation_id = "delete_user",
+    params(
+        ("id" = String, Path, description = "User id (`UserRecord.id`)."),
+        ("x-csrf-token" = String, Header, description = "Double-submit CSRF token: must equal the `llmconduit_csrf` cookie. Missing, empty, or mismatched → 403."),
+    ),
+    responses(
+        (status = 200, description = "The user is soft-deleted and every one of their API keys revoked; the live key registry is reloaded (a reload failure is only logged).", body = UserDeletedBody),
+        (status = 400, description = "`you cannot delete your own account`.", body = DashboardError),
+        (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 403, description = "`administrator role required` (checked first), or `missing or invalid CSRF token`.", body = DashboardError),
+        (status = 404, description = "`user not found`.", body = DashboardError),
+        (status = 500, description = "SQL store failure (`lookup user: …` / `list keys: …` / `revoke key: …` / `delete user: …`).", body = DashboardError),
+        (status = 503, description = "No SQL store configured; user and key management is unavailable.", body = DashboardError),
+    )
+)]
 pub async fn delete_user(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -347,17 +464,21 @@ pub async fn delete_user(
 // /keys
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct KeysQuery {
-    /// Admin only: another user's keys, or `all`.
+    /// Admin only: another user's id, or `all` for every key. A non-admin user
+    /// may only pass their own id.
     pub user_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateKeyRequest {
+    /// Human label; trimmed, blank → none, truncated to 128 characters.
     #[serde(default)]
     pub label: Option<String>,
     /// Client-facing model/alias names this key may request; empty = any.
+    /// Entries are trimmed, blanks dropped, at most 64 kept.
     #[serde(default)]
     pub allowed_models: Vec<String>,
     /// Admin only: create the key for another user (default: the caller).
@@ -365,20 +486,51 @@ pub struct CreateKeyRequest {
     pub user_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct KeysBody {
+/// `GET /dashboard/api/keys` body.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct KeysBody {
     keys: Vec<ApiKeyRecord>,
 }
 
-#[derive(Debug, Serialize)]
-struct CreatedKeyBody {
+/// `POST /dashboard/api/keys` body.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CreatedKeyBody {
     key: ApiKeyRecord,
-    /// The plaintext, shown exactly once.
+    /// The plaintext key (`llmc_…`), shown exactly once; only its digest is stored.
     secret: String,
+    /// Number of keys in the live client-auth registry after the reload.
+    registered_keys: usize,
+}
+
+/// `DELETE /dashboard/api/keys/{id}` success body (documentation of the
+/// handler's inline JSON; the handler itself builds it with `json!`).
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct KeyRevokedBody {
+    /// The `{id}` path parameter, echoed.
+    id: String,
+    /// Always `true`.
+    revoked: bool,
+    /// Number of keys in the live client-auth registry after the reload
+    /// (`0` when the reload failed; the failure is only logged).
     registered_keys: usize,
 }
 
 /// `GET /dashboard/api/keys[?user_id=<id>|all]`
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/keys",
+    tag = "accounts",
+    operation_id = "list_keys",
+    params(KeysQuery),
+    responses(
+        (status = 200, description = "Key metadata (never the secret). Scope: a user session without `user_id` → its own keys; an admin user or a token/dev-open session with `user_id=<id>` → that user's keys, with `user_id=all` → every key; a token/dev-open session without `user_id` → every key.", body = KeysBody),
+        (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 403, description = "`administrator role required`: a non-admin user passed a `user_id` other than their own (including `all`).", body = DashboardError),
+        (status = 500, description = "SQL store failure (`list keys: …`).", body = DashboardError),
+        (status = 503, description = "No SQL store configured; user and key management is unavailable.", body = DashboardError),
+    )
+)]
 pub async fn list_keys(
     State(gateway): State<Arc<Gateway>>,
     session: AuthSession,
@@ -414,6 +566,24 @@ pub async fn list_keys(
 
 /// `POST /dashboard/api/keys` (CSRF): mints a key, stores its digest, reloads
 /// the live registry, and returns the plaintext once.
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/keys",
+    tag = "accounts",
+    operation_id = "create_key",
+    params(
+        ("x-csrf-token" = String, Header, description = "Double-submit CSRF token: must equal the `llmconduit_csrf` cookie. Missing, empty, or mismatched → 403."),
+    ),
+    request_body(content = Option<CreateKeyRequest>, description = "`{label?, allowed_models?, user_id?}`. Optional: a missing or unparsable JSON body is treated as `{}` (no label, any model, owned by the caller)."),
+    responses(
+        (status = 201, description = "The key was stored and the live registry reloaded; `secret` is the only time the plaintext is shown. Owner: the session user (an admin may name another user via `user_id`); a token/dev-open session owns nothing unless it passes `user_id`.", body = CreatedKeyBody),
+        (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 403, description = "`missing or invalid CSRF token` (checked first), or `administrator role required` (a non-admin user passed another user's `user_id`).", body = DashboardError),
+        (status = 404, description = "`user not found` (the `user_id` does not exist).", body = DashboardError),
+        (status = 500, description = "SQL store failure (`lookup user: …` / `store key: …`), or `key stored but not activated: …` when the registry reload failed after storing the digest (the key becomes live on the next successful reload).", body = DashboardError),
+        (status = 503, description = "No SQL store configured; user and key management is unavailable.", body = DashboardError),
+    )
+)]
 pub async fn create_key(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -515,6 +685,24 @@ pub async fn create_key(
 }
 
 /// `DELETE /dashboard/api/keys/{id}` (CSRF): revokes a key (own, or any as admin).
+#[utoipa::path(
+    delete,
+    path = "/dashboard/api/keys/{id}",
+    tag = "accounts",
+    operation_id = "delete_key",
+    params(
+        ("id" = String, Path, description = "Key id (`ApiKeyRecord.id`)."),
+        ("x-csrf-token" = String, Header, description = "Double-submit CSRF token: must equal the `llmconduit_csrf` cookie. Missing, empty, or mismatched → 403."),
+    ),
+    responses(
+        (status = 200, description = "Revoked; the live registry was reloaded (a reload failure is only logged and reports `registered_keys: 0`).", body = KeyRevokedBody),
+        (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 403, description = "`missing or invalid CSRF token` (checked first), or `not your key` (a non-admin user revoking a key they do not own).", body = DashboardError),
+        (status = 404, description = "`key not found`.", body = DashboardError),
+        (status = 500, description = "SQL store failure (`list keys: …` / `revoke key: …`).", body = DashboardError),
+        (status = 503, description = "No SQL store configured; user and key management is unavailable.", body = DashboardError),
+    )
+)]
 pub async fn delete_key(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,

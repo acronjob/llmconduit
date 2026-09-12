@@ -128,6 +128,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         .route("/v1/completions", post(post_completions))
         .route("/v1/models", get(get_models))
         .route("/health", get(get_health))
+        .route("/openapi.json", get(get_openapi))
         .route("/", {
             let dashboard = options.with_debug_ui && options.register_protected_routes;
             get(move |headers: HeaderMap| get_root(headers, dashboard))
@@ -349,6 +350,23 @@ pub fn flow_kill_outcome(
 /// REGISTRATION is D13's job (this is the only mutation route in the phase; replay is
 /// deferred). The handler is provided here so D6 ships the kill behavior + tests
 /// independent of D13's route table (breaking the D6↔D13 cycle).
+/// Abort a live flow (in-flight request) by its api-call id.
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/flows/{id}/kill",
+    tag = "dashboard",
+    operation_id = "dashboard_flow_kill",
+    params(
+        ("id" = String, Path, description = "The flow's `api_call_id` as shown by `/dashboard/api/flows`."),
+        ("x-csrf-token" = String, Header, description = "Double-submit CSRF token; must equal the `llmconduit_csrf` cookie.")
+    ),
+    responses(
+        (status = 200, body = crate::openapi::FlowKillResponse, description = "The flow was aborted."),
+        (status = 401, description = "No valid dashboard session (plain text `unauthorized`)."),
+        (status = 403, body = crate::openapi::DashboardError, description = "Mutations are disabled for this deployment (`LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS` unset) or the CSRF token is missing or wrong."),
+        (status = 404, body = crate::openapi::DashboardError, description = "No live flow with that id.")
+    )
+)]
 pub async fn dashboard_flow_kill(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -1140,10 +1158,39 @@ fn probe_response(allow: &str) -> Response {
     response
 }
 
+/// `HEAD`/`OPTIONS /v1/messages`: capability probe used by Anthropic SDKs.
+#[utoipa::path(
+    method(head, options),
+    path = "/v1/messages",
+    tag = "inference",
+    operation_id = "probe_messages",
+    responses((status = 204, description = "No body; the `Allow` header lists `POST, HEAD, OPTIONS`."))
+)]
 async fn probe_messages() -> Response {
     probe_response("POST, HEAD, OPTIONS")
 }
 
+/// This document: the OpenAPI 3.1 description of every route, generated from
+/// the handler annotations at compile time.
+#[utoipa::path(
+    get,
+    path = "/openapi.json",
+    tag = "system",
+    operation_id = "get_openapi",
+    responses((status = 200, body = serde_json::Value, description = "OpenAPI 3.1 document."))
+)]
+async fn get_openapi() -> Response {
+    (StatusCode::OK, Json(crate::openapi::document())).into_response()
+}
+
+/// Liveness probe. Always `200 {"status":"healthy"}` once the server accepts connections.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "system",
+    operation_id = "get_health",
+    responses((status = 200, body = crate::openapi::HealthResponse))
+)]
 async fn get_health() -> Response {
     (
         StatusCode::OK,
@@ -1155,6 +1202,17 @@ async fn get_health() -> Response {
 /// Root: the JSON status probe. When the dashboard is registered, a browser
 /// (an `Accept` naming `text/html`) is sent to `/dashboard` instead; every
 /// other client keeps the JSON so scripted probes of `/` are unchanged.
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "system",
+    operation_id = "get_root",
+    params(("accept" = Option<String>, Header, description = "When it names `text/html` and the dashboard is registered, the response is a redirect to `/dashboard`.")),
+    responses(
+        (status = 200, body = crate::openapi::RootStatus, description = "JSON status probe (API clients, or no dashboard)."),
+        (status = 303, description = "Browser request while the dashboard is registered: `Location: /dashboard`.")
+    )
+)]
 async fn get_root(headers: HeaderMap, dashboard: bool) -> Response {
     let wants_html = headers
         .get(header::ACCEPT)
@@ -1924,6 +1982,30 @@ fn json_type(value: &Value) -> &'static str {
     }
 }
 
+/// OpenAI Responses API. The body is the standard `POST /v1/responses` request
+/// (`model`, `input` as a string or item list, `instructions`, `tools`,
+/// `tool_choice`, `reasoning`, `stream`, `store`, `prompt_cache_key`,
+/// `previous_response_id`, `temperature`, `top_p`, …); `model` is resolved
+/// through the configured aliases before the request reaches an upstream.
+/// `x-llm-harness`, `x-llm-session-id`, `x-llm-parent-session-id` and
+/// `x-llm-session-kind` headers attribute the call to a harness session.
+#[utoipa::path(
+    post,
+    path = "/v1/responses",
+    tag = "inference",
+    operation_id = "post_responses",
+    request_body(content = serde_json::Value, content_type = "application/json", description = "OpenAI Responses request. See https://platform.openai.com/docs/api-reference/responses/create."),
+    responses(
+        (status = 200, description = "`application/json`: Response object (non-streaming). `text/event-stream`: Server-sent `response.*` events when `stream: true`.", content((serde_json::Value = "application/json"), (String = "text/event-stream"))),
+        (status = 400, body = crate::openapi::ApiError, description = "Malformed body."),
+        (status = 401, body = crate::openapi::ApiError, description = "Missing or invalid API key (when client auth is required)."),
+        (status = 403, body = crate::openapi::ApiError, description = "The key may not use the requested model."),
+        (status = 404, body = crate::openapi::ApiError, description = "Unknown model under `unknown_model_policy: reject`."),
+        (status = 413, body = crate::openapi::ApiError, description = "Body larger than `max_request_body_bytes`."),
+        (status = 502, body = crate::openapi::ApiError, description = "Every backend in the alias chain failed.")
+    ),
+    security(("bearer" = []), ("api_key" = []))
+)]
 async fn post_responses(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
@@ -1968,6 +2050,20 @@ async fn post_responses(
 /// FlowStore/turn-capture (those gate on POST); the api_call_id passed here is
 /// `None` — extend by minting a flow record off the GET if dashboard visibility
 /// for WS turns is needed.
+/// WebSocket transport for the Responses API (used by Codex): upgrade, then send
+/// `response.create` frames and receive the same `response.*` events as the SSE stream.
+#[utoipa::path(
+    get,
+    path = "/v1/responses",
+    tag = "inference",
+    operation_id = "get_responses_ws",
+    responses(
+        (status = 101, description = "Switching to the Responses WebSocket protocol."),
+        (status = 401, body = crate::openapi::ApiError, description = "Missing or invalid API key (when client auth is required)."),
+        (status = 426, description = "Plain GET without `Upgrade: websocket`; `Allow: POST, GET`.")
+    ),
+    security(("bearer" = []), ("api_key" = []))
+)]
 async fn get_responses(
     State(gateway): State<Arc<Gateway>>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
@@ -2125,6 +2221,27 @@ async fn send_responses_ws_error(
     sink.send(Message::Text(text.into())).await.is_ok()
 }
 
+/// Anthropic Messages API. The body is the standard `POST /v1/messages` request
+/// (`model`, `max_tokens`, `system`, `messages`, `tools`, `tool_choice`,
+/// `stream`, `thinking`, `metadata`, …); it is translated to the upstream's
+/// native API when the resolved backend is not Anthropic-compatible.
+#[utoipa::path(
+    post,
+    path = "/v1/messages",
+    tag = "inference",
+    operation_id = "post_messages",
+    request_body(content = serde_json::Value, content_type = "application/json", description = "Anthropic Messages request. See https://docs.anthropic.com/en/api/messages."),
+    responses(
+        (status = 200, description = "`application/json`: Message object (non-streaming). `text/event-stream`: Anthropic `message_start`…`message_stop` events when `stream: true`.", content((serde_json::Value = "application/json"), (String = "text/event-stream"))),
+        (status = 400, body = crate::openapi::AnthropicError, description = "Malformed body (`invalid_request_error`)."),
+        (status = 401, body = crate::openapi::AnthropicError, description = "Missing or invalid API key (`authentication_error`)."),
+        (status = 403, body = crate::openapi::AnthropicError, description = "The key may not use the requested model (`permission_error`)."),
+        (status = 404, body = crate::openapi::AnthropicError, description = "Unknown model under `unknown_model_policy: reject`."),
+        (status = 413, body = crate::openapi::AnthropicError, description = "Body larger than `max_request_body_bytes`."),
+        (status = 502, body = crate::openapi::AnthropicError, description = "Every backend in the alias chain failed.")
+    ),
+    security(("bearer" = []), ("api_key" = []))
+)]
 async fn post_messages(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
@@ -2145,6 +2262,20 @@ async fn post_messages(
     }
 }
 
+/// Anthropic token counting for a Messages request body.
+#[utoipa::path(
+    post,
+    path = "/v1/messages/count_tokens",
+    tag = "inference",
+    operation_id = "post_count_tokens",
+    request_body(content = serde_json::Value, content_type = "application/json", description = "Anthropic Messages request (same shape as `/v1/messages`)."),
+    responses(
+        (status = 200, body = crate::openapi::CountTokensResponse),
+        (status = 400, body = crate::openapi::AnthropicError, description = "Malformed body."),
+        (status = 401, body = crate::openapi::AnthropicError, description = "Missing or invalid API key.")
+    ),
+    security(("bearer" = []), ("api_key" = []))
+)]
 async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
     let request: AnthropicRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -2228,6 +2359,28 @@ async fn handle_count_tokens(
     }
 }
 
+/// OpenAI Chat Completions API. The body is the standard request (`model`,
+/// `messages`, `tools`, `tool_choice`, `stream`, `stream_options`,
+/// `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `stop`,
+/// `response_format`, `reasoning_effort`, …); unknown fields are forwarded to
+/// the upstream unchanged. `model` is resolved through the configured aliases.
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    tag = "inference",
+    operation_id = "post_chat_completions",
+    request_body(content = serde_json::Value, content_type = "application/json", description = "OpenAI Chat Completions request. See https://platform.openai.com/docs/api-reference/chat/create."),
+    responses(
+        (status = 200, description = "`application/json`: Chat completion object (non-streaming). `text/event-stream`: `data: {chunk}` events ending in `data: [DONE]` when `stream: true`.", content((serde_json::Value = "application/json"), (String = "text/event-stream"))),
+        (status = 400, body = crate::openapi::ApiError, description = "Malformed body."),
+        (status = 401, body = crate::openapi::ApiError, description = "Missing or invalid API key (when client auth is required)."),
+        (status = 403, body = crate::openapi::ApiError, description = "The key may not use the requested model."),
+        (status = 404, body = crate::openapi::ApiError, description = "Unknown model under `unknown_model_policy: reject`."),
+        (status = 413, body = crate::openapi::ApiError, description = "Body larger than `max_request_body_bytes`."),
+        (status = 502, body = crate::openapi::ApiError, description = "Every backend in the alias chain failed.")
+    ),
+    security(("bearer" = []), ("api_key" = []))
+)]
 async fn post_chat_completions(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
@@ -2258,6 +2411,21 @@ async fn post_chat_completions(
     Ok(with_model_headers(response, &requested, &model))
 }
 
+/// Legacy OpenAI Completions API, proxied byte-for-byte to the upstream; the
+/// upstream's status and body are returned as-is.
+#[utoipa::path(
+    post,
+    path = "/v1/completions",
+    tag = "inference",
+    operation_id = "post_completions",
+    request_body(content = serde_json::Value, content_type = "application/json", description = "OpenAI Completions request (`model`, `prompt`, `max_tokens`, `stream`, …)."),
+    responses(
+        (status = 200, description = "`application/json`: Completion object, as returned by the upstream. `text/event-stream`: Upstream SSE stream when `stream: true`.", content((serde_json::Value = "application/json"), (String = "text/event-stream"))),
+        (status = 401, body = crate::openapi::ApiError, description = "Missing or invalid API key (when client auth is required)."),
+        (status = 502, body = crate::openapi::ApiError, description = "The upstream could not be reached.")
+    ),
+    security(("bearer" = []), ("api_key" = []))
+)]
 async fn post_completions(
     State(gateway): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -2741,13 +2909,40 @@ fn anthropic_error_response(err: AppError) -> Response {
     (status, Json(body)).into_response()
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// Anthropic-style pagination, honoured only for the Anthropic-shaped listing.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ModelsListQuery {
+    /// Return models after this id.
     after_id: Option<String>,
+    /// Return models before this id.
     before_id: Option<String>,
+    /// Page size (decimal string).
     limit: Option<String>,
 }
 
+/// The models a client may request: the configured aliases plus the upstream
+/// catalog, filtered to the key's allowed models. With an `anthropic-version`
+/// or `anthropic-beta` header the Anthropic list shape
+/// (`{"data":[{"id","type":"model","display_name","created_at"}],"has_more","first_id","last_id"}`)
+/// is returned instead of the OpenAI shape
+/// (`{"object":"list","data":[{"id","object":"model","created","owned_by"}]}`).
+#[utoipa::path(
+    get,
+    path = "/v1/models",
+    tag = "inference",
+    operation_id = "get_models",
+    params(
+        ModelsListQuery,
+        ("anthropic-version" = Option<String>, Header, description = "Presence selects the Anthropic list shape.")
+    ),
+    responses(
+        (status = 200, body = serde_json::Value, description = "Model list (OpenAI or Anthropic shape, see above). Carries an `ETag`."),
+        (status = 401, body = crate::openapi::ApiError, description = "Missing or invalid API key (when client auth is required)."),
+        (status = 502, body = crate::openapi::ApiError, description = "The upstream catalog could not be fetched.")
+    ),
+    security(("bearer" = []), ("api_key" = []))
+)]
 async fn get_models(
     headers: HeaderMap,
     Query(query): Query<ModelsListQuery>,
