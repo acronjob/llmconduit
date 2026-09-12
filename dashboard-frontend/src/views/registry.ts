@@ -7,10 +7,16 @@ import { SankeyView } from './SankeyView';
 import { TheaterView } from './TheaterView';
 import { OverviewView } from './overview/OverviewView';
 import { SessionsView } from './sessions/SessionsView';
+import { ThroughputView } from './throughput/ThroughputView';
+import { ActivityView } from './activity/ActivityView';
+import { AccountView } from './account/AccountView';
 
 export const VIEW_BY_ROUTE: Record<RouteName, ComponentType> = {
   flows: FlowsView,
   sessions: SessionsView,
+  throughput: ThroughputView,
+  activity: ActivityView,
+  account: AccountView,
   topology: TopologyView,
   sankey: SankeyView,
   theater: TheaterView,

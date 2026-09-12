@@ -8,18 +8,26 @@
  * a `csrfToken` getter so the mock backend + tests can inject their own.
  */
 import type {
+  ActivityResponse,
+  ApiKeyRecord,
   CatalogEntry,
+  CreatedKeyResponse,
   FlowDetail,
   FlowsQuery,
   FlowsResponse,
   HistoryBodyHop,
+  HistoryMetricsResponse,
   KillResponse,
   LoginRequest,
+  MeResponse,
   MetricsResponse,
   SessionDetailResponse,
+  SessionUser,
   SessionsResponse,
   SnapshotResponse,
+  ThroughputResponse,
   TopologyResponse,
+  UserRecord,
 } from './types';
 
 export type FetchImpl = typeof fetch;
@@ -77,8 +85,11 @@ export class DashboardClient {
 
   // -- Auth -----------------------------------------------------------------
 
-  /** `POST /dashboard/login` — note: login lives at /dashboard, NOT under /api. */
-  async login(body: LoginRequest): Promise<void> {
+  /**
+   * `POST /dashboard/login` — note: login lives at /dashboard, NOT under /api. Returns the
+   * signed-in user (null for a token login) as the server reports it.
+   */
+  async login(body: LoginRequest): Promise<{ user: SessionUser | null }> {
     const res = await this.fetchImpl('/dashboard/login', {
       method: 'POST',
       credentials: 'include',
@@ -88,6 +99,70 @@ export class DashboardClient {
     if (!res.ok) {
       throw new Error(`login failed: ${res.status}`);
     }
+    try {
+      const parsed = (await res.json()) as { user?: SessionUser | null };
+      return { user: parsed.user ?? null };
+    } catch {
+      return { user: null };
+    }
+  }
+
+  /** A CSRF-carrying mutation under /dashboard/api. */
+  private mutate<T>(path: string, method: 'POST' | 'PATCH' | 'DELETE', body?: unknown): Promise<T> {
+    const csrf = this.getCsrfToken();
+    const headers: Record<string, string> = {};
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    return this.request<T>(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  }
+
+  // -- Accounts -------------------------------------------------------------
+
+  me(): Promise<MeResponse> {
+    return this.request<MeResponse>('/me');
+  }
+
+  listUsers(): Promise<{ users: UserRecord[] }> {
+    return this.request<{ users: UserRecord[] }>('/users');
+  }
+
+  createUser(body: { username: string; password: string; is_admin: boolean }): Promise<UserRecord> {
+    return this.mutate<UserRecord>('/users', 'POST', body);
+  }
+
+  updateUser(id: string, body: { password?: string; is_admin?: boolean }): Promise<{ id: string; updated: boolean }> {
+    return this.mutate(`/users/${encodeURIComponent(id)}`, 'PATCH', body);
+  }
+
+  deleteUser(id: string): Promise<{ id: string; deleted: boolean; keys_revoked: number }> {
+    return this.mutate(`/users/${encodeURIComponent(id)}`, 'DELETE');
+  }
+
+  /** `GET /keys[?user_id=]` — own keys by default; admins may pass a user id or `all`. */
+  listKeys(userId?: string): Promise<{ keys: ApiKeyRecord[] }> {
+    return this.request<{ keys: ApiKeyRecord[] }>(`/keys${userId ? `?user_id=${encodeURIComponent(userId)}` : ''}`);
+  }
+
+  createKey(body: { label?: string; allowed_models?: string[]; user_id?: string }): Promise<CreatedKeyResponse> {
+    return this.mutate<CreatedKeyResponse>('/keys', 'POST', body);
+  }
+
+  deleteKey(id: string): Promise<{ id: string; revoked: boolean }> {
+    return this.mutate(`/keys/${encodeURIComponent(id)}`, 'DELETE');
+  }
+
+  // -- History series -------------------------------------------------------
+
+  historyThroughput(query: { since_ms?: number; bucket_secs?: number; limit?: number } = {}): Promise<ThroughputResponse> {
+    return this.request<ThroughputResponse>(`/history/throughput${buildQuery(query)}`);
+  }
+
+  historyActivity(query: { since_ms?: number; bucket_secs?: number; limit?: number } = {}): Promise<ActivityResponse> {
+    return this.request<ActivityResponse>(`/history/activity${buildQuery(query)}`);
+  }
+
+  historyMetrics(query: { since_ms?: number; limit?: number } = {}): Promise<HistoryMetricsResponse> {
+    return this.request<HistoryMetricsResponse>(`/history/metrics${buildQuery(query)}`);
   }
 
   /** `POST /dashboard/logout` — clears the session cookie. */

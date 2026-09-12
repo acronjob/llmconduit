@@ -10,9 +10,10 @@ import { getConnection, resetConnection } from '../api/connection';
 describe('LoginShell', () => {
   beforeEach(() => {
     authStore.getState().setAuthenticated(false);
+    authStore.getState().setAuthMode('token');
   });
 
-  it('renders the token-entry form when unauthenticated', () => {
+  it('renders the token-entry form when only a token gates the dashboard', () => {
     const client = new DashboardClient();
     render(<LoginShell client={client} />);
     expect(screen.getByLabelText('Dashboard token')).toBeInTheDocument();
@@ -20,7 +21,7 @@ describe('LoginShell', () => {
   });
 
   it('POSTs /dashboard/login and flips auth on success', async () => {
-    const login = vi.fn().mockResolvedValue(undefined);
+    const login = vi.fn().mockResolvedValue({ user: null });
     const client = { login } as unknown as DashboardClient;
     render(<LoginShell client={client} />);
 
@@ -41,6 +42,27 @@ describe('LoginShell', () => {
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/invalid/i));
     expect(authStore.getState().authenticated).toBe(false);
+  });
+
+  it('defaults to username/password once accounts exist, remembers the user, and can switch to a token', async () => {
+    authStore.getState().setAuthMode('users');
+    const login = vi.fn().mockResolvedValue({ user: { id: 'u1', username: 'koen', is_admin: true } });
+    const client = { login } as unknown as DashboardClient;
+    render(<LoginShell client={client} />);
+    expect(screen.getByTestId('login-form').getAttribute('data-mode')).toBe('users');
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'koen' } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'hunter22' } });
+    fireEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    await waitFor(() => expect(login).toHaveBeenCalledWith({ username: 'koen', password: 'hunter22' }));
+    await waitFor(() => expect(authStore.getState().authenticated).toBe(true));
+    expect(authStore.getState().user?.username).toBe('koen');
+
+    cleanup();
+    authStore.getState().setAuthenticated(false);
+    render(<LoginShell client={client} />);
+    fireEvent.click(screen.getByTestId('login-toggle'));
+    expect(screen.getByTestId('login-form').getAttribute('data-mode')).toBe('token');
+    expect(screen.getByLabelText('Dashboard token')).toBeInTheDocument();
   });
 });
 

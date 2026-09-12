@@ -10,23 +10,32 @@
  * A dev flag (`isMockEnabled`) selects mock vs. real (see ../config/env.ts).
  */
 import type {
+  ActivityBucket,
+  ActivityResponse,
+  ApiKeyRecord,
   CatalogEntry,
   DashboardFrame,
   DebugWsMessage,
   FlowDetail,
   FlowSummary,
   FlowsResponse,
+  HistoryMetricsResponse,
   HistoryRequest,
+  MetricSample,
   MetricsResponse,
   MonitorPayload,
   ProviderHealth,
   ProviderLatency,
   SessionDetailResponse,
   SessionRow,
+  SessionUser,
   SessionsResponse,
   SnapshotFrame,
   SnapshotResponse,
+  ThroughputBucket,
+  ThroughputResponse,
   TopologyResponse,
+  UserRecord,
   WsServerMessage,
 } from './types';
 import type { WsLike } from './ws';
@@ -375,9 +384,96 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   const path = url.replace(/^https?:\/\/[^/]+/, '').split('?')[0] ?? url;
   const qs = new URLSearchParams(url.includes('?') ? url.slice(url.indexOf('?')) : '');
 
-  // -- Auth --
+  // -- Auth -- a username/password login is accepted for the seeded users (any password
+  // of 8+ chars), a token login for any non-empty token; the response carries the user.
   if (path === '/dashboard/login' && method === 'POST') {
-    return json({ ok: true });
+    const body = parseBody(init?.body);
+    if (typeof body.username === 'string') {
+      const user = MOCK_USERS.find((u) => u.username === body.username);
+      if (!user || typeof body.password !== 'string' || body.password.length < 8) return json({ error: 'invalid username or password' }, 401);
+      mockSessionUser = { id: user.id, username: user.username, is_admin: user.is_admin };
+      return json({ authenticated: true, user: mockSessionUser });
+    }
+    if (typeof body.token !== 'string' || body.token.length === 0) return json({ error: 'invalid token' }, 401);
+    mockSessionUser = null;
+    return json({ authenticated: true, user: null });
+  }
+  // -- Accounts --
+  if (path === '/dashboard/api/me') {
+    return json({ user: mockSessionUser, is_admin: mockSessionUser?.is_admin ?? true, auth_mode: 'users', accounts_enabled: true });
+  }
+  if (path === '/dashboard/api/users' && method === 'GET') {
+    if (mockSessionUser && !mockSessionUser.is_admin) return json({ error: 'administrator role required' }, 403);
+    return json({ users: MOCK_USERS });
+  }
+  if (path === '/dashboard/api/users' && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const body = parseBody(init?.body);
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    if (!username) return json({ error: 'username must be 1-64 characters' }, 400);
+    if (MOCK_USERS.some((u) => u.username === username)) return json({ error: 'username already exists' }, 409);
+    const user: UserRecord = { id: `user_${MOCK_USERS.length + 1}`, username, is_admin: body.is_admin === true, created_at_ms: Date.now(), updated_at_ms: Date.now() };
+    MOCK_USERS.push(user);
+    return json(user, 201);
+  }
+  const userMatch = path.match(/^\/dashboard\/api\/users\/([^/]+)$/);
+  if (userMatch && (method === 'PATCH' || method === 'DELETE')) {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(userMatch[1] ?? '');
+    const index = MOCK_USERS.findIndex((u) => u.id === id);
+    if (index < 0) return json({ error: 'user not found' }, 404);
+    if (method === 'DELETE') {
+      MOCK_USERS.splice(index, 1);
+      const before = MOCK_KEYS.length;
+      for (let i = MOCK_KEYS.length - 1; i >= 0; i--) if (MOCK_KEYS[i]!.user_id === id) MOCK_KEYS.splice(i, 1);
+      return json({ id, deleted: true, keys_revoked: before - MOCK_KEYS.length });
+    }
+    const body = parseBody(init?.body);
+    if (typeof body.is_admin === 'boolean') MOCK_USERS[index] = { ...MOCK_USERS[index]!, is_admin: body.is_admin };
+    return json({ id, updated: true });
+  }
+  if (path === '/dashboard/api/keys' && method === 'GET') {
+    const scope = qs.get('user_id');
+    const keys = scope === 'all' || (!scope && !mockSessionUser) ? MOCK_KEYS : MOCK_KEYS.filter((k) => k.user_id === (scope ?? mockSessionUser?.id));
+    return json({ keys });
+  }
+  if (path === '/dashboard/api/keys' && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const body = parseBody(init?.body);
+    const key: ApiKeyRecord = {
+      id: `key_${MOCK_KEYS.length + 1}`,
+      label: typeof body.label === 'string' && body.label ? body.label : null,
+      user_id: typeof body.user_id === 'string' ? body.user_id : mockSessionUser?.id ?? null,
+      allowed_models: Array.isArray(body.allowed_models) ? (body.allowed_models as string[]) : [],
+      created_at_ms: Date.now(),
+      updated_at_ms: Date.now(),
+    };
+    MOCK_KEYS.push(key);
+    return json({ key, secret: `llmc_${'0'.repeat(56)}${MOCK_KEYS.length.toString().padStart(8, '0')}`, registered_keys: MOCK_KEYS.length }, 201);
+  }
+  const keyMatch = path.match(/^\/dashboard\/api\/keys\/([^/]+)$/);
+  if (keyMatch && method === 'DELETE') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(keyMatch[1] ?? '');
+    const index = MOCK_KEYS.findIndex((k) => k.id === id);
+    if (index < 0) return json({ error: 'key not found' }, 404);
+    MOCK_KEYS.splice(index, 1);
+    return json({ id, revoked: true, registered_keys: MOCK_KEYS.length });
+  }
+  // -- History series --
+  if (path === '/dashboard/api/history/throughput') {
+    const bucketSecs = Number(qs.get('bucket_secs') ?? 60);
+    const resp: ThroughputResponse = { buckets: seedThroughput(bucketSecs * 1000), since_ms: 0, bucket_ms: bucketSecs * 1000, limit: 2000, truncated: false };
+    return json(resp);
+  }
+  if (path === '/dashboard/api/history/activity') {
+    const bucketSecs = Number(qs.get('bucket_secs') ?? 300);
+    const resp: ActivityResponse = { buckets: seedActivity(bucketSecs * 1000), since_ms: 0, bucket_ms: bucketSecs * 1000, limit: 2000, truncated: false };
+    return json(resp);
+  }
+  if (path === '/dashboard/api/history/metrics') {
+    const resp: HistoryMetricsResponse = { samples: seedUpstreamSamples(), since_ms: 0, limit: 5000, truncated: false };
+    return json(resp);
   }
   if (path === '/dashboard/logout' && method === 'POST') {
     return json({ ok: true });
@@ -562,6 +658,97 @@ export const MOCK_REQUEST_BODIES: Record<string, unknown> = {
   api_002: { model: 'claude-x', system: 'You are Claude Code.', messages: [{ role: 'user', content: 'hi' }] },
   api_001: { model: 'claude-x', system: 'You are Claude Code.', messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }, { role: 'user', content: 'more' }] },
 };
+
+function parseBody(body: BodyInit | null | undefined): Record<string, unknown> {
+  if (typeof body !== 'string') return {};
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The mock's signed-in user (null after a token login). */
+let mockSessionUser: SessionUser | null = null;
+
+export const MOCK_USERS: UserRecord[] = [
+  { id: 'user_admin', username: 'admin', is_admin: true, created_at_ms: Date.now() - 86_400_000 * 30, updated_at_ms: Date.now() - 86_400_000 * 30 },
+  { id: 'user_dev', username: 'dev', is_admin: false, created_at_ms: Date.now() - 86_400_000 * 3, updated_at_ms: Date.now() - 86_400_000 * 3 },
+];
+
+export const MOCK_KEYS: ApiKeyRecord[] = [
+  { id: 'key_admin_laptop', label: 'laptop', user_id: 'user_admin', allowed_models: [], created_at_ms: Date.now() - 86_400_000 * 20, updated_at_ms: Date.now() - 86_400_000 * 20 },
+  { id: 'key_dev_ci', label: 'ci', user_id: 'user_dev', allowed_models: ['local'], created_at_ms: Date.now() - 86_400_000 * 2, updated_at_ms: Date.now() - 86_400_000 * 2 },
+];
+
+/** Reset the mutable mock account state (tests). */
+export function resetMockAccounts(): void {
+  mockSessionUser = null;
+  MOCK_USERS.splice(0, MOCK_USERS.length,
+    { id: 'user_admin', username: 'admin', is_admin: true, created_at_ms: Date.now() - 86_400_000 * 30, updated_at_ms: Date.now() - 86_400_000 * 30 },
+    { id: 'user_dev', username: 'dev', is_admin: false, created_at_ms: Date.now() - 86_400_000 * 3, updated_at_ms: Date.now() - 86_400_000 * 3 },
+  );
+  MOCK_KEYS.splice(0, MOCK_KEYS.length,
+    { id: 'key_admin_laptop', label: 'laptop', user_id: 'user_admin', allowed_models: [], created_at_ms: Date.now() - 86_400_000 * 20, updated_at_ms: Date.now() - 86_400_000 * 20 },
+    { id: 'key_dev_ci', label: 'ci', user_id: 'user_dev', allowed_models: ['local'], created_at_ms: Date.now() - 86_400_000 * 2, updated_at_ms: Date.now() - 86_400_000 * 2 },
+  );
+}
+
+/** Deterministic per-model throughput buckets for the last hour. */
+function seedThroughput(bucketMs: number): ThroughputBucket[] {
+  const now = Date.now();
+  const start = Math.floor((now - 60 * 60_000) / bucketMs) * bucketMs;
+  const out: ThroughputBucket[] = [];
+  for (let t = start, i = 0; t <= now; t += bucketMs, i++) {
+    const wave = 1 + Math.sin(i / 3) * 0.4;
+    out.push({
+      bucket_ms: t, model: 'llama-3.1-70b', backend: 'vllm-a',
+      requests: Math.round(12 * wave), completed: Math.round(11 * wave),
+      input_tokens: Math.round(24_000 * wave), output_tokens: Math.round(4_800 * wave), cached_tokens: Math.round(18_000 * wave),
+      ttft_ms_sum: Math.round(12 * wave * 380), ttft_count: Math.round(12 * wave), prefill_tokens: Math.round(24_000 * wave),
+      decode_ms_sum: Math.round(11 * wave * 2_600), decode_tokens: Math.round(4_400 * wave), decode_count: Math.round(11 * wave),
+    });
+    out.push({
+      bucket_ms: t, model: 'gpt-4o', backend: 'openai',
+      requests: Math.round(4 * wave), completed: Math.round(4 * wave),
+      input_tokens: Math.round(6_000 * wave), output_tokens: Math.round(1_200 * wave), cached_tokens: 0,
+      ttft_ms_sum: Math.round(4 * wave * 900), ttft_count: Math.round(4 * wave), prefill_tokens: Math.round(6_000 * wave),
+      decode_ms_sum: Math.round(4 * wave * 3_000), decode_tokens: Math.round(1_200 * wave), decode_count: Math.round(4 * wave),
+    });
+  }
+  return out;
+}
+
+/** Deterministic per-user/key activity buckets for the last day. */
+function seedActivity(bucketMs: number): ActivityBucket[] {
+  const now = Date.now();
+  const start = Math.floor((now - 24 * 60 * 60_000) / bucketMs) * bucketMs;
+  const out: ActivityBucket[] = [];
+  for (let t = start, i = 0; t <= now; t += bucketMs, i++) {
+    const wave = 1 + Math.cos(i / 4) * 0.5;
+    out.push({ bucket_ms: t, user_id: 'user_admin', virtual_key_id: 'key_admin_laptop', requests: Math.round(30 * wave), failed: i % 5 === 0 ? 1 : 0, input_tokens: Math.round(60_000 * wave), output_tokens: Math.round(9_000 * wave), cached_tokens: Math.round(40_000 * wave) });
+    out.push({ bucket_ms: t, user_id: 'user_dev', virtual_key_id: 'key_dev_ci', requests: Math.round(8 * wave), failed: 0, input_tokens: Math.round(9_000 * wave), output_tokens: Math.round(2_000 * wave), cached_tokens: 0 });
+    if (i % 3 === 0) out.push({ bucket_ms: t, user_id: null, virtual_key_id: null, requests: 2, failed: 0, input_tokens: 800, output_tokens: 200, cached_tokens: 0 });
+  }
+  return out;
+}
+
+/** Two consecutive vLLM scrapes for vllm-a so rates can be derived, plus one health sample. */
+function seedUpstreamSamples(): MetricSample[] {
+  const now = Date.now();
+  const sample = (ts: number, prompt: number, gen: number, running: number) => ({
+    backend: 'vllm-a', ts_ms: ts,
+    data: JSON.stringify({ kind: 'upstream', engine: 'vllm', backend: 'vllm-a', scraped_at_ms: ts, kept_lines: 12, models: { 'llama-3.1-70b': { values: { running, waiting: 1, kv_usage: 0.62, prompt_tokens_total: prompt, generation_tokens_total: gen, prefix_cache_hits_total: 1_500_000, prefix_cache_queries_total: 2_000_000, ttft_seconds_sum: 900, ttft_count: 2_400 } } } }),
+  });
+  const out: MetricSample[] = [];
+  for (let i = 8; i >= 1; i--) {
+    const ts = now - i * 15_000;
+    out.push(sample(ts, 5_000_000 + (8 - i) * 30_000, 900_000 + (8 - i) * 6_000, 3 + (i % 3)));
+  }
+  out.push({ backend: 'vllm-a', ts_ms: now - 60_000, data: JSON.stringify({ kind: 'health', name: 'vllm-a', status: 'healthy' }) });
+  return out;
+}
 
 /** True when `id` is one of the seeded `api_call_id`s (D13 `:id = api_call_id`) — finding 7. */
 function isSeededApiCallId(id: string): boolean {

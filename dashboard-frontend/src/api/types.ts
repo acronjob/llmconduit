@@ -956,7 +956,120 @@ export interface KillResponse {
 
 /** `POST /dashboard/login` body. */
 export interface LoginRequest {
-  token: string;
+  token?: string;
+  username?: string;
+  password?: string;
+}
+
+/** The user behind a dashboard session (embedded in the signed cookie). */
+export interface SessionUser {
+  id: string;
+  username: string;
+  is_admin: boolean;
+}
+
+export type AuthMode = 'users' | 'token' | 'open';
+
+/** `GET /dashboard/api/me` */
+export interface MeResponse {
+  user: SessionUser | null;
+  is_admin: boolean;
+  auth_mode: AuthMode;
+  accounts_enabled: boolean;
+}
+
+export interface UserRecord {
+  id: string;
+  username: string;
+  is_admin: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface ApiKeyRecord {
+  id: string;
+  label: string | null;
+  user_id: string | null;
+  allowed_models: string[];
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+/** `POST /dashboard/api/keys` — the plaintext is returned exactly once. */
+export interface CreatedKeyResponse {
+  key: ApiKeyRecord;
+  secret: string;
+  registered_keys: number;
+}
+
+/** One cell of `GET /dashboard/api/history/throughput` (bucket × model × backend). */
+export interface ThroughputBucket {
+  bucket_ms: number;
+  model: string;
+  backend: string | null;
+  requests: number;
+  completed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  ttft_ms_sum: number;
+  ttft_count: number;
+  prefill_tokens: number;
+  decode_ms_sum: number;
+  decode_tokens: number;
+  decode_count: number;
+}
+
+export interface ThroughputResponse {
+  buckets: ThroughputBucket[];
+  since_ms: number;
+  bucket_ms: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/** One cell of `GET /dashboard/api/history/activity` (bucket × user × key). */
+export interface ActivityBucket {
+  bucket_ms: number;
+  user_id: string | null;
+  virtual_key_id: string | null;
+  requests: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+}
+
+export interface ActivityResponse {
+  buckets: ActivityBucket[];
+  since_ms: number;
+  bucket_ms: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/** One row of `GET /dashboard/api/history/metrics`: the sample JSON is in `data`. */
+export interface MetricSample {
+  backend: string;
+  ts_ms: number;
+  data: string;
+}
+
+export interface HistoryMetricsResponse {
+  samples: MetricSample[];
+  since_ms: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/** A parsed upstream (vLLM/SGLang) sample, `kind: "upstream"` in `MetricSample.data`. */
+export interface UpstreamMetricsSample {
+  kind: 'upstream';
+  engine: 'vllm' | 'sglang' | 'unknown' | string;
+  backend: string;
+  scraped_at_ms: number;
+  models: Record<string, { values?: Record<string, number>; by_label?: Record<string, Record<string, number>> }>;
+  kept_lines: number;
 }
 
 /**
@@ -968,6 +1081,9 @@ export interface DashboardBootstrap {
   authenticated: boolean;
   csrf_token: string | null;
   mutations_enabled: boolean;
+  /** The signed-in user (null for token / dev-open sessions). */
+  user: SessionUser | null;
+  auth_mode: AuthMode;
 }
 
 // ---------------------------------------------------------------------------

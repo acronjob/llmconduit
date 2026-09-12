@@ -29,6 +29,12 @@ export const queryKeys = {
   sessions: ['history', 'sessions'] as const,
   session: (id: string) => ['history', 'sessions', id] as const,
   requestBody: (id: string, hop: string) => ['history', 'requests', id, 'body', hop] as const,
+  throughput: ['history', 'throughput'] as const,
+  activity: ['history', 'activity'] as const,
+  historyMetrics: ['history', 'metrics'] as const,
+  me: ['me'] as const,
+  users: ['users'] as const,
+  keys: (scope: string) => ['keys', scope] as const,
 } as const;
 
 export interface Connection {
@@ -61,6 +67,8 @@ export function getConnection(): Connection {
   authStore.getState().setAuthenticated(boot.authenticated);
   authStore.getState().setCsrfToken(boot.csrf_token);
   authStore.getState().setMutationsEnabled(boot.mutations_enabled);
+  authStore.getState().setUser(boot.user);
+  authStore.getState().setAuthMode(boot.auth_mode);
 
   const queryClient = new QueryClient({
     defaultOptions: {
