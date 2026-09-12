@@ -142,9 +142,9 @@ headers. The extension below makes attribution exact regardless of that flag.
 
 - New extension `extensions/llm-session-headers`, registered on
   `before_provider_headers`. It sets the four headers above from
-  `ctx.sessionManager.getSessionId()`, the package version, and a new
-  environment variable `PI_PARENT_SESSION_ID` that the subagent manager
-  exports when it spawns a child.
+  `ctx.sessionManager.getSessionId()`, the package version, and the new CLI
+  flag `--parent-session-id` that the subagent manager passes when it spawns
+  or restarts a child (persisted in `subagent-meta.json`).
 - The five `completeSimple` bypass sites (oracle, image-analyzer,
   custom-compaction x2, playwright) pass the same headers explicitly, with
   `x-llm-session-kind` naming the caller. Built-in compaction keeps its
@@ -287,6 +287,13 @@ in the same session that was still streaming when it arrived, if any.
   sub-session *is* the chain), `spawned_by_request_id` is the parent chain's
   latest request rather than an in-flight lookup, and ingress now also
   writes `client_label`/`client_source` on the request row.
+- Phase 4 (pi-agent) landed in pi-agent on branch `codex-improvements`:
+  `extensions/llm-session-headers` plus `extensions/shared/llm-session.ts`;
+  the subagent manager passes `--parent-session-id` (a CLI flag, since
+  environment variables do not reliably cross the tmux boundary) and the
+  five direct `completeSimple` call sites merge the headers with their own
+  session kind. Extensions load from source at runtime, so no bundle rebuild
+  is needed.
 
 ## Phases
 
