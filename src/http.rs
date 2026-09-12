@@ -908,6 +908,7 @@ async fn log_api_call(
                     u64::try_from(body_bytes.len()).unwrap_or(u64::MAX),
                     split,
                     inbound.partial,
+                    Some(&headers),
                 ));
             }
             None => {
@@ -918,6 +919,7 @@ async fn log_api_call(
                     body_bytes.len(),
                     &inbound.redacted,
                     inbound.partial,
+                    Some(&headers),
                 ));
             }
         }

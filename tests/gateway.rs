@@ -6097,6 +6097,7 @@ async fn persistent_history_body_route_reassembles_full_bodies_per_hop() {
             100,
             split,
             false,
+            None,
         ),
     )
     .await
@@ -6115,6 +6116,7 @@ async fn persistent_history_body_route_reassembles_full_bodies_per_hop() {
             100,
             split,
             false,
+            None,
         ),
     )
     .await

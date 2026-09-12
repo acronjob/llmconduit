@@ -773,6 +773,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_exec_user_agent_carries_the_version() {
+        // `codex exec` (0.154.0) identifies as `codex_exec/<version>`, not
+        // `codex_cli_rs/…`; seen live through the gateway.
+        let detector = HarnessDetector::builtin();
+        let identity = detector.detect(
+            &headers(&[
+                (
+                    "user-agent",
+                    "codex_exec/0.154.0 (Debian 13.0.0; x86_64) unknown",
+                ),
+                ("originator", "codex_exec"),
+                ("session-id", "s-9"),
+            ]),
+            None,
+        );
+        assert_eq!(identity.harness, "codex");
+        assert_eq!(identity.version.as_deref(), Some("0.154.0"));
+        assert_eq!(identity.session_id.as_deref(), Some("s-9"));
+    }
+
+    #[test]
     fn codex_root_thread_and_spawned_agent() {
         let detector = HarnessDetector::builtin();
         let root = headers(&[

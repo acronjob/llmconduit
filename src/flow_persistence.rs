@@ -818,6 +818,7 @@ impl PersistenceCapture {
                     &[],
                     false,
                     true,
+                    None,
                 ));
             }
             Some(CapturedRequest {
@@ -833,6 +834,7 @@ impl PersistenceCapture {
                     original_bytes,
                     split,
                     partial,
+                    None,
                 ));
             }
             Some(CapturedRequest {
@@ -849,6 +851,7 @@ impl PersistenceCapture {
                     &bytes,
                     true,
                     partial,
+                    None,
                 ));
             }
         }
@@ -920,6 +923,7 @@ pub fn body_write(
     original_bytes: u64,
     split: SplitBody,
     partial: bool,
+    headers: Option<&axum::http::HeaderMap>,
 ) -> BodyWrite {
     debug_assert!(matches!(
         section,
@@ -957,6 +961,7 @@ pub fn body_write(
         split.skeleton.as_bytes(),
         false,
         partial,
+        headers,
     );
     // Record the item count in the envelope so a reader knows the payload is a
     // skeleton even before it looks for references.
@@ -1011,6 +1016,35 @@ struct EventPayloadEnvelope<'a> {
     partial: bool,
     encoding: &'static str,
     content: &'a str,
+    /// Client request headers on the `client_in` hop: redacted (credentials
+    /// become `[redacted]`), each value capped, and the set bounded. Absent on
+    /// upstream hops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Upper bound on captured request headers per event.
+const EVENT_HEADERS_MAX: usize = 64;
+
+/// The client request headers as a redacted, bounded JSON object (repeated
+/// names are joined with `, `, as HTTP allows).
+fn captured_headers(headers: &axum::http::HeaderMap) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for (name, value) in crate::redaction::redact_headers_capped(headers, EVENT_SCALAR_CAP_BYTES) {
+        match map.get_mut(&name) {
+            Some(serde_json::Value::String(existing)) => {
+                existing.push_str(", ");
+                existing.push_str(&value);
+            }
+            _ => {
+                if map.len() >= EVENT_HEADERS_MAX {
+                    break;
+                }
+                map.insert(name, serde_json::Value::String(value));
+            }
+        }
+    }
+    map
 }
 
 /// Build a request-side hop event with the shared secret/image redactor.
@@ -1024,6 +1058,18 @@ pub fn request_payload_event(
     ts_ms: u128,
     raw: &[u8],
     partial: bool,
+) -> EventRow {
+    request_payload_event_with_headers(api_call_id, section, ts_ms, raw, partial, None)
+}
+
+/// [`request_payload_event`] that also records the client request headers.
+pub fn request_payload_event_with_headers(
+    api_call_id: &str,
+    section: PayloadSection,
+    ts_ms: u128,
+    raw: &[u8],
+    partial: bool,
+    headers: Option<&axum::http::HeaderMap>,
 ) -> EventRow {
     debug_assert!(matches!(
         section,
@@ -1042,6 +1088,7 @@ pub fn request_payload_event(
         &captured,
         raw.len() > EVENT_PAYLOAD_CAP_BYTES,
         partial,
+        headers,
     )
 }
 
@@ -1055,6 +1102,7 @@ pub fn redacted_request_payload_event(
     original_bytes: usize,
     redacted: &[u8],
     partial: bool,
+    headers: Option<&axum::http::HeaderMap>,
 ) -> EventRow {
     debug_assert!(matches!(
         section,
@@ -1069,6 +1117,7 @@ pub fn redacted_request_payload_event(
         &redacted[..captured_len],
         redacted.len() > captured_len || original_bytes > EVENT_PAYLOAD_CAP_BYTES,
         partial,
+        headers,
     )
 }
 
@@ -1133,6 +1182,7 @@ impl ModelOutputCapture {
             &bytes,
             truncated || bytes.len() >= EVENT_PAYLOAD_CAP_BYTES,
             partial,
+            None,
         )
     }
 }
@@ -1208,6 +1258,7 @@ fn extend_capped(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn payload_event(
     api_call_id: &str,
     section: PayloadSection,
@@ -1216,6 +1267,7 @@ fn payload_event(
     captured: &[u8],
     truncated: bool,
     partial: bool,
+    headers: Option<&axum::http::HeaderMap>,
 ) -> EventRow {
     let (encoding, content) = match std::str::from_utf8(captured) {
         Ok(text) => ("utf8", text.to_owned()),
@@ -1231,6 +1283,7 @@ fn payload_event(
         partial,
         encoding,
         content: &content,
+        headers: headers.map(captured_headers),
     })
     .expect("serializing a bounded event payload cannot fail");
 
@@ -1527,6 +1580,76 @@ mod tests {
     }
 
     #[test]
+    fn inbound_events_keep_redacted_request_headers() {
+        // The client hop records the request headers (harness detection and
+        // session attribution depend on them), with credentials redacted.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            "codex_exec/0.154.0 (Debian 13.0.0; x86_64)"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("authorization", "Bearer llmc_secret".parse().unwrap());
+        headers.insert("x-api-key", "sk-secret".parse().unwrap());
+        headers.insert("cookie", "llmconduit_session=abc".parse().unwrap());
+        headers.insert("x-llm-session-id", "s-1".parse().unwrap());
+        let split = crate::content_store::split_value(
+            crate::flow_persistence::PROTOCOL_CHAT_COMPLETIONS,
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+            true,
+        )
+        .unwrap();
+        let write = body_write(
+            "api-call-3",
+            PayloadSection::InboundRequest,
+            5,
+            10,
+            split,
+            false,
+            Some(&headers),
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(write.event.payload.as_deref().unwrap()).unwrap();
+        let captured = &envelope["headers"];
+        assert_eq!(
+            captured["user-agent"],
+            "codex_exec/0.154.0 (Debian 13.0.0; x86_64)"
+        );
+        assert_eq!(captured["x-llm-session-id"], "s-1");
+        assert_eq!(captured["authorization"], "[redacted]");
+        assert_eq!(captured["x-api-key"], "[redacted]");
+        assert_eq!(captured["cookie"], "[redacted]");
+        assert!(!envelope.to_string().contains("secret"));
+
+        let event = redacted_request_payload_event(
+            "api-call-4",
+            PayloadSection::InboundRequest,
+            5,
+            2,
+            b"{}",
+            false,
+            Some(&headers),
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(event.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(envelope["headers"]["authorization"], "[redacted]");
+        // Upstream hops carry no client headers.
+        let none = redacted_request_payload_event(
+            "api-call-5",
+            PayloadSection::UpstreamRequest,
+            5,
+            2,
+            b"{}",
+            false,
+            None,
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(none.payload.as_deref().unwrap()).unwrap();
+        assert!(envelope.get("headers").is_none());
+    }
+
+    #[test]
     fn payload_events_are_redacted_bounded_and_fixed_sequence() {
         let secret = "never-persist-me";
         let raw = format!(
@@ -1606,6 +1729,7 @@ mod tests {
             captured.original_bytes,
             split,
             captured.partial,
+            None,
         );
         assert_eq!(write.event.seq, PayloadSection::UpstreamRequest.seq());
         assert_eq!(write.event.hop, "upstream_out");
@@ -1661,6 +1785,7 @@ mod tests {
             10,
             split,
             false,
+            None,
         );
         assert_eq!(write.items.len(), 3);
         assert_eq!(write.blobs.len(), 2, "duplicate item shares one blob");
