@@ -384,7 +384,7 @@ async fn prepare_control_plane_runtime(
                 "loaded SQL-managed API keys into the live registry"
             );
         }
-        all_key_specs.extend(sql_specs);
+        all_key_specs = llmconduit::accounts::merge_key_specs(all_key_specs, sql_specs);
     }
     let client_auth = if loaded.client_auth_required || !all_key_specs.is_empty() {
         Some(llmconduit::client_auth::ClientAuth::from_specs(

@@ -109,13 +109,39 @@ pub fn specs_from_sql(specs: Vec<ApiKeyAuthSpec>) -> Vec<VirtualKeySpec> {
         .collect()
 }
 
+/// Union of the configured (YAML, or legacy relational) key specs and the SQL
+/// keys, keyed by id. A legacy relational database contributes its `api_keys`
+/// rows through the config side as well, so the SQL copy replaces a
+/// same-id config entry instead of registering it twice (which the registry
+/// rejects as a duplicate id and would crash startup).
+pub fn merge_key_specs(
+    configured: Vec<VirtualKeySpec>,
+    sql: Vec<VirtualKeySpec>,
+) -> Vec<VirtualKeySpec> {
+    let mut merged: Vec<VirtualKeySpec> = Vec::with_capacity(configured.len() + sql.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for spec in configured {
+        if seen.insert(spec.id.clone()) {
+            merged.push(spec);
+        }
+    }
+    for spec in sql {
+        if let Some(existing) = merged.iter_mut().find(|m| m.id == spec.id) {
+            *existing = spec;
+        } else {
+            merged.push(spec);
+        }
+    }
+    merged
+}
+
 /// Rebuild the gateway's live key registry from the YAML keys plus every
 /// active SQL key. Returns the number of keys now registered. A failure leaves
 /// the previous registry in place.
 pub async fn reload_client_keys(gateway: &Gateway) -> Result<usize, String> {
     let mut specs = gateway.yaml_key_specs().to_vec();
     if let Some(store) = gateway.persistence_store() {
-        specs.extend(specs_from_sql(store.api_key_auth_specs().await?));
+        specs = merge_key_specs(specs, specs_from_sql(store.api_key_auth_specs().await?));
     }
     let count = specs.len();
     gateway
@@ -153,6 +179,29 @@ pub async fn bootstrap_admin_from_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec(id: &str, label: &str) -> VirtualKeySpec {
+        VirtualKeySpec {
+            id: id.to_string(),
+            label: Some(label.to_string()),
+            owner_id: None,
+            secret_hash: format!("sha256:{}", "0".repeat(64)),
+            allowed_models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_key_specs_dedupes_by_id_with_sql_precedence() {
+        // A legacy relational database contributes its keys through the YAML
+        // (config) side as well; the SQL side must win exactly once.
+        let merged = merge_key_specs(
+            vec![spec("yaml-1", "yaml"), spec("shared", "from-config")],
+            vec![spec("shared", "from-sql"), spec("sql-1", "sql")],
+        );
+        let ids: Vec<&str> = merged.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["yaml-1", "shared", "sql-1"]);
+        assert_eq!(merged[1].label.as_deref(), Some("from-sql"));
+    }
 
     #[test]
     fn passwords_hash_and_verify_with_argon2id() {

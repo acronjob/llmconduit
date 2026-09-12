@@ -1378,12 +1378,11 @@ impl SqlStore {
         );
         let policy = self.get_setting("unknown_model_policy").await?;
 
-        if backends.is_empty()
-            && profiles.is_empty()
-            && aliases.is_empty()
-            && keys.is_empty()
-            && policy.is_none()
-        {
+        // API keys alone are not a legacy signal: the accounts feature stores
+        // its keys in `api_keys` and the startup path loads them into the live
+        // registry separately (YAML ∪ SQL). Only routing state (or a stored
+        // policy) marks a database as an already-seeded operational source.
+        if backends.is_empty() && profiles.is_empty() && aliases.is_empty() && policy.is_none() {
             return Ok(None);
         }
 
@@ -4449,6 +4448,34 @@ mod tests {
         assert_eq!(
             operational,
             crate::control_plane::OperationalConfig::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_keys_alone_do_not_signal_legacy_operational_state() {
+        // Regression: the accounts feature stores its keys in `api_keys`. A
+        // database holding only such keys (no backends/profiles/aliases/policy)
+        // is NOT a legacy operational source; treating it as one replaced the
+        // YAML routing with an empty relational config and then registered the
+        // same key twice ("duplicate virtual API key id") on every restart.
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        store
+            .put_api_key(
+                "80000000-0000-4000-8000-000000000001",
+                "llmc_secret",
+                Some("koen-main"),
+                None,
+                &[],
+                "test",
+            )
+            .await
+            .expect("key");
+        assert_eq!(
+            store.load_legacy_operational().await.expect("load"),
+            None,
+            "account-managed keys are loaded by the accounts registry, not as legacy state"
         );
     }
 
