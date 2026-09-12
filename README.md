@@ -218,6 +218,13 @@ timeout after which the request links cold. `infer_sub_sessions: false`
 keeps every request of a declared session on that session's chain and reports
 divergences there instead of opening inferred sub-sessions.
 
+The dashboard's Throughput tab charts requests/min, prefill and decode tok/s
+and TTFT per model and combined from the gateway series, and shows the scraped
+engine state (running/waiting, KV usage, prefix-cache hit rate, prompt and
+generation tok/s) per backend and model. The Activity tab rolls requests,
+failures and tokens up per user and key; the Account tab manages keys and
+users.
+
 The dashboard surfaces all of this: the flows table has a harness column, a
 `bust` marker on cache-busting rows, and harness / cache / session facets; the
 Sessions tab lists root sessions with their sub-sessions and requests; and the

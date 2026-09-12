@@ -302,6 +302,14 @@ in the same session that was still streaming when it arrived, if any.
   request's full inbound body against its chain predecessor via the content
   store's body endpoint.
 
+- Phase 6 is implemented: `crate::accounts` + `accounts_api` (users with
+  Argon2id passwords, per-user keys with a live YAML ∪ SQL registry, CLI
+  `user` commands, user-aware sessions and password login, `requests.user_id`,
+  migration 0010); `crate::upstream_metrics` (vLLM/SGLang `/metrics` scraper
+  per backend, `control_plane.metrics`); `history/throughput` and
+  `history/activity` series; dashboard Account, Throughput and Activity views
+  and the username/password login.
+
 ## Phases
 
 1. Content store: item splitting, blob store, skeleton events, reconstruction
