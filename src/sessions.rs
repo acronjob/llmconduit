@@ -35,10 +35,24 @@ pub const KIND_INFERRED: &str = "inferred";
 
 /// Whether two prefix-less item lists are the same conversation with some
 /// items changed (a rewritten system prompt, an edited tool) rather than two
-/// unrelated requests that happen to share an item: at least two items in
-/// common, covering at least half of the smaller request.
-fn overlap_is_a_match(common: usize, head_len: usize, input_len: usize) -> bool {
-    common >= 2 && common * 2 >= head_len.min(input_len)
+/// unrelated requests that happen to share a message: the messages in common
+/// (see [`overlap`]) must cover at least half of the conversation messages of
+/// the larger side. A title call that repeats the user's one message is not
+/// a rewrite of a 34-item chain; a re-sent conversation with a new system
+/// prompt still is.
+fn overlap_is_a_match(common: usize, head: &[ItemFingerprint], input: &[ItemFingerprint]) -> bool {
+    common >= 1 && common * 2 >= conversation_messages(head).max(conversation_messages(input))
+}
+
+/// The number of user/assistant/tool turns (the population [`overlap`] counts).
+fn conversation_messages(items: &[ItemFingerprint]) -> usize {
+    items
+        .iter()
+        .filter(|item| {
+            item.section == ItemSection::Message
+                && !matches!(item.kind.as_deref(), Some("system") | Some("developer"))
+        })
+        .count()
 }
 
 /// The part of a split item that lineage needs.
@@ -133,6 +147,17 @@ pub fn classify(predecessor: &[ItemFingerprint], current: &[ItemFingerprint]) ->
             kind: DivergenceKind::Append,
             shared_prefix: shared,
             index: None,
+            cache_bust: false,
+        };
+    }
+    // The request is a strict prefix of its predecessor: the conversation was
+    // rewound (or a new one started from the same prompt, for a harness with
+    // no session id). Everything it sends is still in the KV cache.
+    if shared == current.len() {
+        return Lineage {
+            kind: DivergenceKind::HistoryRewritten,
+            shared_prefix: shared,
+            index: Some(shared),
             cache_bust: false,
         };
     }
@@ -376,7 +401,7 @@ impl SessionLinker {
             };
             let prefix = shared_prefix(&head.items, input.items);
             let common = overlap(&head.items, input.items);
-            if prefix == 0 && !overlap_is_a_match(common, head.items.len(), input.items.len()) {
+            if prefix == 0 && !overlap_is_a_match(common, &head.items, input.items) {
                 continue;
             }
             let score = (prefix, common);
@@ -423,10 +448,9 @@ impl SessionLinker {
                         );
                         (child, new_chain(), None)
                     }
-                    Some(head) => {
-                        let lineage = classify(&head.items, input.items);
-                        (anchor.clone(), lineage, Some(head.request_id))
-                    }
+                    // No chain matched (no prefix, no substantial overlap):
+                    // a new conversation on the anchor, after the previous one.
+                    Some(head) => (anchor.clone(), new_chain(), Some(head.request_id)),
                 }
             }
         };
@@ -896,6 +920,18 @@ mod tests {
     }
 
     #[test]
+    fn a_request_that_is_a_prefix_of_its_predecessor_keeps_the_cache() {
+        // oh-my-pi sends no session id: a new conversation from the same
+        // system prompt and first message is a prefix of the previous chain.
+        let base = convo(&["u1", "a1", "u2", "a2"]);
+        let rewound = convo(&["u1"]);
+        let lineage = classify(&base, &rewound);
+        assert_eq!(lineage.kind, DivergenceKind::HistoryRewritten);
+        assert_eq!(lineage.shared_prefix, 3);
+        assert!(!lineage.cache_bust, "the prefix it sends is still cached");
+    }
+
+    #[test]
     fn a_side_call_sharing_one_message_is_not_a_rewrite_of_the_main_chain() {
         // opencode's title request reuses the user's message verbatim; with a
         // different system prompt and no tools it must not be classified as
@@ -907,6 +943,21 @@ mod tests {
         let title = link(&linker, "r2", &id, &side, 11);
         assert_ne!(title.lineage.kind, DivergenceKind::InstructionsChanged);
         assert!(!title.lineage.cache_bust);
+        // Nor the other way round: the main conversation arriving after the
+        // title call, sharing two of its three items, is not its rewrite.
+        let linker2 = SessionLinker::new(true);
+        let mut short = vec![fp("title-sys", ItemSection::Instructions, None), msg("u1")];
+        short.push(msg("a1"));
+        link(&linker2, "t1", &id, &short, 20);
+        let big = link(
+            &linker2,
+            "t2",
+            &id,
+            &convo(&["u1", "a1", "u2", "a2", "u3", "a3"]),
+            21,
+        );
+        assert_eq!(big.lineage.kind, DivergenceKind::NewChain);
+        assert!(!big.lineage.cache_bust);
         // A genuinely rewritten system prompt still matches by overlap.
         let mut resent = convo(&["u1", "a1", "u2"]);
         resent[0].hash = "sys-v2".into();
