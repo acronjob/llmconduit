@@ -854,6 +854,7 @@ fn has_valid_session_key(env: &DashboardEnv) -> bool {
 
 /// Either a dashboard token or a username + password.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
     /// The dashboard token (`LLMCONDUIT_DASHBOARD_TOKEN`); used only when
     /// `username` + `password` are not both present.
@@ -891,6 +892,7 @@ pub(crate) struct LoginResponse {
     request_body(content = Option<LoginRequest>, description = "`{username, password}` (verified against the SQL `users` table, Argon2id) when both are present; otherwise `{token}` (constant-time match against the dashboard token). A missing or unparsable JSON body is treated as an empty token login."),
     responses(
         (status = 200, description = "Signed in. Sets two cookies: `llmconduit_session` (HMAC-signed, `HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`) and the double-submit CSRF cookie `llmconduit_csrf` (same attributes but NOT `HttpOnly`, so the SPA can echo it in `x-csrf-token`); both add `Secure` when a public https origin is configured. `Cache-Control: no-store`.", body = LoginResponse),
+        (status = 400, description = "Malformed body, wrong content type, or an unknown field (the body is strict); the message names the field.", body = crate::openapi::DashboardError),
         (status = 401, description = "Rejected, `Cache-Control: no-store`. Messages: `invalid username or password`; `user login needs a SQL store` (username/password given but no SQL store is configured); `sign in with username and password` (a token login once user accounts exist, unless the listener is dev-open); `invalid token`.", body = crate::openapi::DashboardError),
     )
 )]
@@ -901,11 +903,22 @@ pub async fn dashboard_login(
 ) -> Response {
     let body = match payload {
         Ok(Json(body)) => body,
-        Err(_) => LoginRequest {
-            token: None,
-            username: None,
-            password: None,
-        },
+        Err(rejection) => {
+            // Strict: a malformed body or an unknown field is a 400 that names
+            // the problem, never a silent fall-through to a failed token login.
+            return no_store(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "invalid JSON body, expected {{token}} or {{username, password}}: {}",
+                            rejection.body_text()
+                        )
+                    })),
+                )
+                    .into_response(),
+            );
+        }
     };
     login_response(Some(gateway.as_ref()), &auth, body).await
 }

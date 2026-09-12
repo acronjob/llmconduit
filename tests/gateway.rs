@@ -6327,6 +6327,165 @@ async fn accounts_request(
 }
 
 #[tokio::test]
+async fn dashboard_rejects_unknown_body_fields_and_query_params() {
+    // The dashboard surface is strict: an unknown JSON field or query parameter
+    // is a 400 that names the field, never silently ignored (a misspelled
+    // filter must not quietly return the unfiltered result).
+    use llmconduit::control_plane_store::{PersistenceStore, SqlStore};
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("store"),
+    );
+    let admin_hash = llmconduit::accounts::hash_password("admin-password-1").unwrap();
+    let admin = PersistenceStore::create_user(store.as_ref(), "admin", &admin_hash, true, "test")
+        .await
+        .unwrap();
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store.clone());
+    gateway.set_users_configured(true);
+    let app = d13_router(Arc::new(gateway));
+
+    async fn error_text(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+    async fn login(app: &axum::Router, body: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dashboard/login")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    // Login body with a stray field: 400 naming it, not a 401 "invalid credentials".
+    let response = login(
+        &app,
+        r#"{"username":"admin","password":"admin-password-1","extra":true}"#,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let text = error_text(response).await;
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `extra`"),
+        "{text}"
+    );
+
+    let response = login(
+        &app,
+        r#"{"username":"admin","password":"admin-password-1"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let (session, csrf) = login_cookies(response.headers());
+
+    // JSON bodies on the accounts API.
+    for (method, uri, body, field) in [
+        (
+            "POST",
+            "/dashboard/api/keys".to_string(),
+            json!({"label": "k", "labell": "typo"}),
+            "labell",
+        ),
+        (
+            "POST",
+            "/dashboard/api/users".to_string(),
+            json!({"username": "u2", "password": "password-2", "is_admin": false, "role": "x"}),
+            "role",
+        ),
+        (
+            "PATCH",
+            format!("/dashboard/api/users/{}", admin.id),
+            json!({"is_admin": true, "admin": true}),
+            "admin",
+        ),
+    ] {
+        let response =
+            accounts_request(&app, method, &uri, &session, Some(&csrf), Some(body)).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{method} {uri}"
+        );
+        let text = error_text(response).await;
+        let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("unknown field `{field}`")),
+            "{method} {uri}: {text}"
+        );
+    }
+
+    // Query strings across the dashboard, history and accounts routes.
+    for (uri, field) in [
+        ("/dashboard/api/keys?user=all", "user"),
+        ("/dashboard/api/flows?state=open", "state"),
+        ("/dashboard/api/snapshot?at_ms=1", "at_ms"),
+        ("/dashboard/api/history/requests?since=1", "since"),
+        ("/dashboard/api/history/throughput?bucket=60", "bucket"),
+        ("/dashboard/api/history/sessions?root=true", "root"),
+    ] {
+        let response = accounts_request(&app, "GET", uri, &session, None, None).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{uri}"
+        );
+        let text = error_text(response).await;
+        assert!(
+            text.contains(&format!("unknown field `{field}`")),
+            "{uri}: {text}"
+        );
+    }
+
+    // The known spellings still work.
+    let response = accounts_request(
+        &app,
+        "GET",
+        "/dashboard/api/keys?user_id=all",
+        &session,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let response = accounts_request(
+        &app,
+        "GET",
+        "/dashboard/api/flows?limit=5",
+        &session,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
 async fn accounts_password_login_keys_live_reload_and_role_gating() {
     use llmconduit::control_plane_store::{PersistenceStore, SqlStore};
 

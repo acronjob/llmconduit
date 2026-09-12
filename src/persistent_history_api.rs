@@ -41,6 +41,7 @@ const _: () = {
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryRequestsQuery {
     /// Maximum rows to return; clamped to 1..=500, default 100.
     pub limit: Option<i64>,
@@ -48,6 +49,7 @@ pub struct HistoryRequestsQuery {
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryUsageQuery {
     /// Restrict to one virtual key by its stable database id (never the credential or its digest); trimmed, 1..=256 bytes.
     pub virtual_key_id: Option<String>,
@@ -61,6 +63,7 @@ pub struct HistoryUsageQuery {
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryMetricsQuery {
     /// Window start (epoch ms, must not be negative); default now − 24 hours.
     pub since_ms: Option<i64>,
@@ -233,6 +236,7 @@ async fn history_request_detail_from(
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryBodyQuery {
     /// Which hop's request body to reassemble: `client_in` (default) or `upstream_out`.
     pub hop: Option<String>,
@@ -240,6 +244,7 @@ pub struct HistoryBodyQuery {
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryThroughputQuery {
     /// Window start (epoch ms, must not be negative); default now − 1 hour.
     pub since_ms: Option<i64>,
@@ -424,6 +429,7 @@ async fn history_activity_from(
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct HistorySessionsQuery {
     /// Window start on `last_seen_ms` (epoch ms, must not be negative); default now − 7 days.
     pub since_ms: Option<i64>,
@@ -435,6 +441,7 @@ pub struct HistorySessionsQuery {
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct HistorySessionQuery {
     /// Maximum requests to include; clamped to 1..=1000, default 200.
     pub limit: Option<usize>,

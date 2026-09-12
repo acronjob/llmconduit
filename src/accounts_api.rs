@@ -34,6 +34,19 @@ fn error(status: StatusCode, message: &str) -> Response {
     json(status, &serde_json::json!({ "error": message }))
 }
 
+/// 400 for a body the extractor refused: wrong content type, malformed JSON,
+/// a missing or mistyped field, or an unknown field (the request types are
+/// `deny_unknown_fields`). The extractor's text names the offending field.
+fn invalid_body(expected: &str, rejection: &axum::extract::rejection::JsonRejection) -> Response {
+    error(
+        StatusCode::BAD_REQUEST,
+        &format!(
+            "invalid JSON body, expected {expected}: {}",
+            rejection.body_text()
+        ),
+    )
+}
+
 fn store_or_503(gateway: &Gateway) -> Result<Arc<dyn PersistenceStore>, Response> {
     gateway.persistence_store().ok_or_else(|| {
         error(
@@ -143,6 +156,7 @@ pub async fn auth_mode(gateway: &Gateway, auth: &DashboardAuth) -> &'static str 
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
     /// Validated before use; an invalid username is rejected with 400.
     pub username: String,
@@ -155,6 +169,7 @@ pub struct CreateUserRequest {
 
 /// Both fields optional; omit a field to leave it unchanged.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateUserRequest {
     /// New password (stored as an Argon2id hash).
     #[serde(default)]
@@ -237,7 +252,7 @@ pub async fn list_users(State(gateway): State<Arc<Gateway>>, session: AuthSessio
     request_body(content = CreateUserRequest, description = "`{username, password, is_admin?}`"),
     responses(
         (status = 201, description = "The created user.", body = UserRecord),
-        (status = 400, description = "Body is not `{username, password, is_admin?}` (`expected {username, password, is_admin?}`), the username fails validation, or the password cannot be hashed (message from the validator).", body = DashboardError),
+        (status = 400, description = "Body is not `{username, password, is_admin?}` (`invalid JSON body, expected …: <extractor text>`, which names an unknown or mistyped field; the body is strict), the username fails validation, or the password cannot be hashed (message from the validator).", body = DashboardError),
         (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
         (status = 403, description = "`administrator role required` (checked first), or `missing or invalid CSRF token`.", body = DashboardError),
         (status = 409, description = "`username already exists`.", body = DashboardError),
@@ -255,11 +270,9 @@ pub async fn create_user(
     if let Err(denied) = require_admin(&session).and_then(|()| require_csrf(&auth, &headers)) {
         return denied;
     }
-    let Ok(Json(body)) = payload else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "expected {username, password, is_admin?}",
-        );
+    let body = match payload {
+        Ok(Json(body)) => body,
+        Err(rejection) => return invalid_body("{username, password, is_admin?}", &rejection),
     };
     let store = match store_or_503(&gateway) {
         Ok(store) => store,
@@ -311,7 +324,7 @@ pub async fn create_user(
     request_body(content = UpdateUserRequest, description = "`{password?, is_admin?}` — reset the password and/or change the role."),
     responses(
         (status = 200, description = "Updated.", body = UserUpdatedBody),
-        (status = 400, description = "Body is not `{password?, is_admin?}` (`expected {password?, is_admin?}`), `you cannot remove your own administrator role` (`is_admin: false` on the caller's own account), or the new password cannot be hashed.", body = DashboardError),
+        (status = 400, description = "Body is not `{password?, is_admin?}` (`invalid JSON body, expected …: <extractor text>`, which names an unknown or mistyped field; the body is strict), `you cannot remove your own administrator role` (`is_admin: false` on the caller's own account), or the new password cannot be hashed.", body = DashboardError),
         (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
         (status = 403, description = "`administrator role required` (checked first), or `missing or invalid CSRF token`.", body = DashboardError),
         (status = 404, description = "`user not found`.", body = DashboardError),
@@ -330,8 +343,9 @@ pub async fn update_user(
     if let Err(denied) = require_admin(&session).and_then(|()| require_csrf(&auth, &headers)) {
         return denied;
     }
-    let Ok(Json(body)) = payload else {
-        return error(StatusCode::BAD_REQUEST, "expected {password?, is_admin?}");
+    let body = match payload {
+        Ok(Json(body)) => body,
+        Err(rejection) => return invalid_body("{password?, is_admin?}", &rejection),
     };
     let store = match store_or_503(&gateway) {
         Ok(store) => store,
@@ -466,6 +480,7 @@ pub async fn delete_user(
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct KeysQuery {
     /// Admin only: another user's id, or `all` for every key. A non-admin user
     /// may only pass their own id.
@@ -473,6 +488,7 @@ pub struct KeysQuery {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateKeyRequest {
     /// Human label; trimmed, blank → none, truncated to 128 characters.
     #[serde(default)]
@@ -525,6 +541,7 @@ pub(crate) struct KeyRevokedBody {
     params(KeysQuery),
     responses(
         (status = 200, description = "Key metadata (never the secret). Scope: a user session without `user_id` → its own keys; an admin user or a token/dev-open session with `user_id=<id>` → that user's keys, with `user_id=all` → every key; a token/dev-open session without `user_id` → every key.", body = KeysBody),
+        (status = 400, description = "Unknown or mistyped query parameter (the query string is strict; the text names the field). Plain text from the extractor.", content_type = "text/plain", body = String),
         (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
         (status = 403, description = "`administrator role required`: a non-admin user passed a `user_id` other than their own (including `all`).", body = DashboardError),
         (status = 500, description = "SQL store failure (`list keys: …`).", body = DashboardError),
@@ -577,6 +594,7 @@ pub async fn list_keys(
     request_body(content = Option<CreateKeyRequest>, description = "`{label?, allowed_models?, user_id?}`. Optional: a missing or unparsable JSON body is treated as `{}` (no label, any model, owned by the caller)."),
     responses(
         (status = 201, description = "The key was stored and the live registry reloaded; `secret` is the only time the plaintext is shown. Owner: the session user (an admin may name another user via `user_id`); a token/dev-open session owns nothing unless it passes `user_id`.", body = CreatedKeyBody),
+        (status = 400, description = "Body is not `{label?, allowed_models?, user_id?}`: wrong content type, malformed JSON, a mistyped field or an unknown field (the body is strict); `invalid JSON body, expected …: <extractor text naming the field>`.", body = DashboardError),
         (status = 401, description = "No valid session. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
         (status = 403, description = "`missing or invalid CSRF token` (checked first), or `administrator role required` (a non-admin user passed another user's `user_id`).", body = DashboardError),
         (status = 404, description = "`user not found` (the `user_id` does not exist).", body = DashboardError),
@@ -596,11 +614,9 @@ pub async fn create_key(
     }
     let body = match payload {
         Ok(Json(body)) => body,
-        Err(_) => CreateKeyRequest {
-            label: None,
-            allowed_models: Vec::new(),
-            user_id: None,
-        },
+        Err(rejection) => {
+            return invalid_body("{label?, allowed_models?, user_id?}", &rejection);
+        }
     };
     let store = match store_or_503(&gateway) {
         Ok(store) => store,

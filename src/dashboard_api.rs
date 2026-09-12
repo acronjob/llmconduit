@@ -258,6 +258,7 @@ pub struct FlowsResponse {
 /// `upstream` filter, `page`/`limit` page (1-based page; absent ⇒ all rows).
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct FlowsQuery {
     /// Filter by lifecycle status: `open`, `completed`, `failed` or `cancelled`
     /// (an unrecognized value is ignored, not an error).
@@ -466,6 +467,7 @@ pub struct SnapshotResponse {
 /// for ~580 million years; the handler widens it to the `u128` `snapshot_at` key.
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotQuery {
     /// Unix-ms instant to time-travel to (the nearest cut at or before it);
     /// absent ⇒ the latest cut.
@@ -1031,6 +1033,7 @@ fn parse_captured_body(body: &Arc<[u8]>) -> serde_json::Value {
             description = "The filtered, paged flow rows plus the FlowStore domain cursor.",
             body = FlowsResponse
         ),
+        (status = 400, description = "Unknown or mistyped query parameter (the query string is strict; the text names the field). Plain text from the extractor.", content_type = "text/plain", body = String),
         (
             status = 401,
             description = "No valid dashboard session (plain text `unauthorized`).",
@@ -1348,6 +1351,7 @@ pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response 
             description = "The frozen cut nearest at-or-before `at` (or the latest). When no cut exists: empty `summaries`, `null` `metrics`/`topology`, zero `cursors`.",
             body = SnapshotResponse
         ),
+        (status = 400, description = "Unknown or mistyped query parameter (the query string is strict; the text names the field). Plain text from the extractor.", content_type = "text/plain", body = String),
         (
             status = 401,
             description = "No valid dashboard session (plain text `unauthorized`).",
