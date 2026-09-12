@@ -16,10 +16,14 @@ import type {
   FlowDetail,
   FlowSummary,
   FlowsResponse,
+  HistoryRequest,
   MetricsResponse,
   MonitorPayload,
   ProviderHealth,
   ProviderLatency,
+  SessionDetailResponse,
+  SessionRow,
+  SessionsResponse,
   SnapshotFrame,
   SnapshotResponse,
   TopologyResponse,
@@ -98,6 +102,9 @@ function seedFlows(): FlowSummary[] {
     {
       api_call_id: 'api_001', response_id: 'resp_001', method: 'POST', uri: '/v1/responses', status: 'open',
       model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a',
+      // Sessions: the newest turn of the seeded claude-code session — a pure append onto api_002.
+      harness: 'claude-code', harness_version: '2.1.205', session_id: 'sess_root',
+      chain_parent_request_id: 'api_002', divergence_kind: 'append', cache_bust: false,
       usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 },
       started_ms: now - 2400, finished_ms: null, elapsed_ms: 2400, terminal_reason: null,
       cost: 0.0061, cost_confidence: 'estimated',
@@ -117,6 +124,9 @@ function seedFlows(): FlowSummary[] {
     {
       api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
       model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a',
+      // Sessions: the first turn of the seeded claude-code session (a new chain, no predecessor).
+      harness: 'claude-code', harness_version: '2.1.205', session_id: 'sess_root',
+      chain_parent_request_id: null, divergence_kind: 'new_chain', cache_bust: false,
       usage: { prompt: 1500, completion: 980, total: 2480 },
       started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed',
       cost: 0.0019, cost_confidence: 'estimated',
@@ -157,6 +167,9 @@ function seedFlows(): FlowSummary[] {
     // span (the no-TTFB path — never a measured prefill, since the wire first byte is absent).
     {
       api_call_id: 'api_004', response_id: 'resp_004', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
+      // Sessions: a codex flow whose tool list changed mid-conversation ⇒ a cache bust on its chain.
+      harness: 'codex', harness_version: '0.104.0', session_id: 'sess_codex',
+      chain_parent_request_id: 'api_005', divergence_kind: 'tools_changed', cache_bust: true,
       model_requested: 'mystery-model', model_served: 'mystery-model', upstream_target: 'vllm-b',
       usage: { prompt: 4096, completion: 512, total: 4608 },
       started_ms: now - 18000, finished_ms: now - 16000, elapsed_ms: 2000, terminal_reason: 'response.completed',
@@ -174,6 +187,8 @@ function seedFlows(): FlowSummary[] {
     // first byte `—` (never 0). Routed via `/v1/responses` on `openai` (the served target).
     {
       api_call_id: 'api_005', response_id: 'resp_005', method: 'POST', uri: '/v1/responses', status: 'completed',
+      harness: 'codex', harness_version: '0.104.0', session_id: 'sess_codex',
+      chain_parent_request_id: null, divergence_kind: 'new_chain', cache_bust: false,
       model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai',
       usage: { prompt: 640, completion: 320, total: 960, cached: 0, reasoning: 0 },
       started_ms: now - 9000, finished_ms: now - 6200, elapsed_ms: 2800, terminal_reason: 'response.completed',
@@ -417,7 +432,135 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     return json(snap);
   }
 
+  // -- Durable history (sessions view + chain diff) --
+  if (path === '/dashboard/api/history/sessions') {
+    const roots = qs.get('roots') !== 'false';
+    const sessions = roots ? MOCK_SESSIONS.filter((s) => s.parent_id === null) : MOCK_SESSIONS;
+    const resp: SessionsResponse = { sessions, since_ms: 0, limit: 100, truncated: false };
+    return json(resp);
+  }
+  const sessionMatch = path.match(/^\/dashboard\/api\/history\/sessions\/([^/]+)$/);
+  if (sessionMatch) {
+    const id = decodeURIComponent(sessionMatch[1] ?? '');
+    const session = MOCK_SESSIONS.find((s) => s.id === id);
+    if (!session) return json({ error: 'session not found' }, 404);
+    const ancestors: SessionRow[] = [];
+    let cursor = session.parent_id;
+    while (cursor) {
+      const parent = MOCK_SESSIONS.find((s) => s.id === cursor);
+      if (!parent) break;
+      ancestors.push(parent);
+      cursor = parent.parent_id;
+    }
+    const resp: SessionDetailResponse = {
+      session,
+      ancestors,
+      children: MOCK_SESSIONS.filter((s) => s.parent_id === id),
+      requests: MOCK_HISTORY_REQUESTS.filter((r) => r.session_id === id),
+      requests_truncated: false,
+    };
+    return json(resp);
+  }
+  const bodyMatch = path.match(/^\/dashboard\/api\/history\/requests\/([^/]+)\/body$/);
+  if (bodyMatch) {
+    const id = decodeURIComponent(bodyMatch[1] ?? '');
+    const body = MOCK_REQUEST_BODIES[id];
+    return body ? json(body) : json({ error: 'request body not stored' }, 404);
+  }
+
   return json({ error: `mock: no route for ${method} ${path}` }, 404);
+};
+
+// ---------------------------------------------------------------------------
+// Durable history seed: a claude-code session with an inferred sub-agent under it, a codex
+// session with a cache bust, and reassembled bodies for the chain diff.
+// ---------------------------------------------------------------------------
+
+const SEED_NOW = Date.now();
+
+function mockSession(over: Partial<SessionRow> & Pick<SessionRow, 'id' | 'harness'>): SessionRow {
+  return {
+    parent_id: null,
+    kind: 'declared',
+    harness_version: null,
+    external_id: null,
+    session_kind: null,
+    client_label: 'key-9f3a1c0b2d4e',
+    virtual_key_id: 'virtual-key-1',
+    depth: 0,
+    root_request_id: null,
+    spawned_by_request_id: null,
+    first_seen_ms: SEED_NOW - 60_000,
+    last_seen_ms: SEED_NOW - 2_400,
+    request_count: 2,
+    ...over,
+  };
+}
+
+export const MOCK_SESSIONS: SessionRow[] = [
+  mockSession({ id: 'sess_root', harness: 'claude-code', harness_version: '2.1.205', external_id: '11111111-1111-4111-8111-111111111111', root_request_id: 'api_002', request_count: 2 }),
+  mockSession({ id: 'sess_agent', harness: 'claude-code', harness_version: '2.1.205', parent_id: 'sess_root', kind: 'inferred', depth: 1, spawned_by_request_id: 'api_002', root_request_id: 'api_agent_1', request_count: 1, first_seen_ms: SEED_NOW - 30_000, last_seen_ms: SEED_NOW - 29_000 }),
+  mockSession({ id: 'sess_codex', harness: 'codex', harness_version: '0.104.0', external_id: 'codex-session-1', root_request_id: 'api_005', request_count: 2, client_label: 'python-httpx/0.27', first_seen_ms: SEED_NOW - 120_000, last_seen_ms: SEED_NOW - 40_000 }),
+];
+
+function mockRequest(over: Partial<HistoryRequest> & Pick<HistoryRequest, 'id' | 'session_id' | 'created_at_ms'>): HistoryRequest {
+  return {
+    response_id: null,
+    client_protocol: 'anthropic_messages',
+    client_model: 'claude-x',
+    backend: 'vllm-a',
+    resolved_model: 'llama-3.1-70b',
+    status: 'completed',
+    completed_at_ms: over.created_at_ms + 3_000,
+    first_token_at_ms: over.created_at_ms + 400,
+    input_tokens: 1200,
+    output_tokens: 300,
+    cached_tokens: 900,
+    error: null,
+    client_label: 'key-9f3a1c0b2d4e',
+    harness: 'claude-code',
+    harness_version: '2.1.205',
+    chain_parent_request_id: null,
+    item_count: 4,
+    shared_prefix_items: null,
+    divergence_kind: 'new_chain',
+    divergence_index: null,
+    cache_bust: false,
+    ...over,
+  };
+}
+
+export const MOCK_HISTORY_REQUESTS: HistoryRequest[] = [
+  mockRequest({ id: 'api_002', session_id: 'sess_root', created_at_ms: SEED_NOW - 12_000, item_count: 3 }),
+  mockRequest({ id: 'api_001', session_id: 'sess_root', created_at_ms: SEED_NOW - 2_400, status: 'running', completed_at_ms: null, chain_parent_request_id: 'api_002', divergence_kind: 'append', shared_prefix_items: 3, item_count: 5 }),
+  mockRequest({ id: 'api_agent_1', session_id: 'sess_agent', created_at_ms: SEED_NOW - 30_000, item_count: 3 }),
+  mockRequest({ id: 'api_005', session_id: 'sess_codex', created_at_ms: SEED_NOW - 120_000, harness: 'codex', harness_version: '0.104.0', client_protocol: 'responses', client_label: 'python-httpx/0.27', item_count: 4 }),
+  mockRequest({ id: 'api_004', session_id: 'sess_codex', created_at_ms: SEED_NOW - 40_000, harness: 'codex', harness_version: '0.104.0', client_protocol: 'responses', client_label: 'python-httpx/0.27', chain_parent_request_id: 'api_005', divergence_kind: 'tools_changed', divergence_index: 1, shared_prefix_items: 1, item_count: 7, cache_bust: true }),
+];
+
+/** Reassembled inbound bodies (what `/history/requests/:id/body` returns) for the chain diff. */
+export const MOCK_REQUEST_BODIES: Record<string, unknown> = {
+  api_005: {
+    model: 'codex-large',
+    instructions: 'You are Codex.',
+    tools: [{ type: 'function', name: 'read_file', parameters: { type: 'object' } }],
+    input: [{ type: 'message', role: 'user', content: 'List the files.' }],
+  },
+  api_004: {
+    model: 'codex-large',
+    instructions: 'You are Codex.',
+    tools: [
+      { type: 'function', name: 'read_file', parameters: { type: 'object' } },
+      { type: 'function', name: 'write_file', parameters: { type: 'object' } },
+    ],
+    input: [
+      { type: 'message', role: 'user', content: 'List the files.' },
+      { type: 'message', role: 'assistant', content: 'a.rs, b.rs' },
+      { type: 'message', role: 'user', content: 'Now edit a.rs' },
+    ],
+  },
+  api_002: { model: 'claude-x', system: 'You are Claude Code.', messages: [{ role: 'user', content: 'hi' }] },
+  api_001: { model: 'claude-x', system: 'You are Claude Code.', messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }, { role: 'user', content: 'more' }] },
 };
 
 /** True when `id` is one of the seeded `api_call_id`s (D13 `:id = api_call_id`) — finding 7. */

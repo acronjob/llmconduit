@@ -12,9 +12,12 @@ import type {
   FlowDetail,
   FlowsQuery,
   FlowsResponse,
+  HistoryBodyHop,
   KillResponse,
   LoginRequest,
   MetricsResponse,
+  SessionDetailResponse,
+  SessionsResponse,
   SnapshotResponse,
   TopologyResponse,
 } from './types';
@@ -137,6 +140,26 @@ export class DashboardClient {
     return this.request<SnapshotResponse>(`/snapshot?at=${encodeURIComponent(String(atMs))}`);
   }
 
+  // -- Durable history (SQL-backed; 503 when no SQL store is configured) ----
+
+  /** `GET /history/sessions` — recent session-tree nodes (roots only unless `roots: false`). */
+  historySessions(query: { since_ms?: number; limit?: number; roots?: boolean } = {}): Promise<SessionsResponse> {
+    return this.request<SessionsResponse>(`/history/sessions${buildQuery(query)}`);
+  }
+
+  /** `GET /history/sessions/:id` — one node with its ancestors, children and newest requests. */
+  historySession(id: string, query: { limit?: number } = {}): Promise<SessionDetailResponse> {
+    return this.request<SessionDetailResponse>(`/history/sessions/${encodeURIComponent(id)}${buildQuery(query)}`);
+  }
+
+  /**
+   * `GET /history/requests/:id/body?hop=` — the FULL reassembled request body of one hop (the
+   * content store joins the skeleton with its items). The response IS the body, not an envelope.
+   */
+  historyRequestBody(id: string, hop: HistoryBodyHop = 'client_in'): Promise<unknown> {
+    return this.request<unknown>(`/history/requests/${encodeURIComponent(id)}/body?hop=${hop}`);
+  }
+
   // -- Mutation (CSRF-gated) ------------------------------------------------
 
   /** `POST /flows/:id/kill` — attaches `X-CSRF-Token` (D7). */
@@ -151,10 +174,10 @@ export class DashboardClient {
   }
 }
 
-/** Serializes a flows query into a `?a=b&c=d` string, dropping undefined values. */
-function buildQuery(query: FlowsQuery): string {
+/** Serializes a query object into a `?a=b&c=d` string, dropping undefined/null values. */
+function buildQuery(query: object): string {
   const params = new URLSearchParams();
-  for (const [k, v] of Object.entries(query)) {
+  for (const [k, v] of Object.entries(query as Record<string, unknown>)) {
     if (v !== undefined && v !== null) params.set(k, String(v));
   }
   const s = params.toString();

@@ -70,6 +70,15 @@ export const COST_CONFIDENCES: readonly CostConfidence[] = ['confident', 'estima
 export type ClientSource = 'key_hash' | 'configured_header' | 'user_agent';
 export const CLIENT_SOURCES: readonly ClientSource[] = ['key_hash', 'configured_header', 'user_agent'];
 
+/**
+ * Sessions — how a request's items diverge from its chain predecessor (the Rust
+ * `sessions::DivergenceKind`). `append` = pure continuation; the three `*_changed`/`rewritten`
+ * kinds fall INSIDE the predecessor's items and bust an upstream prefix cache; `new_chain` =
+ * nothing in common (the start of a conversation).
+ */
+export type DivergenceKind = 'append' | 'instructions_changed' | 'tools_changed' | 'history_rewritten' | 'new_chain';
+export const DIVERGENCE_KINDS: readonly DivergenceKind[] = ['append', 'instructions_changed', 'tools_changed', 'history_rewritten', 'new_chain'];
+
 // ---------------------------------------------------------------------------
 // Gap 02 / 03 spine — per-phase timestamps + the per-attempt failover trace.
 // These mirror the Rust `PhaseTimings` (`#[serde(flatten)]`) + `Attempt` /
@@ -667,10 +676,100 @@ export interface FlowSummary extends PhaseTimings {
    * when `client_label` is absent.
    */
   client_source?: ClientSource | null;
+  /**
+   * Sessions — the detected harness profile (`claude-code`, `codex`, `pi-agent`, ...) and version,
+   * flattened from the Rust `FlowSessionFacts`. Absent ⇒ persistence off / not detected (renders `—`).
+   */
+  harness?: string | null;
+  harness_version?: string | null;
+  /** Sessions — the gateway session node (`sessions.id`) this flow was linked into. */
+  session_id?: string | null;
+  /** Sessions — the chain predecessor's `api_call_id`, when this flow extends a chain. */
+  chain_parent_request_id?: string | null;
+  /** Sessions — where/how the flow diverged from its predecessor. Absent ⇒ lineage not computed. */
+  divergence_kind?: DivergenceKind | null;
+  /** Sessions — true when the divergence falls inside the predecessor's items (prefix-cache miss). */
+  cache_bust?: boolean | null;
 }
 
 /** Body-free frozen summary in a snapshot — identical shape to `FlowSummary` (D1). */
 export type SnapshotFlowSummary = FlowSummary;
+
+// ---------------------------------------------------------------------------
+// Durable history (SQL-backed `/dashboard/api/history/*`). Sessions are the tree nodes requests
+// link into; a request row is the Rust `RequestSummary` (only the fields the UI reads are typed).
+// ---------------------------------------------------------------------------
+
+/** One session-tree node (the Rust `sessions::SessionRow`). */
+export interface SessionRow {
+  id: string;
+  parent_id: string | null;
+  /** `declared` (the harness put the id on the wire) or `inferred` (opened by the gateway). */
+  kind: 'declared' | 'inferred' | string;
+  harness: string;
+  harness_version: string | null;
+  /** The harness's own id when declared; null for inferred nodes. */
+  external_id: string | null;
+  session_kind: string | null;
+  client_label: string | null;
+  virtual_key_id: string | null;
+  depth: number;
+  root_request_id: string | null;
+  spawned_by_request_id: string | null;
+  first_seen_ms: number;
+  last_seen_ms: number;
+  request_count: number;
+}
+
+/** `GET /dashboard/api/history/sessions` */
+export interface SessionsResponse {
+  sessions: SessionRow[];
+  since_ms: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/** A durable request row as the history API returns it (subset the UI reads). */
+export interface HistoryRequest {
+  id: string;
+  response_id: string | null;
+  client_protocol: string;
+  client_model: string;
+  backend: string | null;
+  resolved_model: string | null;
+  status: string;
+  created_at_ms: number;
+  completed_at_ms: number | null;
+  first_token_at_ms: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_tokens: number | null;
+  error: string | null;
+  client_label: string | null;
+  harness: string | null;
+  harness_version: string | null;
+  session_id: string | null;
+  chain_parent_request_id: string | null;
+  item_count: number | null;
+  shared_prefix_items: number | null;
+  divergence_kind: DivergenceKind | null;
+  divergence_index: number | null;
+  cache_bust: boolean | null;
+}
+
+/** `GET /dashboard/api/history/sessions/:id` */
+export interface SessionDetailResponse {
+  session: SessionRow;
+  /** Nearest first. */
+  ancestors: SessionRow[];
+  children: SessionRow[];
+  /** Oldest first. */
+  requests: HistoryRequest[];
+  requests_truncated: boolean;
+}
+
+/** Which request-side hop of a durable request to reassemble. */
+export type HistoryBodyHop = 'client_in' | 'upstream_out';
 
 /** `GET /dashboard/api/flows` */
 export interface FlowsResponse {
@@ -1236,8 +1335,18 @@ function isFlowSummary(v: unknown): v is FlowSummary {
     // `client_source`, when present, must be a bounded `ClientSource` (don't trust the wire — a
     // bogus source must not paint the weak-UA fallback as a strong identity). Both absent ⇒ the
     // unattributed flow (renders `—`).
-    isOptStr(v.client_label) && isOptClientSource(v.client_source)
+    isOptStr(v.client_label) && isOptClientSource(v.client_source) &&
+    // Sessions: the optional harness/session facts (flattened `FlowSessionFacts`). A bogus
+    // divergence kind must not paint a row as a cache bust; `cache_bust` is a bool when present.
+    isOptStr(v.harness) && isOptStr(v.harness_version) && isOptStr(v.session_id) &&
+    isOptStr(v.chain_parent_request_id) && isOptDivergenceKind(v.divergence_kind) &&
+    (v.cache_bust === undefined || v.cache_bust === null || typeof v.cache_bust === 'boolean')
   );
+}
+
+/** Optional `DivergenceKind`: absent, null, or one of the bounded kinds. */
+function isOptDivergenceKind(v: unknown): boolean {
+  return v === undefined || v === null || isOneOf(v, DIVERGENCE_KINDS);
 }
 
 /** Optional `ClientSource` (gap 04): absent, null, or one of the bounded snake_case sources. */

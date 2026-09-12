@@ -294,6 +294,13 @@ in the same session that was still streaming when it arrived, if any.
   five direct `completeSimple` call sites merge the headers with their own
   session kind. Extensions load from source at runtime, so no bundle rebuild
   is needed.
+- Phase 5 (dashboard) is implemented: `FlowSessionFacts` on every live flow
+  surface (row, snapshot, detail, `flow_status` frame); a harness column,
+  cache-bust marker and harness/cache/session facets on the flows table; a
+  Sessions view (root list, ancestors/children, requests with lineage chips,
+  "show in flows" cross-link); and a Chain tab in the inspector that diffs a
+  request's full inbound body against its chain predecessor via the content
+  store's body endpoint.
 
 ## Phases
 

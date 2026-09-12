@@ -25,6 +25,10 @@ export const queryKeys = {
   metrics: ['metrics'] as const,
   topology: ['topology'] as const,
   catalog: ['catalog'] as const,
+  // Durable history (sessions view + the inspector's chain diff).
+  sessions: ['history', 'sessions'] as const,
+  session: (id: string) => ['history', 'sessions', id] as const,
+  requestBody: (id: string, hop: string) => ['history', 'requests', id, 'body', hop] as const,
 } as const;
 
 export interface Connection {

@@ -31,6 +31,8 @@ export interface FlowRowsResult {
   upstreams: string[];
   /** Gap 15 — distinct `client_label`s present, for the per-client filter chips. */
   clients: string[];
+  /** Sessions — distinct detected harnesses present, for the harness filter chips. */
+  harnesses: string[];
 }
 
 /** Union the live store rows (authoritative) with REST-only rows, newest-on-top. */
@@ -143,6 +145,14 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
     // follows `client_label`'s source so the label + its strength tag always agree.
     client_label: live.client_label ?? rest.client_label ?? null,
     client_source: live.client_label != null ? live.client_source : (rest.client_source ?? live.client_source ?? null),
+    // Sessions: the harness/session facts are immutable per flow (computed once at ingress);
+    // live-first / REST-backfilled like the attribution.
+    harness: live.harness ?? rest.harness ?? null,
+    harness_version: live.harness_version ?? rest.harness_version ?? null,
+    session_id: live.session_id ?? rest.session_id ?? null,
+    chain_parent_request_id: live.chain_parent_request_id ?? rest.chain_parent_request_id ?? null,
+    divergence_kind: live.divergence_kind ?? rest.divergence_kind ?? null,
+    cache_bust: live.cache_bust ?? rest.cache_bust ?? null,
   };
   return shallowEqualSummary(live, merged) ? live : merged;
 }
@@ -181,6 +191,13 @@ function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
     // CLIENT cell + the "by client" roll-up re-render with the attribution (else it's discarded).
     (a.client_label ?? null) === (b.client_label ?? null) &&
     (a.client_source ?? null) === (b.client_source ?? null) &&
+    // Sessions: part of row identity so a REST backfill that adds them re-renders the row.
+    (a.harness ?? null) === (b.harness ?? null) &&
+    (a.harness_version ?? null) === (b.harness_version ?? null) &&
+    (a.session_id ?? null) === (b.session_id ?? null) &&
+    (a.chain_parent_request_id ?? null) === (b.chain_parent_request_id ?? null) &&
+    (a.divergence_kind ?? null) === (b.divergence_kind ?? null) &&
+    (a.cache_bust ?? null) === (b.cache_bust ?? null) &&
     // `attempts` is compared via `sameAttempts`: EMPTY and ABSENT are the same "no trace" state
     // (a snapshot's `[]` vs the merge's normalized `undefined` must NOT churn a new object), but a
     // backfilled NON-EMPTY list is a new reference ⇒ unequal, so the row re-renders and the
@@ -197,6 +214,12 @@ function applyFilters(rows: FlowSummary[], f: FlowFilters): FlowSummary[] {
     // Gap 15: the per-client facet matches the row's `client_label` exactly. An unattributed row
     // (no label) never matches a client filter (it can't be claimed by a client).
     if (f.client && row.client_label !== f.client) return false;
+    // Sessions: exact matches on the detected harness / the linked session node; the cache-bust
+    // facet keeps only rows whose divergence fell inside the predecessor (a `true` flag — a row
+    // without lineage is never claimed as a bust).
+    if (f.harness && row.harness !== f.harness) return false;
+    if (f.session && row.session_id !== f.session) return false;
+    if (f.cacheBust === true && row.cache_bust !== true) return false;
     return true;
   });
 }
@@ -260,6 +283,7 @@ export function useFlowRows(filters: FlowFilters): FlowRowsResult {
   // FilterBar can cap to the top-N busiest (high-cardinality defense — review MEDIUM). Unattributed rows
   // have no label ⇒ contribute nothing (an absent attribution is never a filterable client).
   const clients = useMemo(() => clientsByVolume(merged), [merged]);
+  const harnesses = useMemo(() => distinct(merged, (r) => [r.harness]), [merged]);
 
-  return { rows, total: merged.length, models, upstreams, clients };
+  return { rows, total: merged.length, models, upstreams, clients, harnesses };
 }

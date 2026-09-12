@@ -78,9 +78,36 @@ interface ColumnWidths {
 // is a responsive `minmax(120px,0.9fr)` — NOT a fixed 56px (which truncated `key-9f3a1c0b2d4e` /
 // `python-httpx/0.27` to a non-distinguishing prefix, defeating gap 15's purpose) — so seeded clients
 // are visually distinguishable; the endpoint flex is trimmed to keep the grid balanced.
+// 11 columns: the HARNESS column (4th) shows the detected client program; the id cell carries the
+// cache-bust marker so a prefix-cache miss is visible on the main surface without a new column.
 const COLS: ColumnWidths = {
-  grid: 'grid grid-cols-[88px_92px_minmax(120px,0.9fr)_minmax(110px,0.9fr)_minmax(150px,1.4fr)_96px_84px_120px_72px_72px] gap-2 px-3',
+  grid: 'grid grid-cols-[88px_104px_minmax(120px,0.9fr)_88px_minmax(100px,0.8fr)_minmax(150px,1.4fr)_96px_84px_120px_72px_72px] gap-2 px-3',
 };
+
+/** The cache-bust marker's copy per divergence kind (only kinds that bust render a marker). */
+function bustTitle(kind: string | null | undefined): string {
+  switch (kind) {
+    case 'instructions_changed': return 'cache bust — the system/instructions block changed';
+    case 'tools_changed': return 'cache bust — the tool list changed';
+    case 'history_rewritten': return 'cache bust — earlier conversation history changed';
+    default: return 'cache bust — the request diverged inside its predecessor\'s prefix';
+  }
+}
+
+/** The harness cell: the detected profile name (+ version in the title), `—` when undetected. */
+function HarnessCellView({ flow }: { flow: FlowSummary }) {
+  const known = !!flow.harness;
+  return (
+    <span
+      className={cn('truncate', known ? 'text-text-muted' : 'text-text-muted/60')}
+      data-testid="flow-harness"
+      data-quality={known ? 'measured' : 'unavailable'}
+      title={known ? `${flow.harness}${flow.harness_version ? ` ${flow.harness_version}` : ''}${flow.session_id ? ` · session ${flow.session_id}` : ''}` : 'harness not detected (persistence off or unknown client)'}
+    >
+      {known ? flow.harness : '—'}
+    </span>
+  );
+}
 
 export function FlowTable({
   selectedId,
@@ -93,7 +120,7 @@ export function FlowTable({
   // FilterBar below remains the in-table editor (its onChange writes the same store).
   const filters = useFlowFilter((s) => s.filters);
   const setFilters = flowFilterStore.getState().setFilters;
-  const { rows, total, models, upstreams, clients } = useFlowRows(filters);
+  const { rows, total, models, upstreams, clients, harnesses } = useFlowRows(filters);
   const priceTable = useDashboard((s) => s.priceTable);
   // Gap 09: the per-model context-window capacities (gap-06 nullable `context_limit`), for the
   // aggregate context-pressure stat. A `null`/absent window is UNKNOWN ⇒ that flow is excluded from
@@ -119,6 +146,7 @@ export function FlowTable({
         models={models}
         upstreams={upstreams}
         clients={clients}
+        harnesses={harnesses}
         total={total}
         shown={rows.length}
         onChange={setFilters}
@@ -187,6 +215,7 @@ function HeaderRow() {
       <span>time</span>
       <span>id</span>
       <span>client</span>
+      <span>harness</span>
       <span>endpoint</span>
       <span>model</span>
       <span>upstream</span>
@@ -237,8 +266,23 @@ function FlowRow({
       )}
     >
       <span className="tabular-nums text-text-muted">{fmtClock(flow.started_ms)}</span>
-      <span className="truncate font-mono text-text-muted">{shortId(flow.api_call_id)}</span>
+      <span className="flex min-w-0 items-center gap-1">
+        <span className="truncate font-mono text-text-muted">{shortId(flow.api_call_id)}</span>
+        {/* Sessions: a prefix-cache miss is flagged on the main surface (amber, like the other
+            "something is off" markers); `divergence_kind` explains which part diverged. */}
+        {flow.cache_bust === true && (
+          <span
+            className="shrink-0 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase tracking-wide text-status-cooling"
+            data-testid="flow-cache-bust"
+            data-kind={flow.divergence_kind ?? undefined}
+            title={bustTitle(flow.divergence_kind)}
+          >
+            bust
+          </span>
+        )}
+      </span>
       <ClientCellView flow={flow} />
+      <HarnessCellView flow={flow} />
       <span className="truncate font-mono">{flow.uri || '—'}</span>
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="truncate">{fmtModelPair(flow.model_requested, flow.model_served)}</span>

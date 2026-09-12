@@ -4,6 +4,7 @@ import { cn } from '../lib/cn';
 
 const LABELS: Record<RouteName, string> = {
   flows: 'Flows',
+  sessions: 'Sessions',
   topology: 'Topology',
   sankey: 'Sankey',
   theater: 'Theater',

@@ -393,3 +393,49 @@ describe('useFlowRows — time-travel seek shows ONLY the frozen snapshot (findi
     await waitFor(() => expect(result.current.rows.some((r) => r.api_call_id === 'api_future')).toBe(true));
   });
 });
+
+
+describe('useFlowRows — session facts merge (live-first, REST-backfilled)', () => {
+  beforeEach(() => resetWorld());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('backfills harness/session/lineage from the REST row onto a live row that lacks them', async () => {
+    seedFlows([makeFlow({ api_call_id: 'api_s1', status: 'open' })]);
+    stubFlowsFetch([
+      makeFlow({ api_call_id: 'api_s1', status: 'completed', harness: 'claude-code', harness_version: '2.1.205', session_id: 'sess_1', chain_parent_request_id: 'api_s0', divergence_kind: 'append', cache_bust: false }),
+    ]);
+    const { result } = renderRows();
+    await waitFor(() => expect(result.current.rows[0]?.harness).toBe('claude-code'));
+    const row = result.current.rows[0]!;
+    // Live wins on status; REST backfills the immutable session facts.
+    expect(row.status).toBe('open');
+    expect(row.session_id).toBe('sess_1');
+    expect(row.chain_parent_request_id).toBe('api_s0');
+    expect(row.divergence_kind).toBe('append');
+    expect(row.cache_bust).toBe(false);
+    expect(result.current.harnesses).toEqual(['claude-code']);
+  });
+
+  it('the session and cacheBust facets filter the merged rows', async () => {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_s2', session_id: 'sess_a', cache_bust: true, divergence_kind: 'tools_changed' }),
+      makeFlow({ api_call_id: 'api_s3', session_id: 'sess_b', cache_bust: false, divergence_kind: 'append' }),
+      makeFlow({ api_call_id: 'api_s4' }),
+    ]);
+    const { queryClient } = getConnection();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    const { result, rerender } = renderHook(({ f }) => useFlowRows(f), { wrapper, initialProps: { f: EMPTY_FILTERS } });
+    expect(result.current.rows.length).toBe(3);
+    rerender({ f: { ...EMPTY_FILTERS, session: 'sess_a' } });
+    expect(result.current.rows.map((r) => r.api_call_id)).toEqual(['api_s2']);
+    rerender({ f: { ...EMPTY_FILTERS, cacheBust: true } });
+    expect(result.current.rows.map((r) => r.api_call_id)).toEqual(['api_s2']);
+    rerender({ f: { ...EMPTY_FILTERS, cacheBust: null } });
+    expect(result.current.rows.length).toBe(3);
+  });
+});

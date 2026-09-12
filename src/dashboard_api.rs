@@ -1641,7 +1641,7 @@ mod tests {
         assert_eq!(value["cache_bust"], true);
         assert_eq!(value["chain_parent_request_id"], "api_prev");
         // Absent facts are omitted, never null/false.
-        let value = serde_json::to_value(&base()).unwrap();
+        let value = serde_json::to_value(base()).unwrap();
         let object = value.as_object().unwrap();
         for key in [
             "harness",

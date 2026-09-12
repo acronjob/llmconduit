@@ -229,6 +229,9 @@ pub enum SnapshotTag {
 /// The `usage`/`flow_status` arms are keyed by `api_call_id` (authoritative) with
 /// an optional secondary `response_id`.
 #[derive(Debug, Clone, Serialize)]
+// The flow_status variant carries the per-flow spine (phases, attempts, session
+// facts); boxing it would only move the allocation to every frame.
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DashboardPayload {
     /// One per `DebugWsMessage` in the originating `DebugUpdate` batch; the real
