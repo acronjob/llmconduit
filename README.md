@@ -627,6 +627,22 @@ vision_url: "http://127.0.0.1:8001/v1"
 vision_model: "Qwen3-VL"
 ```
 
+Whether a backend has native vision support is detected, not guessed: at startup
+and every ten minutes the gateway sends each routed (backend, model) pair a
+one-pixel PNG with `max_tokens: 1`. A success marks the model multimodal; a 4xx
+that blames the image marks it text-only; anything else (auth, 5xx, unreachable)
+leaves the answer unknown. A profile's explicit `native_vision` still overrides
+the probe, and an unknown model keeps the name-based default. Configure or
+disable it under `control_plane`:
+
+```yaml
+control_plane:
+  vision_probe:
+    enabled: true
+    interval_secs: 600
+    timeout_secs: 20
+```
+
 Any image that still reaches a backend without native vision support (whether or not
 the agent above is active, e.g. no `vision_url` configured) is degraded instead of
 forwarded raw:

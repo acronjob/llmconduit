@@ -193,6 +193,8 @@ pub struct Gateway {
     persistence_keep_media: bool,
     /// Harness/session detection, run once per instrumented request.
     harness_detector: Arc<crate::harness::HarnessDetector>,
+    /// Probed image support per backend model (see `crate::vision_probe`).
+    native_vision_cache: crate::vision_probe::NativeVisionCache,
     /// Session tree + lineage index (see `crate::sessions`).
     session_linker: Arc<crate::sessions::SessionLinker>,
     /// YAML-configured keys + the configured `require` flag, kept so the live
@@ -708,6 +710,23 @@ fn next_cooldown_wake(health: &[ProviderHealth]) -> Option<std::time::Duration> 
         .min()
 }
 
+/// Native-vision decision for one final backend model: an explicit profile
+/// `native_vision` wins; else what the vision probe established for that model
+/// id; else the name-based default (Kimi is the only family known by name).
+pub(crate) fn decide_native_vision(
+    profile_override: Option<bool>,
+    probed: Option<bool>,
+    candidate_model: &str,
+) -> bool {
+    if let Some(native) = profile_override {
+        return native;
+    }
+    if let Some(native) = probed {
+        return native;
+    }
+    candidate_model.to_ascii_lowercase().contains("kimi")
+}
+
 impl Gateway {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -759,6 +778,7 @@ impl Gateway {
             persistence_queue: None,
             persistence_keep_media: true,
             harness_detector: Arc::new(crate::harness::HarnessDetector::builtin()),
+            native_vision_cache: crate::vision_probe::NativeVisionCache::default(),
             session_linker: Arc::new(crate::sessions::SessionLinker::new(true)),
             yaml_key_specs: Vec::new(),
             client_auth_required: false,
@@ -955,6 +975,12 @@ impl Gateway {
 
     pub fn harness_detector(&self) -> &Arc<crate::harness::HarnessDetector> {
         &self.harness_detector
+    }
+
+    /// The probed native-vision cache; the background prober writes into the
+    /// same shared handle.
+    pub fn native_vision_cache(&self) -> &crate::vision_probe::NativeVisionCache {
+        &self.native_vision_cache
     }
 
     pub fn with_session_linker(mut self, linker: Arc<crate::sessions::SessionLinker>) -> Self {
@@ -2094,10 +2120,11 @@ impl Gateway {
     /// name sniff (Kimi). The request model's profile is NOT consulted (round-3
     /// #2). Unknown ⇒ not native.
     fn candidate_is_native_vision(&self, candidate_model: &str) -> bool {
-        if let Some(native) = self.config.profile_native_vision(candidate_model) {
-            return native;
-        }
-        candidate_model.to_ascii_lowercase().contains("kimi")
+        decide_native_vision(
+            self.config.profile_native_vision(candidate_model),
+            self.native_vision_cache.lookup(candidate_model),
+            candidate_model,
+        )
     }
 
     async fn find_replay_baseline(
@@ -4731,6 +4758,31 @@ mod tests {
     use super::AccumulatedUsage;
     use super::failure_event;
     use crate::models::chat::ChunkUsage;
+
+    #[test]
+    fn native_vision_decision_prefers_profile_then_probe_then_name() {
+        // Explicit profile override wins over everything.
+        assert!(!super::decide_native_vision(
+            Some(false),
+            Some(true),
+            "kimi-vl"
+        ));
+        assert!(super::decide_native_vision(
+            Some(true),
+            Some(false),
+            "text-model"
+        ));
+        // Probe result decides when no override is configured.
+        assert!(super::decide_native_vision(
+            None,
+            Some(true),
+            "GLM-5.3-Flash-NVFP4"
+        ));
+        assert!(!super::decide_native_vision(None, Some(false), "kimi-k2"));
+        // Nothing known: the name-based default.
+        assert!(super::decide_native_vision(None, None, "kimi-k2"));
+        assert!(!super::decide_native_vision(None, None, "GLM-5.2-NVFP4"));
+    }
 
     #[test]
     fn accumulated_usage_cached_tokens() {

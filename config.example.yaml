@@ -50,6 +50,13 @@ control_plane:
     #  local: { url: "http://host.docker.internal:8000/metrics" }
     #  openrouter: { enabled: false }
 
+  # Native-vision detection: each routed backend model is sent a one-pixel
+  # image at startup and every interval; a model that accepts it receives
+  # images unchanged, a model that rejects it gets the text placeholder.
+  vision_probe:
+    enabled: true
+    interval_secs: 600
+
   operational:
     backends:
       - id: "10000000-0000-4000-8000-000000000001"

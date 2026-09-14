@@ -116,6 +116,7 @@ struct LoadedRuntimeConfig {
     conversation_id_header: String,
     sessions: llmconduit::harness::SessionsBootstrap,
     metrics: llmconduit::upstream_metrics::MetricsBootstrap,
+    vision_probe: llmconduit::vision_probe::VisionProbeBootstrap,
 }
 
 /// Load the namespaced YAML control plane without changing TOML's upstream
@@ -148,6 +149,7 @@ fn load_runtime_config(
             conversation_id_header,
             sessions: llmconduit::harness::SessionsBootstrap::default(),
             metrics: llmconduit::upstream_metrics::MetricsBootstrap::default(),
+            vision_probe: llmconduit::vision_probe::VisionProbeBootstrap::default(),
         });
     }
 
@@ -199,6 +201,7 @@ fn load_runtime_config(
         conversation_id_header,
         sessions: section.sessions.clone(),
         metrics: section.metrics.clone(),
+        vision_probe: section.vision_probe.clone(),
     })
 }
 
@@ -212,6 +215,21 @@ async fn run_server(
     let (runtime, client_auth, flush_queue) = prepare_control_plane_runtime(&mut loaded).await?;
     let bind_addr = loaded.config.bind_addr;
     let metrics_config = loaded.metrics.clone();
+    let vision_probe_config = loaded.vision_probe.clone();
+    // The legacy primary upstream is a probe target too when it names a model.
+    let primary_probe =
+        loaded
+            .config
+            .upstream_model
+            .clone()
+            .map(|model| llmconduit::vision_probe::ProbeTarget {
+                backend: "primary".to_string(),
+                base_url: loaded.config.upstream_base_url.to_string(),
+                api_key: loaded.config.upstream_api_key.clone(),
+                model,
+            });
+    let probe_targets =
+        llmconduit::vision_probe::targets_from_routes(&loaded.routes, primary_probe);
     run_debug_log_cleanup(&loaded.config, &loaded.routes).await;
     let (app, gateway) = build_app_with_gateway_control_plane_runtime(
         loaded.config,
@@ -224,6 +242,11 @@ async fn run_server(
     )?;
     spawn_persistent_backend_metrics(Arc::clone(&gateway));
     spawn_upstream_metrics_scraper(Arc::clone(&gateway), metrics_config);
+    llmconduit::vision_probe::spawn(
+        &vision_probe_config,
+        probe_targets,
+        gateway.native_vision_cache().clone(),
+    );
     let listener = TcpListener::bind(bind_addr).await?;
     log_listening(bind_addr);
     log_debug_ui_status(&gateway, app_options, bind_addr);
