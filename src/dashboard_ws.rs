@@ -976,6 +976,24 @@ fn topology_snapshot(snapshot: &ProviderHealthSnapshot) -> TopologySnapshot {
 /// finding 1) — live flow frames are stamped with the monitor `update.sequence`, so the
 /// flow + monitor domains dedup against the SAME monotonic clock (the flow `flows` body
 /// still comes from the FlowStore).
+/// Price body-free snapshot rows from a model→price lookup (the FlowStore owns no
+/// price table). Every row ends up with BOTH a `cost` and the `cost_confidence`
+/// tag that explains it — the SPA's `isFlowSummary` REQUIRES the tag, and one
+/// untagged row makes it drop the entire snapshot, leaving the dashboard stuck on
+/// "connecting" with every live frame buffered behind it.
+fn price_snapshot_summaries(
+    summaries: &mut [crate::dashboard_flow::SnapshotFlowSummary],
+    price_for: impl Fn(&str) -> Option<crate::config::ModelPrice>,
+) {
+    for summary in summaries {
+        let price = summary.model_served.as_deref().and_then(&price_for);
+        let (cost, confidence) =
+            crate::dashboard_api::priced_cost_and_confidence(price, summary.usage);
+        summary.cost = cost;
+        summary.cost_confidence = confidence;
+    }
+}
+
 fn snapshot_message(
     flows: Vec<crate::dashboard_flow::SnapshotFlowSummary>,
     flow_seq: u64,
@@ -1132,7 +1150,9 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // Body-free flow summaries from the FlowStore; the FlowStore `seq` is discarded — the
     // flow-domain WS dedup cursor is the monitor's `last_sequence` (finding 1), captured
     // atomically with the transcript below.
-    let (flow_summaries, _flow_store_seq) = flow_store.snapshot_summaries_with_seq();
+    let (mut flow_summaries, _flow_store_seq) = flow_store.snapshot_summaries_with_seq();
+    // Tag every row with its cost + confidence before the snapshot goes out.
+    price_snapshot_summaries(&mut flow_summaries, |model| gateway.price_for(model));
     let initial = snapshot_message(
         flow_summaries,
         // Flow dedup baseline = the monitor's atomically-captured sequence (finding 1).
@@ -2719,6 +2739,23 @@ mod tests {
             flows[0].get("inbound_body").is_none(),
             "summaries are body-free"
         );
+        // Every field the SPA's `isFlowSummary` REQUIRES must be present: one row
+        // missing any of them fails `isSnapshotFrame`, the SPA drops the WHOLE
+        // snapshot, `connection` never leaves `'connecting'` and every live frame
+        // piles up in the shadow buffer (the dashboard looks frozen).
+        for field in ["api_call_id", "method", "uri", "status", "started_ms"] {
+            assert!(
+                flows[0].get(field).is_some_and(|value| !value.is_null()),
+                "flow summary must carry a non-null `{field}`"
+            );
+        }
+        // Gap 07: the cost tag is REQUIRED on every row — `Unavailable` when the
+        // served model has no configured price, never absent.
+        assert!(
+            flows[0]["cost_confidence"].is_string(),
+            "flow summary must carry `cost_confidence` (got {:?})",
+            flows[0].get("cost_confidence")
+        );
         // metrics: the flat tile + metrics_seq + windows{m1,m5,h1}.
         let m = &value["metrics"];
         assert_eq!(m["metrics_seq"], serde_json::json!(7));
@@ -2736,6 +2773,71 @@ mod tests {
         );
         // catalog_size on a snapshot node follows the same non-null-uint rule.
         assert_eq!(t["nodes"][0]["catalog_size"], serde_json::json!(0));
+    }
+
+    /// The snapshot rows are priced from the gateway's table at the socket layer
+    /// (the FlowStore stays pricing-free): a served model WITH a price gets a cost
+    /// and a confident/estimated tag, an unpriced one keeps `Unavailable` and a
+    /// `null` cost — never a fabricated `0`.
+    #[test]
+    fn snapshot_summaries_are_priced_from_the_price_table() {
+        use crate::config::ModelPrice;
+        let priced = ModelPrice {
+            input_per_1k: 1.0,
+            output_per_1k: 2.0,
+            cached_per_1k: 0.5,
+            cached_price_configured: true,
+        };
+        // 1000 prompt + 1000 completion tokens at 1.0/2.0 per 1k, nothing cached.
+        let usage = crate::dashboard_flow::FlowUsage {
+            prompt: 1_000,
+            completion: 1_000,
+            total: 2_000,
+            cached: Some(0),
+            reasoning: None,
+        };
+        let mut summaries = vec![
+            summary_for_pricing("api_priced", Some("GLM-5.2"), Some(usage)),
+            summary_for_pricing("api_unpriced", Some("no-price"), Some(usage)),
+            summary_for_pricing("api_no_model", None, Some(usage)),
+        ];
+        price_snapshot_summaries(&mut summaries, |model| {
+            (model == "GLM-5.2").then_some(priced)
+        });
+        assert_eq!(summaries[0].cost, Some(3.0));
+        assert_eq!(
+            summaries[0].cost_confidence,
+            crate::dashboard_api::CostConfidence::Confident
+        );
+        for unpriced in &summaries[1..] {
+            assert_eq!(unpriced.cost, None);
+            assert_eq!(
+                unpriced.cost_confidence,
+                crate::dashboard_api::CostConfidence::Unavailable,
+                "an unpriced row is UNAVAILABLE, never a fake 0"
+            );
+        }
+    }
+
+    fn summary_for_pricing(
+        id: &str,
+        model_served: Option<&str>,
+        usage: Option<crate::dashboard_flow::FlowUsage>,
+    ) -> crate::dashboard_flow::SnapshotFlowSummary {
+        let store = DashboardFlowStore::new();
+        store.open(
+            id.to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            redact_headers(&HeaderMap::new()),
+            Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
+        );
+        store.finalize(id, FlowStatus::Completed, None, None);
+        let mut summary = store.snapshot_summaries().remove(0);
+        summary.model_served = model_served.map(str::to_string);
+        summary.usage = usage;
+        summary
     }
 
     /// When metrics/topology are absent (disabled / no providers), the snapshot

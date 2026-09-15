@@ -1080,6 +1080,16 @@ pub struct SnapshotFlowSummary {
     /// Harness/session facts, flattened as sibling scalar fields (body-free).
     #[serde(flatten)]
     pub session: FlowSessionFacts,
+    /// Gap 07 — the flow's USD cost, `None` when the served model is unpriced or
+    /// there is no usage to bill (never a fabricated `0`).
+    pub cost: Option<f64>,
+    /// Gap 07 — the confidence tag that goes WITH `cost`. REQUIRED on every row:
+    /// the SPA's `isFlowSummary` rejects a row without it, and one rejected row
+    /// invalidates the whole snapshot, so the dashboard never leaves
+    /// `'connecting'`. The FlowStore has no price table, so `from_record` starts
+    /// it `Unavailable`; the socket layer prices it
+    /// (`dashboard_ws::price_snapshot_summaries`) before the snapshot goes out.
+    pub cost_confidence: crate::dashboard_api::CostConfidence,
 }
 
 impl SnapshotFlowSummary {
@@ -1110,6 +1120,9 @@ impl SnapshotFlowSummary {
             client_label: record.client_label.clone(),
             client_source: record.client_source,
             session: record.session.clone(),
+            // Priced by the socket layer, which owns the gateway's price table.
+            cost: None,
+            cost_confidence: crate::dashboard_api::CostConfidence::Unavailable,
         }
     }
 }

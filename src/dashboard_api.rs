@@ -585,6 +585,17 @@ fn flow_cost_and_confidence(
     gateway: &Gateway,
 ) -> (Option<f64>, CostConfidence) {
     let price = model_served.and_then(|model| gateway.price_for(model));
+    priced_cost_and_confidence(price, usage)
+}
+
+/// The cost/confidence rule itself, independent of where the price came from, so
+/// the REST rows (`FlowRow`) and the WS snapshot rows
+/// (`dashboard_ws::price_snapshot_summaries`) can never tag the same flow
+/// differently.
+pub(crate) fn priced_cost_and_confidence(
+    price: Option<ModelPrice>,
+    usage: Option<FlowUsage>,
+) -> (Option<f64>, CostConfidence) {
     match (price, usage) {
         // Priced AND usage present: a real cost, tagged confident/estimated by the
         // cached-rate presence.
