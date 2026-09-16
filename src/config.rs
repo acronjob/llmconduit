@@ -1001,6 +1001,10 @@ pub struct PersistedModelProfile {
     /// defers to the name-based default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_vision: Option<bool>,
+    /// Opt-in repairs for malformed upstream tool calls (`crate::tool_repair`).
+    /// A non-empty list REPLACES an inherited one; omitted keeps it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_call_repairs: Vec<crate::tool_repair::ToolCallRepair>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     /// Per-model map from a canonical reasoning-effort level (`none`/`low`/
@@ -1046,6 +1050,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             native_vision: Option<bool>,
             #[serde(default)]
+            tool_call_repairs: Vec<crate::tool_repair::ToolCallRepair>,
+            #[serde(default)]
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default)]
             reasoning_effort_map: BTreeMap<String, JsonValue>,
@@ -1066,6 +1072,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
         // `flatten` swept into the shorthand bucket (they live in typed fields).
         upstream_chat_kwargs.remove("template_family");
         upstream_chat_kwargs.remove("native_vision");
+        upstream_chat_kwargs.remove("tool_call_repairs");
         upstream_chat_kwargs.remove("reasoning_effort_map");
         upstream_chat_kwargs.remove("reasoning_effort_default");
         upstream_chat_kwargs.remove("reasoning_effort");
@@ -1079,6 +1086,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             roles: raw.roles,
             template_family: raw.template_family,
             native_vision: raw.native_vision,
+            tool_call_repairs: raw.tool_call_repairs,
             upstream_chat_kwargs,
             reasoning_effort_map: raw.reasoning_effort_map,
             reasoning_effort_default: raw.reasoning_effort_default,
@@ -1096,6 +1104,10 @@ pub struct ModelProfile {
     pub template_family: Option<String>,
     /// Per-profile native-vision override (G4); see `PersistedModelProfile`.
     pub native_vision: Option<bool>,
+    /// Opt-in repairs for malformed upstream tool calls (see
+    /// `crate::tool_repair`). Empty = the upstream's tool calls are forwarded
+    /// exactly as they arrive.
+    pub tool_call_repairs: Vec<crate::tool_repair::ToolCallRepair>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     /// Per-model reasoning-effort map + default; see `PersistedModelProfile`.
     pub reasoning_effort_map: BTreeMap<String, JsonValue>,
@@ -1794,6 +1806,15 @@ impl Config {
             .and_then(|profile| profile.native_vision)
     }
 
+    /// The tool-call repairs configured for EXACTLY `model` (the final backend
+    /// model, matching `profile_native_vision`'s lookup). Empty unless a profile
+    /// opts in: a repair rewrites what the upstream sent, so it is never implied.
+    pub fn profile_tool_call_repairs(&self, model: &str) -> &[crate::tool_repair::ToolCallRepair] {
+        self.model_profile(model)
+            .map(|profile| profile.tool_call_repairs.as_slice())
+            .unwrap_or_default()
+    }
+
     pub fn resolve_system_prompt_prefix(&self, request_model: &str) -> Option<String> {
         let upstream_model = self.resolve_upstream_model(request_model);
         self.resolve_system_prompt_prefix_for_resolved_model(request_model, &upstream_model)
@@ -1888,6 +1909,7 @@ struct ResolvedModelProfile {
     roles: Option<RolesConfig>,
     template_family: Option<String>,
     native_vision: Option<bool>,
+    tool_call_repairs: Vec<crate::tool_repair::ToolCallRepair>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     reasoning_effort_map: BTreeMap<String, JsonValue>,
     reasoning_effort_default: Option<String>,
@@ -1903,6 +1925,7 @@ impl ResolvedModelProfile {
             roles: self.roles,
             template_family: normalize_template_family(self.template_family.as_deref()),
             native_vision: self.native_vision,
+            tool_call_repairs: self.tool_call_repairs,
             upstream_chat_kwargs: self.upstream_chat_kwargs,
             reasoning_effort_map: self.reasoning_effort_map,
             reasoning_effort_default: self.reasoning_effort_default,
@@ -2105,6 +2128,9 @@ fn merge_resolved_model_profile(
     if source.native_vision.is_some() {
         destination.native_vision = source.native_vision;
     }
+    if !source.tool_call_repairs.is_empty() {
+        destination.tool_call_repairs = source.tool_call_repairs.clone();
+    }
     if source.roles.is_some() {
         destination.roles = source.roles;
     }
@@ -2147,6 +2173,9 @@ fn merge_persisted_model_profile(
     }
     if source.native_vision.is_some() {
         destination.native_vision = source.native_vision;
+    }
+    if !source.tool_call_repairs.is_empty() {
+        destination.tool_call_repairs = source.tool_call_repairs.clone();
     }
     if source.roles.is_some() {
         destination.roles.clone_from(&source.roles);

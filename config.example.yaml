@@ -71,6 +71,10 @@ control_plane:
     model_profiles:
       - id: "20000000-0000-4000-8000-000000000001"
         name: "qwen-local"
+        # Opt-in repairs for models that mix tool-call encodings (GLM emits its
+        # native <arg_key>/<arg_value> markup inside the first JSON argument).
+        # Off unless listed; see README "Tool-call repairs".
+        # tool_call_repairs: [glm_arg_markup]
         backends:
           - "10000000-0000-4000-8000-000000000001"
         upstream_model: "Qwen3.5"

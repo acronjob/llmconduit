@@ -38,6 +38,7 @@ pub(crate) mod sse_guard;
 #[cfg(test)]
 pub(crate) mod test_alloc_probe;
 pub(crate) mod tool_delta_gate;
+pub mod tool_repair;
 pub mod turn_capture;
 pub mod upstream;
 pub mod upstream_metrics;

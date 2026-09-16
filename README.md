@@ -455,6 +455,38 @@ model_profiles:
 - A configured cap replaces the base (upstream-supplied, else the default
   capabilities) for that cap key, wholesale; unconfigured caps keep the base.
 
+### Tool-call repairs
+
+Some models mix tool-call encodings: they open the arguments as JSON and then
+switch into the markup their own chat template trained them on. GLM does this
+with `<arg_key>`/`<arg_value>`, mid-argument, so the result is still valid JSON
+and the first argument silently swallows the rest:
+
+```json
+{"action": "edit<arg_key>appendContent</arg_key><arg_value>…the real value…",
+ "scope": "local"}
+```
+
+The harness then rejects the call (`action` is not a valid action) and the agent
+retries — intermittently, because the drift happens on long values. A repair
+rewrites what an upstream sent, so it is opt-in per model profile and off by
+default:
+
+```yaml
+model_profiles:
+  - id: "20000000-0000-4000-8000-000000000001"
+    name: "large/vllm"
+    upstream_model: "GLM-5.2-NVFP4"
+    tool_call_repairs: [glm_arg_markup]
+```
+
+`glm_arg_markup` splits the swallowed key/value back out into real arguments; a
+call that does not carry the markup is never touched, and a partial block is
+left alone rather than guessed at. With a repair enabled the model's tool-call
+argument FRAGMENTS are not streamed (the markup only becomes visible once the
+text is complete, and a sent fragment cannot be recalled) — the client receives
+the whole, repaired call instead. Text content still streams normally.
+
 ### Reasoning effort
 
 A profile's `reasoning_effort` block shapes the upstream `reasoning_effort` field

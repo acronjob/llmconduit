@@ -2751,7 +2751,13 @@ impl Gateway {
                 }
             });
             let mut stream = stream_result?;
-            let mut state = StreamState::default();
+            // Tool-call repairs are per BACKEND MODEL (the model the provider
+            // actually answers as), the same lookup the vision gate uses.
+            let mut state = StreamState::with_tool_call_repairs(
+                self.config
+                    .profile_tool_call_repairs(&upstream_model)
+                    .to_vec(),
+            );
             let mut turn_usage: Option<ChunkUsage> = None;
             // D3: the flow's cumulative usage BEFORE this turn. OpenAI usage chunks
             // are cumulative WITHIN a turn, so the record's running total is
