@@ -2611,6 +2611,15 @@ impl FailoverUpstreamClient {
                 "resolved fallback provider index was out of range",
             ));
         }
+        let provider = &self.providers[provider_index];
+        let provider_body = proxy_body_for_provider(provider, &request.body);
+        let model = proxy_body_model(&provider_body).unwrap_or_default();
+        request.authorization.ensure_candidate(
+            &provider.name,
+            request.authorization_route.as_deref(),
+            &model,
+            InferenceEndpoint::Completions,
+        )?;
         if !self.provider_is_available(provider_index) {
             return Err(self.cooldown_error());
         }
@@ -9021,6 +9030,56 @@ mod tests {
             .expect_err("raw completions must use the same candidate scope");
         assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
         assert_eq!(failover.provider_health()[0].failover_count, 0);
+    }
+
+    #[tokio::test]
+    async fn raw_completions_denial_precedes_selected_provider_cooldown() {
+        let leaf = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse("http://127.0.0.1:9/v1/").unwrap(),
+            None,
+            None,
+            true,
+            4096,
+        );
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "only",
+                leaf,
+                Some("served".to_string()),
+                None,
+                JsonMap::new(),
+            )],
+            Duration::from_secs(60),
+        );
+        failover.mark_failure(0, &AppError::upstream("provider unavailable"));
+        let health_before_denial = failover.provider_health();
+        let request = super::ProxyCompletionsRequest::new(
+            http::HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{"model":"alias","prompt":"hello"}"#),
+        )
+        .with_authorization(AuthorizationScope::restricted(|_, _, _, _| false));
+
+        let err = failover
+            .proxy_completions_from_provider(0, request)
+            .await
+            .expect_err("authorization denial must not disclose provider cooldown state");
+
+        assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
+        let health = failover.provider_health();
+        assert_eq!(
+            health[0].failover_count, health_before_denial[0].failover_count,
+            "denial is not a failure"
+        );
+        assert_eq!(
+            health[0].consecutive_failures, health_before_denial[0].consecutive_failures,
+            "denial does not mutate health"
+        );
+        assert_eq!(health[0].status, health_before_denial[0].status);
+        assert_eq!(
+            health[0].cooling_until_ms,
+            health_before_denial[0].cooling_until_ms
+        );
     }
 }
 
