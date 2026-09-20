@@ -5436,7 +5436,7 @@ fn truncate_for_error(s: &str, max: usize) -> String {
 /// without this they would leak through `response.failed` and failover logs
 /// (AGENTS.md redact rule). Redaction runs BEFORE truncation so a split image
 /// URI cannot survive at the truncation boundary.
-fn redact_and_truncate_error_body(body: &str, max: usize) -> String {
+pub(crate) fn redact_and_truncate_error_body(body: &str, max: usize) -> String {
     truncate_for_error(&crate::redaction::redact_image_uris(body), max)
 }
 

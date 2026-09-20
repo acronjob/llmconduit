@@ -23,6 +23,9 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::bytes::BytesMut;
 use uuid::Uuid;
 
+const MESH_ERROR_BODY_READ_LIMIT: usize = 16 * 1024;
+const MESH_ERROR_BODY_DISPLAY_LIMIT: usize = 500;
+
 #[derive(Debug, Clone)]
 pub struct MeshUpstreamClient {
     registry: Arc<MeshRegistry>,
@@ -308,8 +311,18 @@ async fn open_mesh_http_stream(
 
     let head = read_http_response_head(&mut recv, 64 * 1024).await?;
     let (status, headers) = split_http_response_head(&head)?;
+    let mut stream = MeshHttpStream {
+        _reservation: reservation,
+        recv,
+        write_task: Some(write_task),
+        remaining_content_length: content_length(&headers),
+        chunked: is_chunked(&headers),
+        chunk_buf: BytesMut::new(),
+    };
     if !status.is_success() {
-        let message = format!("mesh worker local upstream returned {status}");
+        let body = stream.read_body_prefix(MESH_ERROR_BODY_READ_LIMIT).await?;
+        stream.finish_writer().await?;
+        let message = mesh_upstream_error_message(status, &body);
         if matches!(
             status,
             http::StatusCode::BAD_REQUEST
@@ -325,14 +338,19 @@ async fn open_mesh_http_stream(
         return Err(AppError::upstream(message));
     }
 
-    Ok(MeshHttpStream {
-        _reservation: reservation,
-        recv,
-        write_task: Some(write_task),
-        remaining_content_length: content_length(&headers),
-        chunked: is_chunked(&headers),
-        chunk_buf: BytesMut::new(),
-    })
+    Ok(stream)
+}
+
+fn mesh_upstream_error_message(status: http::StatusCode, body: &[u8]) -> String {
+    let prefix = format!("mesh worker local upstream returned {status}");
+    if body.is_empty() {
+        return prefix;
+    }
+    let body = String::from_utf8_lossy(body);
+    format!(
+        "{prefix}: {}",
+        crate::upstream::redact_and_truncate_error_body(body.trim(), MESH_ERROR_BODY_DISPLAY_LIMIT,)
+    )
 }
 
 fn admission_error(code: AdmissionRejectCode) -> AppError {
@@ -513,6 +531,18 @@ impl MeshHttpStream {
         }
         Ok(Some(Bytes::copy_from_slice(&buf[..read])))
     }
+
+    async fn read_body_prefix(&mut self, limit: usize) -> AppResult<Vec<u8>> {
+        let mut body = Vec::new();
+        while body.len() < limit {
+            let Some(bytes) = self.next_body_bytes().await? else {
+                break;
+            };
+            let remaining = limit - body.len();
+            body.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        }
+        Ok(body)
+    }
 }
 
 impl Drop for MeshHttpStream {
@@ -612,6 +642,26 @@ mod tests {
         assert_eq!(
             parsed.choices[0].delta.tool_calls.as_ref().unwrap()[0].kind,
             "function"
+        );
+    }
+
+    #[test]
+    fn mesh_upstream_error_includes_redacted_body() {
+        let message = mesh_upstream_error_message(
+            http::StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"Unexpected reasoning effort high","image_url":"data:image/png;base64,secret"}}"#,
+        );
+
+        assert!(message.contains("Unexpected reasoning effort high"));
+        assert!(message.contains("400 Bad Request"));
+        assert!(!message.contains("base64,secret"));
+    }
+
+    #[test]
+    fn mesh_upstream_error_without_body_keeps_status_message() {
+        assert_eq!(
+            mesh_upstream_error_message(http::StatusCode::BAD_GATEWAY, b""),
+            "mesh worker local upstream returned 502 Bad Gateway"
         );
     }
 
@@ -768,6 +818,47 @@ mod tests {
                 assert!(read > 0);
                 request.extend_from_slice(&buf[..read]);
             }
+            let error_body = br#"{"error":{"message":"Unexpected reasoning effort high"}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        error_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(error_body).await.unwrap();
+            drop(socket);
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let read = socket.read(&mut buf).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::to_owned)
+                })
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let read = socket.read(&mut buf).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buf[..read]);
+            }
             socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"id\":\"cancel\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"started\"}}]}\n\n").await.unwrap();
             socket.flush().await.unwrap();
             loop {
@@ -841,7 +932,7 @@ mod tests {
             .await,
         );
         let worker_task = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (send, recv) = worker_connection.accept_bi().await.unwrap();
                 let _ = handle_request(send, recv, Arc::clone(&runtime)).await;
             }
@@ -895,6 +986,26 @@ mod tests {
         let forwarded: Value = serde_json::from_slice(&request_rx.await.unwrap()).unwrap();
         assert_eq!(forwarded["model"], "mesh-model");
         assert_eq!(forwarded["messages"][0]["content"], "ping");
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "mesh-model",
+            "messages": [{"role": "user", "content": "bad effort"}],
+            "stream": true
+        }))
+        .unwrap();
+        let error = match client
+            .stream_chat_completion(&BackendChatRequest::new(request, None, None, None))
+            .await
+        {
+            Ok(_) => panic!("400 response should fail before returning a stream"),
+            Err(error) => error,
+        };
+        assert_eq!(error.failover_disposition(), FailoverDisposition::Terminal);
+        assert!(
+            error
+                .to_string()
+                .contains("Unexpected reasoning effort high")
+        );
 
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "mesh-model",
