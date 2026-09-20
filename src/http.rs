@@ -1601,11 +1601,12 @@ async fn post_responses(
     let wants_stream = request.stream;
     let stream = gateway
         .clone()
-        .stream_responses_authorized(
+        .stream_responses_authorized_with_context(
             request,
             api_call_id.map(|extension| extension.0.0),
             authorization_scope(auth.as_ref()),
             crate::upstream::InferenceEndpoint::Responses,
+            auth,
         )
         .await?;
     let response = if wants_stream {
@@ -1742,11 +1743,12 @@ async fn responses_ws_serve(
     // 3. Run the turn through the SAME engine path as the HTTP POST.
     let event_stream = match gateway
         .clone()
-        .stream_responses_authorized(
+        .stream_responses_authorized_with_context(
             request,
             None,
             authorization_scope(auth.as_ref()),
             crate::upstream::InferenceEndpoint::Responses,
+            auth,
         )
         .await
     {
@@ -1967,11 +1969,12 @@ async fn post_chat_completions(
     let responses_request = chat_completions::convert_request(request)?;
     let stream = gateway
         .clone()
-        .stream_responses_authorized(
+        .stream_responses_authorized_with_context(
             responses_request,
             api_call_id.map(|extension| extension.0.0),
             authorization_scope(auth.as_ref()),
             crate::upstream::InferenceEndpoint::ChatCompletions,
+            auth,
         )
         .await?;
 
@@ -2031,11 +2034,12 @@ async fn handle_post_messages(
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let stream = gateway
         .clone()
-        .stream_responses_authorized(
+        .stream_responses_authorized_with_context(
             responses_request,
             api_call_id,
             authorization_scope(auth.as_ref()),
             crate::upstream::InferenceEndpoint::Messages,
+            auth,
         )
         .await?;
 

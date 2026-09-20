@@ -1637,6 +1637,10 @@ impl Gateway {
             .unwrap_or(0);
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
+        let accounting_context = auth_context.clone();
+        let accounting_api_call_id = api_call_id.clone();
+        let accounting_requested_model = model_requested.clone();
+        let accounting_serving_token = Arc::clone(&serving_token);
         tokio::spawn(async move {
             let result = gateway
                 .run_turn(
@@ -1695,6 +1699,20 @@ impl Gateway {
                 ),
                 Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
             };
+            let accounting_status = match status {
+                crate::dashboard_flow::FlowStatus::Completed => "completed",
+                crate::dashboard_flow::FlowStatus::Cancelled => "cancelled",
+                crate::dashboard_flow::FlowStatus::Failed => "failed",
+                crate::dashboard_flow::FlowStatus::Open => "failed",
+            };
+            gateway.record_authenticated_usage(
+                accounting_context,
+                accounting_api_call_id,
+                endpoint,
+                accounting_requested_model,
+                accounting_status,
+                &accounting_serving_token,
+            );
             if let Some(guard) = &telemetry_guard {
                 guard.finalize(status, Some(reason.clone()));
                 // D5: record the terminal into the metrics rings (sources served
@@ -2573,7 +2591,7 @@ impl Gateway {
                     // production hot path — no `api_call_id` threaded AND the monitor
                     // disabled — keeping `MonitorHub::disabled()` truly zero-overhead.
                     // Borrow `usage` here; it is MOVED into `turn_usage` below.
-                    if api_call_id.is_some() || self.monitor.is_enabled() {
+                    if api_call_id.is_some() || self.monitor.is_enabled() || self.authz.is_enabled() {
                         // `total` is the flow's running cumulative (turn_base + this
                         // cumulative chunk), NOT an increment — so a multi-chunk turn
                         // does not double-count and a midstream cancel keeps this LAST
@@ -2586,6 +2604,11 @@ impl Gateway {
                             // final usage into the metrics layer even if the FlowStore
                             // record is pruned/evicted before finalize. Same dashboard-only
                             // path as `record_usage`, so the disabled path stays zero-cost.
+                            serving_token.set_usage(total);
+                        } else if self.authz.is_enabled() {
+                            // Auth accounting is independent of the debug UI. Keep
+                            // the cumulative total on the shared terminal token even
+                            // when no FlowStore/api_call_id exists.
                             serving_token.set_usage(total);
                         }
                         // D3: emit the usage event to the monitor hub. The `/debug/ws`
