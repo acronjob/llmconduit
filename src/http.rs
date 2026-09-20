@@ -284,23 +284,20 @@ async fn auth_create_key(
         )
             .into_response();
     }
-    let created = match gateway
-        .authz()
-        .create_key(
-            &request.principal_name,
-            &request.name,
-            &request.endpoints,
-            &request.models,
-        )
-    {
+    let created = match gateway.authz().create_key(
+        &request.principal_name,
+        &request.name,
+        &request.endpoints,
+        &request.models,
+    ) {
         Ok(created) => created,
         Err(err) => return AppError::bad_request(err).into_response(),
     };
     (
         StatusCode::CREATED,
-        Json(serde_json::to_value(created).unwrap_or_else(|_| {
-            serde_json::json!({ "error": "failed to serialize created API key" })
-        })),
+        Json(serde_json::to_value(created).unwrap_or_else(
+            |_| serde_json::json!({ "error": "failed to serialize created API key" }),
+        )),
     )
         .into_response()
 }
@@ -318,10 +315,7 @@ async fn auth_revoke_key(
         )
             .into_response();
     }
-    match gateway
-        .authz()
-        .revoke_key(&id)
-    {
+    match gateway.authz().revoke_key(&id) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => AppError::not_found("API key not found or already revoked").into_response(),
         Err(err) => AppError::internal(err).into_response(),
