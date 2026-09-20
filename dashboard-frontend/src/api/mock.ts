@@ -49,8 +49,8 @@ let AUTH_ROLES: AuthRole[] = [
   { id: 'role_operator', name: 'Operator', enabled: true, permissions: ['auth.keys.read', 'auth.keys.create', 'auth.usage.read', 'auth.sessions.read'] },
 ];
 let AUTH_POLICIES: AuthPolicy[] = [
-  { id: 'pol_prod', name: 'Production models', effect: 'allow', enabled: true, subjects: ['grp_prod'], endpoints: ['responses', 'chat'], requested_models: ['gpt-*'], served_models: ['gpt-4.1'], providers: ['openai'], routes: ['cloud'], time_windows: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_utc: '08:00', end_utc: '18:00' }], max_concurrent_sessions: 4, daily_session_starts: 100 },
-  { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], requested_models: ['*'], served_models: ['*'], providers: ['vllm-b'], routes: ['local'], time_windows: [], max_concurrent_sessions: null, daily_session_starts: null },
+  { id: 'pol_prod', name: 'Production models', effect: 'allow', enabled: true, subjects: ['grp_prod'], endpoints: ['responses', 'chat'], models: [], requested_models: ['gpt-*'], served_models: ['gpt-4.1'], providers: ['openai'], routes: ['cloud'], time_windows: [{ weekday_mask: 31, start_minute: 480, end_minute: 1080, absolute_start_ms: null, absolute_end_ms: null }], max_concurrent_sessions: 4, max_daily_session_starts: 100, management_permissions: [] },
+  { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], models: [], requested_models: ['*'], served_models: ['*'], providers: ['vllm-b'], routes: ['local'], time_windows: [], max_concurrent_sessions: null, max_daily_session_starts: null, management_permissions: [] },
 ];
 let AUTH_KEYS: AuthApiKey[] = [
   { id: 'key_ops', principal_id: 'usr_ops', name: 'operator laptop', prefix: 'llmc_7ad2', enabled: true, created_at: '2026-06-03T10:00:00Z', expires_at: null, last_used_at: '2026-06-21T14:19:40Z' },
