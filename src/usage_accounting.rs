@@ -355,4 +355,44 @@ mod tests {
         assert_eq!(charge.nano_usd, 30);
         assert_eq!(charge.confidence, UsageCostConfidence::Estimated);
     }
+
+    #[test]
+    fn legacy_auth_store_schema_is_upgraded_without_losing_insert_compatibility() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE auth_usage_events (
+                auth_request_id TEXT PRIMARY KEY, api_call_id TEXT, key_id TEXT,
+                principal_id TEXT, endpoint TEXT NOT NULL, requested_model TEXT,
+                served_model TEXT, provider TEXT, status TEXT NOT NULL,
+                prompt_tokens INTEGER, completion_tokens INTEGER, cached_tokens INTEGER,
+                reasoning_tokens INTEGER, cost_nanos INTEGER, created_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        migrate_usage_schema(&conn).unwrap();
+        assert!(record_usage_once(&conn, &event("authreq_legacy")).unwrap());
+        let values: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT total_tokens, cost_nano_usd, created_at_ms FROM auth_usage_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (120, 295, 1));
+    }
+
+    #[test]
+    fn model_price_conversion_preserves_cached_price_presence() {
+        let configured =
+            UsageRates::from_model_price(crate::config::ModelPrice::new(0.002, 0.006, 0.001))
+                .unwrap();
+        assert_eq!(configured.input_per_token.get(), 2_000);
+        assert_eq!(configured.output_per_token.get(), 6_000);
+        assert_eq!(configured.cached_per_token.unwrap().get(), 1_000);
+
+        let omitted =
+            UsageRates::from_model_price(crate::config::ModelPrice::without_cached(0.002, 0.006))
+                .unwrap();
+        assert_eq!(omitted.cached_per_token, None);
+    }
 }

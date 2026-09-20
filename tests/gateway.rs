@@ -7580,7 +7580,10 @@ async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["public-model"]).await;
     upstream
-        .push_response(vec![Ok(content_chunk("chat-auth", "allowed"))])
+        .push_response(vec![
+            Ok(content_chunk("chat-auth", "allowed")),
+            Ok(usage_chunk("chat-auth", 12, 5, 17, Some(3), Some(2))),
+        ])
         .await;
     let gateway = test_gateway_with_config_raw_output_and_authz(
         upstream.clone(),
@@ -7632,6 +7635,37 @@ async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
         .unwrap();
     assert_eq!(allowed.status(), axum::http::StatusCode::OK);
     assert_eq!(upstream.requests().await.len(), 1);
+    let usage_row = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let connection = rusqlite::Connection::open(&store_path).expect("open auth store");
+            let row = connection.query_row(
+                "SELECT endpoint, status, prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens
+                 FROM auth_usage_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            );
+            if let Ok(row) = row {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal usage persisted in bounded time");
+    assert_eq!(
+        usage_row,
+        ("chat".to_string(), "completed".to_string(), 12, 5, 17, 3, 2)
+    );
     remove_auth_store(&store_path);
 }
 
