@@ -220,8 +220,13 @@ mod tests {
                     effect: "allow".into(),
                     subjects: vec![format!("principal:{principal_id}")],
                     endpoints: vec!["chat".into()],
-                    models: vec!["public-*".into()],
+                    requested_models: vec!["public-*".into()],
+                    served_models: vec!["backend-*".into()],
                     providers: vec!["provider-a".into()],
+                    routes: vec!["primary".into()],
+                    time_windows: Vec::new(),
+                    max_concurrent_sessions: Some(2),
+                    daily_session_starts: Some(10),
                 })
             ),
             Ok(AccessResult::Policies(_))

@@ -4,8 +4,8 @@ use super::policy::{
 };
 use crate::dashboard_access::{
     AccessApiKey, AccessAuditEvent, AccessCounts, AccessError, AccessGroup, AccessOperation,
-    AccessPolicy, AccessPricingRow, AccessResult, AccessRole, AccessSession, AccessSummary,
-    AccessUsageRow, AccessUser, ActorSummary, ManagementActor,
+    AccessPolicy, AccessPolicyTimeWindow, AccessPricingRow, AccessResult, AccessRole,
+    AccessSession, AccessSummary, AccessUsageRow, AccessUser, ActorSummary, ManagementActor,
     ManagementPermission as WirePermission,
 };
 use axum::http::StatusCode;
@@ -908,6 +908,17 @@ impl AuthStore {
                         .map(|(_, v)| v.clone())
                         .collect()
                 };
+                let time_windows = self
+                    .query_windows(&id)
+                    .map_err(access_internal)?
+                    .into_iter()
+                    .map(|window| AccessPolicyTimeWindow {
+                        days: weekday_names(window.weekday_mask),
+                        start_utc: minute_string(window.start_minute),
+                        end_utc: minute_string(window.end_minute),
+                    })
+                    .collect();
+                let limits = self.query_limits(&id).map_err(access_internal)?;
                 Ok(AccessPolicy {
                     id,
                     name,
@@ -915,8 +926,13 @@ impl AuthStore {
                     enabled,
                     subjects,
                     endpoints: dim("endpoint"),
-                    models: dim("requested_model"),
+                    requested_models: dim("requested_model"),
+                    served_models: dim("served_model"),
                     providers: dim("provider"),
+                    routes: dim("route"),
+                    time_windows,
+                    max_concurrent_sessions: limits.max_concurrent_sessions,
+                    daily_session_starts: limits.max_daily_session_starts,
                 })
             })
             .collect()
@@ -960,15 +976,40 @@ impl AuthStore {
             .into_iter()
             .map(|v| (v, "endpoint"))
             .chain(
-                body.models
+                body.requested_models
                     .into_iter()
-                    .flat_map(|v| [(v.clone(), "requested_model"), (v, "served_model")]),
+                    .map(|v| (v, "requested_model")),
             )
+            .chain(body.served_models.into_iter().map(|v| (v, "served_model")))
             .chain(body.providers.into_iter().map(|v| (v, "provider")))
+            .chain(body.routes.into_iter().map(|v| (v, "route")))
         {
             tx.execute(
                 "INSERT INTO auth_policy_scopes(policy_id,dimension,matcher) VALUES(?1,?2,?3)",
                 params![id, dimension, endpoint],
+            )
+            .map_err(access_db)?;
+        }
+        for window in body.time_windows {
+            let weekday_mask = weekday_mask(&window.days)?;
+            let start_minute = parse_minute(&window.start_utc)?;
+            let end_minute = parse_minute(&window.end_utc)?;
+            if start_minute == end_minute {
+                return Err(AccessError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "UTC window start and end must differ",
+                ));
+            }
+            tx.execute(
+                "INSERT INTO auth_time_windows(id,policy_id,weekday_mask,start_minute,end_minute) VALUES(?1,?2,?3,?4,?5)",
+                params![format!("win_{}", Uuid::new_v4().simple()), id, weekday_mask, start_minute, end_minute],
+            )
+            .map_err(access_db)?;
+        }
+        if body.max_concurrent_sessions.is_some() || body.daily_session_starts.is_some() {
+            tx.execute(
+                "INSERT INTO auth_limits(policy_id,max_concurrent_sessions,max_daily_session_starts) VALUES(?1,?2,?3)",
+                params![id, body.max_concurrent_sessions, body.daily_session_starts],
             )
             .map_err(access_db)?;
         }
@@ -1255,6 +1296,68 @@ fn access_db(e: rusqlite::Error) -> AccessError {
 }
 fn access_internal(e: String) -> AccessError {
     AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, e)
+}
+
+const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+fn weekday_names(mask: u8) -> Vec<String> {
+    WEEKDAYS
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| mask & (1 << index) != 0)
+        .map(|(_, day)| (*day).to_string())
+        .collect()
+}
+
+fn weekday_mask(days: &[String]) -> Result<u8, AccessError> {
+    if days.is_empty() {
+        return Err(AccessError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "UTC window requires at least one day",
+        ));
+    }
+    days.iter().try_fold(0_u8, |mask, day| {
+        let normalized = day.trim().to_ascii_lowercase();
+        let Some(index) = WEEKDAYS
+            .iter()
+            .position(|candidate| *candidate == normalized)
+        else {
+            return Err(AccessError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "UTC window days must be mon,tue,wed,thu,fri,sat,sun",
+            ));
+        };
+        Ok(mask | (1 << index))
+    })
+}
+
+fn parse_minute(value: &str) -> Result<u16, AccessError> {
+    let (hours, minutes) = value.split_once(':').ok_or_else(|| {
+        AccessError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "UTC window times must use HH:MM",
+        )
+    })?;
+    let hours: u16 = hours.parse().map_err(|_| {
+        AccessError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid UTC window hour")
+    })?;
+    let minutes: u16 = minutes.parse().map_err(|_| {
+        AccessError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid UTC window minute",
+        )
+    })?;
+    if hours > 23 || minutes > 59 {
+        return Err(AccessError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "UTC window time is outside 00:00-23:59",
+        ));
+    }
+    Ok(hours * 60 + minutes)
+}
+
+fn minute_string(minute: u16) -> String {
+    format!("{:02}:{:02}", minute / 60, minute % 60)
 }
 fn validate_decimal(v: &str) -> Result<(), AccessError> {
     if v.parse::<f64>()

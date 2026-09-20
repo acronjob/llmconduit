@@ -141,8 +141,8 @@ pub struct AccessPolicy {
     pub providers: Vec<String>,
     pub routes: Vec<String>,
     pub time_windows: Vec<AccessPolicyTimeWindow>,
-    pub max_concurrent_sessions: Option<u64>,
-    pub daily_session_starts: Option<u64>,
+    pub max_concurrent_sessions: Option<u32>,
+    pub daily_session_starts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -260,8 +260,8 @@ pub struct CreatePolicyRequest {
     pub routes: Vec<String>,
     #[serde(default)]
     pub time_windows: Vec<AccessPolicyTimeWindow>,
-    pub max_concurrent_sessions: Option<u64>,
-    pub daily_session_starts: Option<u64>,
+    pub max_concurrent_sessions: Option<u32>,
+    pub daily_session_starts: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
