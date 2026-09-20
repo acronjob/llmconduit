@@ -995,14 +995,20 @@ impl Gateway {
     /// A thin pass-through to [`Config::price_for`] so the dashboard REST handlers
     /// + the flow-cost roll-up resolve prices without reaching into `config()`.
     pub fn price_for(&self, model: &str) -> Option<crate::config::ModelPrice> {
-        self.config.price_for(model)
+        self.config
+            .price_for(model)
+            .or_else(|| self.authz.effective_price(model))
     }
 
     /// D13: the whole per-model price table (`/dashboard/api/topology` returns it,
     /// the Sankey colors edges from it). A borrow of the `Config`-owned map; empty
     /// when none is configured (contract-valid — an empty `price_table` validates).
-    pub fn price_table(&self) -> &std::collections::HashMap<String, crate::config::ModelPrice> {
-        &self.config.price_table
+    pub fn price_table(&self) -> std::collections::HashMap<String, crate::config::ModelPrice> {
+        let mut prices = self.authz.effective_price_table();
+        // Persisted/YAML operator configuration is the final authority. Imported
+        // averages and dashboard-written values only fill otherwise-unpriced models.
+        prices.extend(self.config.price_table.clone());
+        prices
     }
 
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {

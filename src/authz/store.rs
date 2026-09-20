@@ -90,7 +90,98 @@ impl AuthStore {
             .map_err(|err| format!("failed to migrate auth store: {err}"))?;
         crate::usage_accounting::migrate_usage_schema(&connection)
             .map_err(|err| format!("failed to migrate auth usage store: {err}"))?;
+        crate::openrouter_pricing::migrate_pricing_schema(&connection)
+            .map_err(|err| format!("failed to migrate imported pricing store: {err}"))?;
         Ok(Self { connection })
+    }
+
+    pub(crate) fn persist_imported_price(
+        &mut self,
+        actor: &ManagementActor,
+        snapshot: &crate::openrouter_pricing::OpenRouterPriceSnapshot,
+    ) -> Result<(), AccessError> {
+        crate::openrouter_pricing::persist_imported_price(&mut self.connection, snapshot)
+            .map_err(|err| AccessError::new(StatusCode::BAD_GATEWAY, err.to_string()))?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "model".into(),
+            Value::String(snapshot.price.model_id.clone()),
+        );
+        metadata.insert(
+            "source_url".into(),
+            Value::String(snapshot.source_url.clone()),
+        );
+        let tx = self.connection.transaction().map_err(access_db)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "pricing.synced",
+            &snapshot.price.model_id,
+            "ok",
+            metadata,
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
+    }
+
+    pub(crate) fn effective_prices(
+        &self,
+    ) -> Result<HashMap<String, crate::config::ModelPrice>, String> {
+        let mut prices = HashMap::new();
+        let mut imported = self
+            .connection
+            .prepare(
+                "SELECT model_id,prompt_mean_nano_usd,completion_mean_nano_usd,cached_mean_nano_usd
+                 FROM auth_imported_price_snapshots p
+                 WHERE fetched_at_ms=(SELECT MAX(fetched_at_ms) FROM auth_imported_price_snapshots WHERE model_id=p.model_id)
+                 GROUP BY model_id,fetched_at_ms
+                 ORDER BY model_id",
+            )
+            .map_err(db)?;
+        let rows = imported
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .map_err(db)?;
+        for row in rows {
+            let (model, input, output, cached) = row.map_err(db)?;
+            let input = input as f64 / 1_000_000.0;
+            let output = output as f64 / 1_000_000.0;
+            let price = cached.map_or_else(
+                || crate::config::ModelPrice::without_cached(input, output),
+                |cached| crate::config::ModelPrice::new(input, output, cached as f64 / 1_000_000.0),
+            );
+            prices.insert(model, price);
+        }
+
+        let mut overrides = self
+            .connection
+            .prepare("SELECT model,input_per_1k,output_per_1k FROM auth_price_snapshots WHERE source='operator'")
+            .map_err(db)?;
+        let rows = overrides
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(db)?;
+        for row in rows {
+            let (model, input, output) = row.map_err(db)?;
+            let input = input.parse::<f64>().map_err(|err| err.to_string())?;
+            let output = output.parse::<f64>().map_err(|err| err.to_string())?;
+            prices.insert(
+                model,
+                crate::config::ModelPrice::without_cached(input, output),
+            );
+        }
+        Ok(prices)
     }
 
     pub fn record_usage_once(
@@ -662,6 +753,10 @@ impl AuthStore {
             AccessOperation::Usage => self.usage().map(AccessResult::Usage),
             AccessOperation::Audit => self.audit_events().map(AccessResult::Audit),
             AccessOperation::Pricing => self.pricing().map(AccessResult::Pricing),
+            AccessOperation::SyncPricing(_) => Err(AccessError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pricing sync must be handled asynchronously by AuthzService",
+            )),
             AccessOperation::WritePricing(body) => {
                 self.write_pricing(actor, body)?;
                 self.pricing().map(AccessResult::Pricing)
@@ -1239,20 +1334,63 @@ impl AuthStore {
     }
     fn pricing(&self) -> Result<Vec<AccessPricingRow>, AccessError> {
         let mut stmt=self.connection.prepare("SELECT model,provider,source,fetched_at,input_per_1k,output_per_1k,confidence FROM auth_price_snapshots ORDER BY model,provider").map_err(access_db)?;
-        stmt.query_map([], |r| {
-            Ok(AccessPricingRow {
-                model: r.get(0)?,
-                provider: r.get(1)?,
-                source: r.get(2)?,
-                fetched_at: timestamp(r.get(3)?),
-                input_per_1k: r.get(4)?,
-                output_per_1k: r.get(5)?,
-                confidence: r.get(6)?,
+        let mut rows = stmt
+            .query_map([], |r| {
+                Ok(AccessPricingRow {
+                    model: r.get(0)?,
+                    provider: r.get(1)?,
+                    source: r.get(2)?,
+                    source_url: None,
+                    fetched_at: timestamp(r.get(3)?),
+                    input_per_1k: r.get(4)?,
+                    output_per_1k: r.get(5)?,
+                    input_min_per_1k: None,
+                    input_max_per_1k: None,
+                    output_min_per_1k: None,
+                    output_max_per_1k: None,
+                    confidence: r.get(6)?,
+                })
             })
-        })
-        .map_err(access_db)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(access_db)
+            .map_err(access_db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(access_db)?;
+        let mut imported = self
+            .connection
+            .prepare(
+                "SELECT model_id,endpoint_id,source,source_url,fetched_at_ms,
+                    prompt_mean_nano_usd,completion_mean_nano_usd,
+                    prompt_min_nano_usd,prompt_max_nano_usd,
+                    completion_min_nano_usd,completion_max_nano_usd,confidence
+             FROM auth_imported_price_snapshots ORDER BY fetched_at_ms DESC,model_id,endpoint_id",
+            )
+            .map_err(access_db)?;
+        let imported_rows = imported
+            .query_map([], |r| {
+                let price = |column| -> rusqlite::Result<String> {
+                    Ok(format!("{}", r.get::<_, i64>(column)? as f64 / 1_000_000.0))
+                };
+                Ok(AccessPricingRow {
+                    model: r.get(0)?,
+                    provider: r.get(1)?,
+                    source: r.get(2)?,
+                    source_url: Some(r.get(3)?),
+                    fetched_at: timestamp(r.get::<_, i64>(4)? / 1_000),
+                    input_per_1k: price(5)?,
+                    output_per_1k: price(6)?,
+                    input_min_per_1k: Some(price(7)?),
+                    input_max_per_1k: Some(price(8)?),
+                    output_min_per_1k: Some(price(9)?),
+                    output_max_per_1k: Some(price(10)?),
+                    confidence: r.get(11)?,
+                })
+            })
+            .map_err(access_db)?;
+        rows.extend(
+            imported_rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(access_db)?,
+        );
+        Ok(rows)
     }
     fn write_pricing(
         &mut self,

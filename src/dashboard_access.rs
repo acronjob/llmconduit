@@ -233,9 +233,19 @@ pub struct AccessPricingRow {
     pub model: String,
     pub provider: String,
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
     pub fetched_at: String,
     pub input_per_1k: String,
     pub output_per_1k: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_min_per_1k: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_max_per_1k: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_min_per_1k: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_max_per_1k: Option<String>,
     pub confidence: String,
 }
 
@@ -298,6 +308,11 @@ pub struct WritePricingRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SyncPricingRequest {
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AccessPricingInput {
     pub model: String,
     pub provider: String,
@@ -325,6 +340,7 @@ pub enum AccessOperation {
     Usage,
     Audit,
     Pricing,
+    SyncPricing(SyncPricingRequest),
     WritePricing(WritePricingRequest),
 }
 
@@ -426,6 +442,7 @@ where
             "/dashboard/api/auth/pricing",
             get(pricing).post(write_pricing),
         )
+        .route("/dashboard/api/auth/pricing/sync", post(sync_pricing))
         .layer(Extension(backend))
 }
 
@@ -690,6 +707,23 @@ async fn write_pricing(
     }
 }
 
+async fn sync_pricing(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Json(body): Json<SyncPricingRequest>,
+) -> Result<Json<Value>, AccessError> {
+    match execute(
+        (backend, actor),
+        ManagementPermission::PricingSync,
+        AccessOperation::SyncPricing(body),
+    )
+    .await?
+    {
+        AccessResult::Pricing(value) => Ok(Json(json!({ "pricing": value }))),
+        _ => Err(AccessError::contract()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,6 +777,7 @@ mod tests {
                             raw_key: "llmc_secret_once".into(),
                         }))
                     }
+                    AccessOperation::SyncPricing(_) => Ok(AccessResult::Pricing(Vec::new())),
                     _ => Err(AccessError::contract()),
                 }
             })
@@ -836,6 +871,36 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(backend.dispatches.load(Ordering::Relaxed), 1);
         assert_eq!(json_body(response).await, json!({ "api_keys": [] }));
+    }
+
+    #[tokio::test]
+    async fn pricing_sync_requires_exact_named_permission() {
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/dashboard/api/auth/pricing/sync")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"models":["openai/gpt-4"]}"#))
+                .unwrap()
+        };
+        let denied = Arc::new(RouteBackend::default());
+        let response = routes::<()>(denied.clone())
+            .layer(Extension(delegated([ManagementPermission::PricingWrite])))
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(denied.dispatches.load(Ordering::Relaxed), 0);
+
+        let allowed = Arc::new(RouteBackend::default());
+        let response = routes::<()>(allowed.clone())
+            .layer(Extension(delegated([ManagementPermission::PricingSync])))
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(allowed.dispatches.load(Ordering::Relaxed), 1);
+        assert_eq!(json_body(response).await, json!({ "pricing": [] }));
     }
 
     #[tokio::test]

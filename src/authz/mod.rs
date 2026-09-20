@@ -6,6 +6,7 @@ pub mod store;
 
 use crate::config::{AuthConfig, AuthMode};
 use axum::http::HeaderMap;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use keys::{AuthPepper, digest_matches, generate_api_key, key_prefix};
@@ -90,6 +91,7 @@ struct Inner {
     pepper: AuthPepper,
     store: Arc<std::sync::Mutex<store::AuthStore>>,
     authority: RwLock<Arc<store::StoredAuthority>>,
+    effective_prices: RwLock<HashMap<String, crate::config::ModelPrice>>,
     session_limiter: SessionLimiter,
     session_persistence: SessionPersistence,
 }
@@ -221,6 +223,7 @@ impl AuthzService {
             store.insert_bootstrap_key(raw, &pepper.digest(raw))?;
         }
         let authority = Arc::new(store.load_authority()?);
+        let effective_prices = store.effective_prices()?;
         let store = Arc::new(std::sync::Mutex::new(store));
         let session_persistence = SessionPersistence::start(Arc::clone(&store))?;
         Ok(Self {
@@ -228,6 +231,7 @@ impl AuthzService {
                 pepper,
                 store,
                 authority: RwLock::new(authority),
+                effective_prices: RwLock::new(effective_prices),
                 session_limiter: SessionLimiter::default(),
                 session_persistence,
             })),
@@ -527,6 +531,117 @@ impl AuthzService {
             .lock()
             .map_err(|_| "auth store lock poisoned".to_string())?
             .record_usage_once(event)
+    }
+
+    pub fn effective_price(&self, model: &str) -> Option<crate::config::ModelPrice> {
+        let inner = self.inner.as_ref()?;
+        let prices = inner.effective_prices.read().ok()?;
+        prices.get(model).copied().or_else(|| {
+            prices
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(model))
+                .map(|(_, price)| *price)
+        })
+    }
+
+    pub fn effective_price_table(&self) -> HashMap<String, crate::config::ModelPrice> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| {
+                inner
+                    .effective_prices
+                    .read()
+                    .ok()
+                    .map(|prices| prices.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn refresh_effective_prices_locked(
+        &self,
+        inner: &Inner,
+        store: &store::AuthStore,
+    ) -> Result<(), String> {
+        *inner
+            .effective_prices
+            .write()
+            .map_err(|_| "effective pricing lock poisoned")? = store.effective_prices()?;
+        Ok(())
+    }
+
+    async fn sync_openrouter_pricing(
+        &self,
+        actor: crate::dashboard_access::ManagementActor,
+        request: crate::dashboard_access::SyncPricingRequest,
+    ) -> Result<crate::dashboard_access::AccessResult, crate::dashboard_access::AccessError> {
+        use axum::http::StatusCode;
+        use std::collections::HashSet;
+
+        let inner = self.inner().map_err(|message| {
+            crate::dashboard_access::AccessError::new(StatusCode::SERVICE_UNAVAILABLE, message)
+        })?;
+        let management_key = std::env::var("OPENROUTER_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                crate::dashboard_access::AccessError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "OpenRouter pricing sync is not configured",
+                )
+            })?;
+        let mut seen = HashSet::new();
+        let models = request
+            .models
+            .into_iter()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty() && seen.insert(model.clone()))
+            .collect::<Vec<_>>();
+        if models.is_empty() {
+            return Err(crate::dashboard_access::AccessError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "at least one OpenRouter model id is required",
+            ));
+        }
+        if models.len() > 128 {
+            return Err(crate::dashboard_access::AccessError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "pricing sync is limited to 128 models",
+            ));
+        }
+
+        let client = crate::openrouter_pricing::OpenRouterPricingClient::default();
+        let mut snapshots = Vec::with_capacity(models.len());
+        for model in models {
+            snapshots.push(
+                client
+                    .fetch_model(&model, &management_key)
+                    .await
+                    .map_err(|err| {
+                        crate::dashboard_access::AccessError::new(
+                            StatusCode::BAD_GATEWAY,
+                            err.to_string(),
+                        )
+                    })?,
+            );
+        }
+        let mut store = inner.store.lock().map_err(|_| {
+            crate::dashboard_access::AccessError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "auth store lock poisoned",
+            )
+        })?;
+        for snapshot in &snapshots {
+            store.persist_imported_price(&actor, snapshot)?;
+        }
+        self.refresh_effective_prices_locked(inner, &store)
+            .map_err(|message| {
+                crate::dashboard_access::AccessError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    message,
+                )
+            })?;
+        store.dispatch_access(&actor, crate::dashboard_access::AccessOperation::Pricing)
     }
 
     fn inner(&self) -> Result<&Arc<Inner>, String> {
