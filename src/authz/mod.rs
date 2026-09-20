@@ -1,3 +1,4 @@
+mod access;
 pub mod keys;
 pub mod policy;
 pub mod session;
@@ -30,6 +31,23 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    /// Converts an authenticated inference identity into the dashboard actor
+    /// carrier without retaining the presented credential. Only the bootstrap
+    /// key is privileged by the current store schema; all other identities are
+    /// delegated with no management grants and therefore fail closed.
+    pub fn management_actor(&self) -> crate::dashboard_access::ManagementActor {
+        if self.key_id == "key_bootstrap" {
+            crate::dashboard_access::ManagementActor::Bootstrap
+        } else {
+            crate::dashboard_access::ManagementActor::Delegated {
+                session_id: self.auth_request_id.clone(),
+                principal_id: self.principal_id.clone(),
+                key_id: self.key_id.clone(),
+                permissions: Arc::from([]),
+            }
+        }
+    }
+
     pub fn allows_endpoint(&self, endpoint: &str) -> bool {
         decide(&self.grants, endpoint, None)
     }
@@ -158,6 +176,10 @@ impl AuthzService {
 
     pub fn is_enabled(&self) -> bool {
         self.inner.is_some()
+    }
+
+    pub fn access_backend(self: &Arc<Self>) -> Arc<dyn crate::dashboard_access::AccessBackend> {
+        Arc::clone(self) as Arc<dyn crate::dashboard_access::AccessBackend>
     }
 
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Option<AuthContext>, AuthFailure> {
