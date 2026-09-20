@@ -3945,6 +3945,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: PersistedMeshConfig::default(),
         };
         write_persisted_config(&path, &config).expect("write config");
@@ -4017,6 +4018,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
@@ -4197,6 +4199,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
@@ -4273,6 +4276,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
@@ -4379,6 +4383,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
@@ -4485,6 +4490,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
@@ -4882,6 +4888,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
@@ -4944,6 +4951,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: PersistedMeshConfig::default(),
         })
         .expect("config");

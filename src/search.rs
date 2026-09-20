@@ -277,6 +277,7 @@ mod tests {
                 image_cache_ttl_secs: 300,
                 unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
                 price_table: std::collections::HashMap::new(),
+                auth: Default::default(),
                 mesh: MeshConfig::default(),
             },
         );
@@ -329,6 +330,7 @@ mod tests {
                 image_cache_ttl_secs: 300,
                 unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
                 price_table: std::collections::HashMap::new(),
+                auth: Default::default(),
                 mesh: MeshConfig::default(),
             },
         );
