@@ -359,6 +359,81 @@ impl ProviderHealthPublisher {
 pub type UpstreamStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, AppError>> + Send + 'static>>;
 
+/// Inference surface being authorized. This is intentionally transport-neutral:
+/// the same scope is evaluated for HTTP, Responses WebSocket, token counting,
+/// legacy completions, routing/failover, and mesh candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceEndpoint {
+    Responses,
+    ChatCompletions,
+    Messages,
+    CountTokens,
+    Completions,
+}
+
+type CandidatePredicate =
+    dyn Fn(&str, Option<&str>, &str, InferenceEndpoint) -> bool + Send + Sync + 'static;
+
+/// Immutable per-request authorization predicate carried to every dispatch
+/// layer. `Default` is deliberately unrestricted so auth-disabled deployments
+/// and existing callers retain their historical behavior. Enforced requests
+/// install a restricted predicate after policy evaluation.
+#[derive(Clone, Default)]
+pub struct AuthorizationScope {
+    predicate: Option<Arc<CandidatePredicate>>,
+}
+
+impl std::fmt::Debug for AuthorizationScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationScope")
+            .field("restricted", &self.predicate.is_some())
+            .finish()
+    }
+}
+
+impl AuthorizationScope {
+    pub fn unrestricted() -> Self {
+        Self::default()
+    }
+
+    pub fn restricted<F>(predicate: F) -> Self
+    where
+        F: Fn(&str, Option<&str>, &str, InferenceEndpoint) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            predicate: Some(Arc::new(predicate)),
+        }
+    }
+
+    pub fn allows_candidate(
+        &self,
+        provider_id: &str,
+        route_id: Option<&str>,
+        served_model: &str,
+        endpoint: InferenceEndpoint,
+    ) -> bool {
+        self.predicate.as_ref().is_none_or(|predicate| {
+            predicate(provider_id, route_id, served_model, endpoint)
+        })
+    }
+
+    fn ensure_candidate(
+        &self,
+        provider_id: &str,
+        route_id: Option<&str>,
+        served_model: &str,
+        endpoint: InferenceEndpoint,
+    ) -> AppResult<()> {
+        if self.allows_candidate(provider_id, route_id, served_model, endpoint) {
+            Ok(())
+        } else {
+            Err(AppError::forbidden(
+                "the authenticated key is not authorized for this inference candidate",
+            ))
+        }
+    }
+}
+
 /// One entry of the upstream `/v1/models` catalog: the model id plus its
 /// context-window length (`None` when the upstream reports no positive context
 /// length for it). Ids and context limits are derived from a SINGLE
@@ -1980,6 +2055,10 @@ impl FailoverUpstreamClient {
             // F1d (AC-11): carry the turn-capture handle forward too -- a captured
             // turn keeps capturing across a failover provider rebuild.
             capture: backend.capture.clone(),
+            authorization: backend.authorization.clone(),
+            endpoint: backend.endpoint,
+            authorization_route: backend.authorization_route.clone(),
+            authorization_provider: Some(provider.name.clone()),
         }
     }
 
@@ -2526,6 +2605,10 @@ impl RoutingUpstreamClient {
             // F1d: carry the turn-capture handle forward too (same reasoning as the
             // failover rebuild above, `request_for_provider`).
             capture: backend.capture.clone(),
+            authorization: backend.authorization.clone(),
+            endpoint: backend.endpoint,
+            authorization_route: Some(provider_name.to_string()),
+            authorization_provider: Some(provider_name.to_string()),
         }
     }
 
@@ -3788,6 +3871,17 @@ pub struct BackendChatRequest {
     /// (spec Design #3) precisely because the carrier is here, not on
     /// `ServingToken`.
     pub capture: Option<Arc<TurnCaptureState>>,
+    /// Request-local provider/route authorization. Unrestricted unless inference
+    /// auth is enforced. Rebuilds must clone this exact immutable scope.
+    pub authorization: AuthorizationScope,
+    /// The ingress surface whose policy is being enforced.
+    pub endpoint: InferenceEndpoint,
+    /// Routing writes the selected route here so nested failover/leaf checks can
+    /// evaluate both the route and the concrete provider.
+    pub authorization_route: Option<String>,
+    /// Wrappers write the concrete provider before the leaf sends bytes. Bare
+    /// single-provider requests use `primary`.
+    pub authorization_provider: Option<String>,
 }
 
 impl BackendChatRequest {
@@ -3813,7 +3907,21 @@ impl BackendChatRequest {
             response_id,
             serving,
             capture: None,
+            authorization: AuthorizationScope::unrestricted(),
+            endpoint: InferenceEndpoint::Responses,
+            authorization_route: None,
+            authorization_provider: None,
         }
+    }
+
+    pub fn with_authorization(
+        mut self,
+        authorization: AuthorizationScope,
+        endpoint: InferenceEndpoint,
+    ) -> Self {
+        self.authorization = authorization;
+        self.endpoint = endpoint;
+        self
     }
 
     /// F1d: attach the turn-capture handle (builder-style, so the many existing
