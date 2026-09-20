@@ -551,6 +551,36 @@ pub enum UnsupportedImagePolicy {
     Reject,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    #[default]
+    Disabled,
+    Enforce,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthConfig {
+    pub mode: AuthMode,
+    pub store_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersistedAuthConfig {
+    pub mode: AuthMode,
+    pub store_path: String,
+}
+
+impl Default for PersistedAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::Disabled,
+            store_path: "llmconduit-auth.sqlite3".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -636,6 +666,10 @@ pub struct Config {
     /// default — an absent model simply has no price (cost stays `None`/0), which
     /// is contract-valid (the frontend only requires finite rates when present).
     pub price_table: HashMap<String, ModelPrice>,
+    /// Inference authorization configuration. The key-verification pepper and
+    /// optional bootstrap key remain environment-only and are never retained in
+    /// this `Debug + Clone` structure.
+    pub auth: AuthConfig,
     pub mesh: MeshConfig,
 }
 
@@ -1410,8 +1444,14 @@ pub struct PersistedConfig {
     /// `upstream_chat_kwargs` env-JSON pattern). Empty by default.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub price_table: HashMap<String, ModelPrice>,
+    #[serde(default, skip_serializing_if = "is_default_auth_config")]
+    pub auth: PersistedAuthConfig,
     #[serde(default, skip_serializing_if = "PersistedMeshConfig::is_default")]
     pub mesh: PersistedMeshConfig,
+}
+
+fn is_default_auth_config(config: &PersistedAuthConfig) -> bool {
+    config == &PersistedAuthConfig::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1680,6 +1720,7 @@ impl Default for PersistedConfig {
             image_cache_ttl_secs: default_image_cache_ttl_secs(),
             unsupported_image_policy: default_unsupported_image_policy(),
             price_table: HashMap::new(),
+            auth: PersistedAuthConfig::default(),
             mesh: PersistedMeshConfig::default(),
         }
     }
@@ -1899,6 +1940,10 @@ impl Config {
                 let mut table = config.price_table.clone();
                 retain_finite_prices(&mut table);
                 table
+            },
+            auth: AuthConfig {
+                mode: config.auth.mode,
+                store_path: PathBuf::from(config.auth.store_path.trim()),
             },
             mesh,
         })
