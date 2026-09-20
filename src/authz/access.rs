@@ -329,7 +329,7 @@ mod tests {
             "backend-v2",
             crate::upstream::InferenceEndpoint::ChatCompletions
         ));
-        let lease = service.acquire_session(&context).unwrap().unwrap();
+        let lease = service.acquire_session(&context).await.unwrap().unwrap();
         assert!(matches!(
             service.dispatch_access(&actor, AccessOperation::ListSessions),
             Ok(AccessResult::Sessions(ref sessions)) if sessions.iter().any(|session| session.id == lease.session_id())

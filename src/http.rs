@@ -404,7 +404,7 @@ fn authorize_inference(
     )
 }
 
-fn acquire_inference_session(
+async fn acquire_inference_session(
     gateway: &Gateway,
     context: Option<&crate::authz::AuthContext>,
 ) -> AppResult<Option<crate::authz::SessionLease>> {
@@ -412,6 +412,7 @@ fn acquire_inference_session(
         Some(context) => gateway
             .authz()
             .acquire_session(context)
+            .await
             .map_err(|err| AppError::forbidden(err.to_string())),
         None => Ok(None),
     }
@@ -1584,7 +1585,7 @@ async fn post_responses(
         &requested,
     )?;
     let auth = auth.map(|value| value.0);
-    let lease = acquire_inference_session(&gateway, auth.as_ref())?;
+    let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let wants_stream = request.stream;
     let stream = gateway
         .clone()
@@ -1724,7 +1725,7 @@ async fn responses_ws_serve(
         }
     };
 
-    let _lease = match acquire_inference_session(&gateway, auth.as_ref()) {
+    let _lease = match acquire_inference_session(&gateway, auth.as_ref()).await {
         Ok(lease) => lease,
         Err(err) => {
             let _ = send_responses_ws_error(&mut sink, "permission_denied", &err.to_string()).await;
@@ -1919,7 +1920,7 @@ async fn handle_count_tokens(
         crate::upstream::InferenceEndpoint::CountTokens,
     );
 
-    let _lease = acquire_inference_session(&gateway, auth.as_ref())?;
+    let _lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
 
     match gateway.upstream_client().count_tokens(&backend).await {
         Ok(Some(count)) => {
@@ -1951,7 +1952,7 @@ async fn post_chat_completions(
         &requested,
     )?;
     let auth = auth.map(|value| value.0);
-    let lease = acquire_inference_session(&gateway, auth.as_ref())?;
+    let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let wants_stream = request.stream;
     let include_usage = request
         .stream_options
@@ -2002,7 +2003,7 @@ async fn post_completions(
         crate::upstream::AuthorizationScope::unrestricted()
     };
     let auth = auth.map(|value| value.0);
-    let lease = acquire_inference_session(&gateway, auth.as_ref())?;
+    let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let response = gateway
         .upstream_client()
         .proxy_completions(
@@ -2026,7 +2027,7 @@ async fn handle_post_messages(
         crate::upstream::InferenceEndpoint::Messages,
         &requested,
     )?;
-    let lease = acquire_inference_session(&gateway, auth.as_ref())?;
+    let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let wants_stream = request.stream;
     let suppress_reasoning = !matches!(
         request.thinking.as_ref(),
