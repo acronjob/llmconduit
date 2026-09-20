@@ -10,6 +10,33 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on login shell').toEqual([]);
   });
 
+  test('navigation and status controls reflow at half-screen width', async ({ page, consoleErrors }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    await login(page);
+    await page.waitForTimeout(800);
+
+    const dimensions = await page.evaluate(() => {
+      const nav = document.querySelector('nav');
+      const stats = document.querySelector('[data-testid="stats-strip"]');
+      return {
+        viewport: innerWidth,
+        document: document.documentElement.scrollWidth,
+        navClient: nav?.clientWidth ?? 0,
+        navScroll: nav?.scrollWidth ?? 0,
+        statsClient: stats?.clientWidth ?? 0,
+        statsScroll: stats?.scrollWidth ?? 0,
+      };
+    });
+
+    expect(dimensions.document).toBeLessThanOrEqual(dimensions.viewport);
+    expect(dimensions.navScroll).toBeLessThanOrEqual(dimensions.navClient);
+    expect(dimensions.statsScroll).toBeLessThanOrEqual(dimensions.statsClient);
+    await expect(page.getByRole('navigation').getByRole('button', { name: 'Access', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Logout', exact: true })).toBeVisible();
+    await expect(page.getByTestId('window-selector')).toBeVisible();
+    expect(consoleErrors, 'console errors at half-screen width').toEqual([]);
+  });
+
   // Gap 01: the stats strip must be HONEST under live (mock-streamed) traffic — real
   // numeric values, not the all-`0.0` the live WS tile used to ship. The mock streams a
   // snapshot + a metric_tick (active_streams/tokens_per_sec/cost_per_min all > 0), so the

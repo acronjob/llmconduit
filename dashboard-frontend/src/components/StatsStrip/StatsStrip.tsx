@@ -83,11 +83,14 @@ export function StatsStrip() {
   const chips = useMemo(() => deriveChips(cur, prev), [cur, prev]);
 
   return (
-    <Panel className="m-4 mb-0 flex items-center gap-1 px-2 py-1" data-testid="stats-strip">
+    <Panel
+      className="m-4 mb-0 grid grid-cols-2 items-stretch gap-1 px-2 py-1 sm:grid-cols-4 xl:flex xl:items-center"
+      data-testid="stats-strip"
+    >
       {chips.map((chip) => (
         <ChipCell key={chip.key} chip={chip} series={seriesFor(history, window, chip.key)} />
       ))}
-      <div className="ml-auto flex items-center gap-2 pr-1">
+      <div className="col-span-2 flex items-center justify-end gap-2 border-t border-line/50 px-3 py-2 sm:col-span-4 xl:ml-auto xl:border-t-0 xl:px-0 xl:py-0 xl:pl-2">
         <WindowSelector value={window} onChange={setWindow} />
         <ConnectionDot state={connection} />
       </div>
