@@ -1509,8 +1509,11 @@ impl Gateway {
             && let Some(api_call_id) = api_call_id.as_deref()
         {
             let normalized = crate::dashboard_flow::capture_body_from_value(&request);
-            self.flow_store()
-                .set_normalized(api_call_id, Some(model_requested), Some(normalized));
+            self.flow_store().set_normalized(
+                api_call_id,
+                Some(model_requested.clone()),
+                Some(normalized),
+            );
         }
         // Lower the canonical request to the upstream chat payload BEFORE
         // budgeting. The `?` surfaces any lowering/validation error (invalid
@@ -2591,7 +2594,8 @@ impl Gateway {
                     // production hot path — no `api_call_id` threaded AND the monitor
                     // disabled — keeping `MonitorHub::disabled()` truly zero-overhead.
                     // Borrow `usage` here; it is MOVED into `turn_usage` below.
-                    if api_call_id.is_some() || self.monitor.is_enabled() || self.authz.is_enabled() {
+                    if api_call_id.is_some() || self.monitor.is_enabled() || self.authz.is_enabled()
+                    {
                         // `total` is the flow's running cumulative (turn_base + this
                         // cumulative chunk), NOT an increment — so a multi-chunk turn
                         // does not double-count and a midstream cancel keeps this LAST
