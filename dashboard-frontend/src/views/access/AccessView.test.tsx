@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
-import { AccessView } from './AccessView';
-import { validatePolicy } from './policyEditorModel';
+import { AccessView, validatePolicy } from './AccessView';
 import { renderWithQuery, resetWorld } from '../../components/testHarness';
 
 beforeEach(() => resetWorld({ mock: true }));
