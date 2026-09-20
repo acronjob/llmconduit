@@ -166,14 +166,36 @@ pub fn record_usage_once(conn: &Connection, event: &UsageEvent) -> rusqlite::Res
     validate_event(event)?;
     let usage = event.usage.unwrap_or_default();
     let has_usage = event.usage.is_some();
-    let changed = conn.execute(
-        "INSERT OR IGNORE INTO auth_usage_events (
+    let legacy_columns = conn
+        .prepare("PRAGMA table_info(auth_usage_events)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    let (sql, include_legacy) = if legacy_columns.contains("created_at") {
+        (
+            "INSERT OR IGNORE INTO auth_usage_events (
+                auth_request_id, api_call_id, key_id, principal_id, endpoint,
+                requested_model, served_model, provider, route, status,
+                prompt_tokens, completion_tokens, total_tokens, cached_tokens,
+                reasoning_tokens, cost_nano_usd, cost_confidence, created_at_ms,
+                cost_nanos, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                       ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?16, ?18)",
+            true,
+        )
+    } else {
+        (
+            "INSERT OR IGNORE INTO auth_usage_events (
             auth_request_id, api_call_id, key_id, principal_id, endpoint,
             requested_model, served_model, provider, route, status,
             prompt_tokens, completion_tokens, total_tokens, cached_tokens,
             reasoning_tokens, cost_nano_usd, cost_confidence, created_at_ms
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            false,
+        )
+    };
+    let changed = conn.execute(
+        sql,
         params![
             event.auth_request_id,
             event.api_call_id,
@@ -199,6 +221,7 @@ pub fn record_usage_once(conn: &Connection, event: &UsageEvent) -> rusqlite::Res
             event.created_at_ms,
         ],
     )?;
+    debug_assert_eq!(include_legacy, legacy_columns.contains("created_at"));
     Ok(changed == 1)
 }
 
