@@ -7362,6 +7362,26 @@ fn remove_auth_store(path: &std::path::Path) {
     let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
 }
 
+async fn await_single_auth_usage(store_path: &std::path::Path) -> (String, Option<i64>, i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let connection = rusqlite::Connection::open(store_path).expect("open auth store");
+            let row = connection.query_row(
+                "SELECT status, total_tokens, (SELECT COUNT(*) FROM auth_usage_events)
+                 FROM auth_usage_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            );
+            if let Ok(row) = row {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal auth usage persisted in bounded time")
+}
+
 #[tokio::test]
 async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
     let (authz, delegated_key, store_path) = scoped_authz(&["*"], &["*"]);
@@ -7867,6 +7887,90 @@ async fn enforced_auth_allows_scoped_anthropic_messages() {
 
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert_eq!(upstream.requests().await.len(), 1);
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn authenticated_cancel_and_pre_spawn_error_each_record_usage_once() {
+    let (authz, raw_key, store_path) = scoped_authz(&["responses"], &["public-*"]);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-api-key", raw_key.parse().unwrap());
+    let context = authz.authenticate(&headers).unwrap().unwrap();
+    let upstream = ChunkThenPendingUpstream::new(vec![
+        content_chunk("chat-auth-cancel", "partial"),
+        usage_chunk("chat-auth-cancel", 10, 4, 14, None, None),
+    ]);
+    let stream_polled = upstream.stream_polled.notified();
+    let stream_dropped = upstream.stream_dropped.notified();
+    let base = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let gateway = Arc::new(base.as_ref().clone().with_authz(authz));
+    let api_call_id = d3_open_flow(&gateway);
+    let mut request = base_request(vec![user_message("cancel")]);
+    request.model = "public-model".into();
+    let authorization = context
+        .authorization_scope(
+            llmconduit::upstream::InferenceEndpoint::Responses,
+            &request.model,
+        )
+        .unwrap();
+    let mut stream = gateway
+        .clone()
+        .stream_responses_authorized_with_context(
+            request,
+            Some(api_call_id),
+            authorization,
+            llmconduit::upstream::InferenceEndpoint::Responses,
+            Some(context),
+        )
+        .await
+        .unwrap();
+    let _ = stream.next().await;
+    let _ = stream.next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream parked after partial usage");
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_dropped)
+        .await
+        .expect("cancel dropped upstream stream");
+    assert_eq!(
+        await_single_auth_usage(&store_path).await,
+        ("cancelled".into(), Some(14), 1)
+    );
+    remove_auth_store(&store_path);
+
+    let (authz, raw_key, store_path) = scoped_authz(&["responses"], &["public-*"]);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-api-key", raw_key.parse().unwrap());
+    let context = authz.authenticate(&headers).unwrap().unwrap();
+    let base = test_gateway_with_flow_store_upstream(Arc::new(MockUpstream::default()));
+    let gateway = Arc::new(base.as_ref().clone().with_authz(authz));
+    let api_call_id = d3_open_flow(&gateway);
+    let mut request = base_request(vec![user_message("fail")]);
+    request.model = "public-model".into();
+    request.previous_response_id = Some("unsupported".into());
+    let authorization = context
+        .authorization_scope(
+            llmconduit::upstream::InferenceEndpoint::Responses,
+            &request.model,
+        )
+        .unwrap();
+    assert!(
+        gateway
+            .stream_responses_authorized_with_context(
+                request,
+                Some(api_call_id),
+                authorization,
+                llmconduit::upstream::InferenceEndpoint::Responses,
+                Some(context),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        await_single_auth_usage(&store_path).await,
+        ("failed".into(), None, 1)
+    );
     remove_auth_store(&store_path);
 }
 
