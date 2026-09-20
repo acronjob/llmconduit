@@ -575,6 +575,7 @@ impl AuthzService {
         request: crate::dashboard_access::SyncPricingRequest,
     ) -> Result<crate::dashboard_access::AccessResult, crate::dashboard_access::AccessError> {
         use axum::http::StatusCode;
+        use futures::StreamExt;
         use std::collections::HashSet;
 
         let inner = self.inner().map_err(|message| {
@@ -611,8 +612,18 @@ impl AuthzService {
         }
         let client = crate::openrouter_pricing::OpenRouterPricingClient::default();
         let mut snapshots = Vec::with_capacity(models.len());
-        for model in models {
-            match client.fetch_model(&model, &management_key).await {
+        let management_key: Arc<str> = management_key.into();
+        let mut fetches = futures::stream::iter(models.into_iter().map(|model| {
+            let client = client.clone();
+            let management_key = Arc::clone(&management_key);
+            async move {
+                let result = client.fetch_model(&model, &management_key).await;
+                (model, result)
+            }
+        }))
+        .buffer_unordered(8);
+        while let Some((model, result)) = fetches.next().await {
+            match result {
                 Ok(snapshot) => snapshots.push(snapshot),
                 Err(err) => {
                     if let Ok(mut store) = inner.store.lock() {

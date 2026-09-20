@@ -1383,7 +1383,9 @@ impl AuthStore {
                     prompt_mean_nano_usd,completion_mean_nano_usd,
                     prompt_min_nano_usd,prompt_max_nano_usd,
                     completion_min_nano_usd,completion_max_nano_usd,confidence
-             FROM auth_imported_price_snapshots ORDER BY fetched_at_ms DESC,model_id,endpoint_id",
+             FROM auth_imported_price_snapshots p
+             WHERE fetched_at_ms=(SELECT MAX(fetched_at_ms) FROM auth_imported_price_snapshots WHERE model_id=p.model_id)
+             ORDER BY model_id,endpoint_id LIMIT 2000",
             )
             .map_err(access_db)?;
         let imported_rows = imported
