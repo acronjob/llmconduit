@@ -85,7 +85,36 @@ impl AuthStore {
         let connection = Connection::open(path)
             .map_err(|err| format!("failed to open auth store {}: {err}", path.display()))?;
         connection
-            .execute_batch(SCHEMA)
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE IF NOT EXISTS auth_principals (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT NOT NULL,
+                   enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS auth_api_keys (
+                   id TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES auth_principals(id),
+                   name TEXT NOT NULL, prefix TEXT NOT NULL, hmac_sha256_digest BLOB NOT NULL UNIQUE,
+                   enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+                   expires_at INTEGER, last_used_at INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS auth_policies (
+                   id TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES auth_api_keys(id),
+                   effect TEXT NOT NULL CHECK(effect IN ('allow','deny')),
+                   endpoint TEXT NOT NULL, model_pattern TEXT NOT NULL DEFAULT '*',
+                   created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS auth_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
+                 CREATE TABLE IF NOT EXISTS auth_group_members (group_id TEXT NOT NULL, principal_id TEXT NOT NULL, PRIMARY KEY(group_id, principal_id));
+                 CREATE TABLE IF NOT EXISTS auth_roles (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
+                 CREATE TABLE IF NOT EXISTS auth_role_bindings (role_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, PRIMARY KEY(role_id, subject_type, subject_id));
+                 CREATE TABLE IF NOT EXISTS auth_management_permissions (role_id TEXT NOT NULL, permission TEXT NOT NULL, PRIMARY KEY(role_id, permission));
+                 CREATE TABLE IF NOT EXISTS auth_sessions (session_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, started_at INTEGER NOT NULL, endpoint TEXT NOT NULL, requested_model TEXT);
+                 CREATE TABLE IF NOT EXISTS auth_usage_events (auth_request_id TEXT PRIMARY KEY NOT NULL, api_call_id TEXT, key_id TEXT NOT NULL, principal_id TEXT NOT NULL, endpoint TEXT NOT NULL, requested_model TEXT, served_model TEXT, provider TEXT, route TEXT, status TEXT NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER, cost_nano_usd INTEGER, cost_confidence TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS auth_audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT, action TEXT NOT NULL, target_id TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS auth_policy_epoch (singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL);
+                 INSERT OR IGNORE INTO auth_policy_epoch(singleton, epoch) VALUES (1, 0);",
+            )
             .map_err(|err| format!("failed to migrate auth store: {err}"))?;
         crate::usage_accounting::migrate_usage_schema(&connection)
             .map_err(|err| format!("failed to migrate auth usage store: {err}"))?;
