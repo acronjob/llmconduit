@@ -3849,6 +3849,11 @@ struct ServingInfo {
     /// attempt's measured value is never clobbered. `None` until a chunk arrives — NEVER
     /// `0` when unmeasured (don't-lie-with-zeros).
     first_upstream_byte_ms: Option<u128>,
+    /// First canonical content delta emitted to the client. Retained on the same
+    /// evict-safe token as usage so terminal metrics never need to re-read the store.
+    first_content_delta_ms: Option<u128>,
+    /// Clean stream end after the terminal response event was emitted.
+    stream_end_ms: Option<u128>,
     /// Gap 03 round-1 review (F1): a PER-ATTEMPT scratch slot holding the epoch-ms the
     /// CURRENT attempt's upstream RESPONSE HEADERS arrived on the wire — the instant
     /// `logged_send_chat_request` (the `send().await`) returned, stamped by the leaf for
@@ -3984,6 +3989,28 @@ impl ServingToken {
     pub fn attempts_snapshot(&self) -> (Vec<crate::dashboard_flow::Attempt>, Option<u128>) {
         let info = self.lock();
         (info.attempts.clone(), info.first_upstream_byte_ms)
+    }
+
+    /// Record the first canonical content delta timestamp (first-write-wins).
+    pub fn stamp_first_content_delta(&self, ms: u128) {
+        let mut info = self.lock();
+        if info.first_content_delta_ms.is_none() {
+            info.first_content_delta_ms = Some(ms);
+        }
+    }
+
+    /// Record the clean stream-end timestamp (first-write-wins).
+    pub fn stamp_stream_end(&self, ms: u128) {
+        let mut info = self.lock();
+        if info.stream_end_ms.is_none() {
+            info.stream_end_ms = Some(ms);
+        }
+    }
+
+    /// Eviction-safe phase endpoints used to derive prefill/decode speed.
+    pub fn phase_snapshot(&self) -> (Option<u128>, Option<u128>) {
+        let info = self.lock();
+        (info.first_content_delta_ms, info.stream_end_ms)
     }
 
     /// Gap 03 round-1 review (F1): arm the per-attempt wire-header-byte slot to `None`

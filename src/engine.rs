@@ -865,13 +865,15 @@ impl Gateway {
         // SAME `{status, model, endpoint, upstream}` bucket — so a concurrent 5 s
         // snapshot can never split the count and the tokens across two different 1 s
         // slots.
-        self.metrics.record_terminal(
+        self.metrics.record_terminal_with_phases(
             status,
             inputs.model_served.as_deref(),
             &inputs.endpoint,
             inputs.upstream.as_deref(),
             elapsed_ms,
             inputs.usage,
+            inputs.prefill_ms,
+            inputs.decode_ms,
             // Gap 12: the evict-safe per-attempt trace (spec 03) feeds the per-provider
             // latency/error rings off the SAME terminal payload as `usage` — NOT a
             // re-read of the evictable FlowStore record, so a failed primary on a flow
@@ -1768,6 +1770,15 @@ impl Gateway {
                 // latency). No-op when the metrics layer is off. Runs AFTER
                 // `guard.finalize`, which assembled those inputs.
                 gateway.record_terminal_metrics(guard, status, guard.elapsed().as_millis());
+            }
+            // Publish the successful terminal status only AFTER the authoritative
+            // FlowStore record has finalized. Dashboard WS enrichment resolves this
+            // monitor event back to the record; emitting inside `run_turn` raced the
+            // finalize above and could permanently publish a stale `open` status.
+            if status == crate::dashboard_flow::FlowStatus::Completed {
+                gateway
+                    .monitor
+                    .emit(response_id.clone(), MonitorEventKind::Completed);
             }
             // F1c: report the SAME engine terminal to the capture guard (status +
             // reason come from the engine seam ONLY, never the served tee). Idempotent
@@ -2731,7 +2742,9 @@ impl Gateway {
                             // on an `api_call_id` so the production hot path (no dashboard)
                             // skips even the disabled-store early-return's call overhead.
                             if let Some(api_call_id) = &api_call_id {
-                                self.flow_store().stamp_first_content_delta(api_call_id);
+                                let stamped =
+                                    self.flow_store().stamp_first_content_delta(api_call_id);
+                                serving_token.stamp_first_content_delta(stamped);
                             }
                         }
                         StreamEmission::ReasoningItemAdded(item) => {
@@ -3204,9 +3217,9 @@ impl Gateway {
         // hot path skips the call. The `?`s above mean we only reach here on a clean
         // emit, which is exactly the semantics we want.
         if let Some(api_call_id) = &api_call_id {
-            self.flow_store().stamp_stream_end(api_call_id);
+            let stamped = self.flow_store().stamp_stream_end(api_call_id);
+            serving_token.stamp_stream_end(stamped);
         }
-        self.monitor.emit(response_id, MonitorEventKind::Completed);
         // F1c (finding #3): carry the terminal shape to the seam so the capture
         // artifact records `incomplete` for a max-token truncation. `is_incomplete`
         // was already derived above from the upstream `finish_reason` (the same bit

@@ -77,9 +77,19 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
       expect(row?.cost).toBe(0.42);
     });
     const row = result.current.rows.find((r) => r.api_call_id === 'api_live');
-    // …while the live status still WINS over the REST row.
-    expect(row?.status).toBe('open');
+    // A terminal REST status closes a stale live-open row.
+    expect(row?.status).toBe('completed');
     expect(row?.terminal_reason).toBe('response.completed');
+  });
+
+  it('never lets a stale REST open row resurrect a terminal live row', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_terminal', status: 'open' })]);
+    seedFlows([makeFlow({ api_call_id: 'api_terminal', status: 'completed' })]);
+
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    expect(result.current.rows.find((r) => r.api_call_id === 'api_terminal')?.status).toBe('completed');
   });
 
   it('a live cost is NOT overwritten by the REST roll-up (live wins when present)', async () => {
@@ -128,8 +138,7 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
     const row = result.current.rows.find((r) => r.api_call_id === 'api_cc');
     // The confidence tag is backfilled with the cost (no longer stuck at `unavailable`)…
     expect(row?.cost_confidence).toBe('estimated');
-    // …while the live 'open' status still wins.
-    expect(row?.status).toBe('open');
+    expect(row?.status).toBe('completed');
   });
 
   // The confidence tag is PAIRED with the cost source: when the LIVE row authored a real cost, its
@@ -202,8 +211,8 @@ describe('useFlowRows — a WS-created row backfills REST-authoritative fields (
     expect(row?.elapsed_ms).toBe(5_000);
     expect(row?.cost).toBe(0.5);
     expect(row?.terminal_reason).toBe('response.completed');
-    // …while the LIVE status + usage still win over the completed REST row.
-    expect(row?.status).toBe('open');
+    // Terminal status is monotonic; the REST completion closes a stale WS-open row.
+    expect(row?.status).toBe('completed');
     expect(row?.usage?.prompt).toBe(11);
     // The store itself is untouched (merge is view-only).
     expect(dashboardStore.getState().flows.get('api_ws')?.uri).toBe('');
@@ -255,8 +264,7 @@ describe('useFlowRows — live row backfills REST-projected spine fields (gap 10
     expect(row?.finalize_ms).toBe(1_700_000_001_100);
     expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
     expect(row?.attempts).toEqual([SERVED]);
-    // …while the LIVE 'open' status still wins over the completed REST row.
-    expect(row?.status).toBe('open');
+    expect(row?.status).toBe('completed');
   });
 
   it('a live spine value WINS over the REST projection (live-first)', async () => {
@@ -289,7 +297,7 @@ describe('useFlowRows — live row backfills REST-projected spine fields (gap 10
     });
     const row = result.current.rows.find((r) => r.api_call_id === 'api_att');
     expect(row?.attempts).toEqual([SERVED]); // REST trace surfaced, not the empty live []
-    expect(row?.status).toBe('open'); // live status still wins
+    expect(row?.status).toBe('completed');
   });
 
   it('a NON-EMPTY live attempts[] WINS over the REST projection (live-first)', async () => {

@@ -156,6 +156,8 @@ pub struct MetricsSnapshot {
     pub p95: f64,
     pub p99: f64,
     pub tokens_per_sec: f64,
+    pub prefill_tokens_per_sec: f64,
+    pub decode_tokens_per_sec: f64,
     pub cost_per_min: f64,
     /// Terminal-flow sample count of the headline (`m1`) window — the
     /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
@@ -163,6 +165,10 @@ pub struct MetricsSnapshot {
     /// Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
     /// denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
     pub usage_samples: u64,
+    /// Headline flows with both prompt usage and a measured prefill duration.
+    pub prefill_samples: u64,
+    /// Headline flows with both completion usage and a measured decode duration.
+    pub decode_samples: u64,
     /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
     /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
     pub priced_samples: u64,
@@ -290,6 +296,8 @@ pub enum DashboardPayload {
         usage: Option<FlowUsage>,
         started_ms: u128,
         #[serde(skip_serializing_if = "Option::is_none")]
+        finished_ms: Option<u128>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         elapsed_ms: Option<u128>,
         /// Gap 10b — the gap-02 per-phase timestamps reached so far, flattened as sibling
         /// scalar fields (`ingress_ms`/`first_content_delta_ms`/…). `skip_serializing_if`
@@ -327,6 +335,8 @@ pub struct MetricTick {
     pub p95: f64,
     pub p99: f64,
     pub tokens_per_sec: f64,
+    pub prefill_tokens_per_sec: f64,
+    pub decode_tokens_per_sec: f64,
     pub cost_per_min: f64,
     /// Terminal-flow sample count of the headline (`m1`) window — the
     /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
@@ -334,6 +344,8 @@ pub struct MetricTick {
     /// Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
     /// denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
     pub usage_samples: u64,
+    pub prefill_samples: u64,
+    pub decode_samples: u64,
     /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
     /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
     pub priced_samples: u64,
@@ -370,6 +382,8 @@ pub struct MetricWindow {
     pub p95: f64,
     pub p99: f64,
     pub tokens_per_sec: f64,
+    pub prefill_tokens_per_sec: f64,
+    pub decode_tokens_per_sec: f64,
     pub cost_per_min: f64,
     /// Terminal-flow sample count in this window (the measured/unavailable signal for
     /// latency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they
@@ -381,6 +395,8 @@ pub struct MetricWindow {
     /// yet `usage_samples == 0` (every finalized flow omitted usage), in which case
     /// `tokens_per_sec`/`cost_per_min` are unmeasurable and render `—`, never a fake `0`.
     pub usage_samples: u64,
+    pub prefill_samples: u64,
+    pub decode_samples: u64,
     /// Count of usage-bearing terminal flows whose served model has a configured price
     /// (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no
     /// PRICED usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an
@@ -575,12 +591,16 @@ pub fn frames_for_update(
             }
             DebugWsMessage::RequestStatus {
                 response_id,
+                status,
                 completed_at_ms,
                 ..
             } => {
                 let intent = intent_for(&mut intents, &mut intent_index, response_id);
                 // Latest status fallback timestamp wins for a repeated response_id.
-                intent.status_completed_at_ms = Some(*completed_at_ms);
+                intent.status = Some(MonitorTerminal {
+                    status: *status,
+                    completed_at_ms: *completed_at_ms,
+                });
             }
             _ => {}
         }
@@ -617,8 +637,8 @@ pub fn frames_for_update(
                 reasoning,
             });
         }
-        if let Some(completed_at_ms) = merged.status_completed_at_ms {
-            flow_batch.push(flow_status_payload(&merged.record, completed_at_ms));
+        if let Some(terminal) = merged.status {
+            flow_batch.push(flow_status_payload(&merged.record, terminal));
         }
     }
 
@@ -657,6 +677,12 @@ struct UsageTokens {
     total: i64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MonitorTerminal {
+    status: crate::monitor::DebugRequestStatus,
+    completed_at_ms: Option<u128>,
+}
+
 /// A pending flow-domain enrichment for ONE `response_id`, accumulated across the
 /// messages of a single `DebugUpdate` BEFORE the record is resolved. Both arms
 /// COALESCE onto the same intent so repeated messages for one `response_id` fold
@@ -666,9 +692,8 @@ struct FlowEnrichIntent {
     response_id: String,
     /// The latest monitor `Usage` token counts seen for this response_id (if any).
     usage: Option<UsageTokens>,
-    /// The latest monitor `RequestStatus` completion stamp (if a status was seen);
-    /// the inner `Option` is the message's own `completed_at_ms` (may be `None`).
-    status_completed_at_ms: Option<Option<u128>>,
+    /// The latest monitor terminal status seen for this response_id (if any).
+    status: Option<MonitorTerminal>,
 }
 
 /// Get the mutable [`FlowEnrichIntent`] for `response_id`, creating it (preserving
@@ -683,7 +708,7 @@ fn intent_for<'a>(
         intents.push(FlowEnrichIntent {
             response_id: response_id.to_string(),
             usage: None,
-            status_completed_at_ms: None,
+            status: None,
         });
         intents.len() - 1
     });
@@ -705,9 +730,8 @@ struct MergedRecordIntent {
     response_id: String,
     /// Latest monitor `Usage` token counts across all aliasing `response_id`s.
     usage: Option<UsageTokens>,
-    /// Latest monitor `RequestStatus` completion stamp across all aliases (the inner
-    /// `Option` is the message's own `completed_at_ms`, which may be `None`).
-    status_completed_at_ms: Option<Option<u128>>,
+    /// Latest monitor terminal status across all aliases.
+    status: Option<MonitorTerminal>,
 }
 
 /// Resolve each per-`response_id` [`FlowEnrichIntent`] to its FlowStore record and MERGE
@@ -734,7 +758,7 @@ fn merge_intents_by_record(
                 record: Arc::clone(&record),
                 response_id: intent.response_id.clone(),
                 usage: None,
-                status_completed_at_ms: None,
+                status: None,
             });
             merged.len() - 1
         });
@@ -743,8 +767,8 @@ fn merge_intents_by_record(
         if intent.usage.is_some() {
             entry.usage = intent.usage;
         }
-        if intent.status_completed_at_ms.is_some() {
-            entry.status_completed_at_ms = intent.status_completed_at_ms;
+        if intent.status.is_some() {
+            entry.status = intent.status;
         }
     }
     merged
@@ -761,21 +785,36 @@ fn merge_intents_by_record(
 /// `cancelled`, not be flattened to `failed`. The monitor `completed_at_ms` is used
 /// ONLY as a fallback to derive `elapsed_ms` when the record has not finalized its
 /// own measured elapsed yet.
-fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> DashboardPayload {
+fn flow_status_payload(record: &FlowRecord, terminal: MonitorTerminal) -> DashboardPayload {
+    let completed_at_ms = terminal.completed_at_ms;
+    let status = if record.status == FlowStatus::Open {
+        match terminal.status {
+            // Treat a terminal monitor event as authoritative even if an older/open record
+            // snapshot is observed (for example from buffered or legacy event ordering).
+            // Once the record is terminal, its richer status (especially Cancelled) wins.
+            crate::monitor::DebugRequestStatus::Completed => FlowStatus::Completed,
+            crate::monitor::DebugRequestStatus::Failed => FlowStatus::Failed,
+            crate::monitor::DebugRequestStatus::Running => FlowStatus::Open,
+        }
+    } else {
+        record.status
+    };
     // Prefer the record's measured elapsed; fall back to a wall-clock delta from
     // the monitor's completion stamp (when the record has not finalized yet).
     let elapsed_ms = record
         .elapsed_ms
         .or_else(|| completed_at_ms.map(|done| done.saturating_sub(record.started_ms)));
+    let finished_ms = record.finished_ms.or(completed_at_ms);
     DashboardPayload::FlowStatus {
         api_call_id: record.api_call_id.clone(),
         response_id: record.response_id.clone(),
-        status: record.status,
+        status,
         model_requested: record.model_requested.clone(),
         model_served: record.model_served.clone(),
         upstream_target: record.upstream_target.clone(),
         usage: record.usage,
         started_ms: record.started_ms,
+        finished_ms,
         elapsed_ms,
         // Gap 10b: project the gap-02 phases + gap-03 attempts/wire-TTFB reached so far
         // from the SAME record snapshot the rest of this payload is built from (no second
@@ -830,9 +869,13 @@ pub fn metric_tick_frame(
             p95: body.p95,
             p99: body.p99,
             tokens_per_sec: body.tokens_per_sec,
+            prefill_tokens_per_sec: body.prefill_tokens_per_sec,
+            decode_tokens_per_sec: body.decode_tokens_per_sec,
             cost_per_min: body.cost_per_min,
             samples: body.samples,
             usage_samples: body.usage_samples,
+            prefill_samples: body.prefill_samples,
+            decode_samples: body.decode_samples,
             priced_samples: body.priced_samples,
             cost_confidence: body.cost_confidence,
             windows: body.windows,
@@ -1607,11 +1650,20 @@ mod tests {
             DashboardPayload::FlowStatus {
                 api_call_id,
                 status,
+                finished_ms,
                 ..
             } => {
                 assert_eq!(api_call_id, "api_001");
-                // Record status (Open), NOT the monitor message's Completed (finding 4).
-                assert_eq!(*status, FlowStatus::Open);
+                assert_eq!(
+                    *status,
+                    FlowStatus::Completed,
+                    "a monitor terminal event closes an otherwise-still-open record snapshot"
+                );
+                assert_eq!(
+                    *finished_ms,
+                    Some(1718900000003),
+                    "monitor completion time is carried as the live terminal timestamp fallback"
+                );
             }
             other => panic!("expected flow_status payload, got {other:?}"),
         }
@@ -2255,6 +2307,7 @@ mod tests {
                     reasoning: Some(0),
                 }),
                 started_ms: 1718900000000,
+                finished_ms: Some(1718900003100),
                 elapsed_ms: Some(3100),
                 // Gap 10b: the spine fields are absent on this golden fixture (an all-`None`
                 // `PhaseTimings` + an empty attempts vec + `None` TTFB), so they `skip` and
@@ -2279,6 +2332,7 @@ mod tests {
                     "upstream_target": "vllm-a",
                     "usage": { "prompt": 812, "completion": 512, "total": 1324, "cached": 128, "reasoning": 0 },
                     "started_ms": 1718900000000u64,
+                    "finished_ms": 1718900003100u64,
                     "elapsed_ms": 3100
                 }
             ]
@@ -2328,6 +2382,7 @@ mod tests {
             upstream_target: Some("vllm-a".to_string()),
             usage: None,
             started_ms: 1_000,
+            finished_ms: None,
             elapsed_ms: Some(500),
             phases,
             attempts: vec![attempt.clone()],
@@ -2366,6 +2421,7 @@ mod tests {
             upstream_target: None,
             usage: None,
             started_ms: 1_000,
+            finished_ms: None,
             elapsed_ms: None,
             phases: PhaseTimings::default(),
             attempts: Vec::new(),
@@ -2407,9 +2463,13 @@ mod tests {
                 p95: 920.0,
                 p99: 1840.0,
                 tokens_per_sec: 142.0,
+                prefill_tokens_per_sec: 10_430.25,
+                decode_tokens_per_sec: 78.34,
                 cost_per_min: 0.21,
                 samples: 252,
                 usage_samples: 250,
+                prefill_samples: 248,
+                decode_samples: 246,
                 priced_samples: 240,
                 cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                 windows: MetricWindows {
@@ -2421,9 +2481,13 @@ mod tests {
                         p95: 920.0,
                         p99: 1840.0,
                         tokens_per_sec: 142.0,
+                        prefill_tokens_per_sec: 10_430.25,
+                        decode_tokens_per_sec: 78.34,
                         cost_per_min: 0.21,
                         samples: 252,
                         usage_samples: 250,
+                        prefill_samples: 248,
+                        decode_samples: 246,
                         priced_samples: 240,
                         cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
@@ -2435,9 +2499,13 @@ mod tests {
                         p95: 900.0,
                         p99: 1800.0,
                         tokens_per_sec: 128.0,
+                        prefill_tokens_per_sec: 9_840.5,
+                        decode_tokens_per_sec: 74.2,
                         cost_per_min: 0.19,
                         samples: 1140,
                         usage_samples: 1130,
+                        prefill_samples: 1120,
+                        decode_samples: 1118,
                         priced_samples: 1100,
                         cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
@@ -2449,9 +2517,13 @@ mod tests {
                         p95: 850.0,
                         p99: 1700.0,
                         tokens_per_sec: 100.0,
+                        prefill_tokens_per_sec: 9_120.0,
+                        decode_tokens_per_sec: 69.8,
                         cost_per_min: 0.15,
                         samples: 10440,
                         usage_samples: 10400,
+                        prefill_samples: 10350,
+                        decode_samples: 10320,
                         priced_samples: 10000,
                         cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
@@ -2459,23 +2531,25 @@ mod tests {
             })],
         };
         let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
-        let want: serde_json::Value = serde_json::json!({
+        // Parse the golden as JSON text instead of expanding a very wide `json!` tree; the
+        // expanded metric contract otherwise exceeds rustc's default macro recursion limit.
+        let want: serde_json::Value = serde_json::from_str(r#"{
             "domain": "metrics",
             "seq": 2,
             "batch": [
                 {
                     "type": "metric_tick",
                     "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1,
-                    "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21,
-                    "samples": 252, "usage_samples": 250, "priced_samples": 240, "cost_confidence": "estimated",
+                    "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "prefill_tokens_per_sec": 10430.25, "decode_tokens_per_sec": 78.34, "cost_per_min": 0.21,
+                    "samples": 252, "usage_samples": 250, "prefill_samples": 248, "decode_samples": 246, "priced_samples": 240, "cost_confidence": "estimated",
                     "windows": {
-                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21, "samples": 252, "usage_samples": 250, "priced_samples": 240, "cost_confidence": "estimated" },
-                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19, "samples": 1140, "usage_samples": 1130, "priced_samples": 1100, "cost_confidence": "estimated" },
-                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15, "samples": 10440, "usage_samples": 10400, "priced_samples": 10000, "cost_confidence": "estimated" }
+                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "prefill_tokens_per_sec": 10430.25, "decode_tokens_per_sec": 78.34, "cost_per_min": 0.21, "samples": 252, "usage_samples": 250, "prefill_samples": 248, "decode_samples": 246, "priced_samples": 240, "cost_confidence": "estimated" },
+                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "prefill_tokens_per_sec": 9840.5, "decode_tokens_per_sec": 74.2, "cost_per_min": 0.19, "samples": 1140, "usage_samples": 1130, "prefill_samples": 1120, "decode_samples": 1118, "priced_samples": 1100, "cost_confidence": "estimated" },
+                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "prefill_tokens_per_sec": 9120.0, "decode_tokens_per_sec": 69.8, "cost_per_min": 0.15, "samples": 10440, "usage_samples": 10400, "prefill_samples": 10350, "decode_samples": 10320, "priced_samples": 10000, "cost_confidence": "estimated" }
                     }
                 }
             ]
-        });
+        }"#).expect("parse golden metric tick");
         assert_eq!(got, want);
     }
 

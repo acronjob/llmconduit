@@ -426,6 +426,8 @@ export interface MetricWindow {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /**
    * Count of TERMINAL (finalized) flows in this window — the data-quality signal for
@@ -443,6 +445,10 @@ export interface MetricWindow {
    * is unmeasurable → it renders `—`, NEVER a fabricated `0`. A finite `u64`.
    */
   usage_samples: number;
+  /** Flows with prompt usage and a measured non-zero prefill phase. */
+  prefill_samples: number;
+  /** Flows with completion usage and a measured non-zero decode phase. */
+  decode_samples: number;
   /**
    * Count of usage-bearing terminal flows whose served model has a configured price
    * (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no PRICED
@@ -468,11 +474,15 @@ export interface MetricTickPayload {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
   samples: number;
   /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
   usage_samples: number;
+  prefill_samples: number;
+  decode_samples: number;
   /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
   priced_samples: number;
   /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
@@ -511,6 +521,7 @@ export interface FlowStatusPayload extends PhaseTimings {
   upstream_target?: string | null;
   usage: Usage | null;
   started_ms: number;
+  finished_ms?: number | null;
   elapsed_ms?: number | null;
   /** Gap 03 — the per-attempt failover trace (optional; present once the backend projects it). */
   attempts?: Attempt[];
@@ -776,11 +787,15 @@ export interface MetricsResponse {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
   samples: number;
   /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
   usage_samples: number;
+  prefill_samples: number;
+  decode_samples: number;
   /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
   priced_samples: number;
   /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
@@ -1354,11 +1369,13 @@ function isOptUsage(v: unknown): boolean {
 function isMetricWindow(v: unknown): v is MetricWindow {
   return (
     isObj(v) && isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+    isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
     // The three per-metric measurability denominators are non-negative integer counts
     // (gap 01): `samples` (latency/error), `usage_samples` (tok/s), `priced_samples`
     // ($/min). All REQUIRED — the Rust tile always emits them.
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+    isUint(v.decode_samples) && isUint(v.priced_samples) &&
     // Gap 07: the aggregate cost-confidence tag is REQUIRED on every window.
     isCostConfidence(v.cost_confidence)
   );
@@ -1549,8 +1566,10 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
     case 'metric_tick':
       return (
         isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-        isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+        isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+        isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
+        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+        isUint(v.decode_samples) && isUint(v.priced_samples) &&
         isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
       );
     case 'flow_status':
@@ -1558,7 +1577,7 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
         isStr(v.api_call_id) && isOptStr(v.response_id) &&
         isOneOf(v.status, FLOW_STATUSES) &&
         isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
-        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.elapsed_ms) &&
+        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.finished_ms) && isOptUint(v.elapsed_ms) &&
         // Gap 02/03: optional spine fields on the live flow update — validated when present.
         isOptPhaseTimings(v) && isOptAttempts(v.attempts) && isOptUint(v.first_upstream_byte_ms)
       );
@@ -1619,8 +1638,10 @@ function isMetricsResponse(v: unknown): v is MetricsResponse {
   return (
     isObj(v) && isUint(v.metrics_seq) &&
     isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+    isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+    isUint(v.decode_samples) && isUint(v.priced_samples) &&
     isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
   );
 }

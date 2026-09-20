@@ -60,7 +60,7 @@ function fmtRate(n: number): string {
 }
 
 /** Token throughput, compacted with at most two fractional digits. */
-function fmtTokenRate(n: number): string {
+export function fmtTokenRate(n: number): string {
   if (!Number.isFinite(n)) return '—';
   const compact = (value: number, suffix: string) => `${TOKEN_RATE_NUMBER.format(value)}${suffix}`;
   if (n >= 1_000_000) return compact(n / 1_000_000, 'm');
@@ -138,7 +138,8 @@ const METRIC_SPECS: readonly MetricSpec[] = [
   { key: 'p50', label: 'p50 ms', fmt: fmtMs, stroke: colors.statusHealthy, accent: 'text', quality: 'derived' },
   { key: 'p95', label: 'p95 ms', fmt: fmtMs, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
   { key: 'p99', label: 'p99 ms', fmt: fmtMs, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
-  { key: 'tokens_per_sec', label: 'tok/s', fmt: fmtTokenRate, stroke: colors.statusHealthy, accent: 'healthy', quality: 'derived' },
+  { key: 'prefill_tokens_per_sec', label: 'prefill tok/s', fmt: fmtTokenRate, stroke: colors.statusHealthy, accent: 'healthy', quality: 'derived' },
+  { key: 'decode_tokens_per_sec', label: 'decode tok/s', fmt: fmtTokenRate, stroke: colors.statusCooling, accent: 'healthy', quality: 'derived' },
   // $/min: the static tier here is a FALLBACK only — its real quality is derived per-sample from
   // the backend `cost_confidence` (gap 07 finding 5, see `costQuality`), so a confident aggregate
   // reads `derived` and an estimated one reads `estimated` (no longer always `estimated`).
@@ -156,10 +157,10 @@ export const CHIP_METRICS: readonly MetricKey[] = METRIC_SPECS.map((s) => s.key)
  * (no tick yet) renders every value as the unavailable marker with a flat delta.
  *
  * Don't-lie-with-zeros + per-metric availability (gap 01 findings 3/4): each metric has its
- * OWN measurability denominator — latency/err% need a finalized flow (`samples`), tok/s needs
- * a flow that REPORTED usage (`usage_samples`), $/min needs a usage-bearing flow on a PRICED
- * model (`priced_samples`). A window can have `samples > 0` yet `usage_samples === 0` (no
- * tokens reported) or `priced_samples === 0` (only unpriced models): those metrics render
+ * OWN measurability denominator — latency/err% need a finalized flow (`samples`), each phase
+ * speed needs usage plus its measured phase duration (`prefill_samples`/`decode_samples`), and
+ * $/min needs a usage-bearing flow on a PRICED model (`priced_samples`). A window can have
+ * `samples > 0` yet no phase samples or no priced samples: those metrics render
  * `unavailable` (`—`), NEVER a fabricated `0`, with a flat delta and no threshold accent.
  * `req/s` (a genuine idle `0`) and `active_streams` (the live open count) are never gated.
  * Every chip also carries a `quality` provenance tag (measured/derived/estimated/unavailable).

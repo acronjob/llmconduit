@@ -49,7 +49,7 @@ test.describe('Argus dashboard', () => {
 
     // tok/s + $/min + active are the fields the OLD WS tile hard-coded to 0 — they must
     // now carry real values (the mock seeds them > 0), proving live flows reach the strip.
-    for (const key of ['active_streams', 'tokens_per_sec', 'cost_per_min', 'reqs_per_sec']) {
+    for (const key of ['active_streams', 'prefill_tokens_per_sec', 'decode_tokens_per_sec', 'cost_per_min', 'reqs_per_sec']) {
       const value = page.getByTestId(`chip-${key}`).getByTestId('chip-value');
       await expect(value).toBeVisible();
       const text = (await value.textContent())?.trim() ?? '';
@@ -65,7 +65,8 @@ test.describe('Argus dashboard', () => {
     expect(await quality('reqs_per_sec')).toBe('measured');
     expect(await quality('active_streams')).toBe('measured');
     expect(await quality('p50')).toBe('derived');
-    expect(await quality('tokens_per_sec')).toBe('derived');
+    expect(await quality('prefill_tokens_per_sec')).toBe('derived');
+    expect(await quality('decode_tokens_per_sec')).toBe('derived');
     expect(await quality('cost_per_min')).toBe('estimated');
 
     expect(consoleErrors, 'console errors on the stats strip').toEqual([]);

@@ -344,11 +344,15 @@ function buildMetrics(): MetricsResponse {
     const samples = Math.round(252 * m);
     return {
       reqs_per_sec: 4.2 * m, active_streams: Math.round(3 * m), error_pct: 1.1,
-      p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142 * m, cost_per_min: 0.21 * m,
+      p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142 * m,
+      prefill_tokens_per_sec: 10_430.25 * m, decode_tokens_per_sec: 78.34 * m,
+      cost_per_min: 0.21 * m,
       samples,
       // The mock's window is fully measured: every finalized flow reported usage on a
       // priced model, so all three denominators equal `samples` (tok/s + $/min measurable).
       usage_samples: samples,
+      prefill_samples: samples,
+      decode_samples: samples,
       priced_samples: samples,
       // Gap 07: the priced llama model has no configured cache rate (and the seed flow on it
       // bills/omits cached) ⇒ the aggregate $/min is an ESTIMATE, labelled as such.
@@ -359,9 +363,14 @@ function buildMetrics(): MetricsResponse {
   return {
     metrics_seq: 1,
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+    prefill_tokens_per_sec: m1.prefill_tokens_per_sec,
+    decode_tokens_per_sec: m1.decode_tokens_per_sec,
+    cost_per_min: 0.21,
     samples: m1.samples,
     usage_samples: m1.usage_samples,
+    prefill_samples: m1.prefill_samples,
+    decode_samples: m1.decode_samples,
     priced_samples: m1.priced_samples,
     cost_confidence: m1.cost_confidence,
     windows: { m1, m5: win(0.9), h1: win(0.7) },
@@ -772,9 +781,14 @@ export class MockWebSocket implements WsLike {
       batch: [{
         type: 'metric_tick',
         reqs_per_sec: m.reqs_per_sec, active_streams: m.active_streams, error_pct: m.error_pct,
-        p50: m.p50, p95: m.p95, p99: m.p99, tokens_per_sec: m.tokens_per_sec, cost_per_min: m.cost_per_min,
+        p50: m.p50, p95: m.p95, p99: m.p99, tokens_per_sec: m.tokens_per_sec,
+        prefill_tokens_per_sec: m.prefill_tokens_per_sec,
+        decode_tokens_per_sec: m.decode_tokens_per_sec,
+        cost_per_min: m.cost_per_min,
         samples: m.samples,
         usage_samples: m.usage_samples,
+        prefill_samples: m.prefill_samples,
+        decode_samples: m.decode_samples,
         priced_samples: m.priced_samples,
         cost_confidence: m.cost_confidence,
         windows: m.windows,
