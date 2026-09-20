@@ -102,8 +102,8 @@ impl SessionLease {
 mod tests {
     use super::*;
     use crate::authz::{
-        AuthRequestId, PolicyIdentity, Endpoint, LimitSet, PolicyBinding, PolicyEffect, PolicyMatcher,
-        PolicyRule, PolicySnapshot, PolicySubject,
+        AuthRequestId, Endpoint, LimitSet, PolicyBinding, PolicyEffect, PolicyIdentity,
+        PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject,
     };
     use std::collections::{HashMap, HashSet};
 
