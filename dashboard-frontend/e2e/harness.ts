@@ -6,7 +6,7 @@ import { test as base, expect, type Page } from '@playwright/test';
  */
 export const FIXED_NOW = Date.UTC(2026, 5, 21, 14, 20, 0); // 2026-06-21T14:20:00Z
 
-export type ViewName = 'flows' | 'topology' | 'sankey' | 'theater' | 'overview';
+export type ViewName = 'flows' | 'topology' | 'sankey' | 'theater' | 'overview' | 'access';
 
 /** Each view: the nav-tab label to click + a route-specific "ready" marker (text/regex). */
 export const VIEWS: { name: ViewName; tab: string; ready: string | RegExp }[] = [
@@ -16,6 +16,7 @@ export const VIEWS: { name: ViewName; tab: string; ready: string | RegExp }[] = 
   { name: 'theater', tab: 'Theater', ready: /No active streams/i },
   // Gap 16 — the control-room overview (the 5th route). Its masthead text is the ready marker.
   { name: 'overview', tab: 'Overview', ready: /control room/i },
+  { name: 'access', tab: 'Access', ready: /access control/i },
 ];
 
 /**

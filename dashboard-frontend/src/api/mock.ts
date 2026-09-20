@@ -406,9 +406,67 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   if (path === '/dashboard/login' && method === 'POST') {
     return json({ ok: true });
   }
-  if (path === '/dashboard/logout' && method === 'POST') {
+  if (path === '/dashboard/auth/key-login' && method === 'POST') {
     return json({ ok: true });
   }
+  if ((path === '/dashboard/logout' || path === '/dashboard/auth/logout') && method === 'POST') {
+    return json({ ok: true });
+  }
+
+  // -- Access management --
+  if (path === '/dashboard/api/auth/summary' && method === 'GET') {
+    return json({
+      policy_epoch: 7,
+      actor: { kind: 'bootstrap', principal_id: null, display_name: 'Bootstrap superadmin', permissions: [] },
+      counts: { users: AUTH_USERS.length, groups: AUTH_GROUPS.length, roles: AUTH_ROLES.length, policies: AUTH_POLICIES.length, api_keys: AUTH_KEYS.length, active_sessions: AUTH_SESSIONS.length },
+    });
+  }
+  if (path === '/dashboard/api/auth/users') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { display_name?: string; kind?: AuthUser['kind'] };
+      if (!body.display_name || !body.kind) return json({ error: 'invalid user' }, 400);
+      AUTH_USERS.push({ id: `usr_${AUTH_USERS.length + 1}`, display_name: body.display_name, kind: body.kind, enabled: true, created_at: new Date().toISOString() });
+    }
+    return json({ users: AUTH_USERS });
+  }
+  if (path === '/dashboard/api/auth/groups') return json({ groups: AUTH_GROUPS });
+  if (path === '/dashboard/api/auth/roles') return json({ roles: AUTH_ROLES });
+  if (path === '/dashboard/api/auth/policies') return json({ policies: AUTH_POLICIES });
+  if (path === '/dashboard/api/auth/api-keys') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { principal_id?: string; name?: string; expires_at?: string | null };
+      if (!body.principal_id || !body.name) return json({ error: 'invalid key' }, 400);
+      const apiKey: AuthApiKey = { id: `key_${AUTH_KEYS.length + 1}`, principal_id: body.principal_id, name: body.name, prefix: 'llmc_demo', enabled: true, created_at: new Date().toISOString(), expires_at: body.expires_at ?? null, last_used_at: null };
+      AUTH_KEYS = [...AUTH_KEYS, apiKey];
+      return json({ api_key: apiKey, raw_key: `llmc_mock_${apiKey.id}_copy_once` });
+    }
+    return json({ api_keys: AUTH_KEYS });
+  }
+  const keyAction = path.match(/^\/dashboard\/api\/auth\/api-keys\/([^/]+)\/(revoke|rotate)$/);
+  if (keyAction && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(keyAction[1] ?? '');
+    const found = AUTH_KEYS.find((key) => key.id === id);
+    if (!found) return json({ error: 'unknown key' }, 404);
+    if (keyAction[2] === 'revoke') {
+      AUTH_KEYS = AUTH_KEYS.map((key) => key.id === id ? { ...key, enabled: false } : key);
+      return json({ api_keys: AUTH_KEYS });
+    }
+    const rotated = { ...found, id: `${found.id}_rotated`, prefix: 'llmc_rot8', created_at: new Date().toISOString(), last_used_at: null };
+    AUTH_KEYS = [...AUTH_KEYS.filter((key) => key.id !== id), rotated];
+    return json({ api_key: rotated, raw_key: `llmc_mock_${rotated.id}_copy_once` });
+  }
+  if (path === '/dashboard/api/auth/sessions') return json({ sessions: AUTH_SESSIONS });
+  const sessionRevoke = path.match(/^\/dashboard\/api\/auth\/sessions\/([^/]+)\/revoke$/);
+  if (sessionRevoke && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(sessionRevoke[1] ?? '');
+    AUTH_SESSIONS = AUTH_SESSIONS.filter((session) => session.id !== id);
+    return json({ sessions: AUTH_SESSIONS });
+  }
+  if (path === '/dashboard/api/auth/usage') return json({ usage: AUTH_USAGE });
+  if (path === '/dashboard/api/auth/audit') return json({ events: AUTH_AUDIT });
+  if (path === '/dashboard/api/auth/pricing') return json({ pricing: AUTH_PRICING });
 
   // -- Kill (CSRF) -- `:id` == api_call_id ONLY (D13 contract). CSRF checked first
   // (security gate), then the id must be a seeded api_call_id else 404 (finding 7).
