@@ -26,8 +26,19 @@ impl SessionLimiter {
         scope: &PolicyScope,
         now: DateTime<Utc>,
     ) -> Result<SessionLease, AuthError> {
-        let key_id = scope.context().key_id.clone();
-        let limits = scope.effective_limits();
+        self.acquire_for_key(&scope.context().key_id, scope.effective_limits(), now)
+    }
+
+    /// Acquires a request lease from already-evaluated identity and limits.
+    /// This keeps ingress independent of the richer policy representation while
+    /// preserving one limiter and one RAII release path.
+    pub fn acquire_for_key(
+        &self,
+        key_id: &str,
+        limits: super::LimitSet,
+        now: DateTime<Utc>,
+    ) -> Result<SessionLease, AuthError> {
+        let key_id = key_id.to_owned();
         let day = now.date_naive().num_days_from_ce();
         let mut state = self
             .state

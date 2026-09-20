@@ -1,7 +1,6 @@
-use super::keys::{AuthPepper, digest_matches, generate_api_key, key_prefix};
-use super::policy::{AuthError, AuthRequestId, PolicyIdentity, PolicyRule, PolicySnapshot};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::collections::{HashMap, HashSet};
+use chrono::Utc;
+use rusqlite::{Connection, params};
+use serde::Serialize;
 use std::fmt;
 use std::path::Path;
 
@@ -42,8 +41,8 @@ pub struct CreatedApiKey {
     pub raw_key: Option<String>,
 }
 
-impl std::fmt::Debug for CreatedApiKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CreatedApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CreatedApiKey")
             .field("summary", &self.summary)
             .field("raw_key", &self.raw_key.as_ref().map(|_| "[REDACTED]"))
@@ -217,62 +216,26 @@ impl AuthStore {
         Ok(changed)
     }
 
-    pub async fn authenticate(
-        &self,
-        raw_key: &str,
-        at_ms: i64,
-    ) -> Result<PolicyIdentity, AuthError> {
-        let raw_key = raw_key.trim();
-        let prefix = key_prefix(raw_key)
-            .map_err(|_| AuthError::InvalidCredential)?
-            .to_string();
-        let presented = self.pepper.digest(raw_key);
-        let candidates = self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT k.id, k.principal_id, k.prefix, k.hmac_sha256_digest, k.enabled, k.expires_at_ms, p.enabled FROM auth_api_keys k JOIN auth_principals p ON p.id = k.principal_id WHERE k.prefix = ?1",
-            )?;
-            let rows = stmt.query_map(params![prefix], |row| Ok(Candidate {
-                key_id: row.get(0)?, principal_id: row.get(1)?, prefix: row.get(2)?,
-                digest: row.get(3)?, key_enabled: row.get::<_, i64>(4)? != 0,
-                expires_at_ms: row.get(5)?, principal_enabled: row.get::<_, i64>(6)? != 0,
-            }))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(AuthStoreError::from)
-        }).await.map_err(|_| AuthError::PolicyUnavailable)?;
-
-        let mut selected = None;
-        for candidate in candidates {
-            let matches = digest_matches(&candidate.digest, &presented);
-            if matches {
-                selected = Some(candidate);
-            }
-        }
-        let candidate = selected.ok_or(AuthError::InvalidCredential)?;
-        if !candidate.key_enabled
-            || !candidate.principal_enabled
-            || candidate
-                .expires_at_ms
-                .is_some_and(|expires| expires <= at_ms)
-        {
-            return Err(AuthError::InvalidCredential);
-        }
-        let key_id = candidate.key_id.clone();
-        let epoch = self
-            .with_conn(move |conn| {
-                conn.execute(
-                    "UPDATE auth_api_keys SET last_used_at_ms = ?2 WHERE id = ?1",
-                    params![key_id, at_ms],
-                )?;
-                current_epoch(conn)
+    pub fn list_keys(&self) -> Result<Vec<ApiKeySummary>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at FROM auth_api_keys ORDER BY created_at DESC"
+        ).map_err(|err| err.to_string())?;
+        statement
+            .query_map([], |row| {
+                Ok(ApiKeySummary {
+                    id: row.get(0)?,
+                    principal_id: row.get(1)?,
+                    name: row.get(2)?,
+                    prefix: row.get(3)?,
+                    enabled: row.get::<_, i64>(4)? != 0,
+                    created_at: row.get(5)?,
+                    expires_at: row.get(6)?,
+                    last_used_at: row.get(7)?,
+                })
             })
-            .await
-            .map_err(|_| AuthError::PolicyUnavailable)?;
-        Ok(PolicyIdentity {
-            request_id: AuthRequestId::new(),
-            key_id: candidate.key_id,
-            key_prefix: candidate.prefix,
-            principal_id: candidate.principal_id,
-            policy_epoch: epoch,
-        })
+            .map_err(|err| err.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())
     }
 
     pub fn load_active_keys(&self) -> Result<Vec<StoredKey>, String> {

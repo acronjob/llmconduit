@@ -15,6 +15,7 @@ pub use policy::{
     PolicyDecision, PolicyEffect, PolicyIdentity, PolicyMatcher, PolicyRule, PolicyScope,
     PolicySnapshot, PolicySubject, UtcWindow,
 };
+pub use session::{SessionLease, SessionLimiter};
 pub use store::{ApiKeySummary, CreatedApiKey};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -25,6 +26,7 @@ pub struct AuthContext {
     pub key_id: String,
     pub principal_id: String,
     grants: Arc<Vec<PolicyGrant>>,
+    limits: LimitSet,
 }
 
 impl AuthContext {
@@ -50,6 +52,10 @@ impl AuthContext {
                 )
             },
         )
+    }
+
+    pub fn effective_limits(&self) -> LimitSet {
+        self.limits
     }
 }
 
@@ -83,6 +89,7 @@ struct Inner {
     pepper: Vec<u8>,
     store: std::sync::Mutex<store::AuthStore>,
     snapshot: RwLock<Arc<Snapshot>>,
+    session_limiter: SessionLimiter,
 }
 
 #[derive(Clone, Default)]
@@ -144,6 +151,7 @@ impl AuthzService {
                 pepper,
                 store: std::sync::Mutex::new(store),
                 snapshot: RwLock::new(snapshot),
+                session_limiter: SessionLimiter::default(),
             })),
         })
     }
@@ -182,7 +190,24 @@ impl AuthzService {
             key_id: record.id.clone(),
             principal_id: record.principal_id.clone(),
             grants: Arc::clone(&record.grants),
+            limits: LimitSet::default(),
         }))
+    }
+
+    /// Acquires the inference lease after authentication and authorization.
+    /// The cloneable lease releases exactly once when its last owner drops,
+    /// allowing streaming responses to carry it through every terminal path.
+    pub fn acquire_session(
+        &self,
+        context: &AuthContext,
+    ) -> Result<Option<SessionLease>, AuthError> {
+        let Some(inner) = &self.inner else {
+            return Ok(None);
+        };
+        inner
+            .session_limiter
+            .acquire_for_key(&context.key_id, context.limits, chrono::Utc::now())
+            .map(Some)
     }
 
     pub fn create_key(
@@ -410,6 +435,7 @@ mod tests {
                 endpoint: "responses".into(),
                 model_pattern: "public-*".into(),
             }]),
+            limits: Default::default(),
         };
         let scope = context.authorization_scope();
         assert!(scope.allows_candidate(
@@ -460,7 +486,7 @@ mod tests {
             .unwrap();
         let raw = created.raw_key.as_deref().unwrap().to_string();
         assert!(raw.starts_with("llmc_"));
-        assert!(!format!("{created:?}").contains(raw));
+        assert!(!format!("{created:?}").contains(&raw));
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -473,6 +499,9 @@ mod tests {
         assert!(context.allows_model("chat", "public-v1"));
         assert!(!context.allows_model("chat", "secret-v1"));
         assert!(context.auth_request_id.starts_with("areq_"));
+        let lease = service.acquire_session(&context).unwrap().unwrap();
+        assert_eq!(lease.key_id(), context.key_id);
+        drop(lease);
 
         let listed = service.list_keys().unwrap();
         assert!(listed.iter().all(|key| !key.prefix.contains(&raw)));
