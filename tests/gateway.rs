@@ -694,6 +694,7 @@ async fn uses_configured_upstream_model_override() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: llmconduit::config::MeshConfig::default(),
         },
     );
@@ -784,6 +785,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: llmconduit::config::MeshConfig::default(),
         },
     );
@@ -1139,6 +1141,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: llmconduit::config::MeshConfig::default(),
         },
     );
@@ -1217,6 +1220,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
             mesh: llmconduit::config::MeshConfig::default(),
         },
     );
@@ -3194,6 +3198,7 @@ async fn proxies_models_endpoint_with_etag() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
         mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
@@ -3273,6 +3278,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
         mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
@@ -3358,6 +3364,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
         mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
@@ -3446,6 +3453,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
         mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
@@ -3539,6 +3547,7 @@ async fn proxies_completions_endpoint_passthrough() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
         mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
@@ -7336,6 +7345,7 @@ fn test_config() -> Config {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
         mesh: llmconduit::config::MeshConfig::default(),
     }
 }
@@ -10444,6 +10454,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
         mesh: llmconduit::config::MeshConfig::default(),
     };
     // The image agent is off here, so the vision client is inert; a real
