@@ -943,23 +943,19 @@ export interface AuthPolicy {
   enabled: boolean;
   subjects: string[];
   endpoints: string[];
-  models: string[];
   requested_models: string[];
   served_models: string[];
   providers: string[];
   routes: string[];
   time_windows: AuthPolicyTimeWindow[];
   max_concurrent_sessions: number | null;
-  max_daily_session_starts: number | null;
-  management_permissions: ManagementPermission[];
+  daily_session_starts: number | null;
 }
 
 export interface AuthPolicyTimeWindow {
-  weekday_mask: number;
-  start_minute: number;
-  end_minute: number;
-  absolute_start_ms: number | null;
-  absolute_end_ms: number | null;
+  days: string[];
+  start_utc: string;
+  end_utc: string;
 }
 
 export interface AuthApiKey {
@@ -1054,15 +1050,13 @@ export interface CreateAuthPolicyRequest {
   effect: AuthPolicy['effect'];
   subjects: string[];
   endpoints: string[];
-  models: string[];
   requested_models: string[];
   served_models: string[];
   providers: string[];
   routes: string[];
   time_windows: AuthPolicyTimeWindow[];
   max_concurrent_sessions: number | null;
-  max_daily_session_starts: number | null;
-  management_permissions: ManagementPermission[];
+  daily_session_starts: number | null;
 }
 
 export function isAuthSummary(v: unknown): v is AuthSummary {
@@ -1089,15 +1083,12 @@ function isAuthRole(v: unknown): v is AuthRole {
 function isAuthPolicy(v: unknown): v is AuthPolicy {
   return isObj(v) && isStr(v.id) && isStr(v.name) && isOneOf(v.effect, ['allow', 'deny'] as const)
     && typeof v.enabled === 'boolean' && isStringArray(v.subjects) && isStringArray(v.endpoints)
-    && isStringArray(v.models) && isStringArray(v.requested_models) && isStringArray(v.served_models)
+    && isStringArray(v.requested_models) && isStringArray(v.served_models)
     && isStringArray(v.providers) && isStringArray(v.routes)
     && Array.isArray(v.time_windows) && v.time_windows.every((window) => isObj(window)
-      && isUint(window.weekday_mask) && isUint(window.start_minute) && isUint(window.end_minute)
-      && (window.absolute_start_ms === null || typeof window.absolute_start_ms === 'number')
-      && (window.absolute_end_ms === null || typeof window.absolute_end_ms === 'number'))
+      && isStringArray(window.days) && isStr(window.start_utc) && isStr(window.end_utc))
     && (v.max_concurrent_sessions === null || isUint(v.max_concurrent_sessions))
-    && (v.max_daily_session_starts === null || isUint(v.max_daily_session_starts))
-    && isStringArray(v.management_permissions);
+    && (v.daily_session_starts === null || isUint(v.daily_session_starts));
 }
 function isAuthApiKey(v: unknown): v is AuthApiKey {
   return isObj(v) && isStr(v.id) && isStr(v.principal_id) && isStr(v.name) && isStr(v.prefix)
