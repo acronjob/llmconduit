@@ -80,7 +80,37 @@ impl UpstreamClient for MeshUpstreamClient {
         let mut excluded = HashSet::new();
         let mut last_error = None;
         loop {
-            let Some(reservation) = self.registry.reserve_excluding(&model, &excluded) else {
+            let authorization = backend.authorization.clone();
+            let route = backend.authorization_route.clone();
+            let Some(reservation) = self.registry.reserve_excluding_where(
+                &model,
+                &excluded,
+                |endpoint_id, resource_id| {
+                    authorization.allows_candidate(
+                        &format!("mesh:{endpoint_id}"),
+                        route.as_deref().or(Some(resource_id)),
+                        &model,
+                        backend.endpoint,
+                    )
+                },
+            ) else {
+                let any_authorized = self.registry.has_candidate_where(
+                    &model,
+                    |endpoint_id, resource_id| {
+                        authorization.allows_candidate(
+                            &format!("mesh:{endpoint_id}"),
+                            route.as_deref().or(Some(resource_id)),
+                            &model,
+                            backend.endpoint,
+                        )
+                    },
+                );
+                if !any_authorized && self.registry.has_candidate_where(&model, |_, _| true)
+                {
+                    return Err(AppError::forbidden(
+                        "no authorized mesh resource is available for this request",
+                    ));
+                }
                 return Err(last_error.unwrap_or_else(|| {
                     AppError::upstream_with_disposition(
                         "mesh capacity exhausted",

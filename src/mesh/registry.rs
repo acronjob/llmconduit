@@ -138,9 +138,26 @@ impl MeshRegistry {
         model: &str,
         excluded: &HashSet<(EndpointId, String)>,
     ) -> Option<MeshReservation> {
+        self.reserve_excluding_where(model, excluded, |_, _| true)
+    }
+
+    /// Reserve only after the caller's authorization predicate accepts the
+    /// concrete worker/resource candidate. Filtering happens before capacity
+    /// acquisition, so a denied candidate cannot consume a permit or perturb
+    /// dispatch health/accounting.
+    pub(crate) fn reserve_excluding_where<F>(
+        &self,
+        model: &str,
+        excluded: &HashSet<(EndpointId, String)>,
+        allows: F,
+    ) -> Option<MeshReservation>
+    where
+        F: Fn(EndpointId, &str) -> bool,
+    {
         let mut candidates = self.candidates(model);
         candidates.retain(|candidate| {
             !excluded.contains(&(candidate.endpoint_id, candidate.resource_id.clone()))
+                && allows(candidate.endpoint_id, &candidate.resource_id)
         });
         candidates.sort_by(|a, b| {
             (a.active as u64 * b.effective_capacity as u64)
@@ -177,6 +194,15 @@ impl MeshRegistry {
             }
         }
         None
+    }
+
+    pub(crate) fn has_candidate_where<F>(&self, model: &str, allows: F) -> bool
+    where
+        F: Fn(EndpointId, &str) -> bool,
+    {
+        self.candidates(model)
+            .into_iter()
+            .any(|candidate| allows(candidate.endpoint_id, &candidate.resource_id))
     }
 
     pub(crate) fn model_catalog(&self) -> Vec<ModelAdvertisement> {

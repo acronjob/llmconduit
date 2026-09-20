@@ -434,6 +434,32 @@ impl AuthorizationScope {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ProxyCompletionsRequest {
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub authorization: AuthorizationScope,
+    pub authorization_route: Option<String>,
+    pub authorization_provider: Option<String>,
+}
+
+impl ProxyCompletionsRequest {
+    pub fn new(headers: HeaderMap, body: Bytes) -> Self {
+        Self {
+            headers,
+            body,
+            authorization: AuthorizationScope::unrestricted(),
+            authorization_route: None,
+            authorization_provider: None,
+        }
+    }
+
+    pub fn with_authorization(mut self, authorization: AuthorizationScope) -> Self {
+        self.authorization = authorization;
+        self
+    }
+}
+
 /// One entry of the upstream `/v1/models` catalog: the model id plus its
 /// context-window length (`None` when the upstream reports no positive context
 /// length for it). Ids and context limits are derived from a SINGLE
@@ -505,8 +531,7 @@ pub trait UpstreamClient: Send + Sync {
     async fn list_models(&self) -> AppResult<UpstreamModelsResponse>;
     async fn proxy_completions(
         &self,
-        _headers: HeaderMap,
-        _body: Bytes,
+        _request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
         Err(AppError::internal(
             "upstream completions proxy is not implemented",
@@ -1674,6 +1699,12 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // is re-asserted last so an explicit client value still wins).
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
+        backend.authorization.ensure_candidate(
+            backend.authorization_provider.as_deref().unwrap_or("primary"),
+            backend.authorization_route.as_deref(),
+            &backend.request.model,
+            backend.endpoint,
+        )?;
         // D2: the flow's `response_id` keys the on-wire capture below. Capture it
         // BEFORE `backend.request` is moved into `sanitize_chat_request` so the
         // first + retry send sites can both pass `response_id.as_deref()`.
@@ -1792,6 +1823,12 @@ impl UpstreamClient for ReqwestUpstreamClient {
     async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
+        backend.authorization.ensure_candidate(
+            backend.authorization_provider.as_deref().unwrap_or("primary"),
+            backend.authorization_route.as_deref(),
+            &backend.request.model,
+            InferenceEndpoint::CountTokens,
+        )?;
         let request = sanitize_chat_request(backend.request, self.flatten_content);
 
         let mut body = JsonMap::new();
@@ -2248,6 +2285,11 @@ impl FailoverUpstreamClient {
                 "resolved fallback provider index was out of range",
             ));
         }
+        if !self.provider_is_authorized(provider_index, backend) {
+            return Err(AppError::forbidden(
+                "the selected upstream candidate is not authorized",
+            ));
+        }
         if !self.provider_is_available(provider_index) {
             return Err(self.cooldown_error());
         }
@@ -2509,6 +2551,11 @@ impl FailoverUpstreamClient {
         if provider_index >= self.providers.len() {
             return Err(AppError::internal(
                 "resolved fallback provider index was out of range",
+            ));
+        }
+        if !self.provider_is_authorized(provider_index, backend) {
+            return Err(AppError::forbidden(
+                "the selected token-count candidate is not authorized",
             ));
         }
         self.count_tokens_with_provider_indices(vec![provider_index], backend)
