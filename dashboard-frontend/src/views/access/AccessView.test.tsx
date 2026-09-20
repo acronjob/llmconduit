@@ -10,10 +10,10 @@ afterEach(cleanup);
 describe('AccessView', () => {
   it('validates policy subjects, UTC windows, and positive session limits', () => {
     expect(validatePolicy({
-      name: '', effect: 'allow', subjects: [], endpoints: [], requested_models: [],
+      name: '', effect: 'allow', subjects: [], endpoints: [], models: [], requested_models: [],
       served_models: [], providers: [], routes: [],
-      time_windows: [{ days: [], start_utc: '25:00', end_utc: '25:00' }],
-      max_concurrent_sessions: 0, daily_session_starts: 1.5,
+      time_windows: [{ weekday_mask: 0, start_minute: 1500, end_minute: 1500, absolute_start_ms: null, absolute_end_ms: null }],
+      max_concurrent_sessions: 0, max_daily_session_starts: 1.5, management_permissions: [],
     })).toEqual([
       'Policy name is required.', 'Select at least one real subject.',
       'Enter at least one endpoint.', 'Max concurrent sessions must be a positive integer.',
