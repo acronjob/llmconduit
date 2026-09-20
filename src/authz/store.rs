@@ -590,6 +590,26 @@ impl AuthStore {
         self.connection.execute("UPDATE auth_dashboard_sessions SET revoked_at=?2,revoked_reason=?3 WHERE session_id=?1 AND revoked_at IS NULL",params![session_id,Utc::now().timestamp(),reason]).map(|changed|changed>0).map_err(db)
     }
 
+    pub fn dashboard_session_csrf_matches(
+        &self,
+        session_id: &str,
+        presented_digest: &[u8],
+    ) -> Result<bool, String> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT csrf_secret_digest FROM auth_dashboard_sessions WHERE session_id=?1 AND revoked_at IS NULL AND expires_at>?2",
+                params![session_id, Utc::now().timestamp()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(db)?;
+        Ok(stored.is_some_and(|digest| {
+            use subtle::ConstantTimeEq as _;
+            bool::from(digest.as_slice().ct_eq(presented_digest))
+        }))
+    }
+
     pub fn dispatch_access(
         &mut self,
         actor: &ManagementActor,
@@ -1292,10 +1312,12 @@ fn db(e: rusqlite::Error) -> String {
     e.to_string()
 }
 fn access_db(e: rusqlite::Error) -> AccessError {
-    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(error = %e, "dashboard auth store operation failed");
+    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 fn access_internal(e: String) -> AccessError {
-    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, e)
+    tracing::error!(error = %e, "dashboard auth operation failed");
+    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
 const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];

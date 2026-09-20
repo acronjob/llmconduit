@@ -326,6 +326,15 @@ impl AuthzService {
             .revoke_dashboard_session(session_id, "logout")
     }
 
+    pub fn verify_delegated_csrf(&self, session_id: &str, digest: &[u8]) -> Result<bool, String> {
+        let inner = self.inner()?;
+        inner
+            .store
+            .lock()
+            .map_err(|_| "auth store lock poisoned".to_string())?
+            .dashboard_session_csrf_matches(session_id, digest)
+    }
+
     pub fn create_key(
         &self,
         principal_name: &str,

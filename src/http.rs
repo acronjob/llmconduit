@@ -11,11 +11,13 @@ use crate::dashboard_api::dashboard_flows;
 use crate::dashboard_api::dashboard_metrics;
 use crate::dashboard_api::dashboard_snapshot;
 use crate::dashboard_api::dashboard_topology;
+use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationDenied;
 use crate::dashboard_auth::MutationPolicy;
 use crate::dashboard_auth::dashboard_login;
 use crate::dashboard_auth::dashboard_logout;
+use crate::dashboard_auth::delegated_login_response;
 use crate::dashboard_auth::require_session;
 use crate::dashboard_ui::dashboard_asset;
 use crate::dashboard_ui::dashboard_index;
@@ -200,6 +202,9 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
+        .merge(crate::provider_metrics::dashboard_routes::<Arc<Gateway>>(
+            gateway.provider_metrics(),
+        ))
         .route_layer(middleware::map_response(dashboard_api_no_store));
 
     let access_routes =
@@ -221,9 +226,17 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
     // dashboard read AND the kill mutation is 401'd for an unauthenticated caller
     // BEFORE any handler work (the kill's CSRF/mutation gate runs only for an
     // authenticated request).
-    let session_gated = api_routes
-        .merge(debug_routes)
-        .route_layer(middleware::from_fn(require_session));
+    let api_gated = api_routes.route_layer(middleware::from_fn_with_state(
+        Arc::clone(&gateway),
+        require_dashboard_session,
+    ));
+    let debug_gated = debug_routes.route_layer(middleware::from_fn(require_session));
+    let dashboard_shell = Router::new()
+        .route("/dashboard", get(dashboard_index))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            resolve_optional_dashboard_session,
+        ));
 
     // Routes that read the auth context but manage their own access decision,
     // plus the self-gated WS and the public hashed assets.
@@ -234,18 +247,178 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
     // + `Origin` allow-list + cookie-`exp` close, via D7a's `authenticate_ws`), so
     // it OWNS its rejection and the WS `Origin` check stays authoritative.
     let open = Router::new()
-        .route("/dashboard", get(dashboard_index))
         .route("/dashboard/login", post(dashboard_login))
         .route("/dashboard/logout", post(dashboard_logout))
+        .route("/dashboard/auth/key-login", post(dashboard_key_login))
+        .route("/dashboard/auth/logout", post(dashboard_auth_logout))
         .route("/debug/ws", get(debug_ws))
         .route("/dashboard/ws", get(dashboard_ws))
         .route("/dashboard/assets/{*path}", get(dashboard_asset));
 
-    session_gated
+    api_gated
+        .merge(debug_gated)
         .merge(access_routes)
+        .merge(dashboard_shell)
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).
         .layer(Extension(auth))
+}
+
+async fn require_dashboard_session(
+    State(gateway): State<Arc<Gateway>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(auth) = request.extensions().get::<Arc<DashboardAuth>>().cloned() else {
+        return management_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    if let Some(exp) = auth.authenticate(request.headers()) {
+        request.extensions_mut().insert(AuthSession { exp });
+        return next.run(request).await;
+    }
+    if let Some((session_id, exp)) = auth.delegated_session(request.headers()) {
+        match gateway.authz().authenticate_delegated_session(&session_id) {
+            Ok(Some(actor)) => {
+                request.extensions_mut().insert(AuthSession { exp });
+                request.extensions_mut().insert(actor);
+                return next.run(request).await;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return management_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authorization unavailable",
+                );
+            }
+        }
+    }
+    management_error(StatusCode::UNAUTHORIZED, "unauthorized")
+}
+
+async fn resolve_optional_dashboard_session(
+    State(gateway): State<Arc<Gateway>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(auth) = request.extensions().get::<Arc<DashboardAuth>>().cloned() else {
+        return next.run(request).await;
+    };
+    let exp = if let Some(exp) = auth.authenticate(request.headers()) {
+        Some(exp)
+    } else if let Some((session_id, exp)) = auth.delegated_session(request.headers()) {
+        match gateway.authz().authenticate_delegated_session(&session_id) {
+            Ok(Some(actor)) => {
+                request.extensions_mut().insert(actor);
+                Some(exp)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(exp) = exp {
+        request.extensions_mut().insert(AuthSession { exp });
+    }
+    next.run(request).await
+}
+
+#[derive(Deserialize)]
+struct DashboardKeyLogin {
+    api_key: String,
+}
+
+async fn dashboard_key_login(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    headers: HeaderMap,
+    Json(body): Json<DashboardKeyLogin>,
+) -> Response {
+    if !auth.origin_allowed(&headers) {
+        return management_error(StatusCode::FORBIDDEN, "cross-origin login denied");
+    }
+    let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", body.api_key)) else {
+        return management_error(StatusCode::UNAUTHORIZED, "invalid API key");
+    };
+    let mut key_headers = HeaderMap::new();
+    key_headers.insert(header::AUTHORIZATION, value);
+    let context = match gateway.authz().authenticate(&key_headers) {
+        Ok(Some(context)) => context,
+        Ok(None) | Err(crate::authz::AuthFailure::Missing | crate::authz::AuthFailure::Invalid) => {
+            return management_error(StatusCode::UNAUTHORIZED, "invalid API key");
+        }
+        Err(crate::authz::AuthFailure::Forbidden) => {
+            return management_error(StatusCode::FORBIDDEN, "management permission denied");
+        }
+        Err(crate::authz::AuthFailure::Unavailable) => {
+            return management_error(StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable");
+        }
+    };
+    let csrf = auth.issue_csrf_token();
+    let digest = Sha256::digest(csrf.as_bytes());
+    let exp =
+        chrono::Utc::now().timestamp().max(0) as u64 + crate::dashboard_auth::SESSION_TTL_SECS;
+    let actor = match gateway.authz().create_delegated_session(
+        &context,
+        digest.as_slice(),
+        i64::try_from(exp).unwrap_or(i64::MAX),
+    ) {
+        Ok(actor) => actor,
+        Err(crate::authz::AuthError::Forbidden) => {
+            return management_error(StatusCode::FORBIDDEN, "management permission denied");
+        }
+        Err(_) => {
+            return management_error(StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable");
+        }
+    };
+    let crate::dashboard_access::ManagementActor::Delegated { session_id, .. } = actor else {
+        return management_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
+    };
+    delegated_login_response(&auth, &session_id, &csrf, exp)
+}
+
+async fn dashboard_auth_logout(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some((session_id, _)) = auth.delegated_session(&headers) {
+        if !auth.origin_allowed(&headers) {
+            return management_error(StatusCode::FORBIDDEN, "cross-origin logout denied");
+        }
+        if let Err(denied) = auth.authorize_mutation(&headers) {
+            return management_error(denied.status(), denied.message());
+        }
+        let Some(csrf) = headers
+            .get(crate::dashboard_auth::CSRF_HEADER)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return management_error(StatusCode::FORBIDDEN, "missing or invalid CSRF token");
+        };
+        let digest = Sha256::digest(csrf.as_bytes());
+        match gateway
+            .authz()
+            .verify_delegated_csrf(&session_id, digest.as_slice())
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return management_error(StatusCode::FORBIDDEN, "missing or invalid CSRF token");
+            }
+            Err(_) => {
+                return management_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authorization unavailable",
+                );
+            }
+        }
+        if gateway
+            .authz()
+            .revoke_delegated_session(&session_id)
+            .is_err()
+        {
+            return management_error(StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable");
+        }
+    }
+    dashboard_logout(Extension(auth)).await
 }
 
 async fn require_management_access(
@@ -260,6 +433,17 @@ async fn require_management_access(
     let (actor, cookie_or_dashboard_token) =
         if dashboard_auth.authenticate(request.headers()).is_some() {
             (crate::dashboard_access::ManagementActor::Bootstrap, true)
+        } else if let Some((session_id, _)) = dashboard_auth.delegated_session(request.headers()) {
+            match gateway.authz().authenticate_delegated_session(&session_id) {
+                Ok(Some(actor)) => (actor, true),
+                Ok(None) => return management_error(StatusCode::UNAUTHORIZED, "unauthorized"),
+                Err(_) => {
+                    return management_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authorization unavailable",
+                    );
+                }
+            }
         } else {
             match gateway.authz().authenticate(request.headers()) {
                 Ok(Some(context)) => (context.management_actor(), false),
@@ -284,6 +468,37 @@ async fn require_management_access(
         if cookie_or_dashboard_token {
             if let Err(denied) = dashboard_auth.authorize_mutation(request.headers()) {
                 return management_error(denied.status(), denied.message());
+            }
+            if let crate::dashboard_access::ManagementActor::Delegated { session_id, .. } = &actor {
+                let Some(csrf) = request
+                    .headers()
+                    .get(crate::dashboard_auth::CSRF_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                else {
+                    return management_error(
+                        StatusCode::FORBIDDEN,
+                        "missing or invalid CSRF token",
+                    );
+                };
+                let digest = Sha256::digest(csrf.as_bytes());
+                match gateway
+                    .authz()
+                    .verify_delegated_csrf(session_id, digest.as_slice())
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return management_error(
+                            StatusCode::FORBIDDEN,
+                            "missing or invalid CSRF token",
+                        );
+                    }
+                    Err(_) => {
+                        return management_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "authorization unavailable",
+                        );
+                    }
+                }
             }
         } else if !dashboard_auth.mutations_enabled() {
             return management_error(StatusCode::FORBIDDEN, "dashboard mutations are disabled");
@@ -545,7 +760,13 @@ fn is_flow_capture_request(method: &axum::http::Method, path: &str) -> bool {
 /// length. So for these endpoints we suppress ALL body-derived fields (digest,
 /// length, summary, AND payload), logging only non-body metadata.
 fn is_dashboard_auth_path(path: &str) -> bool {
-    matches!(path, "/dashboard/login" | "/dashboard/logout")
+    matches!(
+        path,
+        "/dashboard/login"
+            | "/dashboard/logout"
+            | "/dashboard/auth/key-login"
+            | "/dashboard/auth/logout"
+    )
 }
 
 /// Body-derived tracing fields for the inbound-request log line. `None` for a
@@ -2937,6 +3158,8 @@ mod tests {
         );
         // Logout is symmetric (bodyless, but the same path class).
         assert!(body_log_fields("/dashboard/logout", &Bytes::new()).is_none());
+        assert!(body_log_fields("/dashboard/auth/key-login", &body).is_none());
+        assert!(body_log_fields("/dashboard/auth/logout", &Bytes::new()).is_none());
 
         // A normal inference path still logs the length + digest + summary, and
         // that digest is over the body (never resembles the bare-token digest).
