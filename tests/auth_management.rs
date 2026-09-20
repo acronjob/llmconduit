@@ -301,3 +301,76 @@ async fn management_key_list_and_revoke_are_permissioned_and_never_recover_raw_s
     assert_store_files_do_not_contain(&path, &raw);
     remove_store(&path);
 }
+
+#[tokio::test]
+async fn delegated_role_writer_cannot_grant_permissions_it_does_not_hold() {
+    let (service, path) = enforced_service();
+    let service = Arc::new(service);
+
+    let denied = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(delegated(
+            ManagementPermission::RolesWrite,
+        )))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/dashboard/api/auth/roles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"escalated role","permissions":["auth.keys.revoke"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(
+        json(denied).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not possess")
+    );
+
+    let allowed = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(delegated(
+            ManagementPermission::RolesWrite,
+        )))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/dashboard/api/auth/roles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"bounded role","permissions":["auth.roles.write"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let allowed = json(allowed).await;
+    let roles = allowed["roles"].as_array().unwrap();
+    assert!(roles.iter().any(|role| role["name"] == "bounded role"));
+    assert!(!roles.iter().any(|role| role["name"] == "escalated role"));
+
+    let audit = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(ManagementActor::Bootstrap))
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/audit")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), StatusCode::OK);
+    let events = json(audit).await;
+    assert!(events["events"].as_array().unwrap().iter().any(|event| {
+        event["action"] == "role.create"
+            && event["outcome"] == "denied"
+            && event["metadata"]["reason"] == "requested permissions exceed actor"
+    }));
+
+    drop(service);
+    remove_store(&path);
+}
