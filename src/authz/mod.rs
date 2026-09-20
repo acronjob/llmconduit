@@ -512,6 +512,9 @@ impl AuthzService {
             .list_keys()
     }
 
+    /// Persist one terminal inference event. Disabled auth is a no-op; enabled
+    /// auth uses the same store mutex as key mutations so SQLite is never used
+    /// concurrently from multiple runtime workers.
     pub fn record_usage_once(
         &self,
         event: &crate::usage_accounting::UsageEvent,
