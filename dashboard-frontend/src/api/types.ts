@@ -959,8 +959,7 @@ export interface AuthApiKey {
 }
 
 /** Returned only by create/rotate. `raw_key` must never be persisted or fetched later. */
-export interface CreatedAuthApiKey {
-  api_key: AuthApiKey;
+export interface CreatedAuthApiKey extends AuthApiKey {
   raw_key: string;
 }
 
@@ -1104,7 +1103,9 @@ export const isAuthUsageResponse = (v: unknown): v is AuthUsageResponse => isArr
 export const isAuthAuditResponse = (v: unknown): v is AuthAuditResponse => isArrayEnvelope(v, 'events', isAuthAuditEvent);
 export const isAuthPricingResponse = (v: unknown): v is AuthPricingResponse => isArrayEnvelope(v, 'pricing', isAuthPricingRow);
 export function isCreatedAuthApiKey(v: unknown): v is CreatedAuthApiKey {
-  return isObj(v) && isAuthApiKey(v.api_key) && isStr(v.raw_key) && v.raw_key.startsWith('llmc_');
+  if (!isObj(v) || !isAuthApiKey(v)) return false;
+  const rawKey = (v as unknown as Record<string, unknown>).raw_key;
+  return isStr(rawKey) && rawKey.startsWith('llmc_');
 }
 
 // ---------------------------------------------------------------------------

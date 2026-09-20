@@ -444,10 +444,35 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       if (!body.principal_id || !body.name) return json({ error: 'invalid key' }, 400);
       const apiKey: AuthApiKey = { id: `key_${AUTH_KEYS.length + 1}`, principal_id: body.principal_id, name: body.name, prefix: 'llmc_demo', enabled: true, created_at: new Date().toISOString(), expires_at: body.expires_at ?? null, last_used_at: null };
       AUTH_KEYS = [...AUTH_KEYS, apiKey];
-      return json({ api_key: apiKey, raw_key: `llmc_mock_${apiKey.id}_copy_once` });
+      return json({ ...apiKey, raw_key: `llmc_mock_${apiKey.id}_copy_once` });
     }
     return json({ api_keys: AUTH_KEYS });
   }
+  const keyAction = path.match(/^\/dashboard\/api\/auth\/api-keys\/([^/]+)\/(revoke|rotate)$/);
+  if (keyAction && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(keyAction[1] ?? '');
+    const found = AUTH_KEYS.find((key) => key.id === id);
+    if (!found) return json({ error: 'unknown key' }, 404);
+    if (keyAction[2] === 'revoke') {
+      AUTH_KEYS = AUTH_KEYS.map((key) => key.id === id ? { ...key, enabled: false } : key);
+      return json({ api_keys: AUTH_KEYS });
+    }
+    const rotated = { ...found, id: `${found.id}_rotated`, prefix: 'llmc_rot8', created_at: new Date().toISOString(), last_used_at: null };
+    AUTH_KEYS = [...AUTH_KEYS.filter((key) => key.id !== id), rotated];
+    return json({ ...rotated, raw_key: `llmc_mock_${rotated.id}_copy_once` });
+  }
+  if (path === '/dashboard/api/auth/sessions') return json({ sessions: AUTH_SESSIONS });
+  const sessionRevoke = path.match(/^\/dashboard\/api\/auth\/sessions\/([^/]+)\/revoke$/);
+  if (sessionRevoke && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(sessionRevoke[1] ?? '');
+    AUTH_SESSIONS = AUTH_SESSIONS.filter((session) => session.id !== id);
+    return json({ sessions: AUTH_SESSIONS });
+  }
+  if (path === '/dashboard/api/auth/usage') return json({ usage: AUTH_USAGE });
+  if (path === '/dashboard/api/auth/audit') return json({ events: AUTH_AUDIT });
+  if (path === '/dashboard/api/auth/pricing') return json({ pricing: AUTH_PRICING });
 
   // -- Kill (CSRF) -- `:id` == api_call_id ONLY (D13 contract). CSRF checked first
   // (security gate), then the id must be a seeded api_call_id else 404 (finding 7).

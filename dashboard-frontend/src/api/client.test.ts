@@ -86,8 +86,8 @@ describe('DashboardClient — access management runtime validation', () => {
     const users = await client.authUsers();
     const created = await client.createAuthApiKey({ principal_id: users.users[0]!.id, name: 'test' });
     expect(created.raw_key).toMatch(/^llmc_/);
-    const revoked = await client.revokeAuthApiKey(created.api_key.id);
-    expect(revoked.api_keys.find((key) => key.id === created.api_key.id)?.enabled).toBe(false);
+    const revoked = await client.revokeAuthApiKey(created.id);
+    expect(revoked.api_keys.find((key) => key.id === created.id)?.enabled).toBe(false);
   });
 
   it('rejects an invalid management response before it reaches the UI', async () => {

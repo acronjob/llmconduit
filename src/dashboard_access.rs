@@ -76,6 +76,11 @@ impl ManagementActor {
         matches!(self, Self::Bootstrap)
             || matches!(self, Self::Delegated { permissions, .. } if permissions.contains(&permission))
     }
+
+    fn has_management_access(&self) -> bool {
+        matches!(self, Self::Bootstrap)
+            || matches!(self, Self::Delegated { permissions, .. } if !permissions.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +160,7 @@ pub struct AccessApiKey {
 /// Only the create/rotate response carries `raw_key`; list responses cannot recover it.
 #[derive(Serialize)]
 pub struct CreatedAccessApiKey {
+    #[serde(flatten)]
     pub api_key: AccessApiKey,
     pub raw_key: String,
 }
@@ -243,13 +249,42 @@ pub struct CreatePolicyRequest {
     pub providers: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateGroupRequest {
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRoleRequest {
+    pub name: String,
+    #[serde(default)]
+    pub permissions: Vec<ManagementPermission>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WritePricingRequest {
+    pub pricing: Vec<AccessPricingInput>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AccessPricingInput {
+    pub model: String,
+    pub provider: String,
+    pub input_per_1k: String,
+    pub output_per_1k: String,
+}
+
 #[derive(Debug)]
 pub enum AccessOperation {
     Summary,
     ListUsers,
     CreateUser(CreateUserRequest),
     ListGroups,
+    CreateGroup(CreateGroupRequest),
     ListRoles,
+    CreateRole(CreateRoleRequest),
     ListPolicies,
     CreatePolicy(CreatePolicyRequest),
     ListApiKeys,
@@ -261,6 +296,7 @@ pub enum AccessOperation {
     Usage,
     Audit,
     Pricing,
+    WritePricing(WritePricingRequest),
 }
 
 #[derive(Debug)]
@@ -332,8 +368,8 @@ where
     Router::new()
         .route("/dashboard/api/auth/summary", get(summary))
         .route("/dashboard/api/auth/users", get(users).post(create_user))
-        .route("/dashboard/api/auth/groups", get(groups))
-        .route("/dashboard/api/auth/roles", get(roles))
+        .route("/dashboard/api/auth/groups", get(groups).post(create_group))
+        .route("/dashboard/api/auth/roles", get(roles).post(create_role))
         .route(
             "/dashboard/api/auth/policies",
             get(policies).post(create_policy),
@@ -357,7 +393,10 @@ where
         )
         .route("/dashboard/api/auth/usage", get(usage))
         .route("/dashboard/api/auth/audit", get(audit))
-        .route("/dashboard/api/auth/pricing", get(pricing))
+        .route(
+            "/dashboard/api/auth/pricing",
+            get(pricing).post(write_pricing),
+        )
         .layer(Extension(backend))
 }
 
@@ -393,14 +432,47 @@ async fn summary(
     backend: Extension<Arc<dyn AccessBackend>>,
     actor: Extension<ManagementActor>,
 ) -> Result<Json<AccessSummary>, AccessError> {
+    let Extension(backend) = backend;
+    let Extension(actor) = actor;
+    if !actor.has_management_access() {
+        return Err(AccessError::forbidden());
+    }
+    match backend.dispatch(&actor, AccessOperation::Summary).await? {
+        AccessResult::Summary(value) => Ok(Json(value)),
+        _ => Err(AccessError::contract()),
+    }
+}
+
+async fn create_group(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Json(body): Json<CreateGroupRequest>,
+) -> Result<Json<Value>, AccessError> {
     match execute(
         (backend, actor),
-        ManagementPermission::PrincipalsRead,
-        AccessOperation::Summary,
+        ManagementPermission::GroupsWrite,
+        AccessOperation::CreateGroup(body),
     )
     .await?
     {
-        AccessResult::Summary(value) => Ok(Json(value)),
+        AccessResult::Groups(value) => Ok(Json(json!({ "groups": value }))),
+        _ => Err(AccessError::contract()),
+    }
+}
+
+async fn create_role(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Json(body): Json<CreateRoleRequest>,
+) -> Result<Json<Value>, AccessError> {
+    match execute(
+        (backend, actor),
+        ManagementPermission::RolesWrite,
+        AccessOperation::CreateRole(body),
+    )
+    .await?
+    {
+        AccessResult::Roles(value) => Ok(Json(json!({ "roles": value }))),
         _ => Err(AccessError::contract()),
     }
 }
@@ -567,6 +639,23 @@ async fn revoke_session(
     .await?
     {
         AccessResult::Sessions(value) => Ok(Json(json!({ "sessions": value }))),
+        _ => Err(AccessError::contract()),
+    }
+}
+
+async fn write_pricing(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Json(body): Json<WritePricingRequest>,
+) -> Result<Json<Value>, AccessError> {
+    match execute(
+        (backend, actor),
+        ManagementPermission::PricingWrite,
+        AccessOperation::WritePricing(body),
+    )
+    .await?
+    {
+        AccessResult::Pricing(value) => Ok(Json(json!({ "pricing": value }))),
         _ => Err(AccessError::contract()),
     }
 }
