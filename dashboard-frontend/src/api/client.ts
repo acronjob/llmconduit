@@ -31,10 +31,6 @@ import type {
   MetricsResponse,
   SnapshotResponse,
   TopologyResponse,
-  AuthSummary,
-  ApiKeyListResponse,
-  CreatedApiKey,
-  CreateApiKeyRequest,
 } from './types';
 import {
   isAuthApiKeysResponse,
@@ -266,33 +262,6 @@ export class DashboardClient {
     });
   }
 
-  authSummary(): Promise<AuthSummary> {
-    return this.request<AuthSummary>('/auth/summary');
-  }
-
-  apiKeys(): Promise<ApiKeyListResponse> {
-    return this.request<ApiKeyListResponse>('/auth/api-keys');
-  }
-
-  createApiKey(body: CreateApiKeyRequest): Promise<CreatedApiKey> {
-    return this.authMutation<CreatedApiKey>('/auth/api-keys', body);
-  }
-
-  revokeApiKey(id: string): Promise<void> {
-    return this.authMutation<void>(`/auth/api-keys/${encodeURIComponent(id)}/revoke`);
-  }
-
-  private authMutation<T>(path: string, body?: unknown): Promise<T> {
-    const csrf = this.getCsrfToken();
-    const headers: Record<string, string> = {};
-    if (csrf) headers['X-CSRF-Token'] = csrf;
-    if (body !== undefined) headers['Content-Type'] = 'application/json';
-    return this.request<T>(path, {
-      method: 'POST',
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-  }
 }
 
 /** Serializes a flows query into a `?a=b&c=d` string, dropping undefined values. */

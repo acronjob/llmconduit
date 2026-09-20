@@ -38,7 +38,7 @@ import type { WsLike } from './ws';
 
 const MOCK_CSRF = 'mock-csrf-token';
 
-const AUTH_USERS: AuthUser[] = [
+let AUTH_USERS: AuthUser[] = [
   { id: 'usr_ops', kind: 'user', display_name: 'Operations', enabled: true, created_at: '2026-06-01T09:00:00Z' },
   { id: 'usr_batch', kind: 'service_account', display_name: 'Batch inference', enabled: true, created_at: '2026-06-02T12:00:00Z' },
 ];
@@ -410,23 +410,29 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     return json({ ok: true });
   }
   if (path === '/dashboard/api/auth/summary' && method === 'GET') {
-    return json({ mode: 'enforce', healthy: true });
-  }
-  if (path === '/dashboard/api/auth/api-keys' && method === 'GET') {
     return json({
-      data: [{
-        id: 'key_demo', principal_id: 'usr_demo', name: 'demo service',
-        prefix: 'llmc_demo1234', enabled: true, created_at: 1_750_000_000,
-        expires_at: null, last_used_at: null,
-      }],
+      policy_epoch: 7,
+      actor: {
+        kind: 'bootstrap', principal_id: null, display_name: 'Bootstrap administrator',
+        permissions: [],
+      },
+      counts: {
+        users: AUTH_USERS.length, groups: AUTH_GROUPS.length, roles: AUTH_ROLES.length,
+        policies: AUTH_POLICIES.length, api_keys: AUTH_KEYS.length,
+        active_sessions: AUTH_SESSIONS.length,
+      },
     });
   }
-  if (path === '/dashboard/api/auth/api-keys' && method === 'POST') {
-    return json({
-      id: 'key_new', principal_id: 'usr_new', name: 'new key', prefix: 'llmc_new12345',
-      enabled: true, created_at: 1_750_000_000, expires_at: null, last_used_at: null,
-      raw_key: 'llmc_mock_copy_once_secret',
-    }, 201);
+  if (path === '/dashboard/api/auth/users') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { display_name?: string; kind?: AuthUser['kind'] };
+      if (!body.display_name || !body.kind) return json({ error: 'invalid user' }, 400);
+      AUTH_USERS = [...AUTH_USERS, {
+        id: `usr_${AUTH_USERS.length + 1}`, display_name: body.display_name,
+        kind: body.kind, enabled: true, created_at: new Date().toISOString(),
+      }];
+    }
+    return json({ users: AUTH_USERS });
   }
   if (path === '/dashboard/api/auth/groups') return json({ groups: AUTH_GROUPS });
   if (path === '/dashboard/api/auth/roles') return json({ roles: AUTH_ROLES });
