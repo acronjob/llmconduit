@@ -20,7 +20,9 @@ import type {
   AuthUsersResponse,
   CatalogEntry,
   CreateAuthApiKeyRequest,
+  CreateAuthGroupRequest,
   CreateAuthPolicyRequest,
+  CreateAuthRoleRequest,
   CreateAuthUserRequest,
   CreatedAuthApiKey,
   FlowDetail,
@@ -217,6 +219,12 @@ export class DashboardClient {
 
   createAuthUser(body: CreateAuthUserRequest): Promise<AuthUsersResponse> {
     return this.authMutation('/auth/users', body, isAuthUsersResponse);
+  }
+  createAuthGroup(body: CreateAuthGroupRequest): Promise<AuthGroupsResponse> {
+    return this.authMutation('/auth/groups', body, isAuthGroupsResponse);
+  }
+  createAuthRole(body: CreateAuthRoleRequest): Promise<AuthRolesResponse> {
+    return this.authMutation('/auth/roles', body, isAuthRolesResponse);
   }
   createAuthApiKey(body: CreateAuthApiKeyRequest): Promise<CreatedAuthApiKey> {
     return this.authMutation('/auth/api-keys', body, isCreatedAuthApiKey);

@@ -70,7 +70,7 @@
 <body>
   <main class="card">
     <h1>llmconduit dashboard</h1>
-    <p class="sub">Enter the dashboard access token to continue.</p>
+    <p class="sub">Enter the bootstrap token or a management-enabled API key.</p>
     <form id="login-form" autocomplete="off">
       <label for="token">Access token</label>
       <input id="token" name="token" type="password" autocomplete="current-password" spellcheck="false" autofocus>
@@ -88,10 +88,11 @@
       errorEl.textContent = "";
       submitBtn.disabled = true;
       try {
-        const response = await fetch("/dashboard/login", {
+        const delegated = tokenInput.value.startsWith("llmc_");
+        const response = await fetch(delegated ? "/dashboard/auth/key-login" : "/dashboard/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: tokenInput.value }),
+          body: JSON.stringify(delegated ? { api_key: tokenInput.value } : { token: tokenInput.value }),
         });
         if (response.ok) {
           // The signed session cookie is now set; reload to the SPA shell.

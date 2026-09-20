@@ -1,7 +1,8 @@
 use super::{AuthzService, ManagementPermission, keys::generate_api_key};
 use crate::dashboard_access::{
-    AccessApiKey, AccessBackend, AccessError, AccessFuture, AccessOperation, AccessResult,
-    CreatedAccessApiKey, ManagementActor, ManagementPermission as WirePermission,
+    AccessApiKey, AccessBackend, AccessError, AccessFuture, AccessOperation,
+    AccessPolicyTimeWindow, AccessResult, CreatedAccessApiKey, ManagementActor,
+    ManagementPermission as WirePermission,
 };
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
@@ -115,7 +116,11 @@ fn timestamp(seconds: i64) -> String {
 }
 
 fn internal(message: String) -> AccessError {
+<<<<<<< HEAD
+    tracing::error!(error = %message, "dashboard access backend failed");
+=======
     tracing::error!(error = %message, "authorization management operation failed");
+>>>>>>> master
     AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
@@ -261,6 +266,28 @@ mod tests {
                     effect: "allow".into(),
                     subjects: vec![format!("principal:{principal_id}")],
                     endpoints: vec!["chat".into()],
+<<<<<<< HEAD
+                    requested_models: vec!["public-*".into()],
+                    served_models: vec!["backend-*".into()],
+                    providers: vec!["provider-a".into()],
+                    routes: vec!["primary".into()],
+                    time_windows: vec![AccessPolicyTimeWindow {
+                        days: vec![
+                            "mon".into(),
+                            "tue".into(),
+                            "wed".into(),
+                            "thu".into(),
+                            "fri".into(),
+                            "sat".into(),
+                            "sun".into(),
+                        ],
+                        start_utc: "00:00".into(),
+                        end_utc: "23:59".into(),
+                    }],
+                    max_concurrent_sessions: Some(2),
+                    daily_session_starts: Some(10),
+                })
+=======
                     models: Vec::new(),
                     requested_models: vec!["public-*".into()],
                     served_models: vec!["backend-*".into()],
@@ -277,8 +304,26 @@ mod tests {
                     max_daily_session_starts: Some(10),
                     management_permissions: Vec::new(),
                 }))
+>>>>>>> master
             ),
             Ok(AccessResult::Policies(_))
+        ));
+        let policies = service
+            .dispatch_access(&actor, AccessOperation::ListPolicies)
+            .unwrap();
+        assert!(matches!(
+            policies,
+            AccessResult::Policies(ref policies)
+                if policies.iter().any(|policy|
+                    policy.requested_models == ["public-*"]
+                    && policy.served_models == ["backend-*"]
+                    && policy.routes == ["primary"]
+                    && policy.time_windows.first().is_some_and(|window|
+                        window.days.len() == 7
+                        && window.start_utc == "00:00"
+                        && window.end_utc == "23:59")
+                    && policy.max_concurrent_sessions == Some(2)
+                    && policy.daily_session_starts == Some(10))
         ));
 
         let created = service
@@ -304,6 +349,15 @@ mod tests {
         headers.insert("x-api-key", HeaderValue::from_str(&raw).unwrap());
         let context = service.authenticate(&headers).unwrap().unwrap();
         assert!(context.allows_model("chat", "public-v1"));
+<<<<<<< HEAD
+        let scope = context
+            .authorization_scope_for("chat", Some("public-v1"))
+            .unwrap();
+        assert!(scope.allows_candidate(
+            "provider-a",
+            Some("primary"),
+            "backend-v1",
+=======
         assert_eq!(context.effective_limits().max_concurrent_sessions, Some(2));
         assert!(matches!(
             service.dispatch_access(&actor, AccessOperation::ListPolicies),
@@ -321,6 +375,7 @@ mod tests {
             "provider-a",
             None,
             "backend-v2",
+>>>>>>> master
             crate::upstream::InferenceEndpoint::ChatCompletions
         ));
         assert!(!scope.allows_candidate(
