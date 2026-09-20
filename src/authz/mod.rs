@@ -62,32 +62,22 @@ impl AuthContext {
 
     pub fn authorization_scope(
         &self,
-        endpoint: &str,
+        endpoint: crate::upstream::InferenceEndpoint,
         requested_model: &str,
-    ) -> crate::upstream::AuthorizationScope {
-        let identity = self.identity.clone();
-        let policy = Arc::clone(&self.policy);
-        let Some(endpoint) = Endpoint::parse(endpoint) else {
-            return crate::upstream::AuthorizationScope::restricted(|_, _, _, _| false);
-        };
-        let requested_model = requested_model.to_owned();
-        crate::upstream::AuthorizationScope::restricted(
+    ) -> Result<crate::upstream::AuthorizationScope, AuthError> {
+        let policy_endpoint = inference_endpoint(endpoint);
+        let scope = self.policy.authorize(
+            &self.identity,
+            policy_endpoint,
+            Some(requested_model),
+            chrono::Utc::now(),
+        )?;
+        Ok(crate::upstream::AuthorizationScope::restricted(
             move |provider_id, route_id, served_model, candidate_endpoint| {
-                if inference_endpoint(candidate_endpoint) != endpoint {
-                    return false;
-                }
-                policy
-                    .authorize(
-                        &identity,
-                        endpoint,
-                        Some(&requested_model),
-                        chrono::Utc::now(),
-                    )
-                    .is_ok_and(|scope| {
-                        scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
-                    })
+                inference_endpoint(candidate_endpoint) == policy_endpoint
+                    && scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
             },
-        )
+        ))
     }
 
     pub fn effective_limits(&self) -> LimitSet {
@@ -447,9 +437,14 @@ fn inference_endpoint(endpoint: crate::upstream::InferenceEndpoint) -> Endpoint 
 
 #[cfg(test)]
 mod tests {
-    use super::AuthzService;
+    use super::{
+        AuthContext, AuthRequestId, AuthzService, Endpoint, LimitSet, PolicyBinding, PolicyEffect,
+        PolicyIdentity, PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject,
+    };
     use crate::config::{AuthConfig, AuthMode};
     use axum::http::{HeaderMap, HeaderValue};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     #[test]
     fn key_lifecycle_uses_rich_snapshot_and_revokes_immediately() {
@@ -486,5 +481,73 @@ mod tests {
         assert!(service.authenticate(&headers).is_err());
         drop(service);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn requested_alias_and_served_backend_are_authorized_in_separate_dimensions() {
+        let identity = PolicyIdentity {
+            request_id: AuthRequestId::new(),
+            key_id: "key_alias".into(),
+            key_prefix: "llmc_alias".into(),
+            principal_id: "usr_alias".into(),
+            policy_epoch: 1,
+        };
+        let rule = PolicyRule {
+            id: "allow-alias-remap".into(),
+            effect: PolicyEffect::Allow,
+            binding: PolicyBinding {
+                subject: PolicySubject::Principal(identity.principal_id.clone()),
+            },
+            matcher: PolicyMatcher::new(
+                [Endpoint::ChatCompletions],
+                ["public-alias".into()],
+                ["provider/backend-model".into()],
+                ["provider-a".into()],
+                Vec::<String>::new(),
+            )
+            .unwrap(),
+            windows: Vec::new(),
+            limits: LimitSet::default(),
+            management_permissions: HashSet::new(),
+        };
+        let policy = Arc::new(PolicySnapshot::new(
+            1,
+            vec![rule],
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        let context = AuthContext {
+            auth_request_id: identity.request_id.as_str().to_string(),
+            key_id: identity.key_id.clone(),
+            principal_id: identity.principal_id.clone(),
+            identity,
+            policy,
+        };
+
+        let scope = context
+            .authorization_scope(
+                crate::upstream::InferenceEndpoint::ChatCompletions,
+                "public-alias",
+            )
+            .expect("the original requested alias is authorized");
+
+        assert!(scope.allows_candidate(
+            "provider-a",
+            None,
+            "provider/backend-model",
+            crate::upstream::InferenceEndpoint::ChatCompletions,
+        ));
+        assert!(!scope.allows_candidate(
+            "provider-a",
+            None,
+            "public-alias",
+            crate::upstream::InferenceEndpoint::ChatCompletions,
+        ));
+        assert!(!scope.allows_candidate(
+            "provider-b",
+            None,
+            "provider/backend-model",
+            crate::upstream::InferenceEndpoint::ChatCompletions,
+        ));
     }
 }

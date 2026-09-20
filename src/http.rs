@@ -387,25 +387,21 @@ fn auth_failure_response(path: &str, failure: crate::authz::AuthFailure) -> Resp
     response
 }
 
-fn authorize_model(
+fn authorize_inference(
     context: Option<&crate::authz::AuthContext>,
-    endpoint: &str,
-    requested: &str,
-    _served: &str,
-) -> AppResult<()> {
-    let Some(context) = context else {
-        return Ok(());
-    };
-    // Candidate-specific served-model/provider/route constraints are evaluated
-    // together by AuthorizationScope at dispatch. Evaluating the served model
-    // here as another requested model conflates two independent dimensions.
-    if context.allows_model(endpoint, requested) {
-        Ok(())
-    } else {
-        Err(AppError::forbidden(
-            "the API key is not authorized for the requested model",
-        ))
-    }
+    endpoint: crate::upstream::InferenceEndpoint,
+    requested_model: &str,
+) -> AppResult<crate::upstream::AuthorizationScope> {
+    context.map_or_else(
+        || Ok(crate::upstream::AuthorizationScope::unrestricted()),
+        |context| {
+            context
+                .authorization_scope(endpoint, requested_model)
+                .map_err(|_| {
+                    AppError::forbidden("the API key is not authorized for the requested model")
+                })
+        },
+    )
 }
 
 fn acquire_inference_session(
@@ -419,17 +415,6 @@ fn acquire_inference_session(
             .map_err(|err| AppError::forbidden(err.to_string())),
         None => Ok(None),
     }
-}
-
-fn authorization_scope(
-    context: Option<&crate::authz::AuthContext>,
-    endpoint: &str,
-    requested_model: &str,
-) -> crate::upstream::AuthorizationScope {
-    context.map_or_else(
-        crate::upstream::AuthorizationScope::unrestricted,
-        |context| context.authorization_scope(endpoint, requested_model),
-    )
 }
 
 /// Route-level response middleware (D13 R1 MED): stamp `no-store` + the dashboard
@@ -1593,11 +1578,10 @@ async fn post_responses(
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let served = gateway.resolve_request_model(&request.model).await.0;
-    authorize_model(
+    let authorization = authorize_inference(
         auth.as_ref().map(|value| &value.0),
-        "responses",
+        crate::upstream::InferenceEndpoint::Responses,
         &requested,
-        &served,
     )?;
     let auth = auth.map(|value| value.0);
     let lease = acquire_inference_session(&gateway, auth.as_ref())?;
@@ -1607,7 +1591,7 @@ async fn post_responses(
         .stream_responses_authorized_with_context(
             request,
             api_call_id.map(|extension| extension.0.0),
-            authorization_scope(auth.as_ref(), "responses", &requested),
+            authorization,
             crate::upstream::InferenceEndpoint::Responses,
             auth,
         )
@@ -1722,17 +1706,23 @@ async fn responses_ws_serve(
     request.stream = true;
 
     let requested = request.model.clone();
-    let served = gateway.resolve_request_model(&requested).await.0;
-    if authorize_model(auth.as_ref(), "responses", &requested, &served).is_err() {
-        let _ = send_responses_ws_error(
-            &mut sink,
-            "permission_denied",
-            "the API key is not authorized for the requested model",
-        )
-        .await;
-        let _ = sink.send(Message::Close(None)).await;
-        return;
-    }
+    let authorization = match authorize_inference(
+        auth.as_ref(),
+        crate::upstream::InferenceEndpoint::Responses,
+        &requested,
+    ) {
+        Ok(authorization) => authorization,
+        Err(_) => {
+            let _ = send_responses_ws_error(
+                &mut sink,
+                "permission_denied",
+                "the API key is not authorized for the requested model",
+            )
+            .await;
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
 
     let _lease = match acquire_inference_session(&gateway, auth.as_ref()) {
         Ok(lease) => lease,
@@ -1749,7 +1739,7 @@ async fn responses_ws_serve(
         .stream_responses_authorized_with_context(
             request,
             None,
-            authorization_scope(auth.as_ref(), "responses", &requested),
+            authorization,
             crate::upstream::InferenceEndpoint::Responses,
             auth,
         )
@@ -1879,11 +1869,10 @@ async fn handle_count_tokens(
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
-    authorize_model(
+    let authorization = authorize_inference(
         auth.as_ref(),
-        "count_tokens",
+        crate::upstream::InferenceEndpoint::CountTokens,
         &original_model,
-        &resolved_model,
     )?;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let roles = gateway
@@ -1926,7 +1915,7 @@ async fn handle_count_tokens(
     )
     .with_thinking_override(thinking_override)
     .with_authorization(
-        authorization_scope(auth.as_ref(), "count_tokens", &original_model),
+        authorization,
         crate::upstream::InferenceEndpoint::CountTokens,
     );
 
@@ -1956,11 +1945,10 @@ async fn post_chat_completions(
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
-    authorize_model(
+    let authorization = authorize_inference(
         auth.as_ref().map(|value| &value.0),
-        "chat",
+        crate::upstream::InferenceEndpoint::ChatCompletions,
         &requested,
-        &model,
     )?;
     let auth = auth.map(|value| value.0);
     let lease = acquire_inference_session(&gateway, auth.as_ref())?;
@@ -1975,7 +1963,7 @@ async fn post_chat_completions(
         .stream_responses_authorized_with_context(
             responses_request,
             api_call_id.map(|extension| extension.0.0),
-            authorization_scope(auth.as_ref(), "chat", &requested),
+            authorization,
             crate::upstream::InferenceEndpoint::ChatCompletions,
             auth,
         )
@@ -1995,32 +1983,31 @@ async fn post_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
-    let requested_model = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    if let Some(context) = auth.as_ref() {
-        let model = requested_model
-            .as_deref()
+    let authorization = if let Some(context) = auth.as_ref() {
+        let model = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .ok_or_else(|| AppError::bad_request("request body must include a model"))?;
-        authorize_model(Some(&context.0), "completions", model, model)?;
-    }
+        authorize_inference(
+            Some(&context.0),
+            crate::upstream::InferenceEndpoint::Completions,
+            &model,
+        )?
+    } else {
+        crate::upstream::AuthorizationScope::unrestricted()
+    };
     let auth = auth.map(|value| value.0);
     let lease = acquire_inference_session(&gateway, auth.as_ref())?;
     let response = gateway
         .upstream_client()
         .proxy_completions(
-            crate::upstream::ProxyCompletionsRequest::new(headers, body).with_authorization(
-                authorization_scope(
-                    auth.as_ref(),
-                    "completions",
-                    requested_model.as_deref().unwrap_or_default(),
-                ),
-            ),
+            crate::upstream::ProxyCompletionsRequest::new(headers, body)
+                .with_authorization(authorization),
         )
         .await?;
     Ok(proxy_upstream_response(response, lease))
@@ -2034,7 +2021,11 @@ async fn handle_post_messages(
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
-    authorize_model(auth.as_ref(), "messages", &requested, &model)?;
+    let authorization = authorize_inference(
+        auth.as_ref(),
+        crate::upstream::InferenceEndpoint::Messages,
+        &requested,
+    )?;
     let lease = acquire_inference_session(&gateway, auth.as_ref())?;
     let wants_stream = request.stream;
     let suppress_reasoning = !matches!(
@@ -2047,7 +2038,7 @@ async fn handle_post_messages(
         .stream_responses_authorized_with_context(
             responses_request,
             api_call_id,
-            authorization_scope(auth.as_ref(), "messages", &requested),
+            authorization,
             crate::upstream::InferenceEndpoint::Messages,
             auth,
         )
