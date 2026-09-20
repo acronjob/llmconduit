@@ -7344,6 +7344,106 @@ fn remove_auth_store(path: &std::path::Path) {
 }
 
 #[tokio::test]
+async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
+    let (authz, delegated_key, store_path) = scoped_authz(&["*"], &["*"]);
+    let env = d13_env(true);
+    let dashboard_auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "127.0.0.1:8765".parse().unwrap(),
+        &env,
+    )
+    .expect("dashboard auth builds")
+    .auth;
+    let gateway = Arc::new(
+        test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&dashboard_auth)))
+            .with_authz(authz),
+    );
+    let app = llmconduit::http::build_router(
+        gateway,
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    );
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauthenticated
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+
+    let (session, _) = dashboard_auth.issue_session();
+    let summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/summary")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary_body = d13_json(summary).await;
+    assert_eq!(summary_body["actor"]["kind"], "bootstrap");
+    assert!(summary_body["counts"]["api_keys"].as_u64().unwrap() >= 2);
+
+    let delegated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/api-keys")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {delegated_key}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delegated.status(), StatusCode::FORBIDDEN);
+
+    let missing_csrf = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/auth/api-keys/key_bootstrap/revoke")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
 async fn enforced_auth_rejects_missing_invalid_and_wrong_endpoint_before_dispatch() {
     let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
     let upstream = MockUpstream::default();
