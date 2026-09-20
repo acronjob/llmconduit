@@ -1888,6 +1888,46 @@ impl UpstreamClient for ReqwestUpstreamClient {
 }
 
 impl FailoverUpstreamClient {
+    fn provider_is_authorized(
+        &self,
+        provider_index: usize,
+        backend: &BackendChatRequest,
+    ) -> bool {
+        self.providers.get(provider_index).is_some_and(|provider| {
+            let model = provider
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&backend.request.model);
+            backend.authorization.allows_candidate(
+                &provider.name,
+                backend.authorization_route.as_deref(),
+                model,
+                backend.endpoint,
+            )
+        })
+    }
+
+    fn authorized_provider_indices(
+        &self,
+        provider_indices: Vec<usize>,
+        backend: &BackendChatRequest,
+    ) -> Vec<usize> {
+        provider_indices
+            .into_iter()
+            .filter(|index| self.provider_is_authorized(*index, backend))
+            .collect()
+    }
+
+    fn ensure_any_authorized_provider(&self, backend: &BackendChatRequest) -> AppResult<()> {
+        if (0..self.providers.len()).any(|index| self.provider_is_authorized(index, backend)) {
+            Ok(())
+        } else {
+            Err(AppError::forbidden(
+                "no authorized upstream candidate is available for this request",
+            ))
+        }
+    }
+
     pub fn new(providers: Vec<FailoverUpstreamProvider>, cooldown: Duration) -> Self {
         let states = vec![ProviderCooldownState::default(); providers.len()];
         Self {
@@ -2229,6 +2269,12 @@ impl FailoverUpstreamClient {
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
             let provider_request = Self::request_for_provider(provider, backend);
+            provider_request.authorization.ensure_candidate(
+                &provider.name,
+                provider_request.authorization_route.as_deref(),
+                &provider_request.request.model,
+                provider_request.endpoint,
+            )?;
             // Gap 03: per-attempt provenance. `start_ms` is the wall-clock the dispatch
             // is issued; the provider's on-wire model is `provider_request.request.model`
             // (post `request_for_provider` remap). The attempt's outcome (served / failed)
@@ -2477,6 +2523,12 @@ impl FailoverUpstreamClient {
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
             let provider_request = Self::request_for_provider(provider, backend);
+            provider_request.authorization.ensure_candidate(
+                &provider.name,
+                provider_request.authorization_route.as_deref(),
+                &provider_request.request.model,
+                InferenceEndpoint::CountTokens,
+            )?;
             match provider.client.count_tokens(&provider_request).await {
                 Ok(Some(count)) => return Ok(Some(count)),
                 Ok(None) => {}
@@ -2977,7 +3029,9 @@ impl UpstreamClient for FailoverUpstreamClient {
         backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
-        let provider_indices = self.available_provider_indices();
+        self.ensure_any_authorized_provider(backend)?;
+        let provider_indices =
+            self.authorized_provider_indices(self.available_provider_indices(), backend);
         if provider_indices.is_empty() {
             return Err(self.cooldown_error());
         }
@@ -2990,7 +3044,9 @@ impl UpstreamClient for FailoverUpstreamClient {
     }
 
     async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
-        let provider_indices = self.available_provider_indices();
+        self.ensure_any_authorized_provider(backend)?;
+        let provider_indices =
+            self.authorized_provider_indices(self.available_provider_indices(), backend);
         if provider_indices.is_empty() {
             return Ok(None);
         }
