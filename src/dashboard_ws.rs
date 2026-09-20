@@ -1055,11 +1055,12 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // live tick use — real `active_streams` (live open-flow count) + priced
     // `cost_per_min`/`tokens_per_sec`/true rates — so the strip is honest from the
     // first frame, not a raw-count/`0.0` placeholder.
+    let prices = gateway.price_table();
     let metrics = Some(metrics_snapshot(
         &metrics_view,
         metrics_seq,
         snapshot_active,
-        gateway.price_table(),
+        &prices,
     ));
     let topo = gateway.provider_health_publisher().latest();
     let mut last_topology_version = topo.version;
@@ -1173,7 +1174,8 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                     // Gap 01: the live tick carries the live open-flow count + price table
                     // so `active_streams`/`cost_per_min`/`tokens_per_sec`/true rates are
                     // real (not the old hard-coded `0.0`).
-                    let frame = metric_tick_frame(&view, emit_seq, active, gateway.price_table());
+                    let prices = gateway.price_table();
+                    let frame = metric_tick_frame(&view, emit_seq, active, &prices);
                     match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
                         SendOutcome::Completed => {}
                         SendOutcome::Expired => {

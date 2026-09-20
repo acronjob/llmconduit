@@ -14,6 +14,7 @@ use url::Url;
 pub const OPENROUTER_SOURCE: &str = "openrouter";
 pub const OPENROUTER_SOURCE_URL: &str = "https://openrouter.ai/api/v1";
 pub const OPENROUTER_PRICE_BODY_LIMIT: usize = 2 * 1024 * 1024;
+pub const IMPORTED_PRICE_TABLE: &str = "auth_imported_price_snapshots";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NanoUsd(i64);
@@ -138,13 +139,25 @@ pub struct OpenRouterPricingClient {
 
 impl OpenRouterPricingClient {
     pub fn new(total_timeout: Duration, response_limit: usize) -> Result<Self, PricingError> {
+        Self::with_base_url(
+            total_timeout,
+            response_limit,
+            Url::parse(OPENROUTER_SOURCE_URL).expect("static OpenRouter URL"),
+        )
+    }
+
+    fn with_base_url(
+        total_timeout: Duration,
+        response_limit: usize,
+        base_url: Url,
+    ) -> Result<Self, PricingError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             client,
-            base_url: Url::parse(OPENROUTER_SOURCE_URL).expect("static OpenRouter URL"),
+            base_url,
             response_limit,
             total_timeout,
         })
@@ -328,7 +341,7 @@ fn range(values: impl Iterator<Item = NanoUsd>) -> Option<PriceRange> {
 
 pub fn migrate_pricing_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS auth_price_snapshots (
+        "CREATE TABLE IF NOT EXISTS auth_imported_price_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT NOT NULL,
             source_url TEXT NOT NULL,
@@ -351,7 +364,7 @@ pub fn migrate_pricing_schema(conn: &Connection) -> rusqlite::Result<()> {
             UNIQUE(source, fetched_at_ms, model_id, endpoint_id)
         );
         CREATE INDEX IF NOT EXISTS auth_price_model_fetched_idx
-            ON auth_price_snapshots(model_id, fetched_at_ms DESC);",
+            ON auth_imported_price_snapshots(model_id, fetched_at_ms DESC);",
     )
 }
 
@@ -364,7 +377,7 @@ pub fn persist_imported_price(
     let mut inserted = 0;
     for endpoint in &price.endpoints {
         inserted += tx.execute(
-            "INSERT OR IGNORE INTO auth_price_snapshots (
+            "INSERT OR IGNORE INTO auth_imported_price_snapshots (
                 source, source_url, fetched_at_ms, model_id, endpoint_id,
                 prompt_nano_usd_per_token, completion_nano_usd_per_token,
                 cached_nano_usd_per_token, prompt_min_nano_usd,
@@ -401,6 +414,8 @@ pub fn persist_imported_price(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const RESPONSE: &[u8] = br#"{
       "data": {"id":"openai/gpt-4", "endpoints":[
@@ -451,7 +466,7 @@ mod tests {
         assert_eq!(persist_imported_price(&mut conn, &snapshot).unwrap(), 0);
         let row: (i64, i64, String) = conn
             .query_row(
-                "SELECT prompt_nano_usd_per_token, prompt_mean_nano_usd, confidence FROM auth_price_snapshots WHERE endpoint_id='a'",
+                "SELECT prompt_nano_usd_per_token, prompt_mean_nano_usd, confidence FROM auth_imported_price_snapshots WHERE endpoint_id='a'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -466,5 +481,65 @@ mod tests {
           {"tag":"b","pricing":{"prompt":"0.1","completion":"0.2"}}
         ]}}"#;
         assert!(parse_endpoint_prices(body).unwrap().cached.is_none());
+    }
+
+    async fn test_client(
+        server: &MockServer,
+        timeout: Duration,
+        limit: usize,
+    ) -> OpenRouterPricingClient {
+        OpenRouterPricingClient::with_base_url(
+            timeout,
+            limit,
+            Url::parse(&format!("{}/api/v1", server.uri())).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetch_model_enforces_auth_status_body_limit_and_timeout() {
+        let status_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/models/openai/gpt-4/endpoints"))
+            .and(header("authorization", "Bearer management-secret"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&status_server)
+            .await;
+        let error = test_client(&status_server, Duration::from_secs(1), 1024)
+            .await
+            .fetch_model("openai/gpt-4", "management-secret")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, PricingError::Http(status) if status == reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+
+        let body_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 65]))
+            .mount(&body_server)
+            .await;
+        let error = test_client(&body_server, Duration::from_secs(1), 64)
+            .await
+            .fetch_model("openai/gpt-4", "management-secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PricingError::BodyTooLarge));
+
+        let timeout_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_bytes(RESPONSE),
+            )
+            .mount(&timeout_server)
+            .await;
+        let error = test_client(&timeout_server, Duration::from_millis(10), 1024)
+            .await
+            .fetch_model("openai/gpt-4", "management-secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PricingError::Request(ref request) if request.is_timeout()));
     }
 }

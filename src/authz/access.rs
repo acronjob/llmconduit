@@ -14,11 +14,16 @@ impl AccessBackend for AuthzService {
     ) -> AccessFuture<'a> {
         let service = self.clone();
         let actor = actor.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || service.dispatch_access(&actor, operation))
-                .await
-                .map_err(|error| internal(format!("auth management worker failed: {error}")))?
-        })
+        match operation {
+            AccessOperation::SyncPricing(request) => {
+                Box::pin(async move { service.sync_openrouter_pricing(actor, request).await })
+            }
+            operation => Box::pin(async move {
+                tokio::task::spawn_blocking(move || service.dispatch_access(&actor, operation))
+                    .await
+                    .map_err(|error| internal(format!("auth management worker failed: {error}")))?
+            }),
+        }
     }
 }
 
@@ -45,6 +50,7 @@ impl AuthzService {
                 | AccessOperation::RevokeSession(_)
                 | AccessOperation::WritePricing(_)
         );
+        let changes_pricing = matches!(operation, AccessOperation::WritePricing(_));
         let result = match operation {
             AccessOperation::CreateApiKey(body) => {
                 let expires_at = body
@@ -80,6 +86,10 @@ impl AuthzService {
         }?;
         if mutates {
             self.reload_locked(inner, &store).map_err(internal)?;
+        }
+        if changes_pricing {
+            self.refresh_effective_prices_locked(inner, &store)
+                .map_err(internal)?;
         }
         Ok(result)
     }
@@ -367,6 +377,26 @@ mod tests {
             service.dispatch_access(&actor, AccessOperation::Audit),
             Ok(AccessResult::Audit(ref events)) if !events.is_empty()
         ));
+        let imported = crate::openrouter_pricing::OpenRouterPriceSnapshot {
+            source_url:
+                "https://openrouter.ai/api/v1/models/vendor/model-a/endpoints".to_string(),
+            fetched_at_ms: 1_700_000_000_000,
+            price: crate::openrouter_pricing::parse_endpoint_prices(
+                br#"{"data":{"id":"model-a","endpoints":[{"tag":"provider-a","pricing":{"prompt":"0.000000003","completion":"0.000000004"}}]}}"#,
+            )
+            .unwrap(),
+        };
+        {
+            let inner = service.inner().unwrap();
+            let mut store = inner.store.lock().unwrap();
+            store.persist_imported_price(&actor, &imported).unwrap();
+            service
+                .refresh_effective_prices_locked(inner, &store)
+                .unwrap();
+        }
+        let effective = service.effective_price("model-a").unwrap();
+        assert_eq!(effective.input_per_1k, 0.000003);
+        assert_eq!(effective.output_per_1k, 0.000004);
         assert!(matches!(
             service.dispatch_access(
                 &actor,
@@ -379,12 +409,15 @@ mod tests {
                     }],
                 })
             ),
-            Ok(AccessResult::Pricing(ref prices)) if prices.len() == 1
+            Ok(AccessResult::Pricing(ref prices)) if prices.len() == 2
         ));
         assert!(matches!(
             service.dispatch_access(&actor, AccessOperation::Pricing),
-            Ok(AccessResult::Pricing(ref prices)) if prices.len() == 1
+            Ok(AccessResult::Pricing(ref prices)) if prices.len() == 2
         ));
+        let effective = service.effective_price("model-a").unwrap();
+        assert_eq!(effective.input_per_1k, 0.001);
+        assert_eq!(effective.output_per_1k, 0.002);
 
         drop(service);
         let _ = std::fs::remove_file(path);

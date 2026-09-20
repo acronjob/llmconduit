@@ -5539,6 +5539,47 @@ model_profiles:
         assert!(!ModelPrice::without_cached(1.0, 2.0).cached_price_configured);
     }
 
+    #[test]
+    fn provider_metrics_targets_round_trip_and_validate_at_resolution() {
+        let yaml = r#"
+upstream_base_url: http://127.0.0.1:8000/v1
+metrics_url: http://127.0.0.1:8000/metrics
+metrics_source: vllm
+upstreams:
+  - name: sglang-a
+    upstream_base_url: http://127.0.0.1:30000/v1
+    metrics_url: http://127.0.0.1:30000/metrics
+    metrics_source: sglang
+    fallback_upstreams:
+      - name: backup
+        upstream_base_url: http://127.0.0.1:30001/v1
+        metrics_url: http://127.0.0.1:30001/metrics
+        metrics_source: vllm
+"#;
+        let persisted: PersistedConfig = serde_yaml::from_str(yaml).unwrap();
+        let encoded = serde_yaml::to_string(&persisted).unwrap();
+        let reparsed: PersistedConfig = serde_yaml::from_str(&encoded).unwrap();
+        assert_eq!(persisted, reparsed);
+        let resolved = Config::from_persisted(&persisted).unwrap();
+        assert_eq!(resolved.provider_metrics_targets.len(), 3);
+
+        let mut missing_source = persisted.clone();
+        missing_source.metrics_source = None;
+        assert!(
+            Config::from_persisted(&missing_source)
+                .unwrap_err()
+                .contains("metrics_source is required")
+        );
+
+        let mut wrong_path = persisted;
+        wrong_path.metrics_url = Some("http://127.0.0.1:8000/private".to_string());
+        assert!(
+            Config::from_persisted(&wrong_path)
+                .unwrap_err()
+                .contains("invalid root.metrics_url")
+        );
+    }
+
     /// Gap 07 review round 1, finding 3 — a NO-cache-rate price (`without_cached`,
     /// numeric `cached_per_1k: 0.0`, presence `false`) MUST round-trip as STILL NOT
     /// configured. The serialized form carries BOTH `cached_per_1k: 0.0` AND

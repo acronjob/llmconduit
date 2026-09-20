@@ -1082,7 +1082,8 @@ pub async fn dashboard_flow_detail(
 pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response {
     let (view, metrics_seq) = gateway.metrics().view_with_seq();
     let active = active_stream_count(gateway.as_ref());
-    let body = metrics_body(&view, metrics_seq, active, gateway.price_table());
+    let prices = gateway.price_table();
+    let body = metrics_body(&view, metrics_seq, active, &prices);
     json_no_store(StatusCode::OK, &body)
 }
 
@@ -1092,7 +1093,8 @@ pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response 
 pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response {
     let snapshot = gateway.provider_health_publisher().latest();
     let view = gateway.metrics().view();
-    let body = topology_body(&snapshot, gateway.price_table(), &view.window_1m);
+    let prices = gateway.price_table();
+    let body = topology_body(&snapshot, &prices, &view.window_1m);
     json_no_store(StatusCode::OK, &body)
 }
 
@@ -1177,9 +1179,13 @@ pub async fn dashboard_snapshot(
         &cut.metrics,
         cut.cursors.metrics_seq,
         active,
-        prices,
+        &prices,
     ));
-    let topology = Some(topology_body(&cut.topology, prices, &cut.metrics.window_1m));
+    let topology = Some(topology_body(
+        &cut.topology,
+        &prices,
+        &cut.metrics.window_1m,
+    ));
     json_no_store(
         StatusCode::OK,
         &SnapshotResponse {
