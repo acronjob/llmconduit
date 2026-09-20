@@ -4,13 +4,22 @@
 //! into a request/key usage record because Prometheus samples have no trustworthy
 //! per-request correlation.
 
+use axum::extract::Extension;
+use axum::routing::get;
+use axum::{Json, Router};
 use futures::StreamExt;
+use futures::stream;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 pub const DEFAULT_METRICS_BODY_LIMIT: usize = 512 * 1024;
+/// The configured target list is operator-controlled but still bounded so a bad
+/// configuration cannot turn one refresh into unbounded work or retained state.
+pub const MAX_PROVIDER_METRICS_TARGETS: usize = 64;
+const MAX_CONCURRENT_SCRAPES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +73,128 @@ impl ProviderMetricsTarget {
             source,
         })
     }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+}
+
+/// A body-only dashboard projection. Samples are sorted by provider and carry their
+/// own fetch timestamps; an empty list means metrics are unavailable, never zero.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProviderMetricsSnapshot {
+    pub generated_at_ms: u64,
+    pub providers: Vec<ProviderCacheMetrics>,
+}
+
+/// Outcome of one best-effort refresh pass. Individual scrape errors are counted but
+/// intentionally do not fail the pass or evict the provider's last good sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderMetricsRefresh {
+    pub attempted: usize,
+    pub updated: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+/// Last-good provider cache samples shared by the optional refresh task and dashboard.
+/// The registry has no inference dependency: scrape failure only preserves stale data.
+#[derive(Clone, Default)]
+pub struct ProviderMetricsRegistry {
+    samples: Arc<RwLock<BTreeMap<String, ProviderCacheMetrics>>>,
+}
+
+impl ProviderMetricsRegistry {
+    pub fn snapshot(&self) -> ProviderMetricsSnapshot {
+        let providers = self
+            .samples
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        ProviderMetricsSnapshot {
+            generated_at_ms: now_ms(),
+            providers,
+        }
+    }
+
+    /// Refresh configured targets concurrently with a fixed fan-out. Targets after the
+    /// hard cap are skipped; providers removed from configuration are pruned, while a
+    /// configured provider whose scrape fails keeps its last good sample.
+    pub async fn refresh(
+        &self,
+        scraper: &ProviderMetricsScraper,
+        targets: &[ProviderMetricsTarget],
+    ) -> ProviderMetricsRefresh {
+        let bounded: Vec<_> = targets
+            .iter()
+            .take(MAX_PROVIDER_METRICS_TARGETS)
+            .cloned()
+            .collect();
+        let configured: BTreeSet<_> = bounded
+            .iter()
+            .map(|target| target.provider.clone())
+            .collect();
+        self.samples
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|provider, _| configured.contains(provider));
+
+        let results = stream::iter(bounded.into_iter().map(|target| {
+            let scraper = scraper.clone();
+            async move {
+                let provider = target.provider.clone();
+                (provider, scraper.scrape(&target).await)
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_SCRAPES)
+        .collect::<Vec<_>>()
+        .await;
+
+        let attempted = results.len();
+        let mut updated = 0usize;
+        for (provider, result) in results {
+            if let Ok(sample) = result {
+                self.samples
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(provider, sample);
+                updated += 1;
+            }
+        }
+        ProviderMetricsRefresh {
+            attempted,
+            updated,
+            failed: attempted.saturating_sub(updated),
+            skipped: targets.len().saturating_sub(attempted),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_sample(&self, sample: ProviderCacheMetrics) {
+        self.samples
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(sample.provider.clone(), sample);
+    }
+}
+
+/// Isolated dashboard route; the main dashboard router remains responsible for wrapping
+/// it in the existing authentication and no-store middleware.
+pub fn dashboard_routes<S>(registry: ProviderMetricsRegistry) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/dashboard/api/provider-metrics", get(dashboard_snapshot))
+        .layer(Extension(registry))
+}
+
+async fn dashboard_snapshot(
+    Extension(registry): Extension<ProviderMetricsRegistry>,
+) -> Json<ProviderMetricsSnapshot> {
+    Json(registry.snapshot())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -273,6 +404,9 @@ fn mean(samples: &BTreeMap<&str, Vec<f64>>, name: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     #[test]
     fn vllm_parser_whitelists_and_aggregates_cache_counters() {
@@ -347,5 +481,93 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_retains_last_good_sample_and_prunes_removed_providers() {
+        let registry = ProviderMetricsRegistry::default();
+        registry.record_sample(ProviderCacheMetrics {
+            provider: "kept".into(),
+            source: MetricsSource::Vllm,
+            fetched_at_ms: 1,
+            cache_hits: Some(2.0),
+            cache_queries: Some(4.0),
+            cache_hit_rate: Some(0.5),
+            kv_cache_usage: None,
+            data_quality: "derived",
+        });
+        registry.record_sample(ProviderCacheMetrics {
+            provider: "removed".into(),
+            source: MetricsSource::Sglang,
+            fetched_at_ms: 1,
+            cache_hits: None,
+            cache_queries: None,
+            cache_hit_rate: Some(0.2),
+            kv_cache_usage: None,
+            data_quality: "derived",
+        });
+        let target = ProviderMetricsTarget::from_operator_config(
+            "kept",
+            Url::parse("http://127.0.0.1:1/metrics").unwrap(),
+            MetricsSource::Vllm,
+        )
+        .unwrap();
+        let scraper = ProviderMetricsScraper::new(
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            1024,
+        )
+        .unwrap();
+
+        let report = registry.refresh(&scraper, &[target]).await;
+
+        assert_eq!(
+            report,
+            ProviderMetricsRefresh {
+                attempted: 1,
+                updated: 0,
+                failed: 1,
+                skipped: 0,
+            }
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.providers.len(), 1);
+        assert_eq!(snapshot.providers[0].provider, "kept");
+        assert_eq!(snapshot.providers[0].cache_hit_rate, Some(0.5));
+    }
+
+    #[tokio::test]
+    async fn dashboard_route_exposes_sorted_derived_samples_without_fabricated_zeros() {
+        let registry = ProviderMetricsRegistry::default();
+        registry.record_sample(parse_provider_metrics(
+            "z-provider",
+            MetricsSource::Sglang,
+            "sglang:cache_hit_rate 0.25\n",
+            8,
+        ));
+        registry.record_sample(parse_provider_metrics(
+            "a-provider",
+            MetricsSource::Vllm,
+            "",
+            7,
+        ));
+        let response = dashboard_routes::<()>(registry)
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/api/provider-metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["providers"][0]["provider"], "a-provider");
+        assert!(value["providers"][0]["cache_hit_rate"].is_null());
+        assert_eq!(value["providers"][0]["data_quality"], "derived");
+        assert_eq!(value["providers"][1]["provider"], "z-provider");
+        assert_eq!(value["providers"][1]["cache_hit_rate"], 0.25);
     }
 }
