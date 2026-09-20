@@ -77,57 +77,8 @@ use crate::vision::ReqwestVisionClient;
 use std::sync::Arc;
 use std::time::Duration;
 
-const PROVIDER_METRICS_TARGETS_ENV: &str = "LLMCONDUIT_PROVIDER_METRICS_TARGETS";
 const PROVIDER_METRICS_INTERVAL_ENV: &str = "LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS";
 const DEFAULT_PROVIDER_METRICS_INTERVAL_SECS: u64 = 30;
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OperatorProviderMetricsTarget {
-    provider: String,
-    url: url::Url,
-    source: String,
-}
-
-fn parse_provider_metrics_targets(
-    raw: &str,
-) -> Result<Vec<crate::provider_metrics::ProviderMetricsTarget>, String> {
-    let configured: Vec<OperatorProviderMetricsTarget> =
-        serde_json::from_str(raw).map_err(|err| format!("invalid JSON: {err}"))?;
-    configured
-        .into_iter()
-        .map(|target| {
-            let source = match target.source.trim().to_ascii_lowercase().as_str() {
-                "vllm" => crate::provider_metrics::MetricsSource::Vllm,
-                "sglang" => crate::provider_metrics::MetricsSource::Sglang,
-                other => return Err(format!("unsupported metrics source {other:?}")),
-            };
-            crate::provider_metrics::ProviderMetricsTarget::from_operator_config(
-                target.provider,
-                target.url,
-                source,
-            )
-            .map_err(|err| err.to_string())
-        })
-        .collect()
-}
-
-fn provider_metrics_targets_from_env() -> Vec<crate::provider_metrics::ProviderMetricsTarget> {
-    let Ok(raw) = std::env::var(PROVIDER_METRICS_TARGETS_ENV) else {
-        return Vec::new();
-    };
-    match parse_provider_metrics_targets(&raw) {
-        Ok(targets) => targets,
-        Err(err) => {
-            tracing::warn!(
-                variable = PROVIDER_METRICS_TARGETS_ENV,
-                error = %err,
-                "ignoring invalid operator-configured provider metrics targets"
-            );
-            Vec::new()
-        }
-    }
-}
 
 fn provider_metrics_interval_from_env() -> Duration {
     let seconds = std::env::var(PROVIDER_METRICS_INTERVAL_ENV)
@@ -219,7 +170,7 @@ pub fn build_app_with_gateway_and_options(
     };
     let provider_metrics = crate::provider_metrics::ProviderMetricsRegistry::default();
     let provider_metrics_targets = if options.with_debug_ui {
-        provider_metrics_targets_from_env()
+        config.provider_metrics_targets.clone()
     } else {
         Vec::new()
     };
@@ -545,32 +496,5 @@ impl From<AppOptions> for RouterOptions {
             with_debug_ui: options.with_debug_ui,
             register_protected_routes: false,
         }
-    }
-}
-
-#[cfg(test)]
-mod provider_metrics_config_tests {
-    use super::parse_provider_metrics_targets;
-
-    #[test]
-    fn operator_metrics_targets_accept_only_fixed_sources_and_metrics_paths() {
-        let valid = r#"[
-            {"provider":"vllm-a","url":"http://127.0.0.1:8000/metrics","source":"vllm"},
-            {"provider":"sglang-b","url":"https://metrics.example/metrics","source":"sglang"}
-        ]"#;
-        assert_eq!(parse_provider_metrics_targets(valid).unwrap().len(), 2);
-
-        assert!(
-            parse_provider_metrics_targets(
-                r#"[{"provider":"bad","url":"http://127.0.0.1/private","source":"vllm"}]"#,
-            )
-            .is_err()
-        );
-        assert!(
-            parse_provider_metrics_targets(
-                r#"[{"provider":"bad","url":"http://127.0.0.1/metrics","source":"prometheus"}]"#,
-            )
-            .is_err()
-        );
     }
 }

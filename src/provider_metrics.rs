@@ -9,7 +9,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use futures::StreamExt;
 use futures::stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,7 +21,7 @@ pub const DEFAULT_METRICS_BODY_LIMIT: usize = 512 * 1024;
 pub const MAX_PROVIDER_METRICS_TARGETS: usize = 64;
 const MAX_CONCURRENT_SCRAPES: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricsSource {
     Vllm,

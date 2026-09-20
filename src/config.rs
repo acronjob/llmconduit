@@ -605,6 +605,7 @@ pub struct Config {
     /// capture sink entirely (zero-op: no thread, no alloc, no fs).
     pub turn_capture_dir: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    pub provider_metrics_targets: Vec<crate::provider_metrics::ProviderMetricsTarget>,
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
@@ -1337,6 +1338,10 @@ pub struct PersistedFallbackUpstream {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_source: Option<crate::provider_metrics::MetricsSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1352,6 +1357,10 @@ pub struct PersistedUpstream {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_source: Option<crate::provider_metrics::MetricsSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
 }
@@ -1366,6 +1375,10 @@ pub struct PersistedConfig {
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_source: Option<crate::provider_metrics::MetricsSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1699,6 +1712,8 @@ impl Default for PersistedConfig {
             upstream_base_url: default_upstream_base_url(),
             upstream_api_key: None,
             upstream_model: None,
+            metrics_url: None,
+            metrics_source: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
@@ -1867,6 +1882,55 @@ impl Config {
             .enumerate()
             .map(parse_upstream)
             .collect::<Result<Vec<_>, String>>()?;
+        let mut provider_metrics_targets = Vec::new();
+        if let Some(target) = parse_provider_metrics_target(
+            "primary",
+            config.metrics_url.as_deref(),
+            config.metrics_source,
+            "root",
+        )? {
+            provider_metrics_targets.push(target);
+        }
+        for (index, (persisted, resolved)) in config
+            .fallback_upstreams
+            .iter()
+            .zip(&fallback_upstreams)
+            .enumerate()
+        {
+            if let Some(target) = parse_provider_metrics_target(
+                &resolved.name,
+                persisted.metrics_url.as_deref(),
+                persisted.metrics_source,
+                &format!("fallback_upstreams[{index}]"),
+            )? {
+                provider_metrics_targets.push(target);
+            }
+        }
+        for (index, (persisted, resolved)) in config.upstreams.iter().zip(&upstreams).enumerate() {
+            if let Some(target) = parse_provider_metrics_target(
+                &resolved.name,
+                persisted.metrics_url.as_deref(),
+                persisted.metrics_source,
+                &format!("upstreams[{index}]"),
+            )? {
+                provider_metrics_targets.push(target);
+            }
+            for (fallback_index, (persisted_fallback, resolved_fallback)) in persisted
+                .fallback_upstreams
+                .iter()
+                .zip(&resolved.fallback_upstreams)
+                .enumerate()
+            {
+                if let Some(target) = parse_provider_metrics_target(
+                    &resolved_fallback.name,
+                    persisted_fallback.metrics_url.as_deref(),
+                    persisted_fallback.metrics_source,
+                    &format!("upstreams[{index}].fallback_upstreams[{fallback_index}]"),
+                )? {
+                    provider_metrics_targets.push(target);
+                }
+            }
+        }
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
         let model_routes = resolve_model_routes(&config.model_routes)?;
@@ -1908,6 +1972,7 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
+            provider_metrics_targets,
             upstreams,
             fallback_upstreams,
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
@@ -2854,6 +2919,31 @@ fn parse_upstream(
             .map(PathBuf::from),
         fallback_upstreams,
     })
+}
+
+fn parse_provider_metrics_target(
+    provider: &str,
+    metrics_url: Option<&str>,
+    metrics_source: Option<crate::provider_metrics::MetricsSource>,
+    path: &str,
+) -> Result<Option<crate::provider_metrics::ProviderMetricsTarget>, String> {
+    let metrics_url = trim_nonempty(metrics_url);
+    match (metrics_url, metrics_source) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(format!("{path}.metrics_source is required with metrics_url")),
+        (None, Some(_)) => Err(format!("{path}.metrics_url is required with metrics_source")),
+        (Some(raw_url), Some(source)) => {
+            let url = Url::parse(&raw_url)
+                .map_err(|err| format!("invalid {path}.metrics_url: {err}"))?;
+            crate::provider_metrics::ProviderMetricsTarget::from_operator_config(
+                provider.to_string(),
+                url,
+                source,
+            )
+            .map(Some)
+            .map_err(|err| format!("invalid {path}.metrics_url: {err}"))
+        }
+    }
 }
 
 fn parse_fallback_upstream(

@@ -500,7 +500,6 @@ LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS
 LLMCONDUIT_MAX_REPLAY_ENTRIES
 LLMCONDUIT_FLATTEN_CONTENT
 LLMCONDUIT_TURN_CAPTURE_DIR
-LLMCONDUIT_PROVIDER_METRICS_TARGETS
 LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS
 BRAVE_SEARCH_API_KEY
 OPENAI_API_KEY
@@ -509,15 +508,19 @@ OPENAI_API_KEY
 `OPENAI_API_KEY` is used as a fallback upstream API key.
 
 Provider cache metrics are optional, dashboard-only aggregate observability.
-Targets are accepted only from the operator environment, never from dashboard
+Targets are accepted only from operator configuration, never from dashboard
 request parameters, and each URL must point exactly at an HTTP(S) `/metrics`
-path. For example:
+path. They may be attached to the primary or any configured/fallback upstream:
+
+```yaml
+upstreams:
+  - name: local-vllm
+    upstream_base_url: http://127.0.0.1:8000/v1
+    metrics_url: http://127.0.0.1:8000/metrics
+    metrics_source: vllm
+```
 
 ```bash
-export LLMCONDUIT_PROVIDER_METRICS_TARGETS='[
-  {"provider":"local-vllm","url":"http://127.0.0.1:8000/metrics","source":"vllm"},
-  {"provider":"local-sglang","url":"http://127.0.0.1:30000/metrics","source":"sglang"}
-]'
 export LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=30
 ```
 
