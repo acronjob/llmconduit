@@ -578,7 +578,7 @@ impl AuthzService {
         use futures::StreamExt;
         use std::collections::HashSet;
 
-        let inner = self.inner().map_err(|message| {
+        self.inner().map_err(|message| {
             crate::dashboard_access::AccessError::new(StatusCode::SERVICE_UNAVAILABLE, message)
         })?;
         let management_key = std::env::var("OPENROUTER_API_KEY")
@@ -626,8 +626,16 @@ impl AuthzService {
             match result {
                 Ok(snapshot) => snapshots.push(snapshot),
                 Err(err) => {
-                    if let Ok(mut store) = inner.store.lock() {
-                        let _ = store.audit_pricing_sync_failure(&actor, &model, &err.to_string());
+                    let service = self.clone();
+                    let audit_actor = actor.clone();
+                    let audit_model = model.clone();
+                    let audit_error = err.to_string();
+                    if let Err(join_error) = tokio::task::spawn_blocking(move || {
+                        service.audit_pricing_sync_failure(&audit_actor, &audit_model, &audit_error)
+                    })
+                    .await
+                    {
+                        tracing::warn!(error = %join_error, "pricing sync failure audit worker failed");
                     }
                     let status = match &err {
                         crate::openrouter_pricing::PricingError::InvalidModelId
@@ -646,14 +654,58 @@ impl AuthzService {
                 }
             }
         }
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.persist_synced_pricing(&actor, &snapshots))
+            .await
+            .map_err(|error| {
+                crate::dashboard_access::AccessError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("pricing persistence worker failed: {error}"),
+                )
+            })?
+    }
+
+    fn audit_pricing_sync_failure(
+        &self,
+        actor: &crate::dashboard_access::ManagementActor,
+        model: &str,
+        error: &str,
+    ) -> Result<(), crate::dashboard_access::AccessError> {
+        use axum::http::StatusCode;
+
+        let inner = self.inner().map_err(|message| {
+            crate::dashboard_access::AccessError::new(StatusCode::SERVICE_UNAVAILABLE, message)
+        })?;
+        inner
+            .store
+            .lock()
+            .map_err(|_| {
+                crate::dashboard_access::AccessError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "auth store lock poisoned",
+                )
+            })?
+            .audit_pricing_sync_failure(actor, model, error)
+    }
+
+    fn persist_synced_pricing(
+        &self,
+        actor: &crate::dashboard_access::ManagementActor,
+        snapshots: &[crate::openrouter_pricing::OpenRouterPriceSnapshot],
+    ) -> Result<crate::dashboard_access::AccessResult, crate::dashboard_access::AccessError> {
+        use axum::http::StatusCode;
+
+        let inner = self.inner().map_err(|message| {
+            crate::dashboard_access::AccessError::new(StatusCode::SERVICE_UNAVAILABLE, message)
+        })?;
         let mut store = inner.store.lock().map_err(|_| {
             crate::dashboard_access::AccessError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "auth store lock poisoned",
             )
         })?;
-        for snapshot in &snapshots {
-            store.persist_imported_price(&actor, snapshot)?;
+        for snapshot in snapshots {
+            store.persist_imported_price(actor, snapshot)?;
         }
         self.refresh_effective_prices_locked(inner, &store)
             .map_err(|message| {
@@ -662,7 +714,7 @@ impl AuthzService {
                     message,
                 )
             })?;
-        store.dispatch_access(&actor, crate::dashboard_access::AccessOperation::Pricing)
+        store.dispatch_access(actor, crate::dashboard_access::AccessOperation::Pricing)
     }
 
     fn inner(&self) -> Result<&Arc<Inner>, String> {
