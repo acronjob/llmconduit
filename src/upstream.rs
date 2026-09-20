@@ -1941,7 +1941,11 @@ impl UpstreamClient for ReqwestUpstreamClient {
 }
 
 impl FailoverUpstreamClient {
-    fn provider_is_authorized(&self, provider_index: usize, backend: &BackendChatRequest) -> bool {
+    fn provider_is_authorized(
+        &self,
+        provider_index: usize,
+        backend: &BackendChatRequest,
+    ) -> bool {
         self.providers.get(provider_index).is_some_and(|provider| {
             let model = provider
                 .upstream_model
