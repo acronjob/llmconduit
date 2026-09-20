@@ -943,8 +943,19 @@ export interface AuthPolicy {
   enabled: boolean;
   subjects: string[];
   endpoints: string[];
-  models: string[];
+  requested_models: string[];
+  served_models: string[];
   providers: string[];
+  routes: string[];
+  time_windows: AuthPolicyTimeWindow[];
+  max_concurrent_sessions: number | null;
+  daily_session_starts: number | null;
+}
+
+export interface AuthPolicyTimeWindow {
+  days: string[];
+  start_utc: string;
+  end_utc: string;
 }
 
 export interface AuthApiKey {
@@ -1021,6 +1032,14 @@ export interface CreateAuthUserRequest {
   display_name: string;
   kind: AuthUser['kind'];
 }
+export interface CreateAuthGroupRequest {
+  name: string;
+  members: string[];
+}
+export interface CreateAuthRoleRequest {
+  name: string;
+  permissions: ManagementPermission[];
+}
 export interface CreateAuthApiKeyRequest {
   principal_id: string;
   name: string;
@@ -1031,8 +1050,13 @@ export interface CreateAuthPolicyRequest {
   effect: AuthPolicy['effect'];
   subjects: string[];
   endpoints: string[];
-  models: string[];
+  requested_models: string[];
+  served_models: string[];
   providers: string[];
+  routes: string[];
+  time_windows: AuthPolicyTimeWindow[];
+  max_concurrent_sessions: number | null;
+  daily_session_starts: number | null;
 }
 
 export function isAuthSummary(v: unknown): v is AuthSummary {
@@ -1059,7 +1083,12 @@ function isAuthRole(v: unknown): v is AuthRole {
 function isAuthPolicy(v: unknown): v is AuthPolicy {
   return isObj(v) && isStr(v.id) && isStr(v.name) && isOneOf(v.effect, ['allow', 'deny'] as const)
     && typeof v.enabled === 'boolean' && isStringArray(v.subjects) && isStringArray(v.endpoints)
-    && isStringArray(v.models) && isStringArray(v.providers);
+    && isStringArray(v.requested_models) && isStringArray(v.served_models)
+    && isStringArray(v.providers) && isStringArray(v.routes)
+    && Array.isArray(v.time_windows) && v.time_windows.every((window) => isObj(window)
+      && isStringArray(window.days) && isStr(window.start_utc) && isStr(window.end_utc))
+    && (v.max_concurrent_sessions === null || isUint(v.max_concurrent_sessions))
+    && (v.daily_session_starts === null || isUint(v.daily_session_starts));
 }
 function isAuthApiKey(v: unknown): v is AuthApiKey {
   return isObj(v) && isStr(v.id) && isStr(v.principal_id) && isStr(v.name) && isStr(v.prefix)
