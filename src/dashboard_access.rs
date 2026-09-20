@@ -76,7 +76,6 @@ impl ManagementActor {
         matches!(self, Self::Bootstrap)
             || matches!(self, Self::Delegated { permissions, .. } if permissions.contains(&permission))
     }
-
 }
 
 #[derive(Debug, Clone, Serialize)]
