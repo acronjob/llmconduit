@@ -359,26 +359,18 @@ impl AuthzService {
         if permissions.is_empty() {
             return Err(AuthError::Forbidden);
         }
-        let store = Arc::clone(&inner.store);
-        let principal_id = context.principal_id.clone();
-        let key_id = context.key_id.clone();
-        let csrf_digest = csrf_digest.to_vec();
-        let policy_epoch = context.identity.policy_epoch;
-        let session = tokio::task::spawn_blocking(move || {
-            store
-                .lock()
-                .map_err(|_| AuthError::PolicyUnavailable)?
-                .create_dashboard_session(
-                    &principal_id,
-                    &key_id,
-                    &csrf_digest,
-                    expires_at,
-                    policy_epoch,
-                )
-                .map_err(|_| AuthError::PolicyUnavailable)
-        })
-        .await
-        .map_err(|_| AuthError::PolicyUnavailable)??;
+        let session = inner
+            .store
+            .lock()
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .create_dashboard_session(
+                &context.principal_id,
+                &context.key_id,
+                csrf_digest,
+                expires_at,
+                context.identity.policy_epoch,
+            )
+            .map_err(|_| AuthError::PolicyUnavailable)?;
         Ok(crate::dashboard_access::ManagementActor::Delegated {
             session_id: session.session_id,
             principal_id: session.principal_id,
@@ -407,17 +399,12 @@ impl AuthzService {
         let Some(inner) = &self.inner else {
             return Ok(None);
         };
-        let store = Arc::clone(&inner.store);
-        let session_id_owned = session_id.to_owned();
-        let session = tokio::task::spawn_blocking(move || {
-            store
-                .lock()
-                .map_err(|_| AuthError::PolicyUnavailable)?
-                .load_dashboard_session(&session_id_owned)
-                .map_err(|_| AuthError::PolicyUnavailable)
-        })
-        .await
-        .map_err(|_| AuthError::PolicyUnavailable)??;
+        let session = inner
+            .store
+            .lock()
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .load_dashboard_session(session_id)
+            .map_err(|_| AuthError::PolicyUnavailable)?;
         let Some(session) = session else {
             return Ok(None);
         };
@@ -440,8 +427,11 @@ impl AuthzService {
             .filter_map(access::wire_permission)
             .collect::<Vec<_>>();
         if permissions.is_empty() {
-            self.revoke_delegated_session_with_reason(session_id, "permission_removed")
-                .await
+            inner
+                .store
+                .lock()
+                .map_err(|_| AuthError::PolicyUnavailable)?
+                .revoke_dashboard_session(session_id, "permission_removed")
                 .map_err(|_| AuthError::PolicyUnavailable)?;
             return Ok(None);
         }
