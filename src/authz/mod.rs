@@ -60,14 +60,29 @@ impl AuthContext {
         })
     }
 
-    pub fn authorization_scope(&self) -> crate::upstream::AuthorizationScope {
+    pub fn authorization_scope(
+        &self,
+        endpoint: &str,
+        requested_model: &str,
+    ) -> crate::upstream::AuthorizationScope {
         let identity = self.identity.clone();
         let policy = Arc::clone(&self.policy);
+        let Some(endpoint) = Endpoint::parse(endpoint) else {
+            return crate::upstream::AuthorizationScope::restricted(|_, _, _, _| false);
+        };
+        let requested_model = requested_model.to_owned();
         crate::upstream::AuthorizationScope::restricted(
-            move |provider_id, route_id, served_model, endpoint| {
-                let endpoint = inference_endpoint(endpoint);
+            move |provider_id, route_id, served_model, candidate_endpoint| {
+                if inference_endpoint(candidate_endpoint) != endpoint {
+                    return false;
+                }
                 policy
-                    .authorize(&identity, endpoint, Some(served_model), chrono::Utc::now())
+                    .authorize(
+                        &identity,
+                        endpoint,
+                        Some(&requested_model),
+                        chrono::Utc::now(),
+                    )
                     .is_ok_and(|scope| {
                         scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
                     })

@@ -729,4 +729,49 @@ mod tests {
             AuthError::PolicyUnavailable
         );
     }
+
+    #[test]
+    fn management_permission_registry_is_complete_and_unique() {
+        let unique = ALL_MANAGEMENT_PERMISSIONS
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(ALL_MANAGEMENT_PERMISSIONS.len(), 19);
+        assert_eq!(unique.len(), ALL_MANAGEMENT_PERMISSIONS.len());
+        assert!(ALL_MANAGEMENT_PERMISSIONS.into_iter().all(
+            |permission| ManagementPermission::parse(permission.as_str()) == Some(permission)
+        ));
+    }
+
+    #[test]
+    fn requested_and_served_model_dimensions_are_independent() {
+        let matcher = PolicyMatcher::new(
+            [Endpoint::ChatCompletions],
+            ["public-alias".into()],
+            ["backend/model-v2".into()],
+            ["provider-a".into()],
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        let snapshot = Arc::new(PolicySnapshot::new(
+            1,
+            vec![rule(
+                "allow-remap",
+                PolicyEffect::Allow,
+                PolicySubject::Principal("usr_a".into()),
+                matcher,
+            )],
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        let scope = snapshot
+            .authorize(
+                &context(1),
+                Endpoint::ChatCompletions,
+                Some("public-alias"),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(scope.allows_candidate(Some("provider-a"), None, Some("backend/model-v2")));
+        assert!(!scope.allows_candidate(Some("provider-a"), None, Some("public-alias")));
+    }
 }

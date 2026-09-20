@@ -115,7 +115,8 @@ fn timestamp(seconds: i64) -> String {
 }
 
 fn internal(message: String) -> AccessError {
-    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    tracing::error!(error = %message, "authorization management operation failed");
+    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
 pub(crate) fn wire_permission(permission: ManagementPermission) -> Option<WirePermission> {
@@ -147,8 +148,9 @@ mod tests {
     use super::*;
     use crate::config::{AuthConfig, AuthMode};
     use crate::dashboard_access::{
-        AccessOperation, AccessPricingInput, AccessResult, CreateApiKeyRequest, CreateGroupRequest,
-        CreatePolicyRequest, CreateRoleRequest, CreateUserRequest, WritePricingRequest,
+        AccessOperation, AccessPricingInput, AccessResult, AccessTimeWindow, CreateApiKeyRequest,
+        CreateGroupRequest, CreatePolicyRequest, CreateRoleRequest, CreateUserRequest,
+        WritePricingRequest,
     };
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -202,6 +204,23 @@ mod tests {
             ),
             Ok(AccessResult::Groups(_))
         ));
+        let constrained_actor = ManagementActor::Delegated {
+            session_id: "session_limited".into(),
+            principal_id: principal_id.clone(),
+            key_id: "key_limited".into(),
+            permissions: vec![WirePermission::RolesWrite, WirePermission::PoliciesWrite].into(),
+        };
+        assert!(
+            service
+                .dispatch_access(
+                    &constrained_actor,
+                    AccessOperation::CreateRole(CreateRoleRequest {
+                        name: "escalated".into(),
+                        permissions: vec![WirePermission::KeysRead],
+                    })
+                )
+                .is_err()
+        );
         assert!(matches!(
             service.dispatch_access(
                 &actor,
@@ -212,17 +231,52 @@ mod tests {
             ),
             Ok(AccessResult::Roles(_))
         ));
+        assert!(
+            service
+                .dispatch_access(
+                    &constrained_actor,
+                    AccessOperation::CreatePolicy(Box::new(CreatePolicyRequest {
+                        name: "escalated policy".into(),
+                        effect: "allow".into(),
+                        subjects: vec![format!("principal:{principal_id}")],
+                        endpoints: vec!["chat".into()],
+                        models: vec!["*".into()],
+                        requested_models: Vec::new(),
+                        served_models: Vec::new(),
+                        providers: Vec::new(),
+                        routes: Vec::new(),
+                        time_windows: Vec::new(),
+                        max_concurrent_sessions: None,
+                        max_daily_session_starts: None,
+                        management_permissions: Vec::new(),
+                    }))
+                )
+                .is_err()
+        );
         assert!(matches!(
             service.dispatch_access(
                 &actor,
-                AccessOperation::CreatePolicy(CreatePolicyRequest {
+                AccessOperation::CreatePolicy(Box::new(CreatePolicyRequest {
                     name: "agent chat".into(),
                     effect: "allow".into(),
                     subjects: vec![format!("principal:{principal_id}")],
                     endpoints: vec!["chat".into()],
-                    models: vec!["public-*".into()],
+                    models: Vec::new(),
+                    requested_models: vec!["public-*".into()],
+                    served_models: vec!["backend-*".into()],
                     providers: vec!["provider-a".into()],
-                })
+                    routes: Vec::new(),
+                    time_windows: vec![AccessTimeWindow {
+                        weekday_mask: 0,
+                        start_minute: 0,
+                        end_minute: 0,
+                        absolute_start_ms: None,
+                        absolute_end_ms: None,
+                    }],
+                    max_concurrent_sessions: Some(2),
+                    max_daily_session_starts: Some(10),
+                    management_permissions: Vec::new(),
+                }))
             ),
             Ok(AccessResult::Policies(_))
         ));
@@ -250,17 +304,24 @@ mod tests {
         headers.insert("x-api-key", HeaderValue::from_str(&raw).unwrap());
         let context = service.authenticate(&headers).unwrap().unwrap();
         assert!(context.allows_model("chat", "public-v1"));
-        let scope = context.authorization_scope();
+        assert_eq!(context.effective_limits().max_concurrent_sessions, Some(2));
+        assert!(matches!(
+            service.dispatch_access(&actor, AccessOperation::ListPolicies),
+            Ok(AccessResult::Policies(ref policies))
+                if policies.iter().any(|policy| policy.time_windows.len() == 1
+                    && policy.max_daily_session_starts == Some(10))
+        ));
+        let scope = context.authorization_scope("chat", "public-v1");
         assert!(scope.allows_candidate(
             "provider-a",
             None,
-            "public-v1",
+            "backend-v2",
             crate::upstream::InferenceEndpoint::ChatCompletions
         ));
         assert!(!scope.allows_candidate(
             "provider-b",
             None,
-            "public-v1",
+            "backend-v2",
             crate::upstream::InferenceEndpoint::ChatCompletions
         ));
         let lease = service.acquire_session(&context).unwrap().unwrap();

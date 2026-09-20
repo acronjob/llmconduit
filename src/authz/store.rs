@@ -5,7 +5,7 @@ use super::policy::{
 use crate::dashboard_access::{
     AccessApiKey, AccessAuditEvent, AccessCounts, AccessError, AccessGroup, AccessOperation,
     AccessPolicy, AccessPricingRow, AccessResult, AccessRole, AccessSession, AccessSummary,
-    AccessUsageRow, AccessUser, ActorSummary, ManagementActor,
+    AccessTimeWindow, AccessUsageRow, AccessUser, ActorSummary, ManagementActor,
     ManagementPermission as WirePermission,
 };
 use axum::http::StatusCode;
@@ -614,7 +614,7 @@ impl AuthStore {
             }
             AccessOperation::ListPolicies => self.list_policies().map(AccessResult::Policies),
             AccessOperation::CreatePolicy(body) => {
-                self.create_policy(actor, body)?;
+                self.create_policy(actor, *body)?;
                 self.list_policies().map(AccessResult::Policies)
             }
             AccessOperation::ListApiKeys => self.list_access_keys().map(AccessResult::ApiKeys),
@@ -821,7 +821,7 @@ impl AuthStore {
                     .filter_map(|v| wire_permission(&v))
                     .collect();
                 Ok(AccessRole {
-                    id,
+                    id: id.clone(),
                     name,
                     enabled,
                     permissions,
@@ -836,6 +836,20 @@ impl AuthStore {
         name: &str,
         permissions: &[WirePermission],
     ) -> Result<(), AccessError> {
+        if let ManagementActor::Delegated {
+            permissions: actor_permissions,
+            ..
+        } = actor
+            && permissions
+                .iter()
+                .any(|permission| !actor_permissions.contains(permission))
+        {
+            self.audit_denied(actor, "role.create", "requested permissions exceed actor")?;
+            return Err(AccessError::new(
+                StatusCode::FORBIDDEN,
+                "cannot grant management permissions the actor does not possess",
+            ));
+        }
         let id = format!("rol_{}", Uuid::new_v4().simple());
         let tx = self.connection.transaction().map_err(access_db)?;
         tx.execute(
@@ -909,14 +923,43 @@ impl AuthStore {
                         .collect()
                 };
                 Ok(AccessPolicy {
-                    id,
+                    id: id.clone(),
                     name,
                     effect,
                     enabled,
                     subjects,
                     endpoints: dim("endpoint"),
                     models: dim("requested_model"),
+                    requested_models: dim("requested_model"),
+                    served_models: dim("served_model"),
                     providers: dim("provider"),
+                    routes: dim("route"),
+                    time_windows: self
+                        .query_windows(&id)
+                        .map_err(access_internal)?
+                        .into_iter()
+                        .map(|window| AccessTimeWindow {
+                            weekday_mask: window.weekday_mask,
+                            start_minute: window.start_minute,
+                            end_minute: window.end_minute,
+                            absolute_start_ms: window.absolute_start_ms,
+                            absolute_end_ms: window.absolute_end_ms,
+                        })
+                        .collect(),
+                    max_concurrent_sessions: self
+                        .query_limits(&id)
+                        .map_err(access_internal)?
+                        .max_concurrent_sessions,
+                    max_daily_session_starts: self
+                        .query_limits(&id)
+                        .map_err(access_internal)?
+                        .max_daily_session_starts,
+                    management_permissions: self
+                        .query_permissions(&id)
+                        .map_err(access_internal)?
+                        .into_iter()
+                        .filter_map(crate::authz::access::wire_permission)
+                        .collect(),
                 })
             })
             .collect()
@@ -939,6 +982,58 @@ impl AuthStore {
                 "at least one subject is required",
             ));
         }
+        if let ManagementActor::Delegated {
+            principal_id,
+            key_id,
+            permissions: actor_permissions,
+            ..
+        } = actor
+        {
+            let owns_every_subject = body.subjects.iter().all(|subject| {
+                subject == &format!("principal:{principal_id}")
+                    || subject == &format!("key:{key_id}")
+            });
+            let permissions_are_subset = body
+                .management_permissions
+                .iter()
+                .all(|permission| actor_permissions.contains(permission));
+            let grants_inference_scope = body.effect == "allow"
+                && (!body.endpoints.is_empty()
+                    || !body.models.is_empty()
+                    || !body.requested_models.is_empty()
+                    || !body.served_models.is_empty()
+                    || !body.providers.is_empty()
+                    || !body.routes.is_empty());
+            if !owns_every_subject || !permissions_are_subset || grants_inference_scope {
+                self.audit_denied(actor, "policy.create", "requested grant exceeds actor")?;
+                return Err(AccessError::new(
+                    StatusCode::FORBIDDEN,
+                    "cannot create a policy that expands the actor's privileges",
+                ));
+            }
+        }
+        for window in &body.time_windows {
+            if window.weekday_mask > 0x7f
+                || window.start_minute > 1439
+                || window.end_minute > 1439
+                || matches!((window.absolute_start_ms, window.absolute_end_ms), (Some(start), Some(end)) if start >= end)
+            {
+                return Err(AccessError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid UTC policy window",
+                ));
+            }
+        }
+        let requested_models = if body.requested_models.is_empty() {
+            body.models.clone()
+        } else {
+            body.requested_models.clone()
+        };
+        let served_models = if body.served_models.is_empty() {
+            body.models.clone()
+        } else {
+            body.served_models.clone()
+        };
         let id = format!("pol_{}", Uuid::new_v4().simple());
         let now = Utc::now().timestamp();
         let tx = self.connection.transaction().map_err(access_db)?;
@@ -959,16 +1054,43 @@ impl AuthStore {
             .endpoints
             .into_iter()
             .map(|v| (v, "endpoint"))
-            .chain(
-                body.models
-                    .into_iter()
-                    .flat_map(|v| [(v.clone(), "requested_model"), (v, "served_model")]),
-            )
+            .chain(requested_models.into_iter().map(|v| (v, "requested_model")))
+            .chain(served_models.into_iter().map(|v| (v, "served_model")))
             .chain(body.providers.into_iter().map(|v| (v, "provider")))
+            .chain(body.routes.into_iter().map(|v| (v, "route")))
         {
             tx.execute(
                 "INSERT INTO auth_policy_scopes(policy_id,dimension,matcher) VALUES(?1,?2,?3)",
                 params![id, dimension, endpoint],
+            )
+            .map_err(access_db)?;
+        }
+        for window in body.time_windows {
+            tx.execute(
+                "INSERT INTO auth_time_windows(id,policy_id,weekday_mask,start_minute,end_minute,absolute_start,absolute_end) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    format!("win_{}", Uuid::new_v4().simple()),
+                    id,
+                    window.weekday_mask,
+                    window.start_minute,
+                    window.end_minute,
+                    window.absolute_start_ms,
+                    window.absolute_end_ms
+                ],
+            )
+            .map_err(access_db)?;
+        }
+        if body.max_concurrent_sessions.is_some() || body.max_daily_session_starts.is_some() {
+            tx.execute(
+                "INSERT INTO auth_limits(policy_id,max_concurrent_sessions,max_daily_session_starts) VALUES(?1,?2,?3)",
+                params![id, body.max_concurrent_sessions, body.max_daily_session_starts],
+            )
+            .map_err(access_db)?;
+        }
+        for permission in body.management_permissions {
+            tx.execute(
+                "INSERT INTO auth_management_permissions(policy_id,permission) VALUES(?1,?2)",
+                params![id, wire_permission_name(permission)],
             )
             .map_err(access_db)?;
         }
@@ -982,6 +1104,19 @@ impl AuthStore {
             BTreeMap::new(),
         )
         .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
+    }
+
+    fn audit_denied(
+        &mut self,
+        actor: &ManagementActor,
+        action: &str,
+        reason: &str,
+    ) -> Result<(), AccessError> {
+        let tx = self.connection.transaction().map_err(access_db)?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert("reason".into(), Value::String(reason.into()));
+        audit(&tx, &actor_name(actor), action, "", "denied", metadata).map_err(access_internal)?;
         tx.commit().map_err(access_db)
     }
 
@@ -1251,10 +1386,12 @@ fn db(e: rusqlite::Error) -> String {
     e.to_string()
 }
 fn access_db(e: rusqlite::Error) -> AccessError {
-    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(error = %e, "authorization database operation failed");
+    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 fn access_internal(e: String) -> AccessError {
-    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, e)
+    tracing::error!(error = %e, "authorization management operation failed");
+    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 fn validate_decimal(v: &str) -> Result<(), AccessError> {
     if v.parse::<f64>()

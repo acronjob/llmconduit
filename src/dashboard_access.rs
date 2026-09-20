@@ -136,8 +136,30 @@ pub struct AccessPolicy {
     pub enabled: bool,
     pub subjects: Vec<String>,
     pub endpoints: Vec<String>,
+    /// Compatibility projection for older dashboard clients. New callers should
+    /// use the two explicit model dimensions below.
     pub models: Vec<String>,
+    pub requested_models: Vec<String>,
+    pub served_models: Vec<String>,
     pub providers: Vec<String>,
+    pub routes: Vec<String>,
+    pub time_windows: Vec<AccessTimeWindow>,
+    pub max_concurrent_sessions: Option<u32>,
+    pub max_daily_session_starts: Option<u32>,
+    pub management_permissions: Vec<ManagementPermission>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessTimeWindow {
+    /// Bit 0 is Monday and bit 6 is Sunday. Zero means every weekday.
+    #[serde(default)]
+    pub weekday_mask: u8,
+    #[serde(default)]
+    pub start_minute: u16,
+    #[serde(default)]
+    pub end_minute: u16,
+    pub absolute_start_ms: Option<i64>,
+    pub absolute_end_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,7 +263,19 @@ pub struct CreatePolicyRequest {
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
+    pub requested_models: Vec<String>,
+    #[serde(default)]
+    pub served_models: Vec<String>,
+    #[serde(default)]
     pub providers: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<String>,
+    #[serde(default)]
+    pub time_windows: Vec<AccessTimeWindow>,
+    pub max_concurrent_sessions: Option<u32>,
+    pub max_daily_session_starts: Option<u32>,
+    #[serde(default)]
+    pub management_permissions: Vec<ManagementPermission>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,7 +315,7 @@ pub enum AccessOperation {
     ListRoles,
     CreateRole(CreateRoleRequest),
     ListPolicies,
-    CreatePolicy(CreatePolicyRequest),
+    CreatePolicy(Box<CreatePolicyRequest>),
     ListApiKeys,
     CreateApiKey(CreateApiKeyRequest),
     RevokeApiKey(String),
@@ -562,7 +596,7 @@ async fn create_policy(
     match execute(
         (backend, actor),
         ManagementPermission::PoliciesWrite,
-        AccessOperation::CreatePolicy(body),
+        AccessOperation::CreatePolicy(Box::new(body)),
     )
     .await?
     {
