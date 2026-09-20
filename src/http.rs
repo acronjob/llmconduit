@@ -422,6 +422,28 @@ fn authorize_model(
     }
 }
 
+fn acquire_inference_session(
+    gateway: &Gateway,
+    context: Option<&crate::authz::AuthContext>,
+) -> AppResult<Option<crate::authz::SessionLease>> {
+    match context {
+        Some(context) => gateway
+            .authz()
+            .acquire_session(context)
+            .map_err(|err| AppError::forbidden(err.to_string())),
+        None => Ok(None),
+    }
+}
+
+fn authorization_scope(
+    context: Option<&crate::authz::AuthContext>,
+) -> crate::upstream::AuthorizationScope {
+    context.map_or_else(
+        crate::upstream::AuthorizationScope::unrestricted,
+        crate::authz::AuthContext::authorization_scope,
+    )
+}
+
 /// Route-level response middleware (D13 R1 MED): stamp `no-store` + the dashboard
 /// security header set on EVERY `/dashboard/api/*` response, including an axum
 /// extractor-rejection `400` produced before any handler runs (an invalid
@@ -1589,12 +1611,20 @@ async fn post_responses(
         &requested,
         &served,
     )?;
+    let auth = auth.map(|value| value.0);
+    let lease = acquire_inference_session(&gateway, auth.as_ref())?;
     let wants_stream = request.stream;
     let stream = gateway
-        .stream_responses_with_api_call_id(request, api_call_id.map(|extension| extension.0.0))
+        .clone()
+        .stream_responses_authorized(
+            request,
+            api_call_id.map(|extension| extension.0.0),
+            authorization_scope(auth.as_ref()),
+            crate::upstream::InferenceEndpoint::Responses,
+        )
         .await?;
     let response = if wants_stream {
-        stream_responses_response(stream)
+        stream_responses_response(stream, lease)
     } else {
         collect_responses_response(stream).await?
     };
@@ -1715,9 +1745,24 @@ async fn responses_ws_serve(
         return;
     }
 
+    let _lease = match acquire_inference_session(&gateway, auth.as_ref()) {
+        Ok(lease) => lease,
+        Err(err) => {
+            let _ = send_responses_ws_error(&mut sink, "permission_denied", &err.to_string()).await;
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
     // 3. Run the turn through the SAME engine path as the HTTP POST.
     let event_stream = match gateway
-        .stream_responses_with_api_call_id(request, None)
+        .clone()
+        .stream_responses_authorized(
+            request,
+            None,
+            authorization_scope(auth.as_ref()),
+            crate::upstream::InferenceEndpoint::Responses,
+        )
         .await
     {
         Ok(s) => s,
@@ -1889,7 +1934,13 @@ async fn handle_count_tokens(
         None,
         None,
     )
-    .with_thinking_override(thinking_override);
+    .with_thinking_override(thinking_override)
+    .with_authorization(
+        authorization_scope(auth.as_ref()),
+        crate::upstream::InferenceEndpoint::CountTokens,
+    );
+
+    let _lease = acquire_inference_session(&gateway, auth.as_ref())?;
 
     match gateway.upstream_client().count_tokens(&backend).await {
         Ok(Some(count)) => {
@@ -1921,6 +1972,8 @@ async fn post_chat_completions(
         &requested,
         &model,
     )?;
+    let auth = auth.map(|value| value.0);
+    let lease = acquire_inference_session(&gateway, auth.as_ref())?;
     let wants_stream = request.stream;
     let include_usage = request
         .stream_options
@@ -1928,14 +1981,17 @@ async fn post_chat_completions(
         .is_some_and(|options| options.include_usage);
     let responses_request = chat_completions::convert_request(request)?;
     let stream = gateway
-        .stream_responses_with_api_call_id(
+        .clone()
+        .stream_responses_authorized(
             responses_request,
             api_call_id.map(|extension| extension.0.0),
+            authorization_scope(auth.as_ref()),
+            crate::upstream::InferenceEndpoint::ChatCompletions,
         )
         .await?;
 
     let response = if wants_stream {
-        stream_chat_completions_response(model.clone(), include_usage, stream)
+        stream_chat_completions_response(model.clone(), include_usage, stream, lease)
     } else {
         collect_chat_completions_response(model.clone(), stream).await?
     };
@@ -1960,11 +2016,16 @@ async fn post_completions(
             .ok_or_else(|| AppError::bad_request("request body must include a model"))?;
         authorize_model(Some(&context.0), "completions", &model, &model)?;
     }
+    let auth = auth.map(|value| value.0);
+    let lease = acquire_inference_session(&gateway, auth.as_ref())?;
     let response = gateway
         .upstream_client()
-        .proxy_completions(crate::upstream::ProxyCompletionsRequest::new(headers, body))
+        .proxy_completions(
+            crate::upstream::ProxyCompletionsRequest::new(headers, body)
+                .with_authorization(authorization_scope(auth.as_ref())),
+        )
         .await?;
-    Ok(proxy_upstream_response(response))
+    Ok(proxy_upstream_response(response, lease))
 }
 
 async fn handle_post_messages(
@@ -1976,6 +2037,7 @@ async fn handle_post_messages(
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
     authorize_model(auth.as_ref(), "messages", &requested, &model)?;
+    let lease = acquire_inference_session(&gateway, auth.as_ref())?;
     let wants_stream = request.stream;
     let suppress_reasoning = !matches!(
         request.thinking.as_ref(),
@@ -1983,11 +2045,17 @@ async fn handle_post_messages(
     );
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let stream = gateway
-        .stream_responses_with_api_call_id(responses_request, api_call_id)
+        .clone()
+        .stream_responses_authorized(
+            responses_request,
+            api_call_id,
+            authorization_scope(auth.as_ref()),
+            crate::upstream::InferenceEndpoint::Messages,
+        )
         .await?;
 
     let response = if wants_stream {
-        stream_anthropic_response(model.clone(), suppress_reasoning, stream)?
+        stream_anthropic_response(model.clone(), suppress_reasoning, stream, lease)?
     } else {
         collect_anthropic_response(model.clone(), suppress_reasoning, stream).await?
     };
@@ -2176,9 +2244,11 @@ fn stream_chat_completions_response(
     model: String,
     include_usage: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
+    lease: Option<crate::authz::SessionLease>,
 ) -> Response {
     let (tx, rx) = mpsc::channel(128);
     tokio::spawn(async move {
+        let _lease = lease;
         let mut converter = ChatCompletionStreamConverter::new(model, include_usage);
         let mut stream = std::pin::pin!(stream);
         'streaming: while let Some(event) = stream.next().await {
@@ -2216,9 +2286,11 @@ fn stream_anthropic_response(
     model: String,
     suppress_reasoning: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
+    lease: Option<crate::authz::SessionLease>,
 ) -> AppResult<Response> {
     let (tx, rx) = mpsc::channel(128);
     tokio::spawn(async move {
+        let _lease = lease;
         let mut converter =
             AnthropicStreamConverter::with_reasoning_suppression(model, suppress_reasoning);
         let mut stream = std::pin::pin!(stream);
@@ -2267,15 +2339,22 @@ fn stream_anthropic_response(
     Ok(response)
 }
 
-fn proxy_upstream_response(response: reqwest::Response) -> Response {
+fn proxy_upstream_response(
+    response: reqwest::Response,
+    lease: Option<crate::authz::SessionLease>,
+) -> Response {
     let status = response.status();
     let upstream_headers = response.headers().clone();
     let mut builder = Response::builder().status(status);
     if let Some(headers) = builder.headers_mut() {
         copy_proxy_response_headers(&upstream_headers, headers);
     }
+    let stream = response.bytes_stream().map(move |item| {
+        let _keep_lease_alive = &lease;
+        item
+    });
     builder
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::from_stream(stream))
         .expect("valid upstream proxy response")
 }
 
@@ -2317,8 +2396,12 @@ fn responses_wire_event_data(event: &crate::engine::SseEvent) -> String {
     data.to_string()
 }
 
-fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) -> Response {
-    let mapped = stream.map(|event| {
+fn stream_responses_response(
+    stream: ReceiverStream<crate::engine::SseEvent>,
+    lease: Option<crate::authz::SessionLease>,
+) -> Response {
+    let mapped = stream.map(move |event| {
+        let _keep_lease_alive = &lease;
         let data = responses_wire_event_data(&event);
         Ok::<_, Infallible>(
             axum::response::sse::Event::default()

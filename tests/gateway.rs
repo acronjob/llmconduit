@@ -157,7 +157,29 @@ impl UpstreamClient for MockUpstream {
     async fn list_models(
         &self,
     ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
-        Err(llmconduit::error::AppError::internal("unused in this test"))
+        let models = self
+            .supported_models
+            .lock()
+            .await
+            .iter()
+            .map(|id| json!({"id": id}))
+            .collect::<Vec<_>>();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::header::ETAG,
+            axum::http::HeaderValue::from_static("\"upstream-catalog\""),
+        );
+        Ok(llmconduit::upstream::UpstreamModelsResponse {
+            status: axum::http::StatusCode::OK,
+            headers,
+            body: serde_json::to_vec(&json!({"object": "list", "data": models}))
+                .expect("serialize mock model catalog")
+                .into(),
+        })
     }
 
     async fn count_tokens(
@@ -7467,6 +7489,10 @@ async fn enforced_auth_filters_model_catalog_for_the_authenticated_key() {
         .await
         .unwrap();
     let status = response.status();
+    assert!(
+        response.headers().get(axum::http::header::ETAG).is_none(),
+        "principal-filtered catalogs must not reuse the upstream ETag"
+    );
     let bytes = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .unwrap();
