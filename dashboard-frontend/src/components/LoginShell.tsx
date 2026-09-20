@@ -1,7 +1,7 @@
 /**
  * Login shell — rendered when the SPA loads unauthenticated (D7/D9). A token-entry form
- * POSTs to `/dashboard/login`; on success the session cookie is set server-side and we
- * flip the auth store so the dashboard mounts. Any 401 elsewhere bounces back here.
+ * accepts either the bootstrap dashboard token or an `llmc_` delegated management key.
+ * On success the server sets a session cookie and the dashboard mounts.
  */
 import { useState, type FormEvent } from 'react';
 import { Panel } from './ui/Panel';
@@ -19,7 +19,8 @@ export function LoginShell({ client }: { client: DashboardClient }) {
     setBusy(true);
     setError(null);
     try {
-      await client.login({ token });
+      if (token.startsWith('llmc_')) await client.keyLogin(token);
+      else await client.login({ token });
       // Server set the session cookie; reflect it in the store to mount the dashboard.
       authStore.getState().setAuthenticated(true);
     } catch {
@@ -33,7 +34,7 @@ export function LoginShell({ client }: { client: DashboardClient }) {
     <div className="flex h-full items-center justify-center bg-bg p-4">
       <Panel className="w-full max-w-sm p-6">
         <h1 className="mb-1 text-lg font-semibold text-text">llmconduit</h1>
-        <p className="mb-4 text-sm text-text-muted">Dashboard access token required.</p>
+        <p className="mb-4 text-sm text-text-muted">Bootstrap token or management-enabled API key required.</p>
         <form onSubmit={onSubmit} className="flex flex-col gap-3">
           <label className="flex flex-col gap-1 text-sm">
             <span className="text-text-muted">Token</span>
@@ -43,7 +44,7 @@ export function LoginShell({ client }: { client: DashboardClient }) {
               value={token}
               onChange={(e) => setToken(e.target.value)}
               className="rounded-md border border-line bg-panel-raised px-3 py-2 font-mono text-sm text-text outline-none focus:border-accent"
-              placeholder="LLMCONDUIT_DASHBOARD_TOKEN"
+              placeholder="Dashboard token or llmc_…"
               aria-label="Dashboard token"
             />
           </label>
