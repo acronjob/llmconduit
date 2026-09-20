@@ -16,6 +16,8 @@ pub mod mesh;
 pub mod metrics;
 pub mod models;
 pub mod monitor;
+pub mod openrouter_pricing;
+pub mod provider_metrics;
 pub(crate) mod proxy_headers;
 pub mod raw;
 pub(crate) mod redaction;
@@ -31,6 +33,7 @@ pub(crate) mod test_alloc_probe;
 pub(crate) mod tool_delta_gate;
 pub mod turn_capture;
 pub mod upstream;
+pub mod usage_accounting;
 pub mod vision;
 
 /// Build provenance, embedded at compile time by `build.rs`: git short commit,
