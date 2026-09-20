@@ -56,6 +56,14 @@ describe('policyEditorModel', () => {
     ]);
   });
 
+  it('rejects partial UTC windows while allowing the window to be omitted entirely', () => {
+    expect(validatePolicy({ ...basePolicy, time_windows: [] }, 'model')).toEqual([]);
+    expect(validatePolicy({
+      ...basePolicy,
+      time_windows: [{ weekday_mask: 31, start_minute: Number.NaN, end_minute: Number.NaN, absolute_start_ms: null, absolute_end_ms: null }],
+    }, 'model')).toEqual(['UTC window requires days and distinct HH:MM start/end times.']);
+  });
+
   it('accepts administration policies without model endpoints when management permissions are selected', () => {
     expect(validatePolicy({
       ...basePolicy,

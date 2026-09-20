@@ -74,9 +74,12 @@ describe('AccessView', () => {
     expect(screen.getByText('Wizard models')).toBeInTheDocument();
     expect(screen.getAllByText('All requested models').length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole('button', { name: /continue/i }));
-    expect(screen.getByLabelText('Wizard max concurrent sessions')).toHaveValue(4);
+    expect(screen.getByLabelText('Wizard window days')).toHaveValue('');
+    expect(screen.getByLabelText('Wizard max concurrent sessions')).toHaveValue(null);
+    expect(screen.getByLabelText('Wizard max concurrent sessions')).toHaveAttribute('placeholder', 'Unlimited');
     fireEvent.click(screen.getByRole('button', { name: /continue/i }));
     expect(screen.getByText(/nightly evaluator \(service_account\)/i)).toBeInTheDocument();
+    expect(screen.getAllByText('Any time').length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole('button', { name: /^create access$/i }));
 
     const dialog = await screen.findByRole('dialog', { name: /copy api key/i });
@@ -104,6 +107,9 @@ describe('AccessView', () => {
     await screen.findByText('Policy reader');
 
     fireEvent.click(screen.getByRole('tab', { name: /model policies/i }));
+    expect(screen.getByTestId('policy-payload-preview')).toHaveTextContent('"time_windows": []');
+    expect(screen.getByTestId('policy-payload-preview')).toHaveTextContent('"max_concurrent_sessions": null');
+    expect(screen.getByTestId('policy-payload-preview')).toHaveTextContent('"max_daily_session_starts": null');
     fireEvent.click(screen.getByText('Who this applies to'));
     fireEvent.click(screen.getByRole('checkbox', { name: /principal · Operations/i }));
     const responses = screen.getByRole('checkbox', { name: /responses api/i });

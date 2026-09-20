@@ -53,6 +53,14 @@ const minuteOfDay = (value: string): number => {
   const [hour = Number.NaN, minute = Number.NaN] = value.split(':').map(Number);
   return hour * 60 + minute;
 };
+const optionalTimeWindows = (days: string, start: string, end: string) => {
+  if (!days.trim() && !start && !end) return [];
+  return [{ weekday_mask: weekdayMask(days), start_minute: minuteOfDay(start), end_minute: minuteOfDay(end), absolute_start_ms: null, absolute_end_ms: null }];
+};
+const scheduleReview = (days: string, start: string, end: string) => {
+  if (!days.trim() && !start && !end) return 'Any time';
+  return `${days || 'days?'} ${start || '--:--'}-${end || '--:--'} UTC`;
+};
 const dataOrEmpty = <T,>(value: T[] | undefined): T[] => value ?? [];
 
 async function loadAccess() {
@@ -90,11 +98,11 @@ export function AccessView() {
   const [draftServedModels, setDraftServedModels] = useState('');
   const [draftProviders, setDraftProviders] = useState('');
   const [draftRoutes, setDraftRoutes] = useState('');
-  const [draftWindowDays, setDraftWindowDays] = useState('mon,tue,wed,thu,fri');
-  const [draftWindowStart, setDraftWindowStart] = useState('08:00');
-  const [draftWindowEnd, setDraftWindowEnd] = useState('18:00');
-  const [draftConcurrent, setDraftConcurrent] = useState('4');
-  const [draftDailyStarts, setDraftDailyStarts] = useState('100');
+  const [draftWindowDays, setDraftWindowDays] = useState('');
+  const [draftWindowStart, setDraftWindowStart] = useState('');
+  const [draftWindowEnd, setDraftWindowEnd] = useState('');
+  const [draftConcurrent, setDraftConcurrent] = useState('');
+  const [draftDailyStarts, setDraftDailyStarts] = useState('');
   const [adminPolicyName, setAdminPolicyName] = useState('Dashboard administrator');
   const [adminSubjects, setAdminSubjects] = useState<string[]>([]);
   const [adminPermissions, setAdminPermissions] = useState<ManagementPermission[]>([]);
@@ -111,11 +119,11 @@ export function AccessView() {
   const [wizardModels, setWizardModels] = useState('');
   const [wizardProviders, setWizardProviders] = useState('');
   const [wizardRoutes, setWizardRoutes] = useState('');
-  const [wizardDays, setWizardDays] = useState('mon,tue,wed,thu,fri');
-  const [wizardStart, setWizardStart] = useState('08:00');
-  const [wizardEnd, setWizardEnd] = useState('18:00');
-  const [wizardConcurrent, setWizardConcurrent] = useState('4');
-  const [wizardDailyStarts, setWizardDailyStarts] = useState('100');
+  const [wizardDays, setWizardDays] = useState('');
+  const [wizardStart, setWizardStart] = useState('');
+  const [wizardEnd, setWizardEnd] = useState('');
+  const [wizardConcurrent, setWizardConcurrent] = useState('');
+  const [wizardDailyStarts, setWizardDailyStarts] = useState('');
 
   const users = useMemo(() => query.data?.users.users ?? [], [query.data?.users.users]);
   const principal = keyPrincipal || users[0]?.id || '';
@@ -146,9 +154,7 @@ export function AccessView() {
     endpoints: csv(draftEndpoints), requested_models: [...csv(draftRequestedModels), ...csv(draftModels)],
     models: [],
     served_models: csv(draftServedModels), providers: csv(draftProviders), routes: csv(draftRoutes),
-    time_windows: csv(draftWindowDays).length && draftWindowStart && draftWindowEnd
-      ? [{ weekday_mask: weekdayMask(draftWindowDays), start_minute: minuteOfDay(draftWindowStart), end_minute: minuteOfDay(draftWindowEnd), absolute_start_ms: null, absolute_end_ms: null }]
-      : [],
+    time_windows: optionalTimeWindows(draftWindowDays, draftWindowStart, draftWindowEnd),
     max_concurrent_sessions: positiveInteger(draftConcurrent),
     max_daily_session_starts: positiveInteger(draftDailyStarts),
     management_permissions: [],
@@ -180,9 +186,7 @@ export function AccessView() {
     served_models: [],
     providers: csv(wizardProviders),
     routes: csv(wizardRoutes),
-    time_windows: csv(wizardDays).length && wizardStart && wizardEnd
-      ? [{ weekday_mask: weekdayMask(wizardDays), start_minute: minuteOfDay(wizardStart), end_minute: minuteOfDay(wizardEnd), absolute_start_ms: null, absolute_end_ms: null }]
-      : [],
+    time_windows: optionalTimeWindows(wizardDays, wizardStart, wizardEnd),
     max_concurrent_sessions: positiveInteger(wizardConcurrent),
     max_daily_session_starts: positiveInteger(wizardDailyStarts),
     management_permissions: [],
@@ -631,14 +635,15 @@ function PolicySection(props: {
               <MultiSelectField label="Routing labels" allLabel="All routes" value={csv(props.draftRoutes)} options={props.routeOptions} onChange={(value) => props.setDraftRoutes(value.join(','))} />
             </div>
           </details>
-          <fieldset className="grid grid-cols-3 gap-2 rounded border border-line p-2"><legend className="px-1">UTC window</legend>
-            <input aria-label="Policy window days" value={props.draftWindowDays} onChange={(event) => props.setDraftWindowDays(event.target.value)} placeholder="mon,tue" className="rounded border border-line bg-bg px-2 py-1" />
+          <fieldset className="grid grid-cols-3 gap-2 rounded border border-line p-2"><legend className="px-1">UTC window <span className="text-text-muted">(optional)</span></legend>
+            <input aria-label="Policy window days" value={props.draftWindowDays} onChange={(event) => props.setDraftWindowDays(event.target.value)} placeholder="Any days" className="rounded border border-line bg-bg px-2 py-1" />
             <input aria-label="Policy window start" type="time" value={props.draftWindowStart} onChange={(event) => props.setDraftWindowStart(event.target.value)} className="rounded border border-line bg-bg px-2 py-1" />
             <input aria-label="Policy window end" type="time" value={props.draftWindowEnd} onChange={(event) => props.setDraftWindowEnd(event.target.value)} className="rounded border border-line bg-bg px-2 py-1" />
+            <p className="col-span-3 text-[10px] text-text-muted">Leave all three blank for access at any time.</p>
           </fieldset>
           <div className="grid gap-3 md:grid-cols-2">
-            <label>Max concurrent sessions<input aria-label="Max concurrent sessions" type="number" min="1" value={props.draftConcurrent} onChange={(event) => props.setDraftConcurrent(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-            <label>Daily session starts<input aria-label="Daily session starts" type="number" min="1" value={props.draftDailyStarts} onChange={(event) => props.setDraftDailyStarts(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
+            <label>Max concurrent sessions <span className="text-text-muted">(optional)</span><input aria-label="Max concurrent sessions" type="number" min="1" value={props.draftConcurrent} onChange={(event) => props.setDraftConcurrent(event.target.value)} placeholder="Unlimited" className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
+            <label>Daily session starts <span className="text-text-muted">(optional)</span><input aria-label="Daily session starts" type="number" min="1" value={props.draftDailyStarts} onChange={(event) => props.setDraftDailyStarts(event.target.value)} placeholder="Unlimited" className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
           </div>
           {props.policyValidation.length > 0 && <ul aria-label="Policy validation" className="list-disc pl-4 text-status-down">{props.policyValidation.map((error) => <li key={error}>{error}</li>)}</ul>}
           <div className="flex flex-wrap gap-2"><Button className="w-fit" disabled={props.busy || props.policyValidation.length > 0} onClick={props.onSavePolicy}>Save model policy</Button><Button variant="ghost" className="border-line" onClick={props.onOpenAdministration}>Create admin policy instead</Button></div>
@@ -778,13 +783,14 @@ function CreateAccessDrawer(props: {
           )}
           {props.step === 'limits' && (
             <div className="space-y-3 text-sm">
-              <fieldset className="grid grid-cols-3 gap-2 rounded border border-line p-3"><legend className="px-1 text-xs text-text-muted">UTC window</legend>
-                <input aria-label="Wizard window days" value={props.days} onChange={(event) => props.setDays(event.target.value)} className="rounded border border-line bg-bg px-2 py-2 text-xs" />
+              <fieldset className="grid grid-cols-3 gap-2 rounded border border-line p-3"><legend className="px-1 text-xs text-text-muted">UTC window (optional)</legend>
+                <input aria-label="Wizard window days" value={props.days} onChange={(event) => props.setDays(event.target.value)} placeholder="Any days" className="rounded border border-line bg-bg px-2 py-2 text-xs" />
                 <input aria-label="Wizard window start" type="time" value={props.start} onChange={(event) => props.setStart(event.target.value)} className="rounded border border-line bg-bg px-2 py-2 text-xs" />
                 <input aria-label="Wizard window end" type="time" value={props.end} onChange={(event) => props.setEnd(event.target.value)} className="rounded border border-line bg-bg px-2 py-2 text-xs" />
+                <p className="col-span-3 text-[10px] text-text-muted">Blank means any time.</p>
               </fieldset>
-              <label className="block text-xs">Max concurrent sessions<input aria-label="Wizard max concurrent sessions" type="number" min="1" value={props.concurrent} onChange={(event) => props.setConcurrent(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
-              <label className="block text-xs">Daily session starts<input aria-label="Wizard daily starts" type="number" min="1" value={props.dailyStarts} onChange={(event) => props.setDailyStarts(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
+              <label className="block text-xs">Max concurrent sessions <span className="text-text-muted">(optional)</span><input aria-label="Wizard max concurrent sessions" type="number" min="1" value={props.concurrent} onChange={(event) => props.setConcurrent(event.target.value)} placeholder="Unlimited" className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
+              <label className="block text-xs">Daily session starts <span className="text-text-muted">(optional)</span><input aria-label="Wizard daily starts" type="number" min="1" value={props.dailyStarts} onChange={(event) => props.setDailyStarts(event.target.value)} placeholder="Unlimited" className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
             </div>
           )}
           {props.step === 'review' && (
@@ -795,7 +801,7 @@ function CreateAccessDrawer(props: {
               <ReviewLine label="Models" value={summarizeMatcher(csv(props.models), 'All requested models')} />
               <ReviewLine label="Providers" value={summarizeMatcher(csv(props.providers), 'All providers')} />
               <ReviewLine label="Routing labels" value={summarizeMatcher(csv(props.routes), 'All routes')} />
-              <ReviewLine label="Window" value={`${props.days} ${props.start}-${props.end} UTC`} />
+              <ReviewLine label="Window" value={scheduleReview(props.days, props.start, props.end)} />
               <ReviewLine label="Sessions" value={`${props.concurrent || 'unlimited'} concurrent, ${props.dailyStarts || 'unlimited'} daily starts`} />
             </div>
           )}

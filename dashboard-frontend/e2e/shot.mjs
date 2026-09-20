@@ -5,7 +5,7 @@
 // Deterministic clock + seeded RNG (matches the e2e baselines) so shots are repeatable.
 import { chromium } from '@playwright/test';
 
-const TABS = { flows: 'Flows', topology: 'Topology', sankey: 'Sankey', theater: 'Theater', overview: 'Overview', access: 'Access', 'access-policies': 'Access' };
+const TABS = { flows: 'Flows', topology: 'Topology', sankey: 'Sankey', theater: 'Theater', overview: 'Overview', access: 'Access', 'access-policies': 'Access', 'access-limits': 'Access' };
 const FIXED_NOW = Date.UTC(2026, 5, 21, 14, 20, 0);
 const BASE = process.env.ARGUS_URL || 'http://localhost:5273/dashboard/?mock=1';
 
@@ -59,6 +59,11 @@ for (const name of targets) {
     await page.getByText('Providers', { exact: true }).click();
     await page.getByText('Models', { exact: true }).click();
     await page.getByTestId('access-view').evaluate((element) => { element.scrollTop = 0; });
+  }
+  if (name === 'access-limits') {
+    await page.getByRole('button', { name: /close create access/i }).click();
+    await page.getByRole('tab', { name: 'Model policies', exact: true }).click();
+    await page.getByLabel('Max concurrent sessions').scrollIntoViewIfNeeded();
   }
   await page.waitForTimeout(1000);
   const out = `/tmp/argus-${name}.png`;

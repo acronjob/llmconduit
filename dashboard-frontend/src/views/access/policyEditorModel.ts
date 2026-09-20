@@ -56,7 +56,9 @@ export function validatePolicy(policy: CreateAuthPolicyRequest, kind: PolicyEdit
     }
   }
   for (const window of policy.time_windows) {
-    if (window.weekday_mask < 1 || window.weekday_mask > 0x7f
+    if (!Number.isInteger(window.weekday_mask) || !Number.isInteger(window.start_minute) || !Number.isInteger(window.end_minute)
+      || window.weekday_mask < 1 || window.weekday_mask > 0x7f
+      || window.start_minute < 0 || window.end_minute < 0
       || window.start_minute >= 24 * 60 || window.end_minute > 24 * 60
       || window.start_minute === window.end_minute) {
       errors.push('UTC window requires days and distinct HH:MM start/end times.');
