@@ -69,6 +69,21 @@ gate, so start with `--with-debug-ui` and set
 dashboard CSRF token. The pepper and bootstrap key are never persisted in the
 YAML config or returned by read APIs.
 
+To import current OpenRouter endpoint pricing into the authorization store,
+set the management credential in the environment and name each model to sync:
+
+```bash
+export OPENROUTER_API_KEY='your-openrouter-management-key'
+llmconduit pricing sync openrouter \
+  --model openai/gpt-4.1 \
+  --model anthropic/claude-sonnet-4
+```
+
+The command uses the same bounded importer and SQLite snapshots as the
+dashboard pricing action. Operator-configured price overrides retain
+precedence; unavailable token/cache price components remain unavailable rather
+than being reported as zero.
+
 Multi-upstream model routing:
 
 ```yaml
@@ -503,6 +518,7 @@ LLMCONDUIT_TURN_CAPTURE_DIR
 LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS
 BRAVE_SEARCH_API_KEY
 OPENAI_API_KEY
+OPENROUTER_API_KEY
 ```
 
 `OPENAI_API_KEY` is used as a fallback upstream API key.

@@ -361,6 +361,17 @@ pub fn build_app_with_gateway_and_options(
     let bind_addr = config.bind_addr;
     let authz = crate::authz::AuthzService::from_config(&config.auth)
         .unwrap_or_else(|err| panic!("inference auth startup validation failed: {err}"));
+    match config.auth.mode {
+        crate::config::AuthMode::Disabled => {
+            tracing::info!("inference authentication disabled");
+        }
+        crate::config::AuthMode::Enforce => {
+            tracing::info!(
+                store_path = %config.auth.store_path.display(),
+                "inference authentication enabled"
+            );
+        }
+    }
     let (dashboard_auth, register_protected_routes) = if options.with_debug_ui {
         build_dashboard_auth(bind_addr)
     } else {
