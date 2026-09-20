@@ -13,9 +13,19 @@ use crate::mesh::registry::MeshRegistry;
 use crate::mesh::store::{JoinKeyDecision, MeshStore};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayMode};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+
+const MAX_CONTROLLER_CONNECTION_TASKS: usize = 256;
+const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const INITIAL_CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+type MeshModelAllowlist = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
 pub(crate) fn spawn_controller(config: &MeshControllerConfig) -> AppResult<Arc<MeshRegistry>> {
     let registry = Arc::new(MeshRegistry::new(Duration::from_secs(
@@ -68,28 +78,57 @@ async fn run_controller(
         identity_path = %identity_path.display(),
         "mesh controller listening"
     );
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONTROLLER_CONNECTION_TASKS));
+    let model_allowlist = Arc::new(config.model_allowlist.clone());
+    if model_allowlist.is_empty() {
+        tracing::warn!(
+            "mesh controller model_allowlist is empty; workers may enroll but no mesh models will be routable"
+        );
+    }
     while let Some(incoming) = endpoint.accept().await {
+        let Ok(slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
+            tracing::warn!(
+                limit = MAX_CONTROLLER_CONNECTION_TASKS,
+                "dropping mesh connection while controller is overloaded"
+            );
+            continue;
+        };
         let registry = Arc::clone(&registry);
         let authorizer = Arc::clone(&authorizer);
+        let model_allowlist = Arc::clone(&model_allowlist);
         tokio::spawn(async move {
+            let _slot = slot;
             match incoming.accept() {
                 Ok(mut connecting) => {
-                    let alpn = match connecting.alpn().await {
-                        Ok(alpn) => alpn,
-                        Err(err) => {
+                    let alpn = match timeout(CONNECTION_SETUP_TIMEOUT, connecting.alpn()).await {
+                        Ok(Ok(alpn)) => alpn,
+                        Ok(Err(err)) => {
                             tracing::warn!(error = %err, "mesh worker ALPN negotiation failed");
                             return;
                         }
+                        Err(_) => {
+                            tracing::warn!("mesh worker ALPN negotiation timed out");
+                            return;
+                        }
                     };
-                    match connecting.await {
-                        Ok(connection) => {
-                            if let Err(err) =
-                                handle_connection(registry, authorizer, connection, &alpn).await
+                    match timeout(CONNECTION_SETUP_TIMEOUT, connecting).await {
+                        Ok(Ok(connection)) => {
+                            if let Err(err) = handle_connection(
+                                registry,
+                                authorizer,
+                                model_allowlist,
+                                connection,
+                                &alpn,
+                            )
+                            .await
                             {
                                 tracing::warn!(error = %err, "mesh worker connection ended");
                             }
                         }
-                        Err(err) => tracing::warn!(error = %err, "mesh worker handshake failed"),
+                        Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "mesh worker handshake failed")
+                        }
+                        Err(_) => tracing::warn!("mesh worker handshake timed out"),
                     }
                 }
                 Err(err) => tracing::warn!(error = %err, "failed to accept mesh connection"),
@@ -102,6 +141,7 @@ async fn run_controller(
 async fn handle_connection(
     registry: Arc<MeshRegistry>,
     authorizer: Arc<MeshAuthorizer>,
+    model_allowlist: Arc<MeshModelAllowlist>,
     connection: iroh::endpoint::Connection,
     alpn: &[u8],
 ) -> AppResult<()> {
@@ -115,10 +155,15 @@ async fn handle_connection(
             connection.close(403u32.into(), b"mesh node is not authorized");
             return Err(AppError::upstream("mesh node is not authorized"));
         }
-        let (send, mut recv) = connection.accept_bi().await.map_err(|err| {
-            AppError::upstream(format!("failed to accept mesh control stream: {err}"))
-        })?;
-        let first: WorkerToHub = read_control(&mut recv).await?;
+        let (send, mut recv) = timeout(CONTROL_STREAM_OPEN_TIMEOUT, connection.accept_bi())
+            .await
+            .map_err(|_| AppError::upstream("timed out waiting for mesh control stream"))?
+            .map_err(|err| {
+                AppError::upstream(format!("failed to accept mesh control stream: {err}"))
+            })?;
+        let first: WorkerToHub = timeout(INITIAL_CONTROL_FRAME_TIMEOUT, read_control(&mut recv))
+            .await
+            .map_err(|_| AppError::upstream("timed out waiting for mesh worker hello"))??;
         let WorkerToHub::Hello(advertisement) = first else {
             return Err(AppError::bad_request(
                 "mesh worker did not start with hello",
@@ -126,13 +171,17 @@ async fn handle_connection(
         };
         validate_worker_advertisement(&advertisement)
             .map_err(|err| AppError::bad_request(format!("invalid mesh worker hello: {err}")))?;
+        let advertisement =
+            filter_worker_advertisement(endpoint_id, model_allowlist.as_ref(), advertisement);
+        validate_worker_advertisement(&advertisement)
+            .map_err(|err| AppError::bad_request(format!("invalid mesh worker hello: {err}")))?;
         return handle_worker_control(
             registry,
             authorizer,
+            model_allowlist,
             connection,
             endpoint_id,
-            send,
-            recv,
+            MeshControlStreams { send, recv },
             advertisement,
         )
         .await;
@@ -141,11 +190,13 @@ async fn handle_connection(
         connection.close(400u32.into(), b"unsupported mesh ALPN");
         return Err(AppError::bad_request("unsupported mesh ALPN"));
     }
-    let (mut send, mut recv) = connection
-        .accept_bi()
+    let (mut send, mut recv) = timeout(CONTROL_STREAM_OPEN_TIMEOUT, connection.accept_bi())
         .await
+        .map_err(|_| AppError::upstream("timed out waiting for mesh enrollment stream"))?
         .map_err(|err| AppError::upstream(format!("failed to accept enrollment stream: {err}")))?;
-    let request: EnrollRequest = read_control(&mut recv).await?;
+    let request: EnrollRequest = timeout(INITIAL_CONTROL_FRAME_TIMEOUT, read_control(&mut recv))
+        .await
+        .map_err(|_| AppError::upstream("timed out waiting for mesh enrollment request"))??;
     validate_enroll_request(&request)
         .map_err(|err| AppError::bad_request(format!("invalid mesh enrollment: {err}")))?;
 
@@ -181,15 +232,15 @@ async fn handle_connection(
 async fn handle_worker_control(
     registry: Arc<MeshRegistry>,
     authorizer: Arc<MeshAuthorizer>,
+    model_allowlist: Arc<MeshModelAllowlist>,
     connection: iroh::endpoint::Connection,
     endpoint_id: iroh::EndpointId,
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
+    mut streams: MeshControlStreams,
     advertisement: crate::mesh::protocol::WorkerAdvertisement,
 ) -> AppResult<()> {
     let session = registry.register(endpoint_id, connection.clone(), advertisement);
     write_control(
-        &mut send,
+        &mut streams.send,
         &HubToWorker::HelloAck {
             protocol_version: crate::mesh::protocol::PROTOCOL_VERSION,
         },
@@ -202,44 +253,75 @@ async fn handle_worker_control(
     );
     let result: AppResult<()> = async {
         loop {
-            match read_control::<_, WorkerToHub>(&mut recv).await {
+            match read_control::<_, WorkerToHub>(&mut streams.recv).await {
                 Ok(WorkerToHub::Heartbeat(heartbeat)) => {
-                    if !authorizer
-                        .authorize_worker(endpoint_id)
-                        .await
-                        .map_err(|err| {
-                            AppError::internal(format!("mesh authorization refresh failed: {err}"))
-                        })?
-                    {
-                        return Err(AppError::upstream("mesh node was revoked"));
-                    }
+                    ensure_worker_still_authorized(&authorizer, &connection, endpoint_id).await?;
                     validate_heartbeat(&heartbeat).map_err(|err| {
                         AppError::bad_request(format!("invalid mesh worker heartbeat: {err}"))
                     })?;
                     session.apply_heartbeat(heartbeat);
                 }
                 Ok(WorkerToHub::ResourceUpdate(update)) => {
+                    ensure_worker_still_authorized(&authorizer, &connection, endpoint_id).await?;
                     validate_resource_advertisement(&update).map_err(|err| {
                         AppError::bad_request(format!("invalid mesh resource update: {err}"))
                     })?;
-                    session.update_resource(update);
+                    let update =
+                        filter_resource_update(endpoint_id, model_allowlist.as_ref(), update);
+                    validate_resource_advertisement(&update).map_err(|err| {
+                        AppError::bad_request(format!("invalid mesh resource update: {err}"))
+                    })?;
+                    let resource_id = update.resource_id.clone();
+                    if !session.update_resource(update) {
+                        tracing::warn!(
+                            endpoint_id = %endpoint_id,
+                            resource_id = %resource_id,
+                            "mesh worker attempted to add an unapproved resource"
+                        );
+                    }
                 }
                 Ok(WorkerToHub::ModelCatalogUpdate {
                     resource_id,
                     models,
                     revision,
                 }) => {
+                    ensure_worker_still_authorized(&authorizer, &connection, endpoint_id).await?;
+                    validate_model_catalog(&resource_id, &models).map_err(|err| {
+                        AppError::bad_request(format!("invalid mesh model catalog update: {err}"))
+                    })?;
+                    let models = filter_model_catalog(
+                        endpoint_id,
+                        model_allowlist.as_ref(),
+                        &resource_id,
+                        models,
+                    );
                     validate_model_catalog(&resource_id, &models).map_err(|err| {
                         AppError::bad_request(format!("invalid mesh model catalog update: {err}"))
                     })?;
                     session.update_model_catalog(&resource_id, models, revision);
                 }
                 Ok(WorkerToHub::Hello(advertisement)) => {
+                    ensure_worker_still_authorized(&authorizer, &connection, endpoint_id).await?;
+                    validate_worker_advertisement(&advertisement).map_err(|err| {
+                        AppError::bad_request(format!("invalid mesh worker hello: {err}"))
+                    })?;
+                    let advertisement = filter_worker_advertisement(
+                        endpoint_id,
+                        model_allowlist.as_ref(),
+                        advertisement,
+                    );
                     validate_worker_advertisement(&advertisement).map_err(|err| {
                         AppError::bad_request(format!("invalid mesh worker hello: {err}"))
                     })?;
                     for resource in advertisement.resources {
-                        session.update_resource(resource);
+                        let resource_id = resource.resource_id.clone();
+                        if !session.update_resource(resource) {
+                            tracing::warn!(
+                                endpoint_id = %endpoint_id,
+                                resource_id = %resource_id,
+                                "mesh worker hello attempted to add an unapproved resource"
+                            );
+                        }
                     }
                 }
                 Err(err) => return Err(err),
@@ -252,6 +334,208 @@ async fn handle_worker_control(
     result
 }
 
+struct MeshControlStreams {
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+}
+
+async fn ensure_worker_still_authorized(
+    authorizer: &MeshAuthorizer,
+    connection: &iroh::endpoint::Connection,
+    endpoint_id: iroh::EndpointId,
+) -> AppResult<()> {
+    if authorizer
+        .authorize_worker(endpoint_id)
+        .await
+        .map_err(|err| AppError::internal(format!("mesh authorization refresh failed: {err}")))?
+    {
+        return Ok(());
+    }
+    connection.close(403u32.into(), b"mesh node was revoked");
+    Err(AppError::upstream("mesh node was revoked"))
+}
+
+fn filter_worker_advertisement(
+    endpoint_id: iroh::EndpointId,
+    allowlist: &MeshModelAllowlist,
+    mut advertisement: crate::mesh::protocol::WorkerAdvertisement,
+) -> crate::mesh::protocol::WorkerAdvertisement {
+    let endpoint_id = endpoint_id.to_string();
+    let Some(resources) = allowlist.get(&endpoint_id) else {
+        advertisement.resources.clear();
+        return advertisement;
+    };
+    advertisement.resources.retain_mut(|resource| {
+        if !resources.contains_key(&resource.resource_id) {
+            return false;
+        }
+        filter_resource_models(resources, resource);
+        true
+    });
+    advertisement
+}
+
+fn filter_resource_update(
+    endpoint_id: iroh::EndpointId,
+    allowlist: &MeshModelAllowlist,
+    mut update: crate::mesh::protocol::ResourceAdvertisement,
+) -> crate::mesh::protocol::ResourceAdvertisement {
+    let endpoint_id = endpoint_id.to_string();
+    if let Some(resources) = allowlist.get(&endpoint_id) {
+        filter_resource_models(resources, &mut update);
+    } else {
+        update.models.clear();
+    }
+    update
+}
+
+fn filter_model_catalog(
+    endpoint_id: iroh::EndpointId,
+    allowlist: &MeshModelAllowlist,
+    resource_id: &str,
+    models: Vec<crate::mesh::protocol::ModelAdvertisement>,
+) -> Vec<crate::mesh::protocol::ModelAdvertisement> {
+    let endpoint_id = endpoint_id.to_string();
+    let Some(resources) = allowlist.get(&endpoint_id) else {
+        return Vec::new();
+    };
+    let Some(allowed) = resources.get(resource_id) else {
+        return Vec::new();
+    };
+    models
+        .into_iter()
+        .filter(|model| {
+            allowed
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&model.id))
+        })
+        .collect()
+}
+
+fn filter_resource_models(
+    resources: &BTreeMap<String, Vec<String>>,
+    resource: &mut crate::mesh::protocol::ResourceAdvertisement,
+) {
+    let Some(allowed) = resources.get(&resource.resource_id) else {
+        resource.models.clear();
+        return;
+    };
+    resource.models.retain(|model| {
+        allowed
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&model.id))
+    });
+}
+
 fn default_controller_identity_path() -> PathBuf {
     PathBuf::from("llmconduit-controller.key")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AvailabilitySchedule;
+    use crate::mesh::protocol::{ModelAdvertisement, ResourceAdvertisement, WorkerAdvertisement};
+    use iroh::SecretKey;
+
+    fn advertisement() -> WorkerAdvertisement {
+        WorkerAdvertisement {
+            protocol_version: PROTOCOL_VERSION,
+            node_name: None,
+            agent_version: "test".to_string(),
+            resources: vec![
+                ResourceAdvertisement {
+                    resource_id: "gpu-a".to_string(),
+                    models: vec![
+                        ModelAdvertisement {
+                            id: "allowed-model".to_string(),
+                            context_limit: Some(4096),
+                        },
+                        ModelAdvertisement {
+                            id: "surprise-model".to_string(),
+                            context_limit: None,
+                        },
+                    ],
+                    availability: AvailabilitySchedule::default(),
+                    effective_capacity: 1,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                },
+                ResourceAdvertisement {
+                    resource_id: "gpu-b".to_string(),
+                    models: vec![ModelAdvertisement {
+                        id: "other-model".to_string(),
+                        context_limit: None,
+                    }],
+                    availability: AvailabilitySchedule::default(),
+                    effective_capacity: 1,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn controller_model_allowlist_filters_initial_advertisement() {
+        let endpoint = SecretKey::generate().public();
+        let mut resources = BTreeMap::new();
+        resources.insert("gpu-a".to_string(), vec!["ALLOWED-MODEL".to_string()]);
+        let allowlist = BTreeMap::from([(endpoint.to_string(), resources)]);
+
+        let filtered = filter_worker_advertisement(endpoint, &allowlist, advertisement());
+
+        assert_eq!(filtered.resources.len(), 1);
+        assert_eq!(filtered.resources[0].resource_id, "gpu-a");
+        assert_eq!(filtered.resources[0].models.len(), 1);
+        assert_eq!(filtered.resources[0].models[0].id, "allowed-model");
+    }
+
+    #[test]
+    fn controller_model_allowlist_denies_unlisted_endpoint() {
+        let endpoint = SecretKey::generate().public();
+        let allowlist = BTreeMap::from([(
+            SecretKey::generate().public().to_string(),
+            BTreeMap::from([("gpu-a".to_string(), vec!["allowed-model".to_string()])]),
+        )]);
+
+        let filtered = filter_worker_advertisement(endpoint, &allowlist, advertisement());
+
+        assert!(filtered.resources.is_empty());
+    }
+
+    #[test]
+    fn controller_model_allowlist_fails_closed_when_empty() {
+        let endpoint = SecretKey::generate().public();
+
+        let filtered = filter_worker_advertisement(endpoint, &BTreeMap::new(), advertisement());
+
+        assert!(filtered.resources.is_empty());
+    }
+
+    #[test]
+    fn controller_model_allowlist_filters_later_catalog_updates() {
+        let endpoint = SecretKey::generate().public();
+        let allowlist = BTreeMap::from([(
+            endpoint.to_string(),
+            BTreeMap::from([("gpu-a".to_string(), vec!["allowed-model".to_string()])]),
+        )]);
+        let models = vec![
+            ModelAdvertisement {
+                id: "allowed-model".to_string(),
+                context_limit: Some(4096),
+            },
+            ModelAdvertisement {
+                id: "surprise-model".to_string(),
+                context_limit: None,
+            },
+        ];
+
+        let filtered = filter_model_catalog(endpoint, &allowlist, "gpu-a", models);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "allowed-model");
+    }
 }

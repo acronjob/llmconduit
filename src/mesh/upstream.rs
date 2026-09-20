@@ -1,7 +1,8 @@
 use crate::error::{AppError, AppResult, FailoverDisposition};
 use crate::mesh::io::{
-    Admission, RequestOpen, content_length, drain_http_chunk, is_chunked, read_admission,
-    read_http_response_head, split_http_response_head, write_request_open,
+    Admission, MAX_HTTP_CHUNK_BYTES, MAX_HTTP_CHUNK_LINE_BYTES, RequestOpen, content_length,
+    drain_http_chunk, is_chunked, read_admission, read_http_response_head,
+    split_http_response_head, write_request_open,
 };
 use crate::mesh::protocol::{AdmissionRejectCode, ModelAdvertisement, REQUEST_PROTOCOL_VERSION};
 use crate::mesh::registry::MeshRegistry;
@@ -126,7 +127,9 @@ impl UpstreamClient for MeshUpstreamClient {
             if let Some(capture) = backend.capture.as_ref() {
                 capture.reset_upstream_response();
             }
-            match open_mesh_http_stream(reservation, request.clone()).await {
+            match open_mesh_http_stream(reservation, request.clone(), self.max_sse_frame_bytes)
+                .await
+            {
                 Ok(stream) => {
                     stamp_header_byte(backend.serving.as_ref());
                     let mut stream =
@@ -273,11 +276,13 @@ struct MeshHttpStream {
     remaining_content_length: Option<usize>,
     chunked: bool,
     chunk_buf: BytesMut,
+    max_chunk_bytes: usize,
 }
 
 async fn open_mesh_http_stream(
     reservation: crate::mesh::registry::MeshReservation,
     http_request: Vec<u8>,
+    max_chunk_bytes: usize,
 ) -> AppResult<MeshHttpStream> {
     let connection = reservation
         .resource
@@ -318,6 +323,7 @@ async fn open_mesh_http_stream(
         remaining_content_length: content_length(&headers),
         chunked: is_chunked(&headers),
         chunk_buf: BytesMut::new(),
+        max_chunk_bytes,
     };
     if !status.is_success() {
         let body = stream.read_body_prefix(MESH_ERROR_BODY_READ_LIMIT).await?;
@@ -495,7 +501,7 @@ impl MeshHttpStream {
     async fn next_body_bytes(&mut self) -> AppResult<Option<Bytes>> {
         if self.chunked {
             loop {
-                if let Some(chunk) = drain_http_chunk(&mut self.chunk_buf) {
+                if let Some(chunk) = drain_http_chunk(&mut self.chunk_buf, self.max_chunk_bytes)? {
                     if chunk.is_empty() {
                         return Ok(None);
                     }
@@ -509,6 +515,18 @@ impl MeshHttpStream {
                     })?;
                 if read == 0 {
                     return Ok(None);
+                }
+                let max_buffered = MAX_HTTP_CHUNK_LINE_BYTES
+                    .checked_add(2)
+                    .and_then(|value| {
+                        value.checked_add(self.max_chunk_bytes.min(MAX_HTTP_CHUNK_BYTES))
+                    })
+                    .and_then(|value| value.checked_add(2))
+                    .ok_or_else(|| AppError::upstream("mesh HTTP chunk buffer limit overflow"))?;
+                if self.chunk_buf.len().saturating_add(read) > max_buffered {
+                    return Err(AppError::upstream(format!(
+                        "mesh HTTP chunk buffer exceeds {max_buffered} byte limit"
+                    )));
                 }
                 self.chunk_buf.extend_from_slice(&buf[..read]);
             }
@@ -921,6 +939,7 @@ mod tests {
         let resource_config = MeshWorkerResourceConfig {
             id: "primary".to_string(),
             target,
+            models: Vec::new(),
             model_refresh_secs: 60,
             availability: availability.clone(),
         };

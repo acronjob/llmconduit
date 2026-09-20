@@ -66,9 +66,15 @@ pub enum Commands {
         /// Path to the worker config file. Defaults to ~/.config/llmconduit/config.yaml
         #[arg(long)]
         config: Option<PathBuf>,
-        /// One-shot enrollment key. If omitted, LLMCONDUIT_MESH_JOIN_KEY is used.
-        #[arg(long = "join-key")]
+        /// DEPRECATED: one-shot enrollment key. Prefer LLMCONDUIT_MESH_JOIN_KEY, --join-key-stdin, or --join-key-file so the token is not exposed in process listings.
+        #[arg(long = "join-key", conflicts_with_all = ["join_key_stdin", "join_key_file"])]
         join_key: Option<String>,
+        /// Read the one-shot enrollment key from stdin.
+        #[arg(long = "join-key-stdin", default_value_t = false, conflicts_with_all = ["join_key", "join_key_file"])]
+        join_key_stdin: bool,
+        /// Read the one-shot enrollment key from a file.
+        #[arg(long = "join-key-file", conflicts_with_all = ["join_key", "join_key_stdin"])]
+        join_key_file: Option<PathBuf>,
     },
     /// Manage mesh controller state.
     Mesh {
@@ -341,6 +347,51 @@ mod tests {
             Some(Commands::Worker {
                 config: Some(_),
                 join_key: Some(_),
+                join_key_stdin: false,
+                join_key_file: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_worker_command_with_join_key_stdin() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "worker",
+            "--config",
+            "/etc/llmconduit/worker.yaml",
+            "--join-key-stdin",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worker {
+                config: Some(_),
+                join_key: None,
+                join_key_stdin: true,
+                join_key_file: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_worker_command_with_join_key_file() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "worker",
+            "--config",
+            "/etc/llmconduit/worker.yaml",
+            "--join-key-file",
+            "/run/secrets/mesh-join-key",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worker {
+                config: Some(_),
+                join_key: None,
+                join_key_stdin: false,
+                join_key_file: Some(_),
             })
         ));
     }

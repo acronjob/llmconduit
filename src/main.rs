@@ -17,6 +17,7 @@ use llmconduit::mesh::store::MeshStore;
 use llmconduit::mesh::store::now_ms;
 use llmconduit::raw::RawOutput;
 use llmconduit::request_log::analyze_request_log;
+use std::io::Read;
 use std::path::Path;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -74,10 +75,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
             Ok(())
         }
-        Some(Commands::Worker { config, join_key }) => {
+        Some(Commands::Worker {
+            config,
+            join_key,
+            join_key_stdin,
+            join_key_file,
+        }) => {
             let path = resolve_config_path(config)?;
             let config = Config::from_env_and_file(Some(&path))?;
-            let join_key = join_key.or_else(|| std::env::var("LLMCONDUIT_MESH_JOIN_KEY").ok());
+            if join_key.is_some() {
+                tracing::warn!(
+                    "--join-key exposes the mesh enrollment token in process listings; prefer \
+                     LLMCONDUIT_MESH_JOIN_KEY, --join-key-stdin, or --join-key-file"
+                );
+            }
+            let join_key =
+                resolve_mesh_join_key(join_key, join_key_stdin, join_key_file.as_deref())?;
             tracing::info!(config = %path.display(), "starting mesh worker");
             llmconduit::mesh::run_worker(config.mesh.worker, join_key).await?;
             Ok(())
@@ -331,6 +344,32 @@ fn init_tracing(raw_active: bool) {
     }
 }
 
+fn resolve_mesh_join_key(
+    cli_join_key: Option<String>,
+    read_stdin: bool,
+    file: Option<&Path>,
+) -> Result<Option<String>, std::io::Error> {
+    if let Some(join_key) = cli_join_key.and_then(nonblank) {
+        return Ok(Some(join_key));
+    }
+    if read_stdin {
+        let mut join_key = String::new();
+        std::io::stdin().read_to_string(&mut join_key)?;
+        return Ok(nonblank(join_key));
+    }
+    if let Some(path) = file {
+        return std::fs::read_to_string(path).map(nonblank);
+    }
+    Ok(std::env::var("LLMCONDUIT_MESH_JOIN_KEY")
+        .ok()
+        .and_then(nonblank))
+}
+
+fn nonblank(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 fn command_uses_dedicated_terminal(command: &Option<Commands>) -> bool {
     matches!(command, Some(Commands::Start { raw: true, .. }))
 }
@@ -372,5 +411,34 @@ mod tests {
 
         assert!(cli.with_debug_ui);
         assert!(matches!(cli.command, Some(Commands::Start { .. })));
+    }
+
+    #[test]
+    fn cli_join_key_is_trimmed_when_no_safer_source_is_supplied() {
+        assert_eq!(
+            resolve_mesh_join_key(Some("  llmc_join_cli  ".to_string()), false, None)
+                .expect("resolve")
+                .as_deref(),
+            Some("llmc_join_cli")
+        );
+    }
+
+    #[test]
+    fn blank_cli_join_key_is_ignored() {
+        assert_eq!(
+            resolve_mesh_join_key(Some("  ".to_string()), false, None).expect("resolve"),
+            None
+        );
+    }
+
+    #[test]
+    fn join_key_file_is_trimmed() {
+        let path =
+            std::env::temp_dir().join(format!("llmconduit-join-key-test-{}", std::process::id()));
+        std::fs::write(&path, "  llmc_join_file\n").expect("write key");
+        let resolved = resolve_mesh_join_key(None, false, Some(&path)).expect("resolve");
+        std::fs::remove_file(&path).expect("remove key");
+
+        assert_eq!(resolved.as_deref(), Some("llmc_join_file"));
     }
 }

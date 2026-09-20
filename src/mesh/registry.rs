@@ -385,18 +385,19 @@ impl WorkerSession {
         *self.last_seen.lock().expect("mesh last_seen lock poisoned") = Instant::now();
     }
 
-    pub(crate) fn update_resource(&self, update: ResourceAdvertisement) {
+    pub(crate) fn update_resource(&self, update: ResourceAdvertisement) -> bool {
         self.touch();
         let mut resources = self
             .resources
             .lock()
             .expect("mesh worker resources lock poisoned");
         match resources.get_mut(&update.resource_id) {
-            Some(resource) if update.revision < resource.revision => {}
-            Some(resource) => resource.apply(update),
-            None => {
-                resources.insert(update.resource_id.clone(), ResourceState::from(update));
+            Some(resource) if update.revision < resource.revision => true,
+            Some(resource) => {
+                resource.apply(update);
+                true
             }
+            None => false,
         }
     }
 
@@ -577,5 +578,50 @@ mod tests {
         assert_eq!(provider.active_requests, Some(1));
         assert!(provider.accepting_requests);
         drop(reservation);
+    }
+
+    #[test]
+    fn session_updates_cannot_add_unadvertised_resources() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        let session = registry.register_test(
+            endpoint,
+            WorkerAdvertisement {
+                protocol_version: PROTOCOL_VERSION,
+                node_name: None,
+                agent_version: "test".into(),
+                resources: vec![ResourceAdvertisement {
+                    resource_id: "initial".into(),
+                    models: vec![ModelAdvertisement {
+                        id: "allowed-model".into(),
+                        context_limit: None,
+                    }],
+                    availability: AvailabilitySchedule::default(),
+                    effective_capacity: 1,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                }],
+            },
+        );
+
+        assert!(!session.update_resource(ResourceAdvertisement {
+            resource_id: "injected".into(),
+            models: vec![ModelAdvertisement {
+                id: "injected-model".into(),
+                context_limit: None,
+            }],
+            availability: AvailabilitySchedule::default(),
+            effective_capacity: 1,
+            accepting_requests: true,
+            healthy: true,
+            revision: 2,
+        }));
+        assert!(registry.reserve("injected-model").is_none());
+        assert!(registry.reserve("allowed-model").is_some());
+        let catalog = registry.model_catalog();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "allowed-model");
+        assert_eq!(catalog[0].context_limit, None);
     }
 }

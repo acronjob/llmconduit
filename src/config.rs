@@ -696,6 +696,7 @@ pub struct MeshControllerConfig {
     pub identity_path: Option<PathBuf>,
     pub state_path: Option<PathBuf>,
     pub heartbeat_timeout_secs: u64,
+    pub model_allowlist: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 impl Default for MeshControllerConfig {
@@ -708,6 +709,7 @@ impl Default for MeshControllerConfig {
             identity_path: None,
             state_path: None,
             heartbeat_timeout_secs: 30,
+            model_allowlist: BTreeMap::new(),
         }
     }
 }
@@ -737,6 +739,7 @@ impl Default for MeshWorkerConfig {
 pub struct MeshWorkerResourceConfig {
     pub id: String,
     pub target: SocketAddr,
+    pub models: Vec<String>,
     pub model_refresh_secs: u64,
     pub availability: AvailabilitySchedule,
 }
@@ -1505,6 +1508,11 @@ pub struct PersistedMeshControllerConfig {
     pub state_path: Option<String>,
     #[serde(default = "default_mesh_heartbeat_timeout_secs")]
     pub heartbeat_timeout_secs: u64,
+    /// Controller-side routing approval map:
+    /// endpoint_id -> resource_id -> allowed model ids. An empty map is
+    /// fail-closed: enrolled workers remain connected but cannot receive work.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_allowlist: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 impl Default for PersistedMeshControllerConfig {
@@ -1515,6 +1523,7 @@ impl Default for PersistedMeshControllerConfig {
             identity_path: None,
             state_path: None,
             heartbeat_timeout_secs: default_mesh_heartbeat_timeout_secs(),
+            model_allowlist: BTreeMap::new(),
         }
     }
 }
@@ -1561,6 +1570,8 @@ impl PersistedMeshWorkerConfig {
 pub struct PersistedMeshWorkerResourceConfig {
     pub id: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     #[serde(default = "default_mesh_model_refresh_secs")]
     pub model_refresh_secs: u64,
     #[serde(default)]
@@ -2335,6 +2346,8 @@ pub(crate) fn is_glob_pattern(value: &str) -> bool {
 
 const MAX_MESH_CONFIGURED_CAPACITY: u32 = 65_535;
 const MAX_MESH_RESOURCE_ID_BYTES: usize = 128;
+const MAX_MESH_RESOURCE_MODELS: usize = 1024;
+const MAX_MESH_MODEL_ID_BYTES: usize = 512;
 
 fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String> {
     let controller_bind_addr = config
@@ -2363,6 +2376,7 @@ fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String>
             );
         }
     }
+    validate_mesh_model_allowlist(&config.controller.model_allowlist)?;
 
     let worker_configured = config.worker.controller_addr.is_some()
         || config.worker.controller_endpoint_id.is_some()
@@ -2414,6 +2428,7 @@ fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String>
             identity_path: controller_identity_path,
             state_path: controller_state_path,
             heartbeat_timeout_secs: config.controller.heartbeat_timeout_secs,
+            model_allowlist: config.controller.model_allowlist.clone(),
         },
         worker: MeshWorkerConfig {
             controller_addr: worker_controller_addr,
@@ -2423,6 +2438,69 @@ fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String>
             resources,
         },
     })
+}
+
+fn validate_mesh_model_allowlist(
+    allowlist: &BTreeMap<String, BTreeMap<String, Vec<String>>>,
+) -> Result<(), String> {
+    for (endpoint_id, resources) in allowlist {
+        if endpoint_id.trim().is_empty() {
+            return Err(
+                "mesh.controller.model_allowlist endpoint id must not be blank".to_string(),
+            );
+        }
+        if endpoint_id.chars().any(char::is_control) {
+            return Err(
+                "mesh.controller.model_allowlist endpoint id must not contain control characters"
+                    .to_string(),
+            );
+        }
+        if resources.is_empty() {
+            return Err(format!(
+                "mesh.controller.model_allowlist[{endpoint_id}] must approve at least one resource"
+            ));
+        }
+        for (resource_id, models) in resources {
+            if resource_id.trim().is_empty() {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}] resource id must not be blank"
+                ));
+            }
+            if resource_id.len() > MAX_MESH_RESOURCE_ID_BYTES {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} must be at most {MAX_MESH_RESOURCE_ID_BYTES} bytes"
+                ));
+            }
+            if resource_id.chars().any(char::is_control) {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}] resource id must not contain control characters"
+                ));
+            }
+            if models.is_empty() {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} must approve at least one model"
+                ));
+            }
+            if models.len() > MAX_MESH_RESOURCE_MODELS {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} must contain at most {MAX_MESH_RESOURCE_MODELS} models"
+                ));
+            }
+            for model in models {
+                if model.trim().is_empty() {
+                    return Err(format!(
+                        "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} must not contain blank model ids"
+                    ));
+                }
+                if model.len() > MAX_MESH_MODEL_ID_BYTES || model.chars().any(char::is_control) {
+                    return Err(format!(
+                        "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} contains an invalid model id"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_mesh_worker_resource(
@@ -2444,6 +2522,30 @@ fn parse_mesh_worker_resource(
             "mesh.worker.resources[{index}].model_refresh_secs must be greater than zero"
         ));
     }
+    if resource.models.len() > MAX_MESH_RESOURCE_MODELS {
+        return Err(format!(
+            "mesh.worker.resources[{index}].models must contain at most {MAX_MESH_RESOURCE_MODELS} entries"
+        ));
+    }
+    let models = resource
+        .models
+        .iter()
+        .enumerate()
+        .map(|(model_index, model)| {
+            let model = model.trim();
+            if model.is_empty() {
+                return Err(format!(
+                    "mesh.worker.resources[{index}].models[{model_index}] must not be blank"
+                ));
+            }
+            if model.len() > MAX_MESH_MODEL_ID_BYTES || model.chars().any(char::is_control) {
+                return Err(format!(
+                    "mesh.worker.resources[{index}].models[{model_index}] is invalid"
+                ));
+            }
+            Ok(model.to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let target = resource
         .target
         .trim()
@@ -2456,6 +2558,7 @@ fn parse_mesh_worker_resource(
     Ok(MeshWorkerResourceConfig {
         id: id.to_string(),
         target,
+        models,
         model_refresh_secs: resource.model_refresh_secs,
         availability,
     })
@@ -5681,6 +5784,7 @@ mesh:
     resources:
       - id: "primary"
         target: "127.0.0.1:8000"
+        models: ["qwen3", "llama-vision"]
         availability:
           timezone: "America/Chicago"
           default_capacity: 0
@@ -5707,10 +5811,32 @@ mesh:
         let config = Config::from_persisted(&persisted).expect("config");
         let resource = &config.mesh.worker.resources[0];
         assert_eq!(resource.id, "primary");
+        assert_eq!(resource.models, ["qwen3", "llama-vision"]);
         assert_eq!(resource.model_refresh_secs, 60);
         assert_eq!(resource.availability.timezone, "America/Chicago");
         assert_eq!(resource.availability.weekly.len(), 2);
         assert_eq!(resource.availability.exceptions.len(), 1);
+    }
+
+    #[test]
+    fn mesh_worker_models_reject_blank_entries() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "primary"
+        target: "127.0.0.1:8000"
+        models: ["qwen3", " "]
+"#,
+        )
+        .expect("yaml");
+
+        let err = Config::from_persisted(&persisted).expect_err("blank model rejected");
+        assert!(err.contains("models[1] must not be blank"));
     }
 
     #[test]
@@ -5737,6 +5863,30 @@ mesh:
         .expect("yaml");
         let err = Config::from_persisted(&persisted).expect_err("missing state rejected");
         assert!(err.contains("mesh.controller.state_path"));
+    }
+
+    #[test]
+    fn mesh_controller_model_allowlist_loads() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  controller:
+    enabled: true
+    identity_path: "/var/lib/llmconduit/controller.key"
+    state_path: "/var/lib/llmconduit/mesh.sqlite"
+    model_allowlist:
+      endpoint-a:
+        primary: ["approved-model"]
+"#,
+        )
+        .expect("yaml");
+
+        let config = Config::from_persisted(&persisted).expect("config");
+
+        assert_eq!(
+            config.mesh.controller.model_allowlist["endpoint-a"]["primary"],
+            ["approved-model"]
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::mesh::protocol::{
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -486,7 +486,10 @@ async fn refresh_models(runtime: &WorkerRuntime) -> Vec<ResourceAdvertisement> {
     let mut updates = Vec::new();
     for resource in runtime.resources.values() {
         let (models, healthy) = match fetch_models(resource.config.target).await {
-            Ok(models) => (models, true),
+            Ok(models) => (
+                filter_advertised_models(models, &resource.config.models),
+                true,
+            ),
             Err(err) => {
                 tracing::warn!(
                     resource_id = %resource.config.id,
@@ -514,6 +517,35 @@ async fn refresh_models(runtime: &WorkerRuntime) -> Vec<ResourceAdvertisement> {
         }
     }
     updates
+}
+
+fn filter_advertised_models(
+    discovered: Vec<ModelAdvertisement>,
+    configured: &[String],
+) -> Vec<ModelAdvertisement> {
+    if configured.is_empty() {
+        return discovered;
+    }
+    let discovered_by_lowercase = discovered
+        .into_iter()
+        .map(|model| (model.id.to_ascii_lowercase(), model))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    configured
+        .iter()
+        .filter_map(|id| {
+            let normalized = id.to_ascii_lowercase();
+            if !seen.insert(normalized.clone()) {
+                return None;
+            }
+            discovered_by_lowercase
+                .get(&normalized)
+                .map(|model| ModelAdvertisement {
+                    id: id.clone(),
+                    context_limit: model.context_limit,
+                })
+        })
+        .collect()
 }
 
 async fn fetch_models(target: SocketAddr) -> AppResult<Vec<ModelAdvertisement>> {
@@ -742,6 +774,30 @@ mod tests {
         assert!(gate.try_acquire().is_none());
         drop(b);
         assert!(gate.try_acquire().is_some());
+    }
+
+    #[test]
+    fn configured_models_filter_discovered_catalog() {
+        let discovered = vec![
+            ModelAdvertisement {
+                id: "safe-model".to_string(),
+                context_limit: Some(4096),
+            },
+            ModelAdvertisement {
+                id: "surprise-model".to_string(),
+                context_limit: Some(8192),
+            },
+        ];
+
+        let filtered = filter_advertised_models(discovered, &["SAFE-MODEL".to_string()]);
+
+        assert_eq!(
+            filtered,
+            vec![ModelAdvertisement {
+                id: "SAFE-MODEL".to_string(),
+                context_limit: Some(4096),
+            }]
+        );
     }
 
     fn schedule(json: serde_json::Value) -> AvailabilitySchedule {

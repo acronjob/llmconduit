@@ -171,18 +171,54 @@ pub fn is_chunked(headers: &http::HeaderMap) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
 }
 
-pub fn drain_http_chunk(buf: &mut BytesMut) -> Option<Vec<u8>> {
-    let line_end = buf.windows(2).position(|window| window == b"\r\n")?;
-    let line = std::str::from_utf8(&buf[..line_end]).ok()?;
-    let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
-    let frame_len = line_end + 2 + size + 2;
+pub const MAX_HTTP_CHUNK_LINE_BYTES: usize = 1024;
+pub const MAX_HTTP_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+pub fn drain_http_chunk(buf: &mut BytesMut, max_chunk_bytes: usize) -> AppResult<Option<Vec<u8>>> {
+    let Some(line_end) = buf.windows(2).position(|window| window == b"\r\n") else {
+        if buf.len() > MAX_HTTP_CHUNK_LINE_BYTES {
+            return Err(AppError::upstream(format!(
+                "mesh HTTP chunk size line exceeds {MAX_HTTP_CHUNK_LINE_BYTES} byte limit"
+            )));
+        }
+        return Ok(None);
+    };
+    if line_end > MAX_HTTP_CHUNK_LINE_BYTES {
+        return Err(AppError::upstream(format!(
+            "mesh HTTP chunk size line exceeds {MAX_HTTP_CHUNK_LINE_BYTES} byte limit"
+        )));
+    }
+    let line = std::str::from_utf8(&buf[..line_end])
+        .map_err(|err| AppError::upstream(format!("invalid mesh HTTP chunk size: {err}")))?;
+    let size = usize::from_str_radix(
+        line.split(';')
+            .next()
+            .ok_or_else(|| AppError::upstream("missing mesh HTTP chunk size"))?
+            .trim(),
+        16,
+    )
+    .map_err(|err| AppError::upstream(format!("invalid mesh HTTP chunk size: {err}")))?;
+    let max_chunk_bytes = max_chunk_bytes.min(MAX_HTTP_CHUNK_BYTES);
+    if size > max_chunk_bytes {
+        return Err(AppError::upstream(format!(
+            "mesh HTTP chunk declares {size} bytes, maximum is {max_chunk_bytes}"
+        )));
+    }
+    let frame_len = line_end
+        .checked_add(2)
+        .and_then(|value| value.checked_add(size))
+        .and_then(|value| value.checked_add(2))
+        .ok_or_else(|| AppError::upstream("mesh HTTP chunk frame length overflow"))?;
     if buf.len() < frame_len {
-        return None;
+        return Ok(None);
+    }
+    if &buf[frame_len - 2..frame_len] != b"\r\n" {
+        return Err(AppError::upstream("mesh HTTP chunk missing trailing CRLF"));
     }
     buf.advance(line_end + 2);
     let chunk = buf.split_to(size).to_vec();
     buf.advance(2);
-    Some(chunk)
+    Ok(Some(chunk))
 }
 
 #[cfg(test)]
@@ -211,5 +247,34 @@ mod tests {
         let (status, headers) = split_http_response_head(head).expect("head");
         assert_eq!(status, http::StatusCode::OK);
         assert_eq!(headers[http::header::CONTENT_TYPE], "text/event-stream");
+    }
+
+    #[test]
+    fn chunk_parser_rejects_oversized_size_lines() {
+        let mut buf = BytesMut::from(&b"1"[..]);
+        buf.resize(MAX_HTTP_CHUNK_LINE_BYTES + 1, b'1');
+        assert!(drain_http_chunk(&mut buf, MAX_HTTP_CHUNK_BYTES).is_err());
+    }
+
+    #[test]
+    fn chunk_parser_rejects_oversized_declared_chunks() {
+        let mut buf = BytesMut::from(format!("{:x}\r\n", MAX_HTTP_CHUNK_BYTES + 1).as_bytes());
+        assert!(drain_http_chunk(&mut buf, MAX_HTTP_CHUNK_BYTES).is_err());
+    }
+
+    #[test]
+    fn chunk_parser_honors_configured_chunk_limit() {
+        let mut buf = BytesMut::from(b"6\r\nhello!\r\n".as_slice());
+        assert!(drain_http_chunk(&mut buf, 5).is_err());
+    }
+
+    #[test]
+    fn chunk_parser_waits_for_bounded_incomplete_chunk() {
+        let mut buf = BytesMut::from(b"5\r\nhe".as_slice());
+        assert!(
+            drain_http_chunk(&mut buf, MAX_HTTP_CHUNK_BYTES)
+                .expect("bounded")
+                .is_none()
+        );
     }
 }

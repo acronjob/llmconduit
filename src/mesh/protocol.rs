@@ -17,7 +17,9 @@ pub const REQUEST_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_REQUEST_PREFACE_BYTES: usize = 4 * 1024;
 pub const MAX_NODE_NAME_BYTES: usize = 128;
+pub const MAX_AGENT_VERSION_BYTES: usize = 128;
 pub const MAX_RESOURCE_ID_BYTES: usize = 128;
+pub const MAX_MODEL_ID_BYTES: usize = 512;
 pub const MAX_RESOURCES_PER_NODE: usize = 32;
 pub const MAX_MODELS_PER_RESOURCE: usize = 1024;
 pub const MAX_CAPACITY_PER_RESOURCE: u32 = 65_535;
@@ -131,6 +133,7 @@ pub enum AdmissionRejectCode {
 pub fn validate_enroll_request(request: &EnrollRequest) -> Result<(), ProtocolError> {
     validate_protocol_version(request.protocol_version)?;
     validate_optional_name(request.node_name.as_deref())?;
+    validate_agent_version(&request.agent_version)?;
     if request.join_key.trim().is_empty() {
         return Err(ProtocolError::BlankJoinKey);
     }
@@ -142,6 +145,7 @@ pub fn validate_worker_advertisement(
 ) -> Result<(), ProtocolError> {
     validate_protocol_version(advertisement.protocol_version)?;
     validate_optional_name(advertisement.node_name.as_deref())?;
+    validate_agent_version(&advertisement.agent_version)?;
     if advertisement.resources.len() > MAX_RESOURCES_PER_NODE {
         return Err(ProtocolError::TooManyResources {
             count: advertisement.resources.len(),
@@ -184,8 +188,8 @@ pub fn validate_model_catalog(
             max: MAX_MODELS_PER_RESOURCE,
         });
     }
-    if models.iter().any(|model| model.id.trim().is_empty()) {
-        return Err(ProtocolError::BlankModelId);
+    for model in models {
+        validate_model_id(&model.id)?;
     }
     Ok(())
 }
@@ -207,9 +211,7 @@ pub fn validate_resource_advertisement(
         });
     }
     for model in &resource.models {
-        if model.id.trim().is_empty() {
-            return Err(ProtocolError::BlankModelId);
-        }
+        validate_model_id(&model.id)?;
     }
     Ok(())
 }
@@ -233,7 +235,28 @@ pub fn validate_resource_id(resource_id: &str) -> Result<(), ProtocolError> {
         MAX_RESOURCE_ID_BYTES,
         ProtocolError::BlankResourceId,
         |len, max| ProtocolError::ResourceIdTooLong { len, max },
-    )
+    )?;
+    reject_control_characters(resource_id, "resource id")
+}
+
+fn validate_model_id(model_id: &str) -> Result<(), ProtocolError> {
+    validate_bounded_string(
+        model_id,
+        MAX_MODEL_ID_BYTES,
+        ProtocolError::BlankModelId,
+        |len, max| ProtocolError::ModelIdTooLong { len, max },
+    )?;
+    reject_control_characters(model_id, "model id")
+}
+
+fn validate_agent_version(agent_version: &str) -> Result<(), ProtocolError> {
+    validate_bounded_string(
+        agent_version,
+        MAX_AGENT_VERSION_BYTES,
+        ProtocolError::BlankAgentVersion,
+        |len, max| ProtocolError::AgentVersionTooLong { len, max },
+    )?;
+    reject_control_characters(agent_version, "agent version")
 }
 
 fn validate_optional_name(name: Option<&str>) -> Result<(), ProtocolError> {
@@ -244,6 +267,14 @@ fn validate_optional_name(name: Option<&str>) -> Result<(), ProtocolError> {
             ProtocolError::BlankNodeName,
             |len, max| ProtocolError::NodeNameTooLong { len, max },
         )?;
+        reject_control_characters(name, "node name")?;
+    }
+    Ok(())
+}
+
+fn reject_control_characters(value: &str, field: &'static str) -> Result<(), ProtocolError> {
+    if value.chars().any(char::is_control) {
+        return Err(ProtocolError::ControlCharacter { field });
     }
     Ok(())
 }
@@ -359,6 +390,10 @@ pub enum ProtocolError {
     BlankNodeName,
     #[error("node name is {len} bytes, maximum is {max}")]
     NodeNameTooLong { len: usize, max: usize },
+    #[error("agent version must not be blank")]
+    BlankAgentVersion,
+    #[error("agent version is {len} bytes, maximum is {max}")]
+    AgentVersionTooLong { len: usize, max: usize },
     #[error("resource id must not be blank")]
     BlankResourceId,
     #[error("resource id is {len} bytes, maximum is {max}")]
@@ -371,6 +406,10 @@ pub enum ProtocolError {
     TooManyModels { count: usize, max: usize },
     #[error("model id must not be blank")]
     BlankModelId,
+    #[error("model id is {len} bytes, maximum is {max}")]
+    ModelIdTooLong { len: usize, max: usize },
+    #[error("{field} must not contain control characters")]
+    ControlCharacter { field: &'static str },
     #[error("join key must not be blank")]
     BlankJoinKey,
 }
@@ -478,6 +517,38 @@ mod tests {
         assert!(matches!(
             validate_worker_advertisement(&advertisement),
             Err(ProtocolError::TooManyModels { .. })
+        ));
+    }
+
+    #[test]
+    fn advertisement_validation_rejects_log_injection_and_oversized_model_ids() {
+        let mut advertisement = WorkerAdvertisement {
+            protocol_version: PROTOCOL_VERSION,
+            node_name: Some("node-a\nforged-log".to_string()),
+            agent_version: "test".to_string(),
+            resources: Vec::new(),
+        };
+        assert!(matches!(
+            validate_worker_advertisement(&advertisement),
+            Err(ProtocolError::ControlCharacter { field: "node name" })
+        ));
+
+        advertisement.node_name = None;
+        advertisement.resources.push(ResourceAdvertisement {
+            resource_id: "primary".to_string(),
+            models: vec![ModelAdvertisement {
+                id: "m".repeat(MAX_MODEL_ID_BYTES + 1),
+                context_limit: None,
+            }],
+            availability: AvailabilitySchedule::default(),
+            effective_capacity: 1,
+            accepting_requests: true,
+            healthy: true,
+            revision: 1,
+        });
+        assert!(matches!(
+            validate_worker_advertisement(&advertisement),
+            Err(ProtocolError::ModelIdTooLong { .. })
         ));
     }
 }

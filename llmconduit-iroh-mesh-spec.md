@@ -156,6 +156,10 @@ mesh:
     identity_path: "/var/lib/llmconduit/controller.key"
     state_path: "/var/lib/llmconduit/mesh.sqlite"
     heartbeat_timeout_secs: 30
+    # Fail-closed routing policy, keyed by the authenticated worker EndpointId.
+    model_allowlist:
+      "<worker endpoint id>":
+        primary: ["qwen3"]
 ```
 
 A hub may also retain ordinary HTTP upstreams. Mesh workers are an additional upstream pool, not a replacement for existing functionality.
@@ -180,6 +184,9 @@ mesh:
     resources:
       - id: "primary"
         target: "127.0.0.1:8000"
+        # Limits what an honest worker advertises; controller.model_allowlist
+        # remains the routing security boundary.
+        models: ["qwen3"]
         model_refresh_secs: 60
 
         availability:
@@ -1132,12 +1139,17 @@ llmconduit mesh node enable <endpoint-id>
 
 The CLI must never print stored plaintext join keys because they do not exist after creation. Print the token exactly once at creation time.
 
-Worker enrollment should support a first-run token from an environment variable or CLI argument, e.g.:
+Worker enrollment should read a first-run token from an environment variable,
+stdin, or a protected file, for example:
 
-```text
-LLMCONDUIT_MESH_JOIN_KEY
+```bash
+LLMCONDUIT_MESH_JOIN_KEY='...' llmconduit worker --config worker.yaml
+printf '%s' "$LLMCONDUIT_MESH_JOIN_KEY" | llmconduit worker --config worker.yaml --join-key-stdin
+llmconduit worker --config worker.yaml --join-key-file /run/secrets/mesh-join-key
 ```
 
+`--join-key` remains a deprecated compatibility option because command-line
+arguments can be exposed through process listings and shell history.
 Do not persist the plaintext token into the normal YAML config.
 
 If the worker is already enrolled (persistent identity accepted by hub), ignore the join key for normal operation.
@@ -1158,6 +1170,8 @@ mesh:
     identity_path: null
     state_path: null
     heartbeat_timeout_secs: 30
+    # Empty means no worker-advertised model is routable.
+    model_allowlist: {}
 
   worker:
     controller_addr: null
