@@ -66,6 +66,25 @@ fn remove_store(path: &Path) {
     let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
 }
 
+fn assert_store_files_do_not_contain(path: &Path, secret: &str) {
+    for candidate in [
+        path.to_path_buf(),
+        path.with_extension("sqlite3-wal"),
+        path.with_extension("sqlite3-shm"),
+    ] {
+        let Ok(bytes) = std::fs::read(&candidate) else {
+            continue;
+        };
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "raw key leaked into {}",
+            candidate.display()
+        );
+    }
+}
+
 #[tokio::test]
 async fn management_key_list_and_revoke_are_permissioned_and_never_recover_raw_secret() {
     let (service, path) = enforced_service();
@@ -214,6 +233,37 @@ async fn management_key_list_and_revoke_are_permissioned_and_never_recover_raw_s
         Err(AuthFailure::Invalid)
     ));
 
+    let denied_audit = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(delegated(
+            ManagementPermission::KeysRead,
+        )))
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/audit")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied_audit.status(), StatusCode::FORBIDDEN);
+
+    let audit = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(delegated(
+            ManagementPermission::AuditRead,
+        )))
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/audit")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), StatusCode::OK);
+    let audit = json(audit).await;
+    assert!(!audit.to_string().contains(&raw));
+
     drop(service);
+    assert_store_files_do_not_contain(&path, &raw);
     remove_store(&path);
 }
