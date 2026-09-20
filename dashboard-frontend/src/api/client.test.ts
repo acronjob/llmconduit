@@ -78,6 +78,25 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
   });
 });
 
+describe('DashboardClient — access management runtime validation', () => {
+  it('validates management responses and sends CSRF for mutations', async () => {
+    const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
+    const summary = await client.authSummary();
+    expect(summary.policy_epoch).toBeGreaterThan(0);
+    const users = await client.authUsers();
+    const created = await client.createAuthApiKey({ principal_id: users.users[0]!.id, name: 'test' });
+    expect(created.raw_key).toMatch(/^llmc_/);
+    const revoked = await client.revokeAuthApiKey(created.api_key.id);
+    expect(revoked.api_keys.find((key) => key.id === created.api_key.id)?.enabled).toBe(false);
+  });
+
+  it('rejects an invalid management response before it reaches the UI', async () => {
+    const fetchInvalid: typeof fetch = async () => new Response(JSON.stringify({ users: [{ id: 7 }] }), { status: 200 });
+    const client = new DashboardClient({ fetchImpl: fetchInvalid });
+    await expect(client.authUsers()).rejects.toThrow(/invalid response/);
+  });
+});
+
 describe('readCsrfCookie', () => {
   it('reads the double-submit token from the non-HttpOnly cookie', () => {
     document.cookie = 'llmconduit_csrf=abc123';
