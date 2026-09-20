@@ -69,24 +69,76 @@ fn remove_store(path: &Path) {
 #[tokio::test]
 async fn management_key_list_and_revoke_are_permissioned_and_never_recover_raw_secret() {
     let (service, path) = enforced_service();
-    let created = service
-        .create_key(
-            "management lifecycle principal",
-            "management lifecycle key",
-            &["chat".to_string()],
-            &["allowed-*".to_string()],
-        )
-        .expect("create key");
-    let key_id = created.summary.id.clone();
-    let raw = created
-        .raw_key
-        .as_deref()
-        .expect("copy-once raw key")
-        .to_owned();
-    assert!(raw.starts_with("llmc_"));
-    assert!(!format!("{created:?}").contains(&raw));
-
     let service = Arc::new(service);
+    let users = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(ManagementActor::Bootstrap))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/dashboard/api/auth/users")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"display_name":"management lifecycle principal","kind":"service_account"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(users.status(), StatusCode::OK);
+    let users = json(users).await;
+    let principal_id = users["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["display_name"] == "management lifecycle principal")
+        .expect("created principal is returned")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let create_body = serde_json::json!({
+        "principal_id": principal_id,
+        "name": "management lifecycle key",
+        "expires_at": null
+    })
+    .to_string();
+
+    let denied_create = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(delegated(
+            ManagementPermission::KeysRead,
+        )))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/dashboard/api/auth/api-keys")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied_create.status(), StatusCode::FORBIDDEN);
+
+    let created = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(delegated(
+            ManagementPermission::KeysCreate,
+        )))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/dashboard/api/auth/api-keys")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json(created).await;
+    let key_id = created["id"].as_str().unwrap().to_owned();
+    let raw = created["raw_key"].as_str().unwrap().to_owned();
+    assert!(raw.starts_with("llmc_"));
+    assert!(created.get("api_key").is_none(), "created key is flattened");
+
     let list_response = routes::<()>(service.access_backend())
         .layer(axum::extract::Extension(delegated(
             ManagementPermission::KeysRead,
