@@ -124,6 +124,28 @@ impl AuthStore {
         tx.commit().map_err(access_db)
     }
 
+    pub(crate) fn audit_pricing_sync_failure(
+        &mut self,
+        actor: &ManagementActor,
+        model: &str,
+        error: &str,
+    ) -> Result<(), AccessError> {
+        let tx = self.connection.transaction().map_err(access_db)?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert("model".into(), Value::String(model.to_string()));
+        metadata.insert("error".into(), Value::String(error.to_string()));
+        audit(
+            &tx,
+            &actor_name(actor),
+            "pricing.sync_failed",
+            model,
+            "error",
+            metadata,
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
+    }
+
     pub(crate) fn effective_prices(
         &self,
     ) -> Result<HashMap<String, crate::config::ModelPrice>, String> {

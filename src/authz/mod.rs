@@ -590,6 +590,12 @@ impl AuthzService {
                     "OpenRouter pricing sync is not configured",
                 )
             })?;
+        if request.models.len() > 128 {
+            return Err(crate::dashboard_access::AccessError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "pricing sync is limited to 128 models",
+            ));
+        }
         let mut seen = HashSet::new();
         let models = request
             .models
@@ -603,27 +609,31 @@ impl AuthzService {
                 "at least one OpenRouter model id is required",
             ));
         }
-        if models.len() > 128 {
-            return Err(crate::dashboard_access::AccessError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "pricing sync is limited to 128 models",
-            ));
-        }
-
         let client = crate::openrouter_pricing::OpenRouterPricingClient::default();
         let mut snapshots = Vec::with_capacity(models.len());
         for model in models {
-            snapshots.push(
-                client
-                    .fetch_model(&model, &management_key)
-                    .await
-                    .map_err(|err| {
-                        crate::dashboard_access::AccessError::new(
-                            StatusCode::BAD_GATEWAY,
-                            err.to_string(),
-                        )
-                    })?,
-            );
+            match client.fetch_model(&model, &management_key).await {
+                Ok(snapshot) => snapshots.push(snapshot),
+                Err(err) => {
+                    if let Ok(mut store) = inner.store.lock() {
+                        let _ = store.audit_pricing_sync_failure(&actor, &model, &err.to_string());
+                    }
+                    let status = match &err {
+                        crate::openrouter_pricing::PricingError::InvalidModelId
+                        | crate::openrouter_pricing::PricingError::InvalidPrice(_)
+                        | crate::openrouter_pricing::PricingError::PrecisionLoss(_)
+                        | crate::openrouter_pricing::PricingError::InvalidResponse(_)
+                        | crate::openrouter_pricing::PricingError::NoUsableEndpoints => {
+                            StatusCode::UNPROCESSABLE_ENTITY
+                        }
+                        _ => StatusCode::BAD_GATEWAY,
+                    };
+                    return Err(crate::dashboard_access::AccessError::new(
+                        status,
+                        err.to_string(),
+                    ));
+                }
+            }
         }
         let mut store = inner.store.lock().map_err(|_| {
             crate::dashboard_access::AccessError::new(
