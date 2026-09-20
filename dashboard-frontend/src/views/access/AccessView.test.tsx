@@ -16,7 +16,8 @@ describe('AccessView', () => {
       max_concurrent_sessions: 0, max_daily_session_starts: 1.5, management_permissions: [],
     })).toEqual([
       'Policy name is required.', 'Select at least one real subject.',
-      'Enter at least one endpoint.', 'Max concurrent sessions must be a positive integer.',
+      'Select at least one model API capability.',
+      'Max concurrent sessions must be a positive integer.',
       'Daily session starts must be a positive integer.',
       'UTC window requires days and distinct HH:MM start/end times.',
     ]);
@@ -31,11 +32,13 @@ describe('AccessView', () => {
     fireEvent.click(screen.getByRole('tab', { name: /people & groups/i }));
     expect(screen.getByText(/users and service accounts/i)).toBeInTheDocument();
     expect(screen.getByText(/groups and roles/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: /^api keys$/i }));
-    expect(screen.getByRole('heading', { name: /^api keys$/i })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('tab', { name: /policies/i }));
-    expect(screen.getByText(/policy editor/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /^model api keys$/i }));
+    expect(screen.getByRole('heading', { name: /^model api keys$/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /model policies/i }));
+    expect(screen.getAllByText(/api capabilities/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText('deny').length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole('tab', { name: /administration/i }));
+    expect(screen.getByText(/dashboard administration/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: /sessions/i }));
     expect(screen.getByRole('heading', { name: /active sessions/i })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: /audit & cost/i }));
@@ -48,7 +51,7 @@ describe('AccessView', () => {
     await screen.findByTestId('access-view');
 
     fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
-    fireEvent.click(screen.getByRole('tab', { name: /^api keys$/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /^model api keys$/i }));
     fireEvent.change(screen.getByLabelText('Key name'), { target: { value: 'temporary key' } });
     fireEvent.click(screen.getByRole('button', { name: 'Create key' }));
 
@@ -68,7 +71,8 @@ describe('AccessView', () => {
     fireEvent.change(screen.getByLabelText('Wizard display name'), { target: { value: 'Nightly evaluator' } });
     fireEvent.change(screen.getByLabelText('Wizard key name'), { target: { value: 'nightly runner' } });
     fireEvent.click(screen.getByRole('button', { name: /continue/i }));
-    expect(screen.getByLabelText('Wizard models')).toHaveValue('gpt-*');
+    expect(screen.getByText('Wizard models')).toBeInTheDocument();
+    expect(screen.getAllByText('All requested models').length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole('button', { name: /continue/i }));
     expect(screen.getByLabelText('Wizard max concurrent sessions')).toHaveValue(4);
     fireEvent.click(screen.getByRole('button', { name: /continue/i }));
@@ -99,23 +103,55 @@ describe('AccessView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create role' }));
     await screen.findByText('Policy reader');
 
-    fireEvent.click(screen.getByRole('tab', { name: /policies/i }));
-    const subjects = screen.getByLabelText('Policy subjects') as HTMLSelectElement;
-    Array.from(subjects.options).find((option) => option.value === 'principal:usr_ops')!.selected = true;
-    fireEvent.change(subjects);
-    fireEvent.change(screen.getByLabelText('Policy endpoints'), { target: { value: 'responses,chat' } });
-    fireEvent.change(screen.getByLabelText('Policy requested models'), { target: { value: 'alias-*' } });
-    fireEvent.change(screen.getByLabelText('Policy served models'), { target: { value: 'gpt-4.1' } });
-    fireEvent.change(screen.getByLabelText('Policy providers'), { target: { value: 'openai' } });
-    fireEvent.change(screen.getByLabelText('Policy routes'), { target: { value: 'cloud-primary' } });
+    fireEvent.click(screen.getByRole('tab', { name: /model policies/i }));
+    fireEvent.click(screen.getByText('Who this applies to'));
+    fireEvent.click(screen.getByRole('checkbox', { name: /principal · Operations/i }));
+    const responses = screen.getByRole('checkbox', { name: /responses api/i });
+    const chat = screen.getByRole('checkbox', { name: /chat completions/i });
+    expect(responses).toBeChecked();
+    expect(chat).toBeChecked();
+    fireEvent.click(screen.getByText('Advanced model and routing constraints'));
+    fireEvent.change(screen.getByLabelText('Policy requested aliases'), { target: { value: 'alias-*' } });
+    fireEvent.click(screen.getByText('Served backend models'));
+    fireEvent.click(screen.getAllByRole('checkbox', { name: /gpt-4o/i }).at(-1)!);
+    fireEvent.click(screen.getByText('Providers'));
+    fireEvent.click(screen.getByRole('checkbox', { name: /openai-proxy/i }));
+    fireEvent.click(screen.getByText('Routing labels'));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^cloud$/i }));
 
     const preview = screen.getByTestId('policy-payload-preview');
     expect(preview).toHaveTextContent('"subjects": [');
     expect(preview).toHaveTextContent('"principal:usr_ops"');
+    expect(preview).toHaveTextContent('"endpoints": [');
     expect(preview).toHaveTextContent('"requested_models": [');
+    expect(preview).toHaveTextContent('"alias-*"');
     expect(preview).toHaveTextContent('"served_models": [');
+    expect(preview).toHaveTextContent('"gpt-4o"');
+    expect(preview).toHaveTextContent('"providers": [');
+    expect(preview).toHaveTextContent('"openai"');
     expect(preview).toHaveTextContent('"routes": [');
+    expect(preview).toHaveTextContent('"cloud"');
     expect(preview).not.toHaveTextContent('grp_prod');
-    expect(screen.getByRole('button', { name: 'Save reviewed policy' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Save model policy' })).toBeEnabled();
+  });
+
+  it('keeps dashboard administration separate from model access', async () => {
+    renderWithQuery(<AccessView />);
+    await screen.findByTestId('access-view');
+
+    fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /administration/i }));
+    const subjects = screen.getByLabelText('Administration policy subjects') as HTMLSelectElement;
+    subjects.options[0]!.selected = true;
+    fireEvent.change(subjects);
+    fireEvent.click(screen.getByRole('checkbox', { name: /view keys/i }));
+
+    const preview = screen.getByTestId('administration-policy-payload');
+    expect(preview).toHaveTextContent('"endpoints": []');
+    expect(preview).toHaveTextContent('"auth.keys.read"');
+    expect(screen.getByRole('button', { name: 'Create administration policy' })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create dashboard sign-in key' }));
+    expect(await screen.findByRole('dialog', { name: /copy api key/i })).toBeInTheDocument();
   });
 });

@@ -12,7 +12,7 @@ describe('AccessView management lifecycle', () => {
     await screen.findByTestId('access-view');
 
     fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
-    fireEvent.click(screen.getByRole('tab', { name: /^api keys$/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /^model api keys$/i }));
     const rotate = screen.getAllByRole('button', { name: 'Rotate' })[0];
     expect(rotate).toBeDefined();
     fireEvent.click(rotate!);
@@ -30,7 +30,7 @@ describe('AccessView management lifecycle', () => {
     await screen.findByTestId('access-view');
 
     fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
-    fireEvent.click(screen.getByRole('tab', { name: /^api keys$/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /^model api keys$/i }));
     const revoke = screen.getAllByRole('button', { name: 'Revoke' })[0];
     expect(revoke).toBeDefined();
     const row = revoke!.closest('tr');
@@ -48,14 +48,12 @@ describe('AccessView management lifecycle', () => {
     await screen.findByTestId('access-view');
 
     fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
-    fireEvent.click(screen.getByRole('tab', { name: /policies/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /model policies/i }));
     fireEvent.change(screen.getByLabelText('Policy effect'), { target: { value: 'deny' } });
-    fireEvent.change(screen.getByLabelText('Policy models'), { target: { value: 'secret-*, internal-*' } });
-    fireEvent.change(screen.getByLabelText('Policy providers'), { target: { value: 'private-a' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: /model list/i }));
 
-    const preview = screen.getByText('Effective preview').parentElement?.parentElement;
-    expect(preview).toHaveTextContent(/deny/i);
-    expect(preview).toHaveTextContent('secret-*, internal-*');
-    expect(preview).toHaveTextContent('private-a');
+    expect(screen.getAllByText('deny').length).toBeGreaterThan(0);
+    expect(screen.getByText(/Capabilities: .*Model List/i)).toBeInTheDocument();
+    expect(screen.getByText(/Providers: All providers/i)).toBeInTheDocument();
   });
 });

@@ -21,7 +21,14 @@ import {
   type AccessAttentionItem,
   type AccessPrincipalRow,
 } from './accessOverviewModel';
-import { validatePolicy } from './policyEditorModel';
+import {
+  inferenceEndpointOptions,
+  managementPermissionLabels,
+  summarizeEndpoints,
+  summarizeMatcher,
+  summarizePolicyIntent,
+  validatePolicy,
+} from './policyEditorModel';
 
 const accessQueryKey = ['auth', 'access'] as const;
 const managementPermissions: ManagementPermission[] = [
@@ -31,7 +38,7 @@ const managementPermissions: ManagementPermission[] = [
   'auth.usage.read', 'auth.audit.read', 'auth.pricing.read', 'auth.pricing.sync',
   'auth.pricing.write', 'auth.sessions.read', 'auth.sessions.terminate',
 ];
-const accessTabs = ['overview', 'keys', 'people', 'policies', 'sessions', 'audit'] as const;
+const accessTabs = ['overview', 'keys', 'people', 'policies', 'administration', 'sessions', 'audit'] as const;
 type AccessTab = typeof accessTabs[number];
 type WizardStep = 'identity' | 'permissions' | 'limits' | 'review';
 
@@ -50,12 +57,12 @@ const dataOrEmpty = <T,>(value: T[] | undefined): T[] => value ?? [];
 
 async function loadAccess() {
   const { client } = getConnection();
-  const [summary, users, groups, roles, policies, apiKeys, sessions, usage, audit, pricing] = await Promise.all([
+  const [summary, users, groups, roles, policies, apiKeys, sessions, usage, audit, pricing, catalog, topology] = await Promise.all([
     client.authSummary(), client.authUsers(), client.authGroups(), client.authRoles(),
     client.authPolicies(), client.authApiKeys(), client.authSessions(), client.authUsage(),
-    client.authAudit(), client.authPricing(),
+    client.authAudit(), client.authPricing(), client.catalog(), client.topology(),
   ]);
-  return { summary, users, groups, roles, policies, apiKeys, sessions, usage, audit, pricing };
+  return { summary, users, groups, roles, policies, apiKeys, sessions, usage, audit, pricing, catalog, topology };
 }
 
 export function AccessView() {
@@ -75,20 +82,24 @@ export function AccessView() {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [draftEffect, setDraftEffect] = useState<AuthPolicy['effect']>('allow');
-  const [draftName, setDraftName] = useState('New policy');
+  const [draftName, setDraftName] = useState('Production model access');
   const [draftSubjects, setDraftSubjects] = useState<string[]>([]);
-  const [draftEndpoints, setDraftEndpoints] = useState('responses');
-  const [draftModels, setDraftModels] = useState('gpt-*');
-  const [draftRequestedModels, setDraftRequestedModels] = useState('gpt-*');
-  const [draftServedModels, setDraftServedModels] = useState('gpt-4.1');
-  const [draftProviders, setDraftProviders] = useState('openai');
-  const [draftRoutes, setDraftRoutes] = useState('cloud');
+  const [draftEndpoints, setDraftEndpoints] = useState('responses,chat');
+  const [draftModels, setDraftModels] = useState('');
+  const [draftRequestedModels, setDraftRequestedModels] = useState('');
+  const [draftServedModels, setDraftServedModels] = useState('');
+  const [draftProviders, setDraftProviders] = useState('');
+  const [draftRoutes, setDraftRoutes] = useState('');
   const [draftWindowDays, setDraftWindowDays] = useState('mon,tue,wed,thu,fri');
   const [draftWindowStart, setDraftWindowStart] = useState('08:00');
   const [draftWindowEnd, setDraftWindowEnd] = useState('18:00');
   const [draftConcurrent, setDraftConcurrent] = useState('4');
   const [draftDailyStarts, setDraftDailyStarts] = useState('100');
-  const [draftManagementPermissions, setDraftManagementPermissions] = useState<ManagementPermission[]>([]);
+  const [adminPolicyName, setAdminPolicyName] = useState('Dashboard administrator');
+  const [adminSubjects, setAdminSubjects] = useState<string[]>([]);
+  const [adminPermissions, setAdminPermissions] = useState<ManagementPermission[]>([]);
+  const [adminKeyPrincipal, setAdminKeyPrincipal] = useState('');
+  const [adminKeyName, setAdminKeyName] = useState('dashboard sign-in');
 
   const [wizardMode, setWizardMode] = useState<'existing' | 'new'>('new');
   const [wizardExistingPrincipal, setWizardExistingPrincipal] = useState('');
@@ -97,9 +108,9 @@ export function AccessView() {
   const [wizardKeyName, setWizardKeyName] = useState('default key');
   const [wizardPolicyName, setWizardPolicyName] = useState('Standard inference access');
   const [wizardEndpoints, setWizardEndpoints] = useState('responses,chat');
-  const [wizardModels, setWizardModels] = useState('gpt-*');
-  const [wizardProviders, setWizardProviders] = useState('openai');
-  const [wizardRoutes, setWizardRoutes] = useState('cloud');
+  const [wizardModels, setWizardModels] = useState('');
+  const [wizardProviders, setWizardProviders] = useState('');
+  const [wizardRoutes, setWizardRoutes] = useState('');
   const [wizardDays, setWizardDays] = useState('mon,tue,wed,thu,fri');
   const [wizardStart, setWizardStart] = useState('08:00');
   const [wizardEnd, setWizardEnd] = useState('18:00');
@@ -108,6 +119,7 @@ export function AccessView() {
 
   const users = useMemo(() => query.data?.users.users ?? [], [query.data?.users.users]);
   const principal = keyPrincipal || users[0]?.id || '';
+  const selectedAdminPrincipal = adminKeyPrincipal || users[0]?.id || '';
   const selectedWizardPrincipal = wizardExistingPrincipal || users[0]?.id || '';
   const subjectOptions = useMemo(() => [
     ...users.map((item) => ({ id: `principal:${item.id}`, label: `principal · ${item.display_name}` })),
@@ -115,28 +127,57 @@ export function AccessView() {
     ...dataOrEmpty(query.data?.roles.roles).map((item) => ({ id: `role:${item.id}`, label: `role · ${item.name}` })),
     ...dataOrEmpty(query.data?.apiKeys.api_keys).map((item) => ({ id: `key:${item.id}`, label: `key · ${item.name}` })),
   ], [query.data, users]);
+  const providerOptions = useMemo(() => dataOrEmpty(query.data?.topology.nodes).map((provider) => ({
+    value: provider.id,
+    label: provider.name,
+    description: provider.status,
+  })), [query.data?.topology.nodes]);
+  const modelOptions = useMemo(() => dataOrEmpty(query.data?.catalog).map((model) => ({
+    value: model.id,
+    label: model.id,
+    description: model.context_limit ? `${model.context_limit.toLocaleString()} token context` : 'Context limit unavailable',
+  })), [query.data?.catalog]);
+  const routeOptions = useMemo(() => Array.from(new Set(dataOrEmpty(query.data?.topology.nodes).flatMap((provider) => provider.route ? [provider.route] : []))).map((route) => ({
+    value: route,
+    label: route,
+  })), [query.data?.topology.nodes]);
   const draftPreview = useMemo<CreateAuthPolicyRequest>(() => ({
     name: draftName.trim(), effect: draftEffect, subjects: draftSubjects,
-    endpoints: csv(draftEndpoints), requested_models: csv(draftRequestedModels),
-    models: csv(draftModels),
+    endpoints: csv(draftEndpoints), requested_models: [...csv(draftRequestedModels), ...csv(draftModels)],
+    models: [],
     served_models: csv(draftServedModels), providers: csv(draftProviders), routes: csv(draftRoutes),
     time_windows: csv(draftWindowDays).length && draftWindowStart && draftWindowEnd
       ? [{ weekday_mask: weekdayMask(draftWindowDays), start_minute: minuteOfDay(draftWindowStart), end_minute: minuteOfDay(draftWindowEnd), absolute_start_ms: null, absolute_end_ms: null }]
       : [],
     max_concurrent_sessions: positiveInteger(draftConcurrent),
     max_daily_session_starts: positiveInteger(draftDailyStarts),
-    management_permissions: draftManagementPermissions,
+    management_permissions: [],
   }), [draftConcurrent, draftDailyStarts, draftEffect, draftEndpoints, draftName, draftProviders,
-    draftManagementPermissions, draftModels, draftRequestedModels, draftRoutes, draftServedModels, draftSubjects, draftWindowDays,
+    draftModels, draftRequestedModels, draftRoutes, draftServedModels, draftSubjects, draftWindowDays,
     draftWindowEnd, draftWindowStart]);
+  const adminPreview = useMemo<CreateAuthPolicyRequest>(() => ({
+    name: adminPolicyName.trim(),
+    effect: 'allow',
+    subjects: adminSubjects,
+    endpoints: [],
+    models: [],
+    requested_models: [],
+    served_models: [],
+    providers: [],
+    routes: [],
+    time_windows: [],
+    max_concurrent_sessions: null,
+    max_daily_session_starts: null,
+    management_permissions: adminPermissions,
+  }), [adminPermissions, adminPolicyName, adminSubjects]);
   const wizardPolicy = useMemo<CreateAuthPolicyRequest>(() => ({
     name: wizardPolicyName.trim(),
     effect: 'allow',
     subjects: [],
     endpoints: csv(wizardEndpoints),
-    models: csv(wizardModels),
+    models: [],
     requested_models: csv(wizardModels),
-    served_models: csv(wizardModels),
+    served_models: [],
     providers: csv(wizardProviders),
     routes: csv(wizardRoutes),
     time_windows: csv(wizardDays).length && wizardStart && wizardEnd
@@ -147,6 +188,7 @@ export function AccessView() {
     management_permissions: [],
   }), [wizardConcurrent, wizardDailyStarts, wizardDays, wizardEndpoints, wizardEnd, wizardModels, wizardPolicyName, wizardProviders, wizardRoutes, wizardStart]);
   const policyValidation = useMemo(() => validatePolicy(draftPreview), [draftPreview]);
+  const adminValidation = useMemo(() => validatePolicy(adminPreview, 'administration'), [adminPreview]);
 
   async function run(action: () => Promise<unknown>) {
     setBusy(true);
@@ -202,7 +244,7 @@ export function AccessView() {
           <h1 className="text-2xl font-semibold">Access control</h1>
           <p className="mt-1 text-sm text-text-muted">Manage who can use which models, when, and how much.</p>
         </div>
-        <div className="flex gap-2"><Button className="bg-accent text-white hover:bg-accent/85" onClick={() => { setDrawerOpen(true); setWizardMode('new'); setWizardStep('identity'); }}>＋ Create access</Button><Button variant="ghost" className="border-line" onClick={() => setTab('policies')}>＋ Create policy</Button></div>
+        <div className="flex gap-2"><Button className="bg-accent text-white hover:bg-accent/85" onClick={() => { setDrawerOpen(true); setWizardMode('new'); setWizardStep('identity'); }}>＋ Create model access</Button><Button variant="ghost" className="border-line" onClick={() => { setDrawerOpen(false); setTab('policies'); }}>＋ Create model policy</Button></div>
       </div>
 
       {actionError && <div role="alert" className="mb-3 rounded border border-status-down/40 bg-status-down/10 px-3 py-2 text-xs text-status-down">{actionError}</div>}
@@ -216,7 +258,7 @@ export function AccessView() {
             role="tab"
             aria-selected={tab === item}
             className={cn('border-b-2 px-3 py-2 text-xs font-medium transition-colors', tab === item ? 'border-accent text-accent' : 'border-transparent text-text-muted hover:text-text')}
-            onClick={() => setTab(item)}
+            onClick={() => { setTab(item); setDrawerOpen(false); }}
           >
             {tabLabel(item)}
           </button>
@@ -280,6 +322,9 @@ export function AccessView() {
           subjectOptions={subjectOptions}
           draftPreview={draftPreview}
           policyValidation={policyValidation}
+          providerOptions={providerOptions}
+          modelOptions={modelOptions}
+          routeOptions={routeOptions}
           busy={busy}
           draftEffect={draftEffect}
           draftName={draftName}
@@ -295,7 +340,6 @@ export function AccessView() {
           draftWindowEnd={draftWindowEnd}
           draftConcurrent={draftConcurrent}
           draftDailyStarts={draftDailyStarts}
-          draftManagementPermissions={draftManagementPermissions}
           setDraftEffect={setDraftEffect}
           setDraftName={setDraftName}
           setDraftSubjects={setDraftSubjects}
@@ -310,8 +354,34 @@ export function AccessView() {
           setDraftWindowEnd={setDraftWindowEnd}
           setDraftConcurrent={setDraftConcurrent}
           setDraftDailyStarts={setDraftDailyStarts}
-          setDraftManagementPermissions={setDraftManagementPermissions}
           onSavePolicy={() => void run(() => client.createAuthPolicy(draftPreview))}
+          onOpenAdministration={() => setTab('administration')}
+        />
+      )}
+      {tab === 'administration' && (
+        <AdministrationSection
+          users={users}
+          policies={data.policies.policies}
+          subjectOptions={subjectOptions}
+          policyName={adminPolicyName}
+          subjects={adminSubjects}
+          permissions={adminPermissions}
+          preview={adminPreview}
+          validation={adminValidation}
+          keyPrincipal={selectedAdminPrincipal}
+          keyName={adminKeyName}
+          busy={busy}
+          setPolicyName={setAdminPolicyName}
+          setSubjects={setAdminSubjects}
+          setPermissions={setAdminPermissions}
+          setKeyPrincipal={setAdminKeyPrincipal}
+          setKeyName={setAdminKeyName}
+          onCreatePolicy={() => void run(() => client.createAuthPolicy(adminPreview))}
+          onCreateKey={() => void run(async () => {
+            const created = await client.createAuthApiKey({ principal_id: selectedAdminPrincipal, name: adminKeyName.trim() || 'dashboard sign-in' });
+            setRevealedKey(created);
+            setAdminKeyName('dashboard sign-in');
+          })}
         />
       )}
       {tab === 'sessions' && (
@@ -349,6 +419,9 @@ export function AccessView() {
           setProviders={setWizardProviders}
           routes={wizardRoutes}
           setRoutes={setWizardRoutes}
+          providerOptions={providerOptions}
+          modelOptions={modelOptions}
+          routeOptions={routeOptions}
           days={wizardDays}
           setDays={setWizardDays}
           start={wizardStart}
@@ -424,7 +497,7 @@ function ApiKeysSection({ users, apiKeys, principal, keyName, busy, setKeyPrinci
   onRotate: (key: AuthApiKey) => void;
 }) {
   return (
-    <Section title="API keys" count={apiKeys.length}>
+    <Section title="Model API keys" count={apiKeys.length}>
       <form className="grid gap-2 p-3 md:grid-cols-[1fr_1fr_auto]" onSubmit={(event) => { event.preventDefault(); if (principal && keyName.trim()) onCreateKey(); }}>
         <select aria-label="Key owner" value={principal} onChange={(event) => setKeyPrincipal(event.target.value)} className="rounded border border-line bg-bg px-2 py-1.5 text-xs">{users.map((user) => <option key={user.id} value={user.id}>{user.display_name}</option>)}</select>
         <input aria-label="Key name" value={keyName} onChange={(event) => setKeyName(event.target.value)} placeholder="Key name" className="rounded border border-line bg-bg px-2 py-1.5 text-sm" />
@@ -494,6 +567,9 @@ function PolicySection(props: {
   subjectOptions: Array<{ id: string; label: string }>;
   draftPreview: CreateAuthPolicyRequest;
   policyValidation: string[];
+  providerOptions: Array<{ value: string; label: string; description?: string }>;
+  modelOptions: Array<{ value: string; label: string; description?: string }>;
+  routeOptions: Array<{ value: string; label: string }>;
   busy: boolean;
   draftEffect: AuthPolicy['effect'];
   draftName: string;
@@ -509,7 +585,6 @@ function PolicySection(props: {
   draftWindowEnd: string;
   draftConcurrent: string;
   draftDailyStarts: string;
-  draftManagementPermissions: ManagementPermission[];
   setDraftEffect: (value: AuthPolicy['effect']) => void;
   setDraftName: (value: string) => void;
   setDraftSubjects: (value: string[]) => void;
@@ -524,42 +599,84 @@ function PolicySection(props: {
   setDraftWindowEnd: (value: string) => void;
   setDraftConcurrent: (value: string) => void;
   setDraftDailyStarts: (value: string) => void;
-  setDraftManagementPermissions: (value: ManagementPermission[]) => void;
   onSavePolicy: () => void;
+  onOpenAdministration: () => void;
 }) {
   return (
-    <Section title="Policy editor and effective preview" count={props.policies.length}>
+    <Section title="Model policies" count={props.policies.filter((policy) => policy.management_permissions.length === 0).length}>
       <div className="grid gap-3 p-3 xl:grid-cols-[minmax(0,1fr)_22rem]">
-        <div className="grid gap-3 text-xs md:grid-cols-2">
-          <label className="block">Name<input aria-label="Policy name" value={props.draftName} onChange={(event) => props.setDraftName(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          <label className="block">Effect<select aria-label="Policy effect" value={props.draftEffect} onChange={(event) => props.setDraftEffect(event.target.value as AuthPolicy['effect'])} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5"><option value="allow">Allow</option><option value="deny">Deny</option></select></label>
-          <label className="block md:col-span-2">Subjects<select multiple aria-label="Policy subjects" value={props.draftSubjects} onChange={(event) => props.setDraftSubjects(Array.from(event.target.selectedOptions, (option) => option.value))} className="mt-1 h-24 w-full rounded border border-line bg-bg px-2 py-1">{props.subjectOptions.map((subject) => <option key={subject.id} value={subject.id}>{subject.label} · {subject.id}</option>)}</select></label>
-          <label className="block">Endpoints<input aria-label="Policy endpoints" value={props.draftEndpoints} onChange={(event) => props.setDraftEndpoints(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          <label className="block">Compatibility models<input aria-label="Policy models" value={props.draftModels} onChange={(event) => props.setDraftModels(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          <label className="block">Requested models<input aria-label="Policy requested models" value={props.draftRequestedModels} onChange={(event) => props.setDraftRequestedModels(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          <label className="block">Served models<input aria-label="Policy served models" value={props.draftServedModels} onChange={(event) => props.setDraftServedModels(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          <label className="block">Providers<input aria-label="Policy providers" value={props.draftProviders} onChange={(event) => props.setDraftProviders(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          <label className="block">Routes<input aria-label="Policy routes" value={props.draftRoutes} onChange={(event) => props.setDraftRoutes(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          <label className="block md:col-span-2">Management permissions<select multiple aria-label="Policy management permissions" value={props.draftManagementPermissions} onChange={(event) => props.setDraftManagementPermissions(Array.from(event.target.selectedOptions, (option) => option.value as ManagementPermission))} className="mt-1 h-24 w-full rounded border border-line bg-bg px-2 py-1">{managementPermissions.map((permission) => <option key={permission} value={permission}>{permission}</option>)}</select></label>
-          <fieldset className="grid grid-cols-3 gap-2 rounded border border-line p-2 md:col-span-2"><legend>UTC window</legend>
+        <div className="space-y-4 text-xs">
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="block">Policy name<input aria-label="Policy name" value={props.draftName} onChange={(event) => props.setDraftName(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
+            <label className="block">Decision<select aria-label="Policy effect" value={props.draftEffect} onChange={(event) => props.setDraftEffect(event.target.value as AuthPolicy['effect'])} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5"><option value="allow">Allow model access</option><option value="deny">Deny model access</option></select></label>
+          </div>
+          <MultiSelectField
+            label="Who this applies to"
+            allLabel="Select people, groups, services, roles, or keys"
+            value={props.draftSubjects}
+            options={props.subjectOptions.map((subject) => ({ value: subject.id, label: subject.label }))}
+            onChange={props.setDraftSubjects}
+          />
+          <CheckboxGroup label="API capabilities" value={csv(props.draftEndpoints)} options={inferenceEndpointOptions} onChange={(value) => props.setDraftEndpoints(value.join(','))} />
+          <div className="grid gap-3 md:grid-cols-2">
+            <MultiSelectField label="Providers" allLabel="All providers" value={csv(props.draftProviders)} options={props.providerOptions} onChange={(value) => props.setDraftProviders(value.join(','))} />
+            <MultiSelectField label="Models" allLabel="All requested models" value={csv(props.draftRequestedModels)} options={props.modelOptions} onChange={(value) => props.setDraftRequestedModels(value.join(','))} />
+          </div>
+          <details className="rounded border border-line bg-bg/50 p-3">
+            <summary className="cursor-pointer text-xs font-semibold">Advanced model and routing constraints</summary>
+            <p className="mt-2 text-[11px] leading-relaxed text-text-muted">Use these only when you need to match aliases differently from served backend model IDs, or constrain a named routing label. Empty fields mean unrestricted.</p>
+            <div className="mt-3 grid gap-3 md:grid-cols-3">
+              <label>Additional client model patterns<input aria-label="Policy requested aliases" value={props.draftModels} onChange={(event) => props.setDraftModels(event.target.value)} placeholder="e.g. team-* (optional)" className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
+              <MultiSelectField label="Served backend models" allLabel="All served models" value={csv(props.draftServedModels)} options={props.modelOptions} onChange={(value) => props.setDraftServedModels(value.join(','))} />
+              <MultiSelectField label="Routing labels" allLabel="All routes" value={csv(props.draftRoutes)} options={props.routeOptions} onChange={(value) => props.setDraftRoutes(value.join(','))} />
+            </div>
+          </details>
+          <fieldset className="grid grid-cols-3 gap-2 rounded border border-line p-2"><legend className="px-1">UTC window</legend>
             <input aria-label="Policy window days" value={props.draftWindowDays} onChange={(event) => props.setDraftWindowDays(event.target.value)} placeholder="mon,tue" className="rounded border border-line bg-bg px-2 py-1" />
             <input aria-label="Policy window start" type="time" value={props.draftWindowStart} onChange={(event) => props.setDraftWindowStart(event.target.value)} className="rounded border border-line bg-bg px-2 py-1" />
             <input aria-label="Policy window end" type="time" value={props.draftWindowEnd} onChange={(event) => props.setDraftWindowEnd(event.target.value)} className="rounded border border-line bg-bg px-2 py-1" />
           </fieldset>
-          <label>Max concurrent<input aria-label="Max concurrent sessions" type="number" min="1" value={props.draftConcurrent} onChange={(event) => props.setDraftConcurrent(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          <label>Daily starts<input aria-label="Daily session starts" type="number" min="1" value={props.draftDailyStarts} onChange={(event) => props.setDraftDailyStarts(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-          {props.policyValidation.length > 0 && <ul aria-label="Policy validation" className="list-disc pl-4 text-status-down md:col-span-2">{props.policyValidation.map((error) => <li key={error}>{error}</li>)}</ul>}
-          <Button className="w-fit" disabled={props.busy || props.policyValidation.length > 0} onClick={props.onSavePolicy}>Save reviewed policy</Button>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label>Max concurrent sessions<input aria-label="Max concurrent sessions" type="number" min="1" value={props.draftConcurrent} onChange={(event) => props.setDraftConcurrent(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
+            <label>Daily session starts<input aria-label="Daily session starts" type="number" min="1" value={props.draftDailyStarts} onChange={(event) => props.setDraftDailyStarts(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
+          </div>
+          {props.policyValidation.length > 0 && <ul aria-label="Policy validation" className="list-disc pl-4 text-status-down">{props.policyValidation.map((error) => <li key={error}>{error}</li>)}</ul>}
+          <div className="flex flex-wrap gap-2"><Button className="w-fit" disabled={props.busy || props.policyValidation.length > 0} onClick={props.onSavePolicy}>Save model policy</Button><Button variant="ghost" className="border-line" onClick={props.onOpenAdministration}>Create admin policy instead</Button></div>
         </div>
-        <div className={cn('h-fit rounded border p-3 text-xs', props.draftEffect === 'deny' ? 'border-status-down/50 bg-status-down/10' : 'border-status-healthy/40 bg-status-healthy/10')}>
-          <div className="flex items-center justify-between"><span className="font-semibold uppercase tracking-wide">Effective preview</span><span className={cn('rounded px-1.5 py-0.5 font-bold uppercase', props.draftEffect === 'deny' ? 'bg-status-down/20 text-status-down' : 'bg-status-healthy/20 text-status-healthy')}>{props.draftEffect}</span></div>
-          <div className="mt-2 text-[10px] text-text-muted">{props.draftPreview.models.join(', ')}</div>
-          <pre data-testid="policy-payload-preview" className="mt-3 max-h-[34rem] overflow-auto whitespace-pre-wrap break-all rounded bg-bg p-2 font-mono text-[10px]">{JSON.stringify(props.draftPreview, null, 2)}</pre>
-        </div>
+        <PolicyPreviewCard policy={props.draftPreview} kind="model" />
       </div>
-      <div className="border-t border-line p-3 text-xs">{props.policies.map((policy) => <div key={policy.id} className="mb-2 flex items-center gap-2"><span className={cn('rounded px-1.5 py-0.5 text-[10px] font-bold uppercase', policy.effect === 'deny' ? 'bg-status-down/20 text-status-down' : 'bg-status-healthy/15 text-status-healthy')}>{policy.effect}</span><span>{policy.name}</span><span className="ml-auto font-mono text-[10px] text-text-muted">{policy.requested_models.join(', ')} -&gt; {policy.served_models.join(', ')} · {policy.providers.join(', ')} / {policy.routes.join(', ')}</span></div>)}</div>
+      <PolicyList policies={props.policies.filter((policy) => policy.management_permissions.length === 0)} emptyText="No model policies yet." />
     </Section>
   );
+}
+
+interface ChoiceOption { value: string; label: string; description?: string }
+
+function CheckboxGroup({ label, value, options, onChange }: { label: string; value: string[]; options: readonly ChoiceOption[]; onChange: (value: string[]) => void }) {
+  return <fieldset><legend className="font-semibold">{label}</legend><div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">{options.map((option) => <label key={option.value} className={cn('flex cursor-pointer gap-2 rounded border p-2.5', value.includes(option.value) ? 'border-accent bg-accent/10' : 'border-line bg-bg')}><input type="checkbox" checked={value.includes(option.value)} onChange={() => onChange(toggleValue(value, option.value))} /><span><span className="block font-medium">{option.label}</span>{option.description && <span className="mt-0.5 block text-[9px] leading-snug text-text-muted">{option.description}</span>}</span></label>)}</div></fieldset>;
+}
+
+function MultiSelectField({ label, allLabel, value, options, onChange }: { label: string; allLabel: string; value: string[]; options: ChoiceOption[]; onChange: (value: string[]) => void }) {
+  const [search, setSearch] = useState('');
+  const visible = options.filter((option) => !search || `${option.label} ${option.value}`.toLowerCase().includes(search.toLowerCase()));
+  return <details className="relative"><summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded border border-line bg-bg px-3 py-2"><span className="min-w-0"><span className="block text-[10px] text-text-muted">{label}</span><span className="mt-1 block truncate">{value.length === 0 ? allLabel : value.join(', ')}</span></span><span aria-hidden="true" className="shrink-0 text-sm text-text-muted">⌄</span></summary><div className="absolute z-20 mt-1 max-h-64 w-full overflow-auto rounded border border-line bg-panel-raised p-2 shadow-2xl">{options.length > 6 && <input aria-label={`Search ${label.toLowerCase()}`} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={`Search ${label.toLowerCase()}...`} className="mb-2 w-full rounded border border-line bg-bg px-2 py-1.5" />}<label className="flex cursor-pointer gap-2 rounded px-2 py-1.5 hover:bg-line/30"><input type="checkbox" checked={value.length === 0} onChange={() => onChange([])} /><span>{allLabel}</span></label>{visible.map((option) => <label key={option.value} className="flex cursor-pointer gap-2 rounded px-2 py-1.5 hover:bg-line/30"><input type="checkbox" checked={value.includes(option.value)} onChange={() => onChange(toggleValue(value, option.value))} /><span><span className="block">{option.label}</span>{option.description && <span className="block text-[9px] text-text-muted">{option.description}</span>}</span></label>)}{options.length === 0 && <p className="px-2 py-2 text-[10px] text-text-muted">No choices are currently reported by the gateway.</p>}</div></details>;
+}
+
+function PolicyPreviewCard({ policy, kind }: { policy: CreateAuthPolicyRequest; kind: 'model' | 'administration' }) {
+  return <div className={cn('h-fit rounded border p-4 text-xs', policy.effect === 'deny' ? 'border-status-down/50 bg-status-down/10' : 'border-status-healthy/40 bg-status-healthy/10')}><div className="flex items-center justify-between"><span className="text-sm font-semibold">Policy summary</span><span className={cn('rounded px-1.5 py-0.5 font-bold uppercase', policy.effect === 'deny' ? 'bg-status-down/20 text-status-down' : 'bg-status-healthy/20 text-status-healthy')}>{policy.effect}</span></div><div className="mt-3 space-y-2">{summarizePolicyIntent(policy, kind).map((line) => <p key={line} className="rounded border border-line/70 bg-bg/50 px-2 py-1.5">{line}</p>)}</div><details className="mt-3 text-[10px] text-text-muted"><summary className="cursor-pointer">Technical payload</summary><pre data-testid={kind === 'model' ? 'policy-payload-preview' : 'administration-policy-payload'} className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-bg p-2 font-mono">{JSON.stringify(policy, null, 2)}</pre></details></div>;
+}
+
+function PolicyList({ policies, emptyText }: { policies: AuthPolicy[]; emptyText: string }) {
+  return <div className="border-t border-line p-3 text-xs">{policies.length === 0 ? <p className="text-text-muted">{emptyText}</p> : policies.map((policy) => <div key={policy.id} className="mb-2 flex flex-wrap items-center gap-2 rounded border border-line bg-bg p-2"><span className={cn('rounded px-1.5 py-0.5 text-[9px] font-bold uppercase', policy.effect === 'deny' ? 'bg-status-down/20 text-status-down' : 'bg-status-healthy/15 text-status-healthy')}>{policy.effect}</span><span className="font-medium">{policy.name}</span><span className="text-text-muted">{formatAccessList(policy.subjects)}</span><span className="ml-auto text-right text-[10px] text-text-muted">{policy.management_permissions.length > 0 ? `${policy.management_permissions.length} management permissions` : `${summarizeEndpoints(policy.endpoints)} · ${summarizeMatcher(policy.providers, 'all providers')} · ${summarizeMatcher(policy.requested_models, 'all models')}`}</span><Status enabled={policy.enabled} /></div>)}</div>;
+}
+
+function AdministrationSection(props: { users: AuthUser[]; policies: AuthPolicy[]; subjectOptions: Array<{ id: string; label: string }>; policyName: string; subjects: string[]; permissions: ManagementPermission[]; preview: CreateAuthPolicyRequest; validation: string[]; keyPrincipal: string; keyName: string; busy: boolean; setPolicyName: (value: string) => void; setSubjects: (value: string[]) => void; setPermissions: (value: ManagementPermission[]) => void; setKeyPrincipal: (value: string) => void; setKeyName: (value: string) => void; onCreatePolicy: () => void; onCreateKey: () => void }) {
+  const administrationPolicies = props.policies.filter((policy) => policy.management_permissions.length > 0);
+  return <div className="space-y-3"><Panel className="border-accent/30 bg-accent/5 p-4"><h2 className="text-base font-semibold">Dashboard administration</h2><p className="mt-1 max-w-3xl text-xs leading-relaxed text-text-muted">Dashboard sign-in credentials manage llmconduit. Model API keys are for inference clients. Use a dedicated administrator identity so the two purposes stay separate.</p></Panel><div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_22rem]"><Panel className="p-4"><h3 className="font-semibold">Create administration policy</h3><p className="mt-1 text-xs text-text-muted">Grant only the dashboard actions this administrator needs.</p><div className="mt-4 space-y-3 text-xs"><label className="block">Policy name<input aria-label="Administration policy name" value={props.policyName} onChange={(event) => props.setPolicyName(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-3 py-2" /></label><label className="block">Applies to<select multiple aria-label="Administration policy subjects" value={props.subjects} onChange={(event) => props.setSubjects(Array.from(event.target.selectedOptions, (option) => option.value))} className="mt-1 h-20 w-full rounded border border-line bg-bg px-2 py-1">{props.subjectOptions.map((subject) => <option key={subject.id} value={subject.id}>{subject.label}</option>)}</select></label><fieldset><legend className="font-medium">Management permissions</legend><div className="mt-2 grid gap-1.5 sm:grid-cols-2">{managementPermissions.map((permission) => <label key={permission} className={cn('flex cursor-pointer gap-2 rounded border px-2 py-1.5', props.permissions.includes(permission) ? 'border-accent bg-accent/10' : 'border-line bg-bg')}><input type="checkbox" checked={props.permissions.includes(permission)} onChange={() => props.setPermissions(toggleValue(props.permissions, permission))} /><span>{managementPermissionLabels[permission]}</span></label>)}</div></fieldset>{props.validation.length > 0 && <ul aria-label="Administration policy validation" className="list-disc pl-4 text-status-down">{props.validation.map((error) => <li key={error}>{error}</li>)}</ul>}<Button disabled={props.busy || props.validation.length > 0} onClick={props.onCreatePolicy}>Create administration policy</Button></div></Panel><div className="space-y-3"><PolicyPreviewCard policy={props.preview} kind="administration" /><Panel className="p-4"><h3 className="font-semibold">Create dashboard sign-in key</h3><p className="mt-1 text-xs text-text-muted">Create this after the identity has an administration policy. The secret is shown once.</p><div className="mt-3 space-y-3 text-xs"><label className="block">Administrator identity<select aria-label="Administrator key identity" value={props.keyPrincipal} onChange={(event) => props.setKeyPrincipal(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-3 py-2">{props.users.map((user) => <option key={user.id} value={user.id}>{user.display_name} · {user.kind.replace('_', ' ')}</option>)}</select></label><label className="block">Key label<input aria-label="Administrator key name" value={props.keyName} onChange={(event) => props.setKeyName(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-3 py-2" /></label><div className="rounded border border-status-cooling/40 bg-status-cooling/10 p-3 text-status-cooling">Keep this key out of model clients. Use it only for dashboard sign-in.</div><Button disabled={props.busy || !props.keyPrincipal || !props.keyName.trim()} onClick={props.onCreateKey}>Create dashboard sign-in key</Button></div></Panel></div></div><Section title="Administration policies" count={administrationPolicies.length}><PolicyList policies={administrationPolicies} emptyText="No delegated dashboard administrators." /></Section></div>;
+}
+
+function toggleValue<T extends string>(values: T[], value: T): T[] {
+  return values.includes(value) ? values.filter((candidate) => candidate !== value) : [...values, value];
 }
 
 function SessionsSection({ sessions, busy, onRevoke }: { sessions: AuthSession[]; busy: boolean; onRevoke: (session: AuthSession) => void }) {
@@ -601,6 +718,9 @@ function CreateAccessDrawer(props: {
   setProviders: (value: string) => void;
   routes: string;
   setRoutes: (value: string) => void;
+  providerOptions: Array<{ value: string; label: string; description?: string }>;
+  modelOptions: Array<{ value: string; label: string; description?: string }>;
+  routeOptions: Array<{ value: string; label: string }>;
   days: string;
   setDays: (value: string) => void;
   start: string;
@@ -647,10 +767,13 @@ function CreateAccessDrawer(props: {
           {props.step === 'permissions' && (
             <div className="space-y-3 text-sm">
               <label className="block text-xs">Policy name<input aria-label="Wizard policy name" value={props.policyName} onChange={(event) => props.setPolicyName(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
-              <label className="block text-xs">Endpoints<input aria-label="Wizard endpoints" value={props.endpoints} onChange={(event) => props.setEndpoints(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
-              <label className="block text-xs">Models<input aria-label="Wizard models" value={props.models} onChange={(event) => props.setModels(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
-              <label className="block text-xs">Providers<input aria-label="Wizard providers" value={props.providers} onChange={(event) => props.setProviders(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
-              <label className="block text-xs">Routes<input aria-label="Wizard routes" value={props.routes} onChange={(event) => props.setRoutes(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-2 text-sm" /></label>
+              <CheckboxGroup label="API capabilities" value={csv(props.endpoints)} options={inferenceEndpointOptions} onChange={(value) => props.setEndpoints(value.join(','))} />
+              <MultiSelectField label="Wizard models" allLabel="All requested models" value={csv(props.models)} options={props.modelOptions} onChange={(value) => props.setModels(value.join(','))} />
+              <MultiSelectField label="Wizard providers" allLabel="All providers" value={csv(props.providers)} options={props.providerOptions} onChange={(value) => props.setProviders(value.join(','))} />
+              <details className="rounded border border-line bg-bg/50 p-3 text-xs">
+                <summary className="cursor-pointer font-semibold">Advanced routing label</summary>
+                <div className="mt-3"><MultiSelectField label="Wizard routes" allLabel="All routes" value={csv(props.routes)} options={props.routeOptions} onChange={(value) => props.setRoutes(value.join(','))} /></div>
+              </details>
             </div>
           )}
           {props.step === 'limits' && (
@@ -668,8 +791,10 @@ function CreateAccessDrawer(props: {
             <div className="space-y-3 text-sm">
               <ReviewLine label="Identity" value={props.mode === 'existing' ? props.users.find((user) => user.id === props.existingPrincipal)?.display_name ?? props.existingPrincipal : `${props.displayName || 'New identity'} (${props.kind})`} />
               <ReviewLine label="Key" value={props.keyName || 'default key'} />
-              <ReviewLine label="Models" value={props.models} />
-              <ReviewLine label="Provider/route" value={`${props.providers} / ${props.routes}`} />
+              <ReviewLine label="Capabilities" value={summarizeEndpoints(csv(props.endpoints))} />
+              <ReviewLine label="Models" value={summarizeMatcher(csv(props.models), 'All requested models')} />
+              <ReviewLine label="Providers" value={summarizeMatcher(csv(props.providers), 'All providers')} />
+              <ReviewLine label="Routing labels" value={summarizeMatcher(csv(props.routes), 'All routes')} />
               <ReviewLine label="Window" value={`${props.days} ${props.start}-${props.end} UTC`} />
               <ReviewLine label="Sessions" value={`${props.concurrent || 'unlimited'} concurrent, ${props.dailyStarts || 'unlimited'} daily starts`} />
             </div>
@@ -751,9 +876,10 @@ function cost(row: AuthUsageRow): string {
 function tabLabel(tab: AccessTab): string {
   switch (tab) {
     case 'overview': return 'Overview';
-    case 'keys': return 'API keys';
+    case 'keys': return 'Model API keys';
     case 'people': return 'People & groups';
-    case 'policies': return 'Policies';
+    case 'policies': return 'Model policies';
+    case 'administration': return 'Administration';
     case 'sessions': return 'Sessions';
     case 'audit': return 'Audit & cost';
   }
