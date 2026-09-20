@@ -101,16 +101,21 @@ impl AuthStore {
         {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let store = Self { path: path.as_ref().to_path_buf(), pepper };
-        store.with_conn(|conn| {
-            conn.execute_batch(SCHEMA)?;
-            let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if version > SCHEMA_VERSION {
-                return Err(AuthStoreError::UnsupportedSchema(version));
-            }
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            Ok(())
-        }).await?;
+        let store = Self {
+            path: path.as_ref().to_path_buf(),
+            pepper,
+        };
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(SCHEMA)?;
+                let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                if version > SCHEMA_VERSION {
+                    return Err(AuthStoreError::UnsupportedSchema(version));
+                }
+                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                Ok(())
+            })
+            .await?;
         Ok(store)
     }
 
@@ -156,7 +161,9 @@ impl AuthStore {
             return Err(AuthStoreError::InvalidInput("blank API key name"));
         }
         if expires_at_ms.is_some_and(|expires| expires <= now_ms()) {
-            return Err(AuthStoreError::InvalidInput("API key expiry must be in the future"));
+            return Err(AuthStoreError::InvalidInput(
+                "API key expiry must be in the future",
+            ));
         }
         let generated = generate_api_key(&self.pepper);
         let raw_key = generated.raw().to_string();
@@ -195,7 +202,9 @@ impl AuthStore {
 
     pub async fn authenticate(&self, raw_key: &str, at_ms: i64) -> Result<AuthContext, AuthError> {
         let raw_key = raw_key.trim();
-        let prefix = key_prefix(raw_key).map_err(|_| AuthError::InvalidCredential)?.to_string();
+        let prefix = key_prefix(raw_key)
+            .map_err(|_| AuthError::InvalidCredential)?
+            .to_string();
         let presented = self.pepper.digest(raw_key);
         let candidates = self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
@@ -217,16 +226,25 @@ impl AuthStore {
             }
         }
         let candidate = selected.ok_or(AuthError::InvalidCredential)?;
-        if !candidate.key_enabled || !candidate.principal_enabled
-            || candidate.expires_at_ms.is_some_and(|expires| expires <= at_ms)
+        if !candidate.key_enabled
+            || !candidate.principal_enabled
+            || candidate
+                .expires_at_ms
+                .is_some_and(|expires| expires <= at_ms)
         {
             return Err(AuthError::InvalidCredential);
         }
         let key_id = candidate.key_id.clone();
-        let epoch = self.with_conn(move |conn| {
-            conn.execute("UPDATE auth_api_keys SET last_used_at_ms = ?2 WHERE id = ?1", params![key_id, at_ms])?;
-            current_epoch(conn)
-        }).await.map_err(|_| AuthError::PolicyUnavailable)?;
+        let epoch = self
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE auth_api_keys SET last_used_at_ms = ?2 WHERE id = ?1",
+                    params![key_id, at_ms],
+                )?;
+                current_epoch(conn)
+            })
+            .await
+            .map_err(|_| AuthError::PolicyUnavailable)?;
         Ok(AuthContext {
             request_id: AuthRequestId::new(),
             key_id: candidate.key_id,
@@ -294,7 +312,9 @@ impl AuthStore {
             conn.pragma_update(None, "foreign_keys", "ON")?;
             conn.busy_timeout(std::time::Duration::from_secs(5))?;
             operation(&mut conn)
-        }).await.map_err(AuthStoreError::Join)?
+        })
+        .await
+        .map_err(AuthStoreError::Join)?
     }
 }
 
@@ -345,17 +365,25 @@ INSERT OR IGNORE INTO auth_policy_epoch(singleton, epoch) VALUES (1, 1);
 "#;
 
 fn current_epoch(conn: &Connection) -> Result<u64, AuthStoreError> {
-    let epoch = conn.query_row("SELECT epoch FROM auth_policy_epoch WHERE singleton = 1", [], |row| row.get::<_, i64>(0))?;
+    let epoch = conn.query_row(
+        "SELECT epoch FROM auth_policy_epoch WHERE singleton = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
     u64::try_from(epoch).map_err(|_| AuthStoreError::InvalidInput("negative policy epoch"))
 }
 
 fn bump_epoch(tx: &rusqlite::Transaction<'_>) -> Result<(), AuthStoreError> {
-    tx.execute("UPDATE auth_policy_epoch SET epoch = epoch + 1 WHERE singleton = 1", [])?;
+    tx.execute(
+        "UPDATE auth_policy_epoch SET epoch = epoch + 1 WHERE singleton = 1",
+        [],
+    )?;
     Ok(())
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
 }
@@ -371,13 +399,25 @@ mod tests {
     #[tokio::test]
     async fn plaintext_is_returned_once_and_never_persisted_or_debugged() {
         let path = path("key");
-        let store = AuthStore::open(&path, AuthPepper::new("pepper").unwrap()).await.unwrap();
-        let principal = store.create_principal(PrincipalKind::ServiceAccount, "agent").await.unwrap();
-        let created = store.create_api_key(&principal.id, "primary", None).await.unwrap();
+        let store = AuthStore::open(&path, AuthPepper::new("pepper").unwrap())
+            .await
+            .unwrap();
+        let principal = store
+            .create_principal(PrincipalKind::ServiceAccount, "agent")
+            .await
+            .unwrap();
+        let created = store
+            .create_api_key(&principal.id, "primary", None)
+            .await
+            .unwrap();
         let raw = created.raw_key().to_string();
         assert!(!format!("{created:?}").contains(&raw));
         let bytes = std::fs::read(&path).unwrap();
-        assert!(!bytes.windows(raw.len()).any(|window| window == raw.as_bytes()));
+        assert!(
+            !bytes
+                .windows(raw.len())
+                .any(|window| window == raw.as_bytes())
+        );
         let context = store.authenticate(&raw, now_ms()).await.unwrap();
         assert_eq!(context.principal_id, principal.id);
         assert_eq!(store.list_api_keys().await.unwrap()[0].prefix, &raw[..12]);
@@ -387,13 +427,27 @@ mod tests {
     #[tokio::test]
     async fn revoked_expired_unknown_and_malformed_keys_fail_closed() {
         let path = path("reject");
-        let store = AuthStore::open(&path, AuthPepper::new("pepper").unwrap()).await.unwrap();
-        let principal = store.create_principal(PrincipalKind::User, "user").await.unwrap();
-        let created = store.create_api_key(&principal.id, "key", Some(now_ms() + 10_000)).await.unwrap();
+        let store = AuthStore::open(&path, AuthPepper::new("pepper").unwrap())
+            .await
+            .unwrap();
+        let principal = store
+            .create_principal(PrincipalKind::User, "user")
+            .await
+            .unwrap();
+        let created = store
+            .create_api_key(&principal.id, "key", Some(now_ms() + 10_000))
+            .await
+            .unwrap();
         let raw = created.raw_key().to_string();
         assert!(store.revoke_api_key(&created.record.id).await.unwrap());
-        assert_eq!(store.authenticate(&raw, now_ms()).await.unwrap_err(), AuthError::InvalidCredential);
-        assert_eq!(store.authenticate("blank", now_ms()).await.unwrap_err(), AuthError::InvalidCredential);
+        assert_eq!(
+            store.authenticate(&raw, now_ms()).await.unwrap_err(),
+            AuthError::InvalidCredential
+        );
+        assert_eq!(
+            store.authenticate("blank", now_ms()).await.unwrap_err(),
+            AuthError::InvalidCredential
+        );
         let _ = std::fs::remove_file(path);
     }
 }

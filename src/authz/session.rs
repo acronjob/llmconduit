@@ -29,7 +29,10 @@ impl SessionLimiter {
         let key_id = scope.context().key_id.clone();
         let limits = scope.effective_limits();
         let day = now.date_naive().num_days_from_ce();
-        let mut state = self.state.lock().map_err(|_| AuthError::PolicyUnavailable)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AuthError::PolicyUnavailable)?;
         let sessions = state.by_key.entry(key_id.clone()).or_default();
         if sessions.day != day {
             sessions.day = day;
@@ -99,8 +102,8 @@ impl SessionLease {
 mod tests {
     use super::*;
     use crate::authz::{
-        AuthContext, AuthRequestId, Endpoint, LimitSet, PolicyBinding, PolicyEffect,
-        PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject,
+        AuthContext, AuthRequestId, Endpoint, LimitSet, PolicyBinding, PolicyEffect, PolicyMatcher,
+        PolicyRule, PolicySnapshot, PolicySubject,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -108,7 +111,9 @@ mod tests {
         let rule = PolicyRule {
             id: "pol_limit".into(),
             effect: PolicyEffect::Allow,
-            binding: PolicyBinding { subject: PolicySubject::Key("key_a".into()) },
+            binding: PolicyBinding {
+                subject: PolicySubject::Key("key_a".into()),
+            },
             matcher: PolicyMatcher::all(),
             windows: Vec::new(),
             limits: LimitSet {
@@ -117,19 +122,26 @@ mod tests {
             },
             management_permissions: HashSet::new(),
         };
-        let snapshot = Arc::new(PolicySnapshot::new(1, vec![rule], HashMap::new(), HashMap::new()));
-        snapshot.authorize(
-            &AuthContext {
-                request_id: AuthRequestId::new(),
-                key_id: "key_a".into(),
-                key_prefix: "llmc_example".into(),
-                principal_id: "usr_a".into(),
-                policy_epoch: 1,
-            },
-            Endpoint::Responses,
-            Some("model"),
-            Utc::now(),
-        ).unwrap()
+        let snapshot = Arc::new(PolicySnapshot::new(
+            1,
+            vec![rule],
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        snapshot
+            .authorize(
+                &AuthContext {
+                    request_id: AuthRequestId::new(),
+                    key_id: "key_a".into(),
+                    key_prefix: "llmc_example".into(),
+                    principal_id: "usr_a".into(),
+                    policy_epoch: 1,
+                },
+                Endpoint::Responses,
+                Some("model"),
+                Utc::now(),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -141,7 +153,10 @@ mod tests {
         let clone = lease.clone();
         drop(lease);
         assert_eq!(limiter.active_for_key("key_a"), 1);
-        assert_eq!(limiter.acquire(&scope, now), Err(AuthError::QuotaExceeded));
+        assert!(matches!(
+            limiter.acquire(&scope, now),
+            Err(AuthError::QuotaExceeded)
+        ));
         drop(clone);
         assert_eq!(limiter.active_for_key("key_a"), 0);
         assert!(limiter.acquire(&scope, now).is_ok());

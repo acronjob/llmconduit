@@ -189,7 +189,9 @@ pub struct UtcWindow {
 impl UtcWindow {
     pub fn contains(&self, now: DateTime<Utc>) -> bool {
         let timestamp = now.timestamp_millis();
-        if self.absolute_start_ms.is_some_and(|start| timestamp < start)
+        if self
+            .absolute_start_ms
+            .is_some_and(|start| timestamp < start)
             || self.absolute_end_ms.is_some_and(|end| timestamp >= end)
         {
             return false;
@@ -354,7 +356,9 @@ impl AuthorizationScope {
         route_id: Option<&str>,
         served_model: Option<&str>,
     ) -> bool {
-        let rules = self.snapshot.applicable_rules(&self.context, self.evaluated_at);
+        let rules = self
+            .snapshot
+            .applicable_rules(&self.context, self.evaluated_at);
         let matches = |rule: &&PolicyRule| {
             rule.matcher.matches_candidate(
                 self.endpoint,
@@ -364,8 +368,12 @@ impl AuthorizationScope {
                 served_model,
             )
         };
-        !rules.iter().any(|rule| rule.effect == PolicyEffect::Deny && matches(rule))
-            && rules.iter().any(|rule| rule.effect == PolicyEffect::Allow && matches(rule))
+        !rules
+            .iter()
+            .any(|rule| rule.effect == PolicyEffect::Deny && matches(rule))
+            && rules
+                .iter()
+                .any(|rule| rule.effect == PolicyEffect::Allow && matches(rule))
     }
 
     pub fn allows_provider(&self, provider_id: &str) -> bool {
@@ -381,13 +389,19 @@ impl AuthorizationScope {
     }
 
     pub fn effective_limits(&self) -> LimitSet {
-        let rules = self.snapshot.applicable_rules(&self.context, self.evaluated_at);
+        let rules = self
+            .snapshot
+            .applicable_rules(&self.context, self.evaluated_at);
         LimitSet {
             max_concurrent_sessions: minimum_limit(
-                rules.iter().filter_map(|rule| rule.limits.max_concurrent_sessions),
+                rules
+                    .iter()
+                    .filter_map(|rule| rule.limits.max_concurrent_sessions),
             ),
             max_daily_session_starts: minimum_limit(
-                rules.iter().filter_map(|rule| rule.limits.max_daily_session_starts),
+                rules
+                    .iter()
+                    .filter_map(|rule| rule.limits.max_daily_session_starts),
             ),
         }
     }
@@ -452,9 +466,13 @@ fn compile_names(values: impl IntoIterator<Item = String>) -> Result<Vec<NameMat
                 return Err(AuthError::InvalidPolicy("blank matcher".to_string()));
             }
             if value.contains(['*', '?', '[']) {
-                let regex = Regex::new(&glob_regex(&value))
-                    .map_err(|err| AuthError::InvalidPolicy(format!("invalid matcher {value:?}: {err}")))?;
-                Ok(NameMatcher::Glob { source: value, regex })
+                let regex = Regex::new(&glob_regex(&value)).map_err(|err| {
+                    AuthError::InvalidPolicy(format!("invalid matcher {value:?}: {err}"))
+                })?;
+                Ok(NameMatcher::Glob {
+                    source: value,
+                    regex,
+                })
             } else {
                 Ok(NameMatcher::Exact(value))
             }
@@ -463,8 +481,7 @@ fn compile_names(values: impl IntoIterator<Item = String>) -> Result<Vec<NameMat
 }
 
 fn glob_regex(pattern: &str) -> String {
-    let mut regex = String::from("(?i)^\");
-    regex.pop();
+    let mut regex = String::from("(?i)^");
     for ch in pattern.chars() {
         match ch {
             '*' => regex.push_str(".*"),
@@ -508,7 +525,12 @@ mod tests {
         }
     }
 
-    fn rule(id: &str, effect: PolicyEffect, subject: PolicySubject, matcher: PolicyMatcher) -> PolicyRule {
+    fn rule(
+        id: &str,
+        effect: PolicyEffect,
+        subject: PolicySubject,
+        matcher: PolicyMatcher,
+    ) -> PolicyRule {
         PolicyRule {
             id: id.into(),
             effect,
@@ -522,10 +544,30 @@ mod tests {
 
     #[test]
     fn explicit_deny_overrides_additive_allow() {
-        let allow = rule("allow", PolicyEffect::Allow, PolicySubject::Principal("usr_a".into()), PolicyMatcher::all());
-        let deny = rule("deny", PolicyEffect::Deny, PolicySubject::Key("key_a".into()), PolicyMatcher::all());
-        let snapshot = Arc::new(PolicySnapshot::new(7, vec![allow, deny], HashMap::new(), HashMap::new()));
-        assert_eq!(snapshot.authorize(&context(7), Endpoint::Responses, Some("gpt"), Utc::now()).unwrap_err(), AuthError::Forbidden);
+        let allow = rule(
+            "allow",
+            PolicyEffect::Allow,
+            PolicySubject::Principal("usr_a".into()),
+            PolicyMatcher::all(),
+        );
+        let deny = rule(
+            "deny",
+            PolicyEffect::Deny,
+            PolicySubject::Key("key_a".into()),
+            PolicyMatcher::all(),
+        );
+        let snapshot = Arc::new(PolicySnapshot::new(
+            7,
+            vec![allow, deny],
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        assert_eq!(
+            snapshot
+                .authorize(&context(7), Endpoint::Responses, Some("gpt"), Utc::now())
+                .unwrap_err(),
+            AuthError::Forbidden
+        );
     }
 
     #[test]
@@ -536,14 +578,22 @@ mod tests {
             ["openai/*".into()],
             ["primary".into()],
             Vec::<String>::new(),
-        ).unwrap();
+        )
+        .unwrap();
         let snapshot = Arc::new(PolicySnapshot::new(
             1,
-            vec![rule("allow", PolicyEffect::Allow, PolicySubject::Principal("usr_a".into()), matcher)],
+            vec![rule(
+                "allow",
+                PolicyEffect::Allow,
+                PolicySubject::Principal("usr_a".into()),
+                matcher,
+            )],
             HashMap::new(),
             HashMap::new(),
         ));
-        let scope = snapshot.authorize(&context(1), Endpoint::Responses, Some("GPT-4o"), Utc::now()).unwrap();
+        let scope = snapshot
+            .authorize(&context(1), Endpoint::Responses, Some("GPT-4o"), Utc::now())
+            .unwrap();
         assert!(scope.allows_candidate(Some("PRIMARY"), None, Some("openai/gpt-4o")));
         assert!(!scope.allows_candidate(Some("fallback"), None, Some("openai/gpt-4o")));
         assert!(!scope.allows_candidate(Some("primary"), None, Some("other/model")));
@@ -551,7 +601,17 @@ mod tests {
 
     #[test]
     fn stale_snapshot_context_is_denied() {
-        let snapshot = Arc::new(PolicySnapshot::new(2, Vec::new(), HashMap::new(), HashMap::new()));
-        assert_eq!(snapshot.authorize(&context(1), Endpoint::Models, None, Utc::now()).unwrap_err(), AuthError::PolicyUnavailable);
+        let snapshot = Arc::new(PolicySnapshot::new(
+            2,
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        assert_eq!(
+            snapshot
+                .authorize(&context(1), Endpoint::Models, None, Utc::now())
+                .unwrap_err(),
+            AuthError::PolicyUnavailable
+        );
     }
 }

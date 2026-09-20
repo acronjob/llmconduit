@@ -73,7 +73,11 @@ pub fn generate_api_key(pepper: &AuthPepper) -> GeneratedApiKey {
     let raw = format!("{API_KEY_PREFIX}{}", URL_SAFE_NO_PAD.encode(secret));
     let prefix = raw[..DISPLAY_CHARS.min(raw.len())].to_string();
     let digest = pepper.digest(&raw);
-    GeneratedApiKey { raw, prefix, digest }
+    GeneratedApiKey {
+        raw,
+        prefix,
+        digest,
+    }
 }
 
 pub fn key_prefix(raw: &str) -> Result<&str, KeyError> {
