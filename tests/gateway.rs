@@ -7641,6 +7641,80 @@ async fn enforced_auth_blocks_completions_and_count_tokens_endpoint_bypasses() {
 }
 
 #[tokio::test]
+async fn enforced_auth_allows_scoped_legacy_completions() {
+    let (authz, raw_key, store_path) = scoped_authz(&["completions"], &["public-*"]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(header("authorization", "Bearer upstream-secret"))
+        .and(body_json(json!({
+            "model": "public-model",
+            "prompt": "hello",
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cmpl-auth",
+            "object": "text_completion",
+            "choices": [{"text": "allowed", "index": 0, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().unwrap();
+    config.upstream_api_key = Some("upstream-secret".into());
+    let upstream = llmconduit::upstream::ReqwestUpstreamClient::new(
+        reqwest::Client::new(),
+        config.upstream_base_url.clone(),
+        config.upstream_api_key.clone(),
+        None,
+        config.flatten_content,
+        config.min_completion_tokens,
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    let gateway = Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(16),
+            Arc::new(upstream),
+            Arc::new(MockSearch::default()),
+            vision,
+            image_cache,
+            MonitorHub::disabled(),
+            None,
+            llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+        .with_authz(authz),
+    );
+    let response = llmconduit::build_app_from_gateway(gateway)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "public-model",
+                        "prompt": "hello",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
 async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
     let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
     let upstream = MockUpstream::default();
