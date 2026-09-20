@@ -169,6 +169,46 @@ mod tests {
     };
     use axum::http::{HeaderMap, HeaderValue};
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn access_dispatch_returns_before_a_busy_sqlite_mutex() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-access-runtime-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let service = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"access-runtime-pepper".to_vec(),
+            Some(&format!("llmc_{}", uuid::Uuid::new_v4().simple())),
+        )
+        .unwrap();
+        let store = std::sync::Arc::clone(&service.inner().unwrap().store);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        });
+        locked_rx.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let dispatch = AccessBackend::dispatch(
+            &service,
+            &ManagementActor::Bootstrap,
+            AccessOperation::Summary,
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(75),
+            "dispatch performed SQLite work before returning its future"
+        );
+        assert!(matches!(dispatch.await, Ok(AccessResult::Summary(_))));
+        blocker.join().unwrap();
+        drop(service);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn every_access_operation_is_backed_by_live_storage() {
         let path = std::env::temp_dir().join(format!(

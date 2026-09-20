@@ -359,18 +359,26 @@ impl AuthzService {
         if permissions.is_empty() {
             return Err(AuthError::Forbidden);
         }
-        let session = inner
-            .store
-            .lock()
-            .map_err(|_| AuthError::PolicyUnavailable)?
-            .create_dashboard_session(
-                &context.principal_id,
-                &context.key_id,
-                csrf_digest,
-                expires_at,
-                context.identity.policy_epoch,
-            )
-            .map_err(|_| AuthError::PolicyUnavailable)?;
+        let store = Arc::clone(&inner.store);
+        let principal_id = context.principal_id.clone();
+        let key_id = context.key_id.clone();
+        let csrf_digest = csrf_digest.to_vec();
+        let policy_epoch = context.identity.policy_epoch;
+        let session = tokio::task::spawn_blocking(move || {
+            store
+                .lock()
+                .map_err(|_| AuthError::PolicyUnavailable)?
+                .create_dashboard_session(
+                    &principal_id,
+                    &key_id,
+                    &csrf_digest,
+                    expires_at,
+                    policy_epoch,
+                )
+                .map_err(|_| AuthError::PolicyUnavailable)
+        })
+        .await
+        .map_err(|_| AuthError::PolicyUnavailable)??;
         Ok(crate::dashboard_access::ManagementActor::Delegated {
             session_id: session.session_id,
             principal_id: session.principal_id,
@@ -399,12 +407,17 @@ impl AuthzService {
         let Some(inner) = &self.inner else {
             return Ok(None);
         };
-        let session = inner
-            .store
-            .lock()
-            .map_err(|_| AuthError::PolicyUnavailable)?
-            .load_dashboard_session(session_id)
-            .map_err(|_| AuthError::PolicyUnavailable)?;
+        let store = Arc::clone(&inner.store);
+        let session_id_owned = session_id.to_owned();
+        let session = tokio::task::spawn_blocking(move || {
+            store
+                .lock()
+                .map_err(|_| AuthError::PolicyUnavailable)?
+                .load_dashboard_session(&session_id_owned)
+                .map_err(|_| AuthError::PolicyUnavailable)
+        })
+        .await
+        .map_err(|_| AuthError::PolicyUnavailable)??;
         let Some(session) = session else {
             return Ok(None);
         };
@@ -427,11 +440,9 @@ impl AuthzService {
             .filter_map(access::wire_permission)
             .collect::<Vec<_>>();
         if permissions.is_empty() {
-            let _ = inner
-                .store
-                .lock()
-                .map_err(|_| AuthError::PolicyUnavailable)?
-                .revoke_dashboard_session(session_id, "permission_removed");
+            self.revoke_delegated_session_with_reason(session_id, "permission_removed")
+                .await
+                .map_err(|_| AuthError::PolicyUnavailable)?;
             return Ok(None);
         }
         Ok(Some(crate::dashboard_access::ManagementActor::Delegated {
@@ -907,6 +918,51 @@ mod tests {
                 .await
                 .unwrap()
         );
+        drop(service);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delegated_session_sqlite_does_not_block_the_tokio_thread() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-dashboard-session-runtime-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+        let service = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"dashboard-runtime-pepper".to_vec(),
+            Some(&bootstrap),
+        )
+        .unwrap();
+        let store = Arc::clone(&service.inner().unwrap().store);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        });
+        locked_rx.recv().unwrap();
+
+        let verification = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .verify_delegated_csrf_digest("missing", &[0; 32])
+                    .await
+            }
+        });
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(75),
+            "SQLite mutex wait blocked the current-thread runtime"
+        );
+        assert!(!verification.await.unwrap().unwrap());
+        blocker.join().unwrap();
         drop(service);
         let _ = std::fs::remove_file(path);
     }
