@@ -8989,6 +8989,39 @@ mod tests {
         assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
         assert_eq!(failover.provider_health()[0].failover_count, 0);
     }
+
+    #[tokio::test]
+    async fn authorization_scope_cannot_be_bypassed_by_raw_completions_proxy() {
+        let leaf = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse("http://127.0.0.1:9/v1/").unwrap(),
+            None,
+            None,
+            true,
+            4096,
+        );
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "only",
+                leaf,
+                Some("served".to_string()),
+                None,
+                JsonMap::new(),
+            )],
+            Duration::from_secs(60),
+        );
+        let request = super::ProxyCompletionsRequest::new(
+            http::HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{"model":"alias","prompt":"hello"}"#),
+        )
+        .with_authorization(AuthorizationScope::restricted(|_, _, _, _| false));
+        let err = failover
+            .proxy_completions(request)
+            .await
+            .expect_err("raw completions must use the same candidate scope");
+        assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
+        assert_eq!(failover.provider_health()[0].failover_count, 0);
+    }
 }
 
 #[cfg(test)]
