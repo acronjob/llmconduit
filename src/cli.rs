@@ -239,6 +239,9 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
     };
 
     let config = PersistedConfig {
+        metrics_url: None,
+        metrics_source: None,
+
         bind_addr,
         upstream_base_url,
         upstream_api_key,

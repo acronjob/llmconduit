@@ -484,6 +484,7 @@ pub const TEST_IMAGE_DATA_URL: &str =
 
 pub fn test_config() -> Config {
     Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
         upstream_api_key: None,

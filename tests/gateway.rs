@@ -683,6 +683,7 @@ async fn uses_configured_upstream_model_override() {
         upstream.clone(),
         MockSearch::default(),
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
@@ -774,6 +775,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
         upstream.clone(),
         MockSearch::default(),
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
@@ -1127,6 +1129,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
         upstream.clone(),
         MockSearch::default(),
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
@@ -1194,6 +1197,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
         upstream.clone(),
         MockSearch::default(),
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
@@ -3187,6 +3191,7 @@ async fn proxies_models_endpoint_with_etag() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -3267,6 +3272,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("upstream-secret".to_string()),
@@ -3353,6 +3359,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -3442,6 +3449,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -3536,6 +3544,7 @@ async fn proxies_completions_endpoint_passthrough() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("upstream-secret".to_string()),
@@ -7792,6 +7801,7 @@ fn test_gateway_with_config_raw_output_and_authz(
 
 fn test_config() -> Config {
     Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
         upstream_api_key: None,
@@ -10901,6 +10911,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
     let upstream = PendingChunkUpstream::new();
     let stream_polled = upstream.stream_polled.notified();
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
         upstream_api_key: None,

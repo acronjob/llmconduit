@@ -2930,11 +2930,15 @@ fn parse_provider_metrics_target(
     let metrics_url = trim_nonempty(metrics_url);
     match (metrics_url, metrics_source) {
         (None, None) => Ok(None),
-        (Some(_), None) => Err(format!("{path}.metrics_source is required with metrics_url")),
-        (None, Some(_)) => Err(format!("{path}.metrics_url is required with metrics_source")),
+        (Some(_), None) => Err(format!(
+            "{path}.metrics_source is required with metrics_url"
+        )),
+        (None, Some(_)) => Err(format!(
+            "{path}.metrics_url is required with metrics_source"
+        )),
         (Some(raw_url), Some(source)) => {
-            let url = Url::parse(&raw_url)
-                .map_err(|err| format!("invalid {path}.metrics_url: {err}"))?;
+            let url =
+                Url::parse(&raw_url).map_err(|err| format!("invalid {path}.metrics_url: {err}"))?;
             crate::provider_metrics::ProviderMetricsTarget::from_operator_config(
                 provider.to_string(),
                 url,
@@ -3508,6 +3512,9 @@ model_profiles:
     #[test]
     fn from_persisted_invalid_base_url() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_base_url: "not a url".to_string(),
             ..PersistedConfig::default()
         };
@@ -3517,6 +3524,9 @@ model_profiles:
     #[test]
     fn whitespace_api_key_trimmed() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_api_key: Some("  secret  ".to_string()),
             ..PersistedConfig::default()
         };
@@ -3524,6 +3534,9 @@ model_profiles:
         assert_eq!(result.upstream_api_key, Some("secret".to_string()));
 
         let config2 = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_api_key: Some("   ".to_string()),
             ..PersistedConfig::default()
         };
@@ -3538,6 +3551,9 @@ model_profiles:
     #[test]
     fn turn_capture_dir_trims_blank_to_none() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             turn_capture_dir: Some("  /tmp/llmconduit-turns  ".to_string()),
             ..PersistedConfig::default()
         };
@@ -3548,6 +3564,9 @@ model_profiles:
         );
 
         let blank = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             turn_capture_dir: Some("   ".to_string()),
             ..PersistedConfig::default()
         };
@@ -3612,8 +3631,14 @@ model_profiles:
     #[test]
     fn from_persisted_parses_fallback_upstreams() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             fallback_upstreams: vec![
                 PersistedFallbackUpstream {
+                    metrics_url: None,
+                    metrics_source: None,
+
                     name: Some(" backup ".to_string()),
                     upstream_base_url: "  http://127.0.0.1:8001/v1  ".to_string(),
                     upstream_api_key: Some(" backup-secret ".to_string()),
@@ -3629,6 +3654,9 @@ model_profiles:
                     upstream_request_log_path: Some(" /tmp/llmconduit-fallback.jsonl ".to_string()),
                 },
                 PersistedFallbackUpstream {
+                    metrics_url: None,
+                    metrics_source: None,
+
                     name: Some("   ".to_string()),
                     upstream_base_url: "http://127.0.0.1:8002/v1".to_string(),
                     upstream_api_key: Some("   ".to_string()),
@@ -3685,7 +3713,13 @@ model_profiles:
     #[test]
     fn from_persisted_parses_explicit_upstreams_with_nested_fallbacks() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstreams: vec![PersistedUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 name: Some(" local ".to_string()),
                 upstream_base_url: " http://127.0.0.1:8000/v1 ".to_string(),
                 upstream_api_key: Some(" local-secret ".to_string()),
@@ -3696,6 +3730,9 @@ model_profiles:
                 )]),
                 upstream_request_log_path: Some(" /tmp/llmconduit-local.jsonl ".to_string()),
                 fallback_upstreams: vec![PersistedFallbackUpstream {
+                    metrics_url: None,
+                    metrics_source: None,
+
                     name: Some(" backup ".to_string()),
                     upstream_base_url: " https://openrouter.ai/api/v1 ".to_string(),
                     upstream_api_key: Some(" backup-secret ".to_string()),
@@ -3745,7 +3782,13 @@ model_profiles:
     #[test]
     fn from_persisted_rejects_invalid_fallback_upstream_url() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "not a url".to_string(),
                 ..PersistedFallbackUpstream::default()
             }],
@@ -3792,6 +3835,9 @@ model_profiles:
             std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
         }
         let mut config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_api_key: None,
             ..Default::default()
         };
@@ -3852,6 +3898,9 @@ model_profiles:
             std::env::set_var("LLMCONDUIT_TURN_CAPTURE_DIR", "   ");
         }
         let mut config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             turn_capture_dir: Some("/tmp/llmconduit-existing".to_string()),
             ..PersistedConfig::default()
         };
@@ -3940,6 +3989,9 @@ model_profiles:
             std::env::set_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY", "bogus");
         }
         let mut config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             unsupported_image_policy: UnsupportedImagePolicy::Reject,
             ..PersistedConfig::default()
         };
@@ -3976,6 +4028,9 @@ model_profiles:
             uuid::Uuid::new_v4().simple()
         ));
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: Some("upstream-secret".to_string()),
@@ -4056,6 +4111,9 @@ model_profiles:
     #[test]
     fn resolves_profile_specific_upstream_chat_kwargs() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -4170,6 +4228,9 @@ model_profiles:
         // NOT sniff to any family, so the per-model override (not name sniffing)
         // is what drives injection at the leaf.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             template_family: Some("deepseek".to_string()),
             model_profiles: BTreeMap::from_iter([(
                 "Router-X".to_string(),
@@ -4209,6 +4270,9 @@ model_profiles:
         // Unknown/blank override values normalize to None (fall back to name
         // sniffing) rather than forcing a wrong contract.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             template_family: Some("  Bogus ".to_string()),
             ..PersistedConfig::default()
         })
@@ -4222,6 +4286,9 @@ model_profiles:
 
         // A recognized value is canonicalized to lowercase.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             template_family: Some("KIMI".to_string()),
             ..PersistedConfig::default()
         })
@@ -4244,6 +4311,9 @@ model_profiles:
     #[test]
     fn resolves_model_profiles_case_insensitively() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -4325,6 +4395,9 @@ model_profiles:
     #[test]
     fn resolves_upstream_model_profile_after_global_model_remap() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
@@ -4412,6 +4485,9 @@ model_profiles:
         // model ONLY (at-most-one per-model policy over the global base), so the
         // request-alias profile's kwargs do NOT bleed into the backend request.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
@@ -4524,6 +4600,9 @@ model_profiles:
     #[test]
     fn resolves_exact_model_profile_before_case_insensitive_fallback() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -4612,6 +4691,9 @@ model_profiles:
     #[test]
     fn resolves_global_system_prompt_prefix_with_profile_prefix() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             system_prompt_prefix: Some("Global prefix.".to_string()),
             model_profiles: BTreeMap::from_iter([(
                 "GLM-5.1".to_string(),
@@ -4644,6 +4726,9 @@ model_profiles:
     #[test]
     fn model_profiles_extend_templates_in_order() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             model_profile_templates: BTreeMap::from_iter([
                 (
                     "reasoning".to_string(),
@@ -4819,6 +4904,9 @@ model_profiles:
     #[test]
     fn model_profiles_reject_unknown_template() {
         let error = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             model_profiles: BTreeMap::from_iter([(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
@@ -4841,6 +4929,9 @@ model_profiles:
     #[test]
     fn model_profiles_reject_template_cycles() {
         let error = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             model_profile_templates: BTreeMap::from_iter([
                 (
                     "a".to_string(),
@@ -4953,6 +5044,9 @@ model_profiles:
     #[test]
     fn passes_prefixed_model_name_unmodified_when_no_profile() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -5005,6 +5099,9 @@ model_profiles:
     #[test]
     fn resolves_exact_prefix_model_profile_when_present() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -5067,8 +5164,14 @@ model_profiles:
         // empty branch in `build_app_with_gateway_and_options`. The top-level
         // primary path and the global fallback paths are the active log paths.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "http://127.0.0.1:8001/v1".to_string(),
                 upstream_request_log_path: Some("/tmp/llmconduit-global/backup.jsonl".to_string()),
                 ..PersistedFallbackUpstream::default()
@@ -5095,10 +5198,16 @@ model_profiles:
         // top-level `upstream_request_log_path` and global `fallback_upstreams`
         // are never written to, so they must NOT be collected for cleanup.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_request_log_path: Some(
                 "/tmp/llmconduit-inactive-top/primary.jsonl".to_string(),
             ),
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "http://127.0.0.1:9001/v1".to_string(),
                 upstream_request_log_path: Some(
                     "/tmp/llmconduit-inactive-global/backup.jsonl".to_string(),
@@ -5106,11 +5215,17 @@ model_profiles:
                 ..PersistedFallbackUpstream::default()
             }],
             upstreams: vec![PersistedUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
                 upstream_request_log_path: Some(
                     "/tmp/llmconduit-routing/primary.jsonl".to_string(),
                 ),
                 fallback_upstreams: vec![PersistedFallbackUpstream {
+                    metrics_url: None,
+                    metrics_source: None,
+
                     upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
                     upstream_request_log_path: Some(
                         "/tmp/llmconduit-routing-fallback/backup.jsonl".to_string(),
@@ -5150,6 +5265,9 @@ model_profiles:
     #[test]
     fn debug_log_dirs_includes_turn_capture_dir() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             ..PersistedConfig::default()
@@ -5173,8 +5291,14 @@ model_profiles:
     #[test]
     fn debug_log_dirs_includes_turn_capture_dir_in_routing_mode() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             upstreams: vec![PersistedUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
                 ..PersistedUpstream::default()
             }],
@@ -5195,6 +5319,9 @@ model_profiles:
     #[test]
     fn debug_log_dirs_dedups_turn_capture_dir_against_request_log_dir() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_request_log_path: Some("/tmp/llmconduit-shared/requests.jsonl".to_string()),
             turn_capture_dir: Some("/tmp/llmconduit-shared".to_string()),
             ..PersistedConfig::default()
@@ -5237,6 +5364,9 @@ model_profiles:
         let mut table = HashMap::new();
         table.insert("GLM-5.1".to_string(), ModelPrice::without_cached(1.0, 2.0));
         let persisted = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             price_table: table,
             ..Default::default()
         };
@@ -5450,6 +5580,9 @@ model_profiles:
         let mut table = HashMap::new();
         table.insert("no-cache".to_string(), ModelPrice::without_cached(2.0, 6.0));
         let persisted = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             price_table: table,
             ..Default::default()
         };

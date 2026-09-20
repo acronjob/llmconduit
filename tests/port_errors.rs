@@ -329,6 +329,7 @@ mod integration {
 
     fn config_for(server_uri: &str) -> Config {
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: format!("{server_uri}/v1/").parse().expect("url"),
             upstream_api_key: None,
