@@ -1494,11 +1494,13 @@ fn json_type(value: &Value) -> &'static str {
 
 async fn post_responses(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let served = gateway.resolve_request_model(&request.model).await.0;
+    authorize_model(auth.as_ref().map(|value| &value.0), "responses", &requested, &served)?;
     let wants_stream = request.stream;
     let stream = gateway
         .stream_responses_with_api_call_id(request, api_call_id.map(|extension| extension.0.0))
@@ -1533,11 +1535,12 @@ async fn post_responses(
 /// for WS turns is needed.
 async fn get_responses(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     match upgrade {
         Ok(upgrade) => upgrade
-            .on_upgrade(move |socket| responses_ws_serve(socket, gateway))
+            .on_upgrade(move |socket| responses_ws_serve(socket, gateway, auth.map(|value| value.0)))
             .into_response(),
         Err(_) => {
             // Plain GET without an `Upgrade: websocket` header. 426 tells the
@@ -1557,7 +1560,11 @@ async fn get_responses(
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
 /// The Responses-WS socket loop. See [`get_responses`] for the protocol rationale.
-async fn responses_ws_serve(socket: WebSocket, gateway: Arc<Gateway>) {
+async fn responses_ws_serve(
+    socket: WebSocket,
+    gateway: Arc<Gateway>,
+    auth: Option<crate::authz::AuthContext>,
+) {
     // `split` so the inbound `recv` and outbound `send` can be raced in the same
     // `select!` without a double-`&mut` borrow conflict (the dashboard/debug WS
     // loops use the same pattern).
@@ -1604,6 +1611,19 @@ async fn responses_ws_serve(socket: WebSocket, gateway: Arc<Gateway>) {
         }
     };
     request.stream = true;
+
+    let requested = request.model.clone();
+    let served = gateway.resolve_request_model(&requested).await.0;
+    if authorize_model(auth.as_ref(), "responses", &requested, &served).is_err() {
+        let _ = send_responses_ws_error(
+            &mut sink,
+            "permission_denied",
+            "the API key is not authorized for the requested model",
+        )
+        .await;
+        let _ = sink.send(Message::Close(None)).await;
+        return;
+    }
 
     // 3. Run the turn through the SAME engine path as the HTTP POST.
     let event_stream = match gateway
@@ -1690,17 +1710,22 @@ async fn send_responses_ws_error(
 
 async fn post_messages(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
     let api_call_id = api_call_id.map(|extension| extension.0.0);
-    match handle_post_messages(gateway, request, api_call_id).await {
+    match handle_post_messages(gateway, request, api_call_id, auth.map(|value| value.0)).await {
         Ok(response) => response,
         Err(err) => anthropic_error_response(err),
     }
 }
 
-async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
+async fn post_count_tokens(
+    State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
+    body: Bytes,
+) -> Response {
     let request: AnthropicRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
@@ -1709,7 +1734,7 @@ async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> 
             )));
         }
     };
-    match handle_count_tokens(gateway, request).await {
+    match handle_count_tokens(gateway, request, auth.map(|value| value.0)).await {
         Ok(response) => response,
         Err(err) => anthropic_error_response(err),
     }
@@ -1718,6 +1743,7 @@ async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> 
 async fn handle_count_tokens(
     gateway: Arc<Gateway>,
     request: AnthropicRequest,
+    auth: Option<crate::authz::AuthContext>,
 ) -> AppResult<Response> {
     use crate::engine::TokenizeCapability;
 
@@ -1728,6 +1754,7 @@ async fn handle_count_tokens(
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
+    authorize_model(auth.as_ref(), "count_tokens", &original_model, &resolved_model)?;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let roles = gateway
         .config()
@@ -1787,11 +1814,13 @@ async fn handle_count_tokens(
 
 async fn post_chat_completions(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
+    authorize_model(auth.as_ref().map(|value| &value.0), "chat", &requested, &model)?;
     let wants_stream = request.stream;
     let include_usage = request
         .stream_options
@@ -1815,9 +1844,17 @@ async fn post_chat_completions(
 
 async fn post_completions(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
+    if let Some(context) = auth.as_ref() {
+        let model = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| AppError::bad_request("request body must include a model"))?;
+        authorize_model(Some(&context.0), "completions", &model, &model)?;
+    }
     let response = gateway
         .upstream_client()
         .proxy_completions(headers, body)
@@ -1829,9 +1866,11 @@ async fn handle_post_messages(
     gateway: Arc<Gateway>,
     request: AnthropicRequest,
     api_call_id: Option<String>,
+    auth: Option<crate::authz::AuthContext>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
+    authorize_model(auth.as_ref(), "messages", &requested, &model)?;
     let wants_stream = request.stream;
     let suppress_reasoning = !matches!(
         request.thinking.as_ref(),
