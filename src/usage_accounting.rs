@@ -25,6 +25,32 @@ impl UsageCostConfidence {
     }
 }
 
+impl UsageRates {
+    /// Convert the dashboard's USD-per-1k-token representation into the integer
+    /// nanodollars-per-token representation used by durable accounting.
+    pub fn from_model_price(price: crate::config::ModelPrice) -> Option<Self> {
+        fn per_token(rate_per_1k: f64) -> Option<NanoUsd> {
+            if !rate_per_1k.is_finite() || rate_per_1k < 0.0 {
+                return None;
+            }
+            let nanos = rate_per_1k * 1_000_000.0;
+            if nanos > i64::MAX as f64 {
+                return None;
+            }
+            NanoUsd::new(nanos.round() as i64)
+        }
+
+        Some(Self {
+            input_per_token: per_token(price.input_per_1k)?,
+            output_per_token: per_token(price.output_per_1k)?,
+            cached_per_token: price
+                .cached_price_configured
+                .then(|| per_token(price.cached_per_1k))
+                .flatten(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageRates {
     pub input_per_token: NanoUsd,
@@ -103,12 +129,36 @@ pub fn migrate_usage_schema(conn: &Connection) -> rusqlite::Result<()> {
             cost_nano_usd INTEGER,
             cost_confidence TEXT NOT NULL,
             created_at_ms INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS auth_usage_created_idx
+        );",
+    )?;
+    // Older auth-store revisions created the table before the final accounting
+    // contract included these columns. Upgrade in place without discarding
+    // existing usage rows.
+    let columns = conn
+        .prepare("PRAGMA table_info(auth_usage_events)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    for (name, definition) in [
+        ("route", "TEXT"),
+        ("total_tokens", "INTEGER"),
+        ("cost_nano_usd", "INTEGER"),
+        ("cost_confidence", "TEXT NOT NULL DEFAULT 'unavailable'"),
+        ("created_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.contains(name) {
+            conn.execute(
+                &format!("ALTER TABLE auth_usage_events ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS auth_usage_created_idx
             ON auth_usage_events(created_at_ms);
-        CREATE INDEX IF NOT EXISTS auth_usage_key_created_idx
+         CREATE INDEX IF NOT EXISTS auth_usage_key_created_idx
             ON auth_usage_events(key_id, created_at_ms);",
-    )
+    )?;
+    Ok(())
 }
 
 /// Returns `true` only for the first insert of an `auth_request_id`.

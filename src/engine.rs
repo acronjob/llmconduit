@@ -214,6 +214,16 @@ pub struct SseEvent {
     pub data: Value,
 }
 
+fn inference_endpoint_name(endpoint: crate::upstream::InferenceEndpoint) -> &'static str {
+    match endpoint {
+        crate::upstream::InferenceEndpoint::Responses => "responses",
+        crate::upstream::InferenceEndpoint::ChatCompletions => "chat",
+        crate::upstream::InferenceEndpoint::Messages => "messages",
+        crate::upstream::InferenceEndpoint::CountTokens => "count_tokens",
+        crate::upstream::InferenceEndpoint::Completions => "completions",
+    }
+}
+
 #[derive(Clone)]
 struct CachedUpstreamModelCatalog {
     fetched_at: std::time::Instant,
@@ -853,6 +863,53 @@ impl Gateway {
         );
     }
 
+    /// Schedule durable per-key terminal accounting off the async runtime.
+    /// `auth_request_id` is the idempotency key, so a defensive duplicate
+    /// finalize attempt cannot double-charge the request.
+    fn record_authenticated_usage(
+        &self,
+        context: Option<crate::authz::AuthContext>,
+        api_call_id: Option<String>,
+        endpoint: crate::upstream::InferenceEndpoint,
+        requested_model: String,
+        status: &'static str,
+        serving: &crate::upstream::ServingToken,
+    ) {
+        let Some(context) = context else {
+            return;
+        };
+        let (route, provider) = serving.snapshot();
+        let (served_model, usage) = serving.metrics_snapshot();
+        let charge = usage.and_then(|usage| {
+            let price = served_model
+                .as_deref()
+                .and_then(|model| self.price_for(model))?;
+            let rates = crate::usage_accounting::UsageRates::from_model_price(price)?;
+            crate::usage_accounting::charge_for_usage(usage, rates)
+        });
+        let event = crate::usage_accounting::UsageEvent {
+            auth_request_id: context.auth_request_id,
+            api_call_id,
+            key_id: context.key_id,
+            principal_id: context.principal_id,
+            endpoint: inference_endpoint_name(endpoint).to_string(),
+            requested_model: Some(requested_model),
+            served_model,
+            provider,
+            route,
+            status: status.to_string(),
+            usage,
+            charge,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let authz = self.authz.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = authz.record_usage_once(&event) {
+                tracing::error!(error = %err, "failed to persist authenticated usage event");
+            }
+        });
+    }
+
     /// Attach the D7 dashboard auth context (built from the environment in the
     /// DI root). Consuming builder so it threads through the `Gateway::new(...)`
     /// → `Arc::new` construction without widening the constructor signature
@@ -1208,6 +1265,27 @@ impl Gateway {
         api_call_id: Option<String>,
         authorization: crate::upstream::AuthorizationScope,
         endpoint: crate::upstream::InferenceEndpoint,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_authorized_with_context(
+            request,
+            api_call_id,
+            authorization,
+            endpoint,
+            None,
+        )
+        .await
+    }
+
+    /// Authenticated HTTP ingress additionally supplies the identity used for
+    /// exactly-once terminal usage accounting. Keeping the context separate
+    /// from the candidate predicate ensures the raw credential is never retained.
+    pub async fn stream_responses_authorized_with_context(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+        auth_context: Option<crate::authz::AuthContext>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
         // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
         // telemetry guard built BELOW and every per-turn `BackendChatRequest` in

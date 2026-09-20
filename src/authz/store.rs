@@ -87,7 +87,17 @@ impl AuthStore {
         connection
             .execute_batch(SCHEMA)
             .map_err(|err| format!("failed to migrate auth store: {err}"))?;
+        crate::usage_accounting::migrate_usage_schema(&connection)
+            .map_err(|err| format!("failed to migrate auth usage store: {err}"))?;
         Ok(Self { connection })
+    }
+
+    pub fn record_usage_once(
+        &self,
+        event: &crate::usage_accounting::UsageEvent,
+    ) -> Result<bool, String> {
+        crate::usage_accounting::record_usage_once(&self.connection, event)
+            .map_err(|err| format!("failed to record auth usage: {err}"))
     }
 
     pub fn key_count(&self) -> Result<u64, String> {

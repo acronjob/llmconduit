@@ -364,14 +364,25 @@ impl AuthzService {
             .list_keys()
     }
 
-    fn inner(&self) -> Result<&Arc<Inner>, String> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| "inference auth is disabled".to_string())
+    /// Persist one terminal inference event. Disabled auth is a no-op; enabled
+    /// auth uses the same store mutex as key mutations so SQLite is never used
+    /// concurrently from multiple runtime workers.
+    pub fn record_usage_once(
+        &self,
+        event: &crate::usage_accounting::UsageEvent,
+    ) -> Result<bool, String> {
+        let Some(inner) = &self.inner else {
+            return Ok(false);
+        };
+        inner
+            .store
+            .lock()
+            .map_err(|_| "auth store lock poisoned".to_string())?
+            .record_usage_once(event)
     }
 
-    fn reload_locked(&self, inner: &Inner, store: &store::AuthStore) -> Result<(), String> {
-        let fresh = Arc::new(store.load_authority()?);
+    fn reload_locked(&self, inner: &Inner, store: &mut store::AuthStore) -> Result<(), String> {
+        let fresh = Arc::new(load_snapshot(store)?);
         *inner
             .authority
             .write()
