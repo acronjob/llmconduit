@@ -27,16 +27,28 @@ const managementPermissions: ManagementPermission[] = [
 
 const csv = (value: string) => value.split(',').map((item) => item.trim()).filter(Boolean);
 const positiveInteger = (value: string): number | null => value === '' ? null : Number(value);
-const weekdays = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
-const weekdayMask = (value: string): number => csv(value).reduce((mask, day) => {
-  const index = weekdays.indexOf(day.toLowerCase());
-  return index < 0 ? mask : mask | (1 << index);
-}, 0);
-const minuteOfDay = (value: string): number => {
-  const [hour = Number.NaN, minute = Number.NaN] = value.split(':').map(Number);
-  return hour * 60 + minute;
-};
 const dataOrEmpty = <T,>(value: T[] | undefined): T[] => value ?? [];
+
+export function validatePolicy(policy: CreateAuthPolicyRequest): string[] {
+  const errors: string[] = [];
+  if (!policy.name) errors.push('Policy name is required.');
+  if (policy.subjects.length === 0) errors.push('Select at least one real subject.');
+  if (policy.endpoints.length === 0) errors.push('Enter at least one endpoint.');
+  for (const [label, value] of [
+    ['Max concurrent sessions', policy.max_concurrent_sessions],
+    ['Daily session starts', policy.daily_session_starts],
+  ] as const) {
+    if (value !== null && (!Number.isInteger(value) || value < 1)) errors.push(`${label} must be a positive integer.`);
+  }
+  for (const window of policy.time_windows) {
+    if (!window.days.length || !/^([01]\d|2[0-3]):[0-5]\d$/.test(window.start_utc)
+      || !/^([01]\d|2[0-3]):[0-5]\d$/.test(window.end_utc)
+      || window.start_utc === window.end_utc) {
+      errors.push('UTC window requires days and distinct HH:MM start/end times.');
+    }
+  }
+  return errors;
+}
 
 async function loadAccess() {
   const { client } = getConnection();
@@ -93,7 +105,6 @@ export function AccessView() {
   const [draftName, setDraftName] = useState('New policy');
   const [draftSubjects, setDraftSubjects] = useState<string[]>([]);
   const [draftEndpoints, setDraftEndpoints] = useState('responses');
-  const [draftModels, setDraftModels] = useState('gpt-*');
   const [draftRequestedModels, setDraftRequestedModels] = useState('gpt-*');
   const [draftServedModels, setDraftServedModels] = useState('gpt-4.1');
   const [draftProviders, setDraftProviders] = useState('openai');
@@ -103,29 +114,26 @@ export function AccessView() {
   const [draftWindowEnd, setDraftWindowEnd] = useState('18:00');
   const [draftConcurrent, setDraftConcurrent] = useState('4');
   const [draftDailyStarts, setDraftDailyStarts] = useState('100');
-  const [draftManagementPermissions, setDraftManagementPermissions] = useState<ManagementPermission[]>([]);
 
   const users = useMemo(() => query.data?.users.users ?? [], [query.data?.users.users]);
   const principal = keyPrincipal || users[0]?.id || '';
   const subjectOptions = useMemo(() => [
-    ...users.map((item) => ({ id: `principal:${item.id}`, label: `principal · ${item.display_name}` })),
-    ...dataOrEmpty(query.data?.groups.groups).map((item) => ({ id: `group:${item.id}`, label: `group · ${item.name}` })),
-    ...dataOrEmpty(query.data?.roles.roles).map((item) => ({ id: `role:${item.id}`, label: `role · ${item.name}` })),
-    ...dataOrEmpty(query.data?.apiKeys.api_keys).map((item) => ({ id: `key:${item.id}`, label: `key · ${item.name}` })),
+    ...users.map((item) => ({ id: item.id, label: `principal · ${item.display_name}` })),
+    ...dataOrEmpty(query.data?.groups.groups).map((item) => ({ id: item.id, label: `group · ${item.name}` })),
+    ...dataOrEmpty(query.data?.roles.roles).map((item) => ({ id: item.id, label: `role · ${item.name}` })),
+    ...dataOrEmpty(query.data?.apiKeys.api_keys).map((item) => ({ id: item.id, label: `key · ${item.name}` })),
   ], [query.data, users]);
   const draftPreview = useMemo<CreateAuthPolicyRequest>(() => ({
     name: draftName.trim(), effect: draftEffect, subjects: draftSubjects,
     endpoints: csv(draftEndpoints), requested_models: csv(draftRequestedModels),
-    models: csv(draftModels),
     served_models: csv(draftServedModels), providers: csv(draftProviders), routes: csv(draftRoutes),
     time_windows: csv(draftWindowDays).length && draftWindowStart && draftWindowEnd
-      ? [{ weekday_mask: weekdayMask(draftWindowDays), start_minute: minuteOfDay(draftWindowStart), end_minute: minuteOfDay(draftWindowEnd), absolute_start_ms: null, absolute_end_ms: null }]
+      ? [{ days: csv(draftWindowDays), start_utc: draftWindowStart, end_utc: draftWindowEnd }]
       : [],
     max_concurrent_sessions: positiveInteger(draftConcurrent),
-    max_daily_session_starts: positiveInteger(draftDailyStarts),
-    management_permissions: draftManagementPermissions,
+    daily_session_starts: positiveInteger(draftDailyStarts),
   }), [draftConcurrent, draftDailyStarts, draftEffect, draftEndpoints, draftName, draftProviders,
-    draftManagementPermissions, draftModels, draftRequestedModels, draftRoutes, draftServedModels, draftSubjects, draftWindowDays,
+    draftRequestedModels, draftRoutes, draftServedModels, draftSubjects, draftWindowDays,
     draftWindowEnd, draftWindowStart]);
   const policyValidation = useMemo(() => validatePolicy(draftPreview), [draftPreview]);
 
@@ -210,12 +218,10 @@ export function AccessView() {
               <label className="block">Effect<select aria-label="Policy effect" value={draftEffect} onChange={(event) => setDraftEffect(event.target.value as AuthPolicy['effect'])} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5"><option value="allow">Allow</option><option value="deny">Deny</option></select></label>
               <label className="block">Subjects<select multiple aria-label="Policy subjects" value={draftSubjects} onChange={(event) => setDraftSubjects(Array.from(event.target.selectedOptions, (option) => option.value))} className="mt-1 h-24 w-full rounded border border-line bg-bg px-2 py-1">{subjectOptions.map((subject) => <option key={subject.id} value={subject.id}>{subject.label} · {subject.id}</option>)}</select></label>
               <label className="block">Endpoints<input aria-label="Policy endpoints" value={draftEndpoints} onChange={(event) => setDraftEndpoints(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-              <label className="block">Compatibility models<input aria-label="Policy models" value={draftModels} onChange={(event) => setDraftModels(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
               <label className="block">Requested models<input aria-label="Policy requested models" value={draftRequestedModels} onChange={(event) => setDraftRequestedModels(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
               <label className="block">Served models<input aria-label="Policy served models" value={draftServedModels} onChange={(event) => setDraftServedModels(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
               <label className="block">Providers<input aria-label="Policy providers" value={draftProviders} onChange={(event) => setDraftProviders(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
               <label className="block">Routes<input aria-label="Policy routes" value={draftRoutes} onChange={(event) => setDraftRoutes(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
-              <label className="block">Management permissions<select multiple aria-label="Policy management permissions" value={draftManagementPermissions} onChange={(event) => setDraftManagementPermissions(Array.from(event.target.selectedOptions, (option) => option.value as ManagementPermission))} className="mt-1 h-24 w-full rounded border border-line bg-bg px-2 py-1">{managementPermissions.map((permission) => <option key={permission} value={permission}>{permission}</option>)}</select></label>
               <fieldset className="grid grid-cols-3 gap-2 rounded border border-line p-2"><legend>UTC window</legend>
                 <input aria-label="Policy window days" value={draftWindowDays} onChange={(event) => setDraftWindowDays(event.target.value)} placeholder="mon,tue" className="rounded border border-line bg-bg px-2 py-1" />
                 <input aria-label="Policy window start" type="time" value={draftWindowStart} onChange={(event) => setDraftWindowStart(event.target.value)} className="rounded border border-line bg-bg px-2 py-1" />
@@ -230,7 +236,6 @@ export function AccessView() {
             </div>
             <div className={cn('rounded border p-3 text-xs', draftEffect === 'deny' ? 'border-status-down/50 bg-status-down/10' : 'border-status-healthy/40 bg-status-healthy/10')}>
               <div className="flex items-center justify-between"><span className="font-semibold uppercase tracking-wide">Effective preview</span><span className={cn('rounded px-1.5 py-0.5 font-bold uppercase', draftEffect === 'deny' ? 'bg-status-down/20 text-status-down' : 'bg-status-healthy/20 text-status-healthy')}>{draftEffect}</span></div>
-              <div className="mt-2 text-[10px] text-text-muted">{draftPreview.models.join(', ')}</div>
               <pre data-testid="policy-payload-preview" className="mt-3 max-h-[34rem] overflow-auto whitespace-pre-wrap break-all rounded bg-bg p-2 font-mono text-[10px]">{JSON.stringify(draftPreview, null, 2)}</pre>
             </div>
           </div>
