@@ -302,7 +302,9 @@ async fn require_management_access(
 }
 
 fn management_error(status: StatusCode, message: &'static str) -> Response {
-    (status, Json(serde_json::json!({ "error": message }))).into_response()
+    crate::dashboard_auth::no_store(
+        (status, Json(serde_json::json!({ "error": message }))).into_response(),
+    )
 }
 
 async fn require_inference_auth(
