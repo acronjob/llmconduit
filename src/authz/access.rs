@@ -12,8 +12,13 @@ impl AccessBackend for AuthzService {
         actor: &'a ManagementActor,
         operation: AccessOperation,
     ) -> AccessFuture<'a> {
-        let result = self.dispatch_access(actor, operation);
-        Box::pin(std::future::ready(result))
+        let service = self.clone();
+        let actor = actor.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || service.dispatch_access(&actor, operation))
+                .await
+                .map_err(|error| internal(format!("auth management worker failed: {error}")))?
+        })
     }
 }
 

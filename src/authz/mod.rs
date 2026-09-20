@@ -313,7 +313,23 @@ impl AuthzService {
         Ok(Some(lease))
     }
 
-    pub fn create_delegated_session(
+    pub async fn create_delegated_session(
+        &self,
+        context: &AuthContext,
+        csrf_digest: &[u8],
+        expires_at: i64,
+    ) -> Result<crate::dashboard_access::ManagementActor, AuthError> {
+        let service = self.clone();
+        let context = context.clone();
+        let csrf_digest = csrf_digest.to_vec();
+        tokio::task::spawn_blocking(move || {
+            service.create_delegated_session_blocking(&context, &csrf_digest, expires_at)
+        })
+        .await
+        .map_err(|_| AuthError::PolicyUnavailable)?
+    }
+
+    fn create_delegated_session_blocking(
         &self,
         context: &AuthContext,
         csrf_digest: &[u8],
@@ -349,7 +365,20 @@ impl AuthzService {
         })
     }
 
-    pub fn authenticate_delegated_session(
+    pub async fn authenticate_delegated_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::dashboard_access::ManagementActor>, AuthError> {
+        let service = self.clone();
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            service.authenticate_delegated_session_blocking(&session_id)
+        })
+        .await
+        .map_err(|_| AuthError::PolicyUnavailable)?
+    }
+
+    fn authenticate_delegated_session_blocking(
         &self,
         session_id: &str,
     ) -> Result<Option<crate::dashboard_access::ManagementActor>, AuthError> {
@@ -399,7 +428,15 @@ impl AuthzService {
         }))
     }
 
-    pub fn revoke_delegated_session(&self, session_id: &str) -> Result<bool, String> {
+    pub async fn revoke_delegated_session(&self, session_id: &str) -> Result<bool, String> {
+        let service = self.clone();
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || service.revoke_delegated_session_blocking(&session_id))
+            .await
+            .map_err(|error| format!("auth session worker failed: {error}"))?
+    }
+
+    fn revoke_delegated_session_blocking(&self, session_id: &str) -> Result<bool, String> {
         let inner = self.inner()?;
         inner
             .store
@@ -410,7 +447,22 @@ impl AuthzService {
 
     /// Verify the caller-provided digest of the delegated session's CSRF
     /// secret. The raw CSRF token never enters the authorization store.
-    pub fn verify_delegated_csrf_digest(
+    pub async fn verify_delegated_csrf_digest(
+        &self,
+        session_id: &str,
+        presented_digest: &[u8],
+    ) -> Result<bool, String> {
+        let service = self.clone();
+        let session_id = session_id.to_owned();
+        let presented_digest = presented_digest.to_vec();
+        tokio::task::spawn_blocking(move || {
+            service.verify_delegated_csrf_digest_blocking(&session_id, &presented_digest)
+        })
+        .await
+        .map_err(|error| format!("auth session worker failed: {error}"))?
+    }
+
+    fn verify_delegated_csrf_digest_blocking(
         &self,
         session_id: &str,
         presented_digest: &[u8],
@@ -576,8 +628,8 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn delegated_dashboard_sessions_verify_csrf_and_revoke_immediately() {
+    #[tokio::test]
+    async fn delegated_dashboard_sessions_verify_csrf_and_revoke_immediately() {
         let path = std::env::temp_dir().join(format!(
             "llmconduit-dashboard-session-{}.sqlite3",
             uuid::Uuid::new_v4()
@@ -598,6 +650,7 @@ mod tests {
         let csrf_digest = [7u8; 32];
         let actor = service
             .create_delegated_session(&context, &csrf_digest, chrono::Utc::now().timestamp() + 300)
+            .await
             .unwrap();
         let session_id = match actor {
             ManagementActor::Delegated { session_id, .. } => session_id,
@@ -606,29 +659,34 @@ mod tests {
         assert!(
             service
                 .verify_delegated_csrf_digest(&session_id, &csrf_digest)
+                .await
                 .unwrap()
         );
         assert!(
             !service
                 .verify_delegated_csrf_digest(&session_id, &[8u8; 32])
+                .await
                 .unwrap()
         );
         assert!(
             service
                 .authenticate_delegated_session(&session_id)
+                .await
                 .unwrap()
                 .is_some()
         );
-        assert!(service.revoke_delegated_session(&session_id).unwrap());
+        assert!(service.revoke_delegated_session(&session_id).await.unwrap());
         assert!(
             service
                 .authenticate_delegated_session(&session_id)
+                .await
                 .unwrap()
                 .is_none()
         );
         assert!(
             !service
                 .verify_delegated_csrf_digest(&session_id, &csrf_digest)
+                .await
                 .unwrap()
         );
         drop(service);
