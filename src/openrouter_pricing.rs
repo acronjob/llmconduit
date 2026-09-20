@@ -5,11 +5,15 @@
 //! persisted and malformed/non-finite values cannot enter the snapshot table.
 
 use crate::config::ModelPrice;
+use futures::StreamExt;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use url::Url;
 
 pub const OPENROUTER_SOURCE: &str = "openrouter";
 pub const OPENROUTER_SOURCE_URL: &str = "https://openrouter.ai/api/v1";
+pub const OPENROUTER_PRICE_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NanoUsd(i64);
@@ -30,7 +34,7 @@ impl NanoUsd {
     /// rejected instead of being rounded through an `f64`.
     pub fn parse_usd(value: &str) -> Result<Self, PricingError> {
         let value = value.trim();
-        if value.is_empty() || value.starts_with(['+', '-']) {
+        if value.is_empty() || value.starts_with('+') || value.starts_with('-') {
             return Err(PricingError::InvalidPrice(value.to_string()));
         }
         let mut parts = value.split('.');
@@ -83,6 +87,14 @@ pub enum PricingError {
     InvalidResponse(#[from] serde_json::Error),
     #[error("pricing database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("OpenRouter request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("OpenRouter returned HTTP {0}")]
+    Http(reqwest::StatusCode),
+    #[error("OpenRouter response exceeds the configured size limit")]
+    BodyTooLarge,
+    #[error("model id must contain an author and slug")]
+    InvalidModelId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +119,95 @@ pub struct ImportedModelPrice {
     pub prompt: PriceRange,
     pub completion: PriceRange,
     pub cached: Option<PriceRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRouterPriceSnapshot {
+    pub source_url: String,
+    pub fetched_at_ms: i64,
+    pub price: ImportedModelPrice,
+}
+
+#[derive(Clone)]
+pub struct OpenRouterPricingClient {
+    client: reqwest::Client,
+    base_url: Url,
+    response_limit: usize,
+    total_timeout: Duration,
+}
+
+impl OpenRouterPricingClient {
+    pub fn new(total_timeout: Duration, response_limit: usize) -> Result<Self, PricingError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self {
+            client,
+            base_url: Url::parse(OPENROUTER_SOURCE_URL).expect("static OpenRouter URL"),
+            response_limit,
+            total_timeout,
+        })
+    }
+
+    /// Fetch the official per-endpoint pricing for one model. This is intended for
+    /// explicit operator/admin sync actions, never an inference hot-path request.
+    pub async fn fetch_model(
+        &self,
+        model_id: &str,
+        management_key: &str,
+    ) -> Result<OpenRouterPriceSnapshot, PricingError> {
+        let (author, slug) = model_id
+            .split_once('/')
+            .filter(|(author, slug)| !author.is_empty() && !slug.is_empty())
+            .ok_or(PricingError::InvalidModelId)?;
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .expect("OpenRouter base URL can accept path segments")
+            .extend(["models", author, slug, "endpoints"]);
+        let response = self
+            .client
+            .get(url.clone())
+            .bearer_auth(management_key)
+            .timeout(self.total_timeout)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(PricingError::Http(response.status()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.response_limit as u64)
+        {
+            return Err(PricingError::BodyTooLarge);
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if body.len().saturating_add(chunk.len()) > self.response_limit {
+                return Err(PricingError::BodyTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(OpenRouterPriceSnapshot {
+            source_url: url.into(),
+            fetched_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX),
+            price: parse_endpoint_prices(&body)?,
+        })
+    }
+}
+
+impl Default for OpenRouterPricingClient {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(15), OPENROUTER_PRICE_BODY_LIMIT)
+            .expect("static OpenRouter pricing client configuration")
+    }
 }
 
 impl ImportedModelPrice {
@@ -243,6 +344,9 @@ pub fn migrate_pricing_schema(conn: &Connection) -> rusqlite::Result<()> {
             completion_min_nano_usd INTEGER NOT NULL,
             completion_mean_nano_usd INTEGER NOT NULL,
             completion_max_nano_usd INTEGER NOT NULL,
+            cached_min_nano_usd INTEGER,
+            cached_mean_nano_usd INTEGER,
+            cached_max_nano_usd INTEGER,
             confidence TEXT NOT NULL CHECK(confidence IN ('imported', 'operator')),
             UNIQUE(source, fetched_at_ms, model_id, endpoint_id)
         );
@@ -253,9 +357,9 @@ pub fn migrate_pricing_schema(conn: &Connection) -> rusqlite::Result<()> {
 
 pub fn persist_imported_price(
     conn: &mut Connection,
-    price: &ImportedModelPrice,
-    fetched_at_ms: i64,
+    snapshot: &OpenRouterPriceSnapshot,
 ) -> Result<usize, PricingError> {
+    let price = &snapshot.price;
     let tx = conn.transaction()?;
     let mut inserted = 0;
     for endpoint in &price.endpoints {
@@ -266,12 +370,13 @@ pub fn persist_imported_price(
                 cached_nano_usd_per_token, prompt_min_nano_usd,
                 prompt_mean_nano_usd, prompt_max_nano_usd,
                 completion_min_nano_usd, completion_mean_nano_usd,
-                completion_max_nano_usd, confidence
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'imported')",
+                completion_max_nano_usd, cached_min_nano_usd,
+                cached_mean_nano_usd, cached_max_nano_usd, confidence
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'imported')",
             params![
                 OPENROUTER_SOURCE,
-                OPENROUTER_SOURCE_URL,
-                fetched_at_ms,
+                snapshot.source_url,
+                snapshot.fetched_at_ms,
                 price.model_id,
                 endpoint.endpoint_id,
                 endpoint.prompt.get(),
@@ -283,6 +388,9 @@ pub fn persist_imported_price(
                 price.completion.min.get(),
                 price.completion.mean.get(),
                 price.completion.max.get(),
+                price.cached.map(|range| range.min.get()),
+                price.cached.map(|range| range.mean.get()),
+                price.cached.map(|range| range.max.get()),
             ],
         )?;
     }
@@ -334,8 +442,13 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate_pricing_schema(&conn).unwrap();
         let price = parse_endpoint_prices(RESPONSE).unwrap();
-        assert_eq!(persist_imported_price(&mut conn, &price, 123).unwrap(), 2);
-        assert_eq!(persist_imported_price(&mut conn, &price, 123).unwrap(), 0);
+        let snapshot = OpenRouterPriceSnapshot {
+            source_url: "https://openrouter.ai/api/v1/models/openai/gpt-4/endpoints".to_string(),
+            fetched_at_ms: 123,
+            price,
+        };
+        assert_eq!(persist_imported_price(&mut conn, &snapshot).unwrap(), 2);
+        assert_eq!(persist_imported_price(&mut conn, &snapshot).unwrap(), 0);
         let row: (i64, i64, String) = conn
             .query_row(
                 "SELECT prompt_nano_usd_per_token, prompt_mean_nano_usd, confidence FROM auth_price_snapshots WHERE endpoint_id='a'",
