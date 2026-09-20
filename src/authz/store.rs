@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 pub(crate) struct AuthStore {
@@ -588,6 +589,32 @@ impl AuthStore {
         reason: &str,
     ) -> Result<bool, String> {
         self.connection.execute("UPDATE auth_dashboard_sessions SET revoked_at=?2,revoked_reason=?3 WHERE session_id=?1 AND revoked_at IS NULL",params![session_id,Utc::now().timestamp(),reason]).map(|changed|changed>0).map_err(db)
+    }
+
+    pub fn verify_dashboard_csrf_digest(
+        &self,
+        session_id: &str,
+        presented_digest: &[u8],
+    ) -> Result<bool, String> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT csrf_secret_digest FROM auth_dashboard_sessions WHERE session_id=?1 AND revoked_at IS NULL AND expires_at>?2",
+                params![session_id, Utc::now().timestamp()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(db)?;
+        let Some(stored) = stored else {
+            return Ok(false);
+        };
+        // Compare equal-sized buffers without data-dependent early exit. A
+        // length mismatch is still rejected after doing fixed work over the
+        // stored digest length.
+        let mut candidate = vec![0u8; stored.len()];
+        let copy_len = candidate.len().min(presented_digest.len());
+        candidate[..copy_len].copy_from_slice(&presented_digest[..copy_len]);
+        Ok(stored.ct_eq(&candidate).into() && stored.len() == presented_digest.len())
     }
 
     pub fn dispatch_access(

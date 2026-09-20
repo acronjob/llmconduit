@@ -408,6 +408,21 @@ impl AuthzService {
             .revoke_dashboard_session(session_id, "logout")
     }
 
+    /// Verify the caller-provided digest of the delegated session's CSRF
+    /// secret. The raw CSRF token never enters the authorization store.
+    pub fn verify_delegated_csrf_digest(
+        &self,
+        session_id: &str,
+        presented_digest: &[u8],
+    ) -> Result<bool, String> {
+        let inner = self.inner()?;
+        inner
+            .store
+            .lock()
+            .map_err(|_| "auth store lock poisoned".to_string())?
+            .verify_dashboard_csrf_digest(session_id, presented_digest)
+    }
+
     pub fn create_key(
         &self,
         principal_name: &str,
@@ -557,6 +572,65 @@ mod tests {
         assert!(service.acquire_session(&context).await.unwrap().is_some());
         assert!(service.revoke_key(&created.summary.id).unwrap());
         assert!(service.authenticate(&headers).is_err());
+        drop(service);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delegated_dashboard_sessions_verify_csrf_and_revoke_immediately() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-dashboard-session-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+        let service = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"dashboard-session-pepper".to_vec(),
+            Some(&bootstrap),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(&bootstrap).unwrap());
+        let context = service.authenticate(&headers).unwrap().unwrap();
+        let csrf_digest = [7u8; 32];
+        let actor = service
+            .create_delegated_session(&context, &csrf_digest, chrono::Utc::now().timestamp() + 300)
+            .unwrap();
+        let session_id = match actor {
+            ManagementActor::Delegated { session_id, .. } => session_id,
+            ManagementActor::Bootstrap => panic!("delegated session returned bootstrap actor"),
+        };
+        assert!(
+            service
+                .verify_delegated_csrf_digest(&session_id, &csrf_digest)
+                .unwrap()
+        );
+        assert!(
+            !service
+                .verify_delegated_csrf_digest(&session_id, &[8u8; 32])
+                .unwrap()
+        );
+        assert!(
+            service
+                .authenticate_delegated_session(&session_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(service.revoke_delegated_session(&session_id).unwrap());
+        assert!(
+            service
+                .authenticate_delegated_session(&session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !service
+                .verify_delegated_csrf_digest(&session_id, &csrf_digest)
+                .unwrap()
+        );
         drop(service);
         let _ = std::fs::remove_file(path);
     }
