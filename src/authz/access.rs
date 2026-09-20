@@ -276,14 +276,22 @@ mod tests {
                     effect: "allow".into(),
                     subjects: vec![format!("principal:{principal_id}")],
                     endpoints: vec!["chat".into()],
+                    models: Vec::new(),
                     requested_models: vec!["public-*".into()],
                     served_models: vec!["backend-*".into()],
                     providers: vec!["provider-a".into()],
-                    routes: vec!["primary".into()],
-                    time_windows: Vec::new(),
+                    routes: Vec::new(),
+                    time_windows: vec![AccessTimeWindow {
+                        weekday_mask: 0,
+                        start_minute: 0,
+                        end_minute: 0,
+                        absolute_start_ms: None,
+                        absolute_end_ms: None,
+                    }],
                     max_concurrent_sessions: Some(2),
-                    daily_session_starts: Some(10),
-                })
+                    max_daily_session_starts: Some(10),
+                    management_permissions: Vec::new(),
+                }))
             ),
             Ok(AccessResult::Policies(_))
         ));
@@ -318,12 +326,7 @@ mod tests {
                 if policies.iter().any(|policy| policy.time_windows.len() == 1
                     && policy.max_daily_session_starts == Some(10))
         ));
-        let scope = context
-            .authorization_scope(
-                crate::upstream::InferenceEndpoint::ChatCompletions,
-                "public-v1",
-            )
-            .unwrap();
+        let scope = context.authorization_scope("chat", "public-v1");
         assert!(scope.allows_candidate(
             "provider-a",
             None,
