@@ -412,9 +412,9 @@ impl AuthorizationScope {
         served_model: &str,
         endpoint: InferenceEndpoint,
     ) -> bool {
-        self.predicate.as_ref().is_none_or(|predicate| {
-            predicate(provider_id, route_id, served_model, endpoint)
-        })
+        self.predicate
+            .as_ref()
+            .is_none_or(|predicate| predicate(provider_id, route_id, served_model, endpoint))
     }
 
     fn ensure_candidate(
@@ -1700,7 +1700,10 @@ impl UpstreamClient for ReqwestUpstreamClient {
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
         backend.authorization.ensure_candidate(
-            backend.authorization_provider.as_deref().unwrap_or("primary"),
+            backend
+                .authorization_provider
+                .as_deref()
+                .unwrap_or("primary"),
             backend.authorization_route.as_deref(),
             &backend.request.model,
             backend.endpoint,
@@ -1824,7 +1827,10 @@ impl UpstreamClient for ReqwestUpstreamClient {
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
         backend.authorization.ensure_candidate(
-            backend.authorization_provider.as_deref().unwrap_or("primary"),
+            backend
+                .authorization_provider
+                .as_deref()
+                .unwrap_or("primary"),
             backend.authorization_route.as_deref(),
             &backend.request.model,
             InferenceEndpoint::CountTokens,
@@ -1913,14 +1919,17 @@ impl UpstreamClient for ReqwestUpstreamClient {
     ) -> AppResult<reqwest::Response> {
         let model = proxy_body_model(&request.body).unwrap_or_default();
         request.authorization.ensure_candidate(
-            request.authorization_provider.as_deref().unwrap_or("primary"),
+            request
+                .authorization_provider
+                .as_deref()
+                .unwrap_or("primary"),
             request.authorization_route.as_deref(),
             &model,
             InferenceEndpoint::Completions,
         )?;
         let url = self.endpoint_url("completions")?;
-        let outbound = copy_proxy_request_headers(self.client.post(url), &request.headers)
-            .body(request.body);
+        let outbound =
+            copy_proxy_request_headers(self.client.post(url), &request.headers).body(request.body);
         self.with_auth(outbound).send().await.map_err(|err| {
             AppError::upstream(format!("upstream completions request failed: {err}"))
         })
@@ -1932,11 +1941,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
 }
 
 impl FailoverUpstreamClient {
-    fn provider_is_authorized(
-        &self,
-        provider_index: usize,
-        backend: &BackendChatRequest,
-    ) -> bool {
+    fn provider_is_authorized(&self, provider_index: usize, backend: &BackendChatRequest) -> bool {
         self.providers.get(provider_index).is_some_and(|provider| {
             let model = provider
                 .upstream_model
@@ -8893,6 +8898,94 @@ mod tests {
             "F3: model scalar capped to SCALAR_CAP before retention"
         );
     }
+    #[tokio::test]
+    async fn authorization_scope_filters_failover_before_dispatch_or_health_mutation() {
+        let denied = MockServer::start().await;
+        let allowed = MockServer::start().await;
+        for server in [&denied, &allowed] {
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+                )
+                .mount(server)
+                .await;
+        }
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "denied",
+                    d2_capturing_client(&denied.uri(), DashboardFlowStore::disabled()),
+                    Some("model-denied".to_string()),
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "allowed",
+                    d2_capturing_client(&allowed.uri(), DashboardFlowStore::disabled()),
+                    Some("model-allowed".to_string()),
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            Duration::from_secs(60),
+        );
+        let scope = AuthorizationScope::restricted(|provider, _, model, endpoint| {
+            provider == "allowed"
+                && model == "model-allowed"
+                && endpoint == InferenceEndpoint::ChatCompletions
+        });
+        let backend = BackendChatRequest::new(family_request("alias"), None, None, None)
+            .with_authorization(scope, InferenceEndpoint::ChatCompletions);
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("authorized fallback serves");
+        while let Some(chunk) = stream.next().await {
+            chunk.expect("valid chunk");
+        }
+
+        assert!(denied.received_requests().await.unwrap().is_empty());
+        assert_eq!(allowed.received_requests().await.unwrap().len(), 1);
+        let health = failover.provider_health();
+        assert_eq!(health[0].failover_count, 0, "denial is not a failure");
+        assert_eq!(health[0].consecutive_failures, 0, "denial does not cool");
+    }
+
+    #[tokio::test]
+    async fn authorization_scope_empty_candidate_set_is_terminal_forbidden() {
+        let leaf = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse("http://127.0.0.1:9/v1/").unwrap(),
+            None,
+            None,
+            true,
+            4096,
+        );
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "only",
+                leaf,
+                Some("served".to_string()),
+                None,
+                JsonMap::new(),
+            )],
+            Duration::from_secs(60),
+        );
+        let backend = BackendChatRequest::new(family_request("alias"), None, None, None)
+            .with_authorization(
+                AuthorizationScope::restricted(|_, _, _, _| false),
+                InferenceEndpoint::ChatCompletions,
+            );
+        let err = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect_err("empty authorized set denies before network");
+        assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
+        assert_eq!(failover.provider_health()[0].failover_count, 0);
+    }
 }
 
 #[cfg(test)]
@@ -9418,94 +9511,5 @@ mod f1e_upstream_response_truthful_tests {
             section["partial"], true,
             "a byte-then-cancel stays sticky-partial (AC-14): {artifact}"
         );
-    }
-
-    #[tokio::test]
-    async fn authorization_scope_filters_failover_before_dispatch_or_health_mutation() {
-        let denied = MockServer::start().await;
-        let allowed = MockServer::start().await;
-        for server in [&denied, &allowed] {
-            Mock::given(wm_method("POST"))
-                .and(wm_path("/v1/chat/completions"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .insert_header("content-type", "text/event-stream")
-                        .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
-                )
-                .mount(server)
-                .await;
-        }
-        let failover = FailoverUpstreamClient::new(
-            vec![
-                FailoverUpstreamProvider::new(
-                    "denied",
-                    d2_capturing_client(&denied.uri(), DashboardFlowStore::disabled()),
-                    Some("model-denied".to_string()),
-                    None,
-                    JsonMap::new(),
-                ),
-                FailoverUpstreamProvider::new(
-                    "allowed",
-                    d2_capturing_client(&allowed.uri(), DashboardFlowStore::disabled()),
-                    Some("model-allowed".to_string()),
-                    None,
-                    JsonMap::new(),
-                ),
-            ],
-            Duration::from_secs(60),
-        );
-        let scope = AuthorizationScope::restricted(|provider, _, model, endpoint| {
-            provider == "allowed"
-                && model == "model-allowed"
-                && endpoint == InferenceEndpoint::ChatCompletions
-        });
-        let backend = BackendChatRequest::new(family_request("alias"), None, None, None)
-            .with_authorization(scope, InferenceEndpoint::ChatCompletions);
-        let mut stream = failover
-            .stream_chat_completion(&backend)
-            .await
-            .expect("authorized fallback serves");
-        while let Some(chunk) = stream.next().await {
-            chunk.expect("valid chunk");
-        }
-
-        assert!(denied.received_requests().await.unwrap().is_empty());
-        assert_eq!(allowed.received_requests().await.unwrap().len(), 1);
-        let health = failover.provider_health();
-        assert_eq!(health[0].failover_count, 0, "denial is not a failure");
-        assert_eq!(health[0].consecutive_failures, 0, "denial does not cool");
-    }
-
-    #[tokio::test]
-    async fn authorization_scope_empty_candidate_set_is_terminal_forbidden() {
-        let leaf = ReqwestUpstreamClient::new(
-            reqwest::Client::new(),
-            url::Url::parse("http://127.0.0.1:9/v1/").unwrap(),
-            None,
-            None,
-            true,
-            4096,
-        );
-        let failover = FailoverUpstreamClient::new(
-            vec![FailoverUpstreamProvider::new(
-                "only",
-                leaf,
-                Some("served".to_string()),
-                None,
-                JsonMap::new(),
-            )],
-            Duration::from_secs(60),
-        );
-        let backend = BackendChatRequest::new(family_request("alias"), None, None, None)
-            .with_authorization(
-                AuthorizationScope::restricted(|_, _, _, _| false),
-                InferenceEndpoint::ChatCompletions,
-            );
-        let err = failover
-            .stream_chat_completion(&backend)
-            .await
-            .expect_err("empty authorized set denies before network");
-        assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
-        assert_eq!(failover.provider_health()[0].failover_count, 0);
     }
 }

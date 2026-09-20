@@ -1947,9 +1947,7 @@ async fn post_completions(
     }
     let response = gateway
         .upstream_client()
-        .proxy_completions(crate::upstream::ProxyCompletionsRequest::new(
-            headers, body,
-        ))
+        .proxy_completions(crate::upstream::ProxyCompletionsRequest::new(headers, body))
         .await?;
     Ok(proxy_upstream_response(response))
 }
