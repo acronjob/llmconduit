@@ -7594,10 +7594,15 @@ async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
             Ok(usage_chunk("chat-auth", 12, 5, 17, Some(3), Some(2))),
         ])
         .await;
+    let mut config = test_config();
+    config.price_table.insert(
+        "public-model".to_string(),
+        llmconduit::config::ModelPrice::new(2.0, 6.0, 0.5),
+    );
     let gateway = test_gateway_with_config_raw_output_and_authz(
         upstream.clone(),
         MockSearch::default(),
-        test_config(),
+        config,
         None,
         authz,
     );
@@ -7648,7 +7653,9 @@ async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
         loop {
             let connection = rusqlite::Connection::open(&store_path).expect("open auth store");
             let row = connection.query_row(
-                "SELECT endpoint, status, prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens
+                "SELECT endpoint, status, prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens,
+                        cost_nano_usd, cost_confidence,
+                        (SELECT COUNT(*) FROM auth_usage_events)
                  FROM auth_usage_events",
                 [],
                 |row| {
@@ -7660,6 +7667,9 @@ async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
                         row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             );
@@ -7673,7 +7683,18 @@ async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
     .expect("terminal usage persisted in bounded time");
     assert_eq!(
         usage_row,
-        ("chat".to_string(), "completed".to_string(), 12, 5, 17, 3, 2)
+        (
+            "chat".to_string(),
+            "completed".to_string(),
+            12,
+            5,
+            17,
+            3,
+            2,
+            49_500_000,
+            "confident".to_string(),
+            1,
+        )
     );
     remove_auth_store(&store_path);
 }
