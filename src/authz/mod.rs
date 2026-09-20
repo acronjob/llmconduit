@@ -174,14 +174,8 @@ impl AuthzService {
         let digest = hmac_digest(&inner.pepper, &raw)?;
         let created = {
             let mut store = inner.store.lock().map_err(|_| "auth store lock poisoned")?;
-            let created = store.create_key(
-                principal_name,
-                key_name,
-                &raw,
-                &digest,
-                endpoints,
-                models,
-            )?;
+            let created =
+                store.create_key(principal_name, key_name, &raw, &digest, endpoints, models)?;
             self.reload_locked(inner, &mut store)?;
             created
         };
@@ -213,11 +207,7 @@ impl AuthzService {
             .list_keys()
     }
 
-    fn reload_locked(
-        &self,
-        inner: &Inner,
-        store: &mut store::AuthStore,
-    ) -> Result<(), String> {
+    fn reload_locked(&self, inner: &Inner, store: &mut store::AuthStore) -> Result<(), String> {
         let fresh = Arc::new(load_snapshot(store)?);
         *inner
             .snapshot
@@ -315,9 +305,7 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
     let value = value.as_bytes();
     let (mut star, mut retry) = (None, 0usize);
     while v < value.len() {
-        if p < bytes.len()
-            && (bytes[p] == b'?' || bytes[p].eq_ignore_ascii_case(&value[v]))
-        {
+        if p < bytes.len() && (bytes[p] == b'?' || bytes[p].eq_ignore_ascii_case(&value[v])) {
             p += 1;
             v += 1;
         } else if p < bytes.len() && bytes[p] == b'*' {
@@ -340,7 +328,9 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Effect, PolicyGrant, decide, matches_pattern};
+    use super::{AuthzService, Effect, PolicyGrant, decide, matches_pattern};
+    use crate::config::{AuthConfig, AuthMode};
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn explicit_deny_overrides_allow() {
@@ -365,5 +355,57 @@ mod tests {
     fn glob_matching_is_case_insensitive() {
         assert!(matches_pattern("Claude-*-Sonnet", "claude-4-sonnet"));
         assert!(!matches_pattern("Claude-*-Sonnet", "claude-4-opus"));
+    }
+
+    #[test]
+    fn key_lifecycle_is_scoped_and_revocation_is_immediate() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-auth-test-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AuthConfig {
+            mode: AuthMode::Enforce,
+            store_path: path.clone(),
+        };
+        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+        let service = AuthzService::open_enforced(
+            &config,
+            b"unit-test-pepper-never-log".to_vec(),
+            Some(&bootstrap),
+        )
+        .unwrap();
+
+        let created = service
+            .create_key(
+                "reporting service",
+                "reporting",
+                &["chat".to_string()],
+                &["public-*".to_string()],
+            )
+            .unwrap();
+        let raw = created.raw_key.as_deref().unwrap();
+        assert!(raw.starts_with("llmc_"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(raw).expect("generated key is a valid header"),
+        );
+        let context = service.authenticate(&headers).unwrap().unwrap();
+        assert!(context.allows_endpoint("chat"));
+        assert!(!context.allows_endpoint("responses"));
+        assert!(context.allows_model("chat", "public-v1"));
+        assert!(!context.allows_model("chat", "secret-v1"));
+        assert!(context.auth_request_id.starts_with("areq_"));
+
+        let listed = service.list_keys().unwrap();
+        assert!(listed.iter().all(|key| !key.prefix.contains(raw)));
+        assert!(service.revoke_key(&created.summary.id).unwrap());
+        assert!(service.authenticate(&headers).is_err());
+
+        drop(service);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 }

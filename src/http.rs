@@ -200,6 +200,15 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
+        .route("/dashboard/api/auth/summary", get(auth_summary))
+        .route(
+            "/dashboard/api/auth/api-keys",
+            get(auth_list_keys).post(auth_create_key),
+        )
+        .route(
+            "/dashboard/api/auth/api-keys/{id}/revoke",
+            post(auth_revoke_key),
+        )
         .route_layer(middleware::map_response(dashboard_api_no_store));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
@@ -237,6 +246,65 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).
         .layer(Extension(auth))
+}
+
+async fn auth_summary(State(gateway): State<Arc<Gateway>>) -> Response {
+    Json(serde_json::json!({
+        "mode": if gateway.authz().is_enabled() { "enforce" } else { "disabled" },
+        "healthy": true
+    }))
+    .into_response()
+}
+
+async fn auth_list_keys(State(gateway): State<Arc<Gateway>>) -> AppResult<Json<Value>> {
+    let keys = gateway.authz().list_keys().map_err(AppError::internal)?;
+    Ok(Json(serde_json::json!({ "data": keys })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateApiKeyRequest {
+    principal_name: String,
+    name: String,
+    #[serde(default)]
+    endpoints: Vec<String>,
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+async fn auth_create_key(
+    State(gateway): State<Arc<Gateway>>,
+    Json(request): Json<CreateApiKeyRequest>,
+) -> AppResult<(StatusCode, Json<Value>)> {
+    let created = gateway
+        .authz()
+        .create_key(
+            &request.principal_name,
+            &request.name,
+            &request.endpoints,
+            &request.models,
+        )
+        .map_err(AppError::bad_request)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::to_value(created).map_err(|err| {
+            AppError::internal(format!("failed to serialize created API key: {err}"))
+        })?),
+    ))
+}
+
+async fn auth_revoke_key(
+    State(gateway): State<Arc<Gateway>>,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    if gateway
+        .authz()
+        .revoke_key(&id)
+        .map_err(AppError::internal)?
+    {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Err(AppError::not_found("API key not found or already revoked"))
+    }
 }
 
 async fn require_inference_auth(
@@ -1500,7 +1568,12 @@ async fn post_responses(
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let served = gateway.resolve_request_model(&request.model).await.0;
-    authorize_model(auth.as_ref().map(|value| &value.0), "responses", &requested, &served)?;
+    authorize_model(
+        auth.as_ref().map(|value| &value.0),
+        "responses",
+        &requested,
+        &served,
+    )?;
     let wants_stream = request.stream;
     let stream = gateway
         .stream_responses_with_api_call_id(request, api_call_id.map(|extension| extension.0.0))
@@ -1540,7 +1613,9 @@ async fn get_responses(
 ) -> Response {
     match upgrade {
         Ok(upgrade) => upgrade
-            .on_upgrade(move |socket| responses_ws_serve(socket, gateway, auth.map(|value| value.0)))
+            .on_upgrade(move |socket| {
+                responses_ws_serve(socket, gateway, auth.map(|value| value.0))
+            })
             .into_response(),
         Err(_) => {
             // Plain GET without an `Upgrade: websocket` header. 426 tells the
@@ -1754,7 +1829,12 @@ async fn handle_count_tokens(
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
-    authorize_model(auth.as_ref(), "count_tokens", &original_model, &resolved_model)?;
+    authorize_model(
+        auth.as_ref(),
+        "count_tokens",
+        &original_model,
+        &resolved_model,
+    )?;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let roles = gateway
         .config()
@@ -1820,7 +1900,12 @@ async fn post_chat_completions(
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
-    authorize_model(auth.as_ref().map(|value| &value.0), "chat", &requested, &model)?;
+    authorize_model(
+        auth.as_ref().map(|value| &value.0),
+        "chat",
+        &requested,
+        &model,
+    )?;
     let wants_stream = request.stream;
     let include_usage = request
         .stream_options
@@ -1851,7 +1936,12 @@ async fn post_completions(
     if let Some(context) = auth.as_ref() {
         let model = serde_json::from_slice::<Value>(&body)
             .ok()
-            .and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_string))
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .ok_or_else(|| AppError::bad_request("request body must include a model"))?;
         authorize_model(Some(&context.0), "completions", &model, &model)?;
     }
@@ -2328,17 +2418,24 @@ async fn get_models(
     headers: HeaderMap,
     Query(query): Query<ModelsListQuery>,
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
 ) -> AppResult<Response> {
     let anthropic_models = is_anthropic_models_request(&headers);
     let response = gateway.upstream_client().list_models().await?;
-    let (status, body, etag) = collect_models_response(response).await?;
+    let (status, mut body, etag) = collect_models_response(response).await?;
+    if let Some(context) = auth.as_ref() {
+        filter_models_body(&mut body, &context.0);
+    }
     let body = if anthropic_models {
         transform_models_response_for_anthropic(body, &query, gateway.config())?
     } else {
         body
     };
     let mut headers = HeaderMap::new();
-    if !anthropic_models && let Some(etag) = etag {
+    if auth.is_none()
+        && !anthropic_models
+        && let Some(etag) = etag
+    {
         headers.insert(
             http::header::ETAG,
             HeaderValue::from_str(&etag)
@@ -2346,6 +2443,30 @@ async fn get_models(
         );
     }
     Ok((status, headers, Json(body)).into_response())
+}
+
+fn filter_models_body(body: &mut Value, context: &crate::authz::AuthContext) {
+    let models = match body {
+        Value::Array(models) => Some(models),
+        Value::Object(map) => {
+            let key = if map.contains_key("data") {
+                "data"
+            } else {
+                "models"
+            };
+            map.get_mut(key).and_then(Value::as_array_mut)
+        }
+        _ => None,
+    };
+    if let Some(models) = models {
+        models.retain(|model| {
+            model
+                .get("id")
+                .or_else(|| model.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| context.allows_model("models", id))
+        });
+    }
 }
 
 fn is_anthropic_models_request(headers: &HeaderMap) -> bool {
