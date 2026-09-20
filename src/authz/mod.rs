@@ -557,6 +557,23 @@ impl AuthzService {
             .unwrap_or_default()
     }
 
+    pub async fn sync_openrouter_pricing_models(
+        &self,
+        models: Vec<String>,
+    ) -> Result<Vec<crate::dashboard_access::AccessPricingRow>, crate::dashboard_access::AccessError>
+    {
+        match self
+            .sync_openrouter_pricing(
+                crate::dashboard_access::ManagementActor::Bootstrap,
+                crate::dashboard_access::SyncPricingRequest { models },
+            )
+            .await?
+        {
+            crate::dashboard_access::AccessResult::Pricing(pricing) => Ok(pricing),
+            _ => unreachable!("pricing sync always returns the pricing projection"),
+        }
+    }
+
     fn refresh_effective_prices_locked(
         &self,
         inner: &Inner,

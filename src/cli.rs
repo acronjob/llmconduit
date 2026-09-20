@@ -4,6 +4,7 @@ use crate::config::load_persisted_config;
 use crate::config::write_persisted_config;
 use clap::Parser;
 use clap::Subcommand;
+use clap::ValueEnum;
 use dialoguer::Confirm;
 use dialoguer::Input;
 use dialoguer::Password;
@@ -77,6 +78,30 @@ pub enum Commands {
         #[command(subcommand)]
         command: MeshCommands,
     },
+    /// Import model pricing into the authorization store.
+    Pricing {
+        /// Path to the config file. Defaults to ~/.config/llmconduit/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: PricingCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PricingCommands {
+    /// Fetch official endpoint pricing and persist normalized snapshots.
+    Sync {
+        source: PricingSource,
+        /// OpenRouter model id to import, repeatable (for example openai/gpt-4.1).
+        #[arg(long = "model", required = true)]
+        models: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum PricingSource {
+    Openrouter,
 }
 
 #[derive(Debug, Subcommand)]
@@ -364,6 +389,31 @@ mod tests {
                 },
                 ..
             }) if endpoint_id == "endpoint-id"
+        ));
+    }
+
+    #[test]
+    fn parses_openrouter_pricing_sync_models() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "pricing",
+            "sync",
+            "openrouter",
+            "--model",
+            "openai/gpt-4.1",
+            "--model",
+            "anthropic/claude-sonnet-4",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Pricing {
+                command: PricingCommands::Sync {
+                    source: PricingSource::Openrouter,
+                    models,
+                },
+                ..
+            }) if models == ["openai/gpt-4.1", "anthropic/claude-sonnet-4"]
         ));
     }
 }
