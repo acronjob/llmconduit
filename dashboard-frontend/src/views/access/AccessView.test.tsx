@@ -70,7 +70,7 @@ describe('AccessView', () => {
     await screen.findByText('Policy reader');
 
     const subjects = screen.getByLabelText('Policy subjects') as HTMLSelectElement;
-    Array.from(subjects.options).find((option) => option.value === 'principal:usr_ops')!.selected = true;
+    Array.from(subjects.options).find((option) => option.value === 'usr_ops')!.selected = true;
     fireEvent.change(subjects);
     fireEvent.change(screen.getByLabelText('Policy endpoints'), { target: { value: 'responses,chat' } });
     fireEvent.change(screen.getByLabelText('Policy requested models'), { target: { value: 'alias-*' } });
@@ -80,7 +80,7 @@ describe('AccessView', () => {
 
     const preview = screen.getByTestId('policy-payload-preview');
     expect(preview).toHaveTextContent('"subjects": [');
-    expect(preview).toHaveTextContent('"principal:usr_ops"');
+    expect(preview).toHaveTextContent('"usr_ops"');
     expect(preview).toHaveTextContent('"requested_models": [');
     expect(preview).toHaveTextContent('"served_models": [');
     expect(preview).toHaveTextContent('"routes": [');
