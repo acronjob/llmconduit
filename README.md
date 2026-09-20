@@ -37,6 +37,38 @@ upstream_base_url: "http://127.0.0.1:8000/v1"
 upstream_model: "Qwen3.5"
 ```
 
+### Inference API keys
+
+Inference authentication is opt-in and defaults to the legacy-compatible
+`disabled` mode. To enable fail-closed API-key enforcement, configure a
+dedicated SQLite store and supply the verifier pepper through the environment:
+
+```yaml
+auth:
+  mode: enforce
+  store_path: "/var/lib/llmconduit/auth.sqlite3"
+```
+
+```bash
+export LLMCONDUIT_AUTH_PEPPER='a-long-random-environment-only-secret'
+# Required only on the first startup of an empty auth store.
+export LLMCONDUIT_AUTH_BOOTSTRAP_KEY='llmc_<at-least-27-more-random-characters>'
+```
+
+The bootstrap key receives wildcard inference access. Subsequent keys are
+created from the dashboard **Access** view and are displayed exactly once;
+only an HMAC-SHA256 verifier and short non-secret prefix are stored. Clients may
+send either `Authorization: Bearer llmc_...`, a raw `Authorization` value, or
+`x-api-key`. Missing/invalid credentials receive `401`; valid keys without an
+endpoint/model grant receive `403`. Authenticated `/v1/models` responses are
+filtered to the caller's grants and upstream ETags are stripped.
+
+Key creation and revocation use the existing dashboard session and mutation
+gate, so start with `--with-debug-ui` and set
+`LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`; browser writes also require the
+dashboard CSRF token. The pepper and bootstrap key are never persisted in the
+YAML config or returned by read APIs.
+
 Multi-upstream model routing:
 
 ```yaml
