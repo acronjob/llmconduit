@@ -64,7 +64,7 @@ const AUTH_USAGE: AuthUsageRow[] = [
   { dimension: 'group', value: 'grp_prod', requests: 18, prompt_tokens: null, completion_tokens: null, cached_tokens: null, reasoning_tokens: null, cost: null, cost_confidence: 'unavailable' },
 ];
 const AUTH_AUDIT: AuthAuditEvent[] = [
-  { id: 'audit_001', timestamp: '2026-06-21T14:18:00Z', actor: 'usr_ops', action: 'api_key.create', target: 'key_ops', outcome: 'allowed', metadata: { prefix: 'llmc_7ad2' } },
+  { id: 'audit_001', timestamp: '2026-06-21T14:18:00Z', actor: 'usr_ops', action: 'api_key.create', target: 'key_ops', outcome: 'ok', metadata: { prefix: 'llmc_7ad2' } },
   { id: 'audit_002', timestamp: '2026-06-21T14:19:00Z', actor: 'key_ops', action: 'inference.authorize', target: 'vllm-b', outcome: 'denied', metadata: { policy: 'pol_deny_local' } },
 ];
 const AUTH_PRICING: AuthPricingRow[] = [

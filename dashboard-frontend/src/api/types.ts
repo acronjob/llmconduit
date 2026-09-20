@@ -1007,7 +1007,7 @@ export interface AuthAuditEvent {
   actor: string;
   action: string;
   target: string;
-  outcome: 'allowed' | 'denied' | 'error';
+  outcome: 'ok' | 'denied' | 'error';
   metadata: Record<string, unknown>;
 }
 
@@ -1117,7 +1117,7 @@ function isAuthUsageRow(v: unknown): v is AuthUsageRow {
 }
 function isAuthAuditEvent(v: unknown): v is AuthAuditEvent {
   return isObj(v) && isStr(v.id) && isStr(v.timestamp) && isStr(v.actor) && isStr(v.action)
-    && isStr(v.target) && isOneOf(v.outcome, ['allowed', 'denied', 'error'] as const) && isObj(v.metadata);
+    && isStr(v.target) && isOneOf(v.outcome, ['ok', 'denied', 'error'] as const) && isObj(v.metadata);
 }
 function isAuthPricingRow(v: unknown): v is AuthPricingRow {
   return isObj(v) && isStr(v.model) && isStr(v.provider) && isStr(v.source) && isStr(v.fetched_at)

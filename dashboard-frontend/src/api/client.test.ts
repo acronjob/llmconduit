@@ -95,6 +95,25 @@ describe('DashboardClient — access management runtime validation', () => {
     const client = new DashboardClient({ fetchImpl: fetchInvalid });
     await expect(client.authUsers()).rejects.toThrow(/invalid response/);
   });
+
+  it('accepts the backend audit outcome used for successful management events', async () => {
+    const fetchAudit: typeof fetch = async () => new Response(JSON.stringify({
+      events: [{
+        id: '1',
+        timestamp: '2026-09-20T12:06:19+00:00',
+        actor: 'bootstrap',
+        action: 'bootstrap.created',
+        target: 'key_bootstrap',
+        outcome: 'ok',
+        metadata: {},
+      }],
+    }), { status: 200 });
+    const client = new DashboardClient({ fetchImpl: fetchAudit });
+
+    await expect(client.authAudit()).resolves.toMatchObject({
+      events: [{ outcome: 'ok' }],
+    });
+  });
 });
 
 describe('readCsrfCookie', () => {
