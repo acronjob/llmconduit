@@ -10,6 +10,15 @@
  * A dev flag (`isMockEnabled`) selects mock vs. real (see ../config/env.ts).
  */
 import type {
+  AuthApiKey,
+  AuthAuditEvent,
+  AuthGroup,
+  AuthPolicy,
+  AuthPricingRow,
+  AuthRole,
+  AuthSession,
+  AuthUsageRow,
+  AuthUser,
   CatalogEntry,
   DashboardFrame,
   DebugWsMessage,
@@ -28,6 +37,39 @@ import type {
 import type { WsLike } from './ws';
 
 const MOCK_CSRF = 'mock-csrf-token';
+
+const AUTH_USERS: AuthUser[] = [
+  { id: 'usr_ops', kind: 'user', display_name: 'Operations', enabled: true, created_at: '2026-06-01T09:00:00Z' },
+  { id: 'usr_batch', kind: 'service_account', display_name: 'Batch inference', enabled: true, created_at: '2026-06-02T12:00:00Z' },
+];
+const AUTH_GROUPS: AuthGroup[] = [
+  { id: 'grp_prod', name: 'Production', enabled: true, member_count: 2 },
+];
+const AUTH_ROLES: AuthRole[] = [
+  { id: 'role_operator', name: 'Operator', enabled: true, permissions: ['auth.keys.read', 'auth.keys.create', 'auth.usage.read', 'auth.sessions.read'] },
+];
+const AUTH_POLICIES: AuthPolicy[] = [
+  { id: 'pol_prod', name: 'Production models', effect: 'allow', enabled: true, subjects: ['grp_prod'], endpoints: ['responses', 'chat'], models: ['gpt-*'], providers: ['openai'] },
+  { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], models: ['*'], providers: ['vllm-b'] },
+];
+let AUTH_KEYS: AuthApiKey[] = [
+  { id: 'key_ops', principal_id: 'usr_ops', name: 'operator laptop', prefix: 'llmc_7ad2', enabled: true, created_at: '2026-06-03T10:00:00Z', expires_at: null, last_used_at: '2026-06-21T14:19:40Z' },
+];
+let AUTH_SESSIONS: AuthSession[] = [
+  { id: 'sess_admin', kind: 'dashboard', principal_id: 'usr_ops', key_id: 'key_ops', endpoint: null, requested_model: null, started_at: '2026-06-21T14:00:00Z', expires_at: '2026-06-21T22:00:00Z' },
+  { id: 'sess_infer', kind: 'inference', principal_id: 'usr_batch', key_id: 'key_batch', endpoint: 'responses', requested_model: 'gpt-4.1', started_at: '2026-06-21T14:19:57Z', expires_at: null },
+];
+const AUTH_USAGE: AuthUsageRow[] = [
+  { dimension: 'key', value: 'key_ops', requests: 142, prompt_tokens: 82120, completion_tokens: 11940, cached_tokens: 30220, reasoning_tokens: null, cost: 1.8241, cost_confidence: 'confident' },
+  { dimension: 'group', value: 'grp_prod', requests: 18, prompt_tokens: null, completion_tokens: null, cached_tokens: null, reasoning_tokens: null, cost: null, cost_confidence: 'unavailable' },
+];
+const AUTH_AUDIT: AuthAuditEvent[] = [
+  { id: 'audit_001', timestamp: '2026-06-21T14:18:00Z', actor: 'usr_ops', action: 'api_key.create', target: 'key_ops', outcome: 'allowed', metadata: { prefix: 'llmc_7ad2' } },
+  { id: 'audit_002', timestamp: '2026-06-21T14:19:00Z', actor: 'key_ops', action: 'inference.authorize', target: 'vllm-b', outcome: 'denied', metadata: { policy: 'pol_deny_local' } },
+];
+const AUTH_PRICING: AuthPricingRow[] = [
+  { model: 'gpt-4.1', provider: 'openai', source: 'operator', fetched_at: '2026-06-20T00:00:00Z', input_per_1k: '0.002', output_per_1k: '0.008', confidence: 'confident' },
+];
 
 // ---------------------------------------------------------------------------
 // Seed data — shapes mirror the REAL Rust DTOs (D1 FlowSummary, D4 ProviderHealth).
