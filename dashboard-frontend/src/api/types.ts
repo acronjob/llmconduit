@@ -1520,3 +1520,34 @@ export function isSnapshotFrame(v: unknown): v is SnapshotFrame {
 export function assertNever(value: never): never {
   throw new Error(`Unhandled discriminated union member: ${JSON.stringify(value)}`);
 }
+
+export interface AuthSummary {
+  mode: 'disabled' | 'enforce';
+  healthy: boolean;
+}
+
+export interface ApiKeySummary {
+  id: string;
+  principal_id: string;
+  name: string;
+  prefix: string;
+  enabled: boolean;
+  created_at: number;
+  expires_at?: number | null;
+  last_used_at?: number | null;
+}
+
+export interface ApiKeyListResponse {
+  data: ApiKeySummary[];
+}
+
+export interface CreatedApiKey extends ApiKeySummary {
+  raw_key: string;
+}
+
+export interface CreateApiKeyRequest {
+  principal_name: string;
+  name: string;
+  endpoints: string[];
+  models: string[];
+}

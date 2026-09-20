@@ -16,7 +16,7 @@ export const VIEWS: { name: ViewName; tab: string; ready: string | RegExp }[] = 
   { name: 'theater', tab: 'Theater', ready: /No active streams/i },
   // Gap 16 — the control-room overview (the 5th route). Its masthead text is the ready marker.
   { name: 'overview', tab: 'Overview', ready: /control room/i },
-  { name: 'access', tab: 'Access', ready: /access control/i },
+  { name: 'access', tab: 'Access', ready: /Access control/i },
 ];
 
 /**
