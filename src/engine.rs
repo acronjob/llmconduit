@@ -1185,6 +1185,26 @@ impl Gateway {
         request: ResponsesRequest,
         api_call_id: Option<String>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_authorized(
+            request,
+            api_call_id,
+            crate::upstream::AuthorizationScope::unrestricted(),
+            crate::upstream::InferenceEndpoint::Responses,
+        )
+        .await
+    }
+
+    /// Stream a canonical request while retaining the ingress authorization
+    /// scope through every tool-loop turn and backend rebuild. HTTP ingress uses
+    /// this entry point after authentication; internal and legacy callers keep
+    /// the unrestricted wrapper above.
+    pub async fn stream_responses_authorized(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
         // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
         // telemetry guard built BELOW and every per-turn `BackendChatRequest` in
         // `run_turn` share the SAME `Arc` — the failover/routing layers tag
@@ -1550,6 +1570,8 @@ impl Gateway {
                     // read by the guard at finalize) threaded onto every per-turn
                     // `BackendChatRequest`.
                     serving_token,
+                    authorization,
+                    endpoint,
                     tx.clone(),
                     // D6: the flow's kill token, composed with every `tx.closed()`
                     // client-hangup check inside `run_turn` + its helpers.
@@ -1860,6 +1882,11 @@ impl Gateway {
         // (cancelled vs failed vs completed) and the guard's `Drop` still covers a
         // panic inside this function (it unwinds through the closure).
         serving_token: Arc<crate::upstream::ServingToken>,
+        // Request-local authorization is immutable and reused for every turn in
+        // the server-tool loop. Provider/route selection still occurs downstream,
+        // where candidates are checked before dispatch or capacity mutation.
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
         tx: mpsc::Sender<SseEvent>,
         // D6: the flow's cancellation token (registered in the AbortHub by the L1 guard
         // under `api_call_id`). COMPOSED with — never a replacement for — every existing
@@ -2315,6 +2342,7 @@ impl Gateway {
                 Some(response_id.clone()),
                 Some(Arc::clone(&serving_token)),
             )
+            .with_authorization(authorization.clone(), endpoint)
             .with_thinking_override(request.thinking)
             // F1d: attach the turn-capture handle (see above) so the leaf's
             // `upstream_request` write can reach this turn's artifact.
