@@ -7257,6 +7257,230 @@ fn login_token_is_never_logged() {
     );
 }
 
+static AUTH_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+fn scoped_authz(
+    endpoints: &[&str],
+    models: &[&str],
+) -> (llmconduit::authz::AuthzService, String, std::path::PathBuf) {
+    let _guard = AUTH_ENV_LOCK.lock().expect("auth env lock");
+    let path = std::env::temp_dir().join(format!(
+        "llmconduit-http-auth-test-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    ));
+    let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+    let old_pepper = std::env::var_os("LLMCONDUIT_AUTH_PEPPER");
+    let old_bootstrap = std::env::var_os("LLMCONDUIT_AUTH_BOOTSTRAP_KEY");
+    // SAFETY: this integration-test binary serializes mutation of these two
+    // process-local variables, restores both before releasing the lock, and no
+    // production code mutates the environment.
+    unsafe {
+        std::env::set_var("LLMCONDUIT_AUTH_PEPPER", "http-test-pepper-never-log");
+        std::env::set_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY", &bootstrap);
+    }
+    let service = llmconduit::authz::AuthzService::from_config(&llmconduit::config::AuthConfig {
+        mode: llmconduit::config::AuthMode::Enforce,
+        store_path: path.clone(),
+    })
+    .expect("create enforced auth service");
+    // SAFETY: see the serialized environment mutation above.
+    unsafe {
+        match old_pepper {
+            Some(value) => std::env::set_var("LLMCONDUIT_AUTH_PEPPER", value),
+            None => std::env::remove_var("LLMCONDUIT_AUTH_PEPPER"),
+        }
+        match old_bootstrap {
+            Some(value) => std::env::set_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY", value),
+            None => std::env::remove_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY"),
+        }
+    }
+    let created = service
+        .create_key(
+            "HTTP integration test",
+            "scoped key",
+            &endpoints
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            &models
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("create scoped key");
+    (
+        service,
+        created.raw_key.expect("raw key returned exactly once"),
+        path,
+    )
+}
+
+fn remove_auth_store(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+}
+
+#[tokio::test]
+async fn enforced_auth_rejects_missing_invalid_and_wrong_endpoint_before_dispatch() {
+    let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let chat_body = json!({
+        "model": "public-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    })
+    .to_string();
+
+    for authorization in [None, Some("Bearer llmc_invalid_but_long_enough_1234567890")] {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(value) = authorization {
+            builder = builder.header("authorization", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(chat_body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer realm=\"llmconduit\"")
+        );
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "public-model", "input": "hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    assert!(upstream.requests().await.is_empty());
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
+    let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["public-model"]).await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-auth", "allowed"))])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "secret-model",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let allowed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("x-api-key", &raw_key)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "public-model",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), axum::http::StatusCode::OK);
+    assert_eq!(upstream.requests().await.len(), 1);
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_filters_model_catalog_for_the_authenticated_key() {
+    let (authz, raw_key, store_path) = scoped_authz(&["models"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    upstream
+        .set_supported_models(["public-one", "secret-one", "public-two"])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream,
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let response = llmconduit::build_app_from_gateway(gateway)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let ids = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["public-one", "public-two"]);
+    remove_auth_store(&store_path);
+}
+
 fn test_gateway(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
     test_gateway_with_config(upstream, search, test_config())
 }
