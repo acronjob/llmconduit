@@ -1909,12 +1909,19 @@ impl UpstreamClient for ReqwestUpstreamClient {
 
     async fn proxy_completions(
         &self,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
+        let model = proxy_body_model(&request.body).unwrap_or_default();
+        request.authorization.ensure_candidate(
+            request.authorization_provider.as_deref().unwrap_or("primary"),
+            request.authorization_route.as_deref(),
+            &model,
+            InferenceEndpoint::Completions,
+        )?;
         let url = self.endpoint_url("completions")?;
-        let request = copy_proxy_request_headers(self.client.post(url), &headers).body(body);
-        self.with_auth(request).send().await.map_err(|err| {
+        let outbound = copy_proxy_request_headers(self.client.post(url), &request.headers)
+            .body(request.body);
+        self.with_auth(outbound).send().await.map_err(|err| {
             AppError::upstream(format!("upstream completions request failed: {err}"))
         })
     }
