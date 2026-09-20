@@ -2706,9 +2706,9 @@ async fn responses_ws_connect(
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, router.into_make_service()).await;
     });
-    let request = format!(
+    let request = String::from(
         "GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
-         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
     );
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
