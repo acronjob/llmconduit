@@ -906,8 +906,9 @@ fn inference_endpoint(endpoint: crate::upstream::InferenceEndpoint) -> Endpoint 
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthContext, AuthRequestId, AuthzService, Endpoint, LimitSet, PolicyBinding, PolicyEffect,
-        PolicyIdentity, PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject,
+        AuthContext, AuthFailure, AuthRequestId, AuthzService, Endpoint, LimitSet, PolicyBinding,
+        PolicyEffect, PolicyIdentity, PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject,
+        USAGE_PERSISTENCE_CAPACITY,
     };
     use crate::config::{AuthConfig, AuthMode};
     use crate::dashboard_access::{AccessBackend, AccessOperation, AccessResult, ManagementActor};
