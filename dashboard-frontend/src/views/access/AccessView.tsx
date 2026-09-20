@@ -97,10 +97,10 @@ export function AccessView() {
   const users = useMemo(() => query.data?.users.users ?? [], [query.data?.users.users]);
   const principal = keyPrincipal || users[0]?.id || '';
   const subjectOptions = useMemo(() => [
-    ...users.map((item) => ({ id: item.id, label: `principal · ${item.display_name}` })),
-    ...dataOrEmpty(query.data?.groups.groups).map((item) => ({ id: item.id, label: `group · ${item.name}` })),
-    ...dataOrEmpty(query.data?.roles.roles).map((item) => ({ id: item.id, label: `role · ${item.name}` })),
-    ...dataOrEmpty(query.data?.apiKeys.api_keys).map((item) => ({ id: item.id, label: `key · ${item.name}` })),
+    ...users.map((item) => ({ id: `principal:${item.id}`, label: `principal · ${item.display_name}` })),
+    ...dataOrEmpty(query.data?.groups.groups).map((item) => ({ id: `group:${item.id}`, label: `group · ${item.name}` })),
+    ...dataOrEmpty(query.data?.roles.roles).map((item) => ({ id: `role:${item.id}`, label: `role · ${item.name}` })),
+    ...dataOrEmpty(query.data?.apiKeys.api_keys).map((item) => ({ id: `key:${item.id}`, label: `key · ${item.name}` })),
   ], [query.data, users]);
   const draftPreview = useMemo<CreateAuthPolicyRequest>(() => ({
     name: draftName.trim(), effect: draftEffect, subjects: draftSubjects,
