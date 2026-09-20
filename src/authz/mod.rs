@@ -368,8 +368,10 @@ fn inference_endpoint_name(endpoint: crate::upstream::InferenceEndpoint) -> &'st
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthContext, Effect, PolicyGrant, decide, matches_pattern};
+    use super::{AuthContext, AuthzService, Effect, PolicyGrant, decide, matches_pattern};
+    use crate::config::{AuthConfig, AuthMode};
     use crate::upstream::InferenceEndpoint;
+    use axum::http::{HeaderMap, HeaderValue};
     use std::sync::Arc;
 
     #[test]
@@ -428,5 +430,58 @@ mod tests {
             "public-model",
             InferenceEndpoint::Messages
         ));
+    }
+
+    #[test]
+    fn key_lifecycle_is_scoped_redacted_and_immediately_revoked() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-auth-test-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AuthConfig {
+            mode: AuthMode::Enforce,
+            store_path: path.clone(),
+        };
+        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+        let service = AuthzService::open_enforced(
+            &config,
+            b"unit-test-pepper-never-log".to_vec(),
+            Some(&bootstrap),
+        )
+        .unwrap();
+
+        let created = service
+            .create_key(
+                "reporting service",
+                "reporting",
+                &["chat".to_string()],
+                &["public-*".to_string()],
+            )
+            .unwrap();
+        let raw = created.raw_key.as_deref().unwrap().to_string();
+        assert!(raw.starts_with("llmc_"));
+        assert!(!format!("{created:?}").contains(&raw));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&raw).expect("generated key is a valid header"),
+        );
+        let context = service.authenticate(&headers).unwrap().unwrap();
+        assert!(context.allows_endpoint("chat"));
+        assert!(!context.allows_endpoint("responses"));
+        assert!(context.allows_model("chat", "public-v1"));
+        assert!(!context.allows_model("chat", "secret-v1"));
+        assert!(context.auth_request_id.starts_with("areq_"));
+
+        let listed = service.list_keys().unwrap();
+        assert!(listed.iter().all(|key| !key.prefix.contains(&raw)));
+        assert!(service.revoke_key(&created.summary.id).unwrap());
+        assert!(service.authenticate(&headers).is_err());
+
+        drop(service);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 }
