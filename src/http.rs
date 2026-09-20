@@ -139,7 +139,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         options.with_debug_ui && options.register_protected_routes,
         gateway.dashboard_auth(),
     ) {
-        (true, Some(auth)) => router.merge(protected_routes(auth)),
+        (true, Some(auth)) => router.merge(protected_routes(Arc::clone(&gateway), auth)),
         _ => router,
     };
 
@@ -181,7 +181,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
 /// The shared `Arc<DashboardAuth>` is attached as a request `Extension` scoped to
 /// this sub-router so the middleware/handlers/extractors can read it
 /// (`/debug/ws` reads it via `gateway.dashboard_auth()` instead).
-fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
+fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
     // D13 `/dashboard/api/*` REST surface. `no-store` + the dashboard security
     // headers are applied as ROUTE-LEVEL response middleware on the WHOLE api router
     // (D13 R1 MED), so EVERY response carries them — including an axum EXTRACTOR
@@ -200,16 +200,15 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
-        .route("/dashboard/api/auth/summary", get(auth_summary))
-        .route(
-            "/dashboard/api/auth/api-keys",
-            get(auth_list_keys).post(auth_create_key),
-        )
-        .route(
-            "/dashboard/api/auth/api-keys/{id}/revoke",
-            post(auth_revoke_key),
-        )
         .route_layer(middleware::map_response(dashboard_api_no_store));
+
+    let access_routes =
+        crate::dashboard_access::routes::<Arc<Gateway>>(gateway.authz_arc().access_backend())
+            .route_layer(middleware::map_response(dashboard_api_no_store))
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&gateway),
+                require_management_access,
+            ));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
     // headers in-handler (they serve HTML, not the JSON `no-store` set), so they are
@@ -243,83 +242,67 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/assets/{*path}", get(dashboard_asset));
 
     session_gated
+        .merge(access_routes)
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).
         .layer(Extension(auth))
 }
 
-async fn auth_summary(State(gateway): State<Arc<Gateway>>) -> Response {
-    Json(serde_json::json!({
-        "mode": if gateway.authz().is_enabled() { "enforce" } else { "disabled" },
-        "healthy": true
-    }))
-    .into_response()
-}
-
-async fn auth_list_keys(State(gateway): State<Arc<Gateway>>) -> AppResult<Json<Value>> {
-    let keys = gateway.authz().list_keys().map_err(AppError::internal)?;
-    Ok(Json(serde_json::json!({ "data": keys })))
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateApiKeyRequest {
-    principal_name: String,
-    name: String,
-    #[serde(default)]
-    endpoints: Vec<String>,
-    #[serde(default)]
-    models: Vec<String>,
-}
-
-async fn auth_create_key(
+async fn require_management_access(
     State(gateway): State<Arc<Gateway>>,
-    Extension(dashboard_auth): Extension<Arc<DashboardAuth>>,
-    headers: HeaderMap,
-    Json(request): Json<CreateApiKeyRequest>,
+    mut request: Request,
+    next: Next,
 ) -> Response {
-    if let Err(denied) = dashboard_auth.authorize_mutation(&headers) {
-        return (
-            denied.status(),
-            Json(serde_json::json!({ "error": denied.message() })),
-        )
-            .into_response();
-    }
-    let created = match gateway.authz().create_key(
-        &request.principal_name,
-        &request.name,
-        &request.endpoints,
-        &request.models,
-    ) {
-        Ok(created) => created,
-        Err(err) => return AppError::bad_request(err).into_response(),
+    let Some(dashboard_auth) = request.extensions().get::<Arc<DashboardAuth>>().cloned() else {
+        return management_error(StatusCode::UNAUTHORIZED, "unauthorized");
     };
-    (
-        StatusCode::CREATED,
-        Json(serde_json::to_value(created).unwrap_or_else(
-            |_| serde_json::json!({ "error": "failed to serialize created API key" }),
-        )),
-    )
-        .into_response()
+
+    let (actor, cookie_or_dashboard_token) =
+        if dashboard_auth.authenticate(request.headers()).is_some() {
+            (crate::dashboard_access::ManagementActor::Bootstrap, true)
+        } else {
+            match gateway.authz().authenticate(request.headers()) {
+                Ok(Some(context)) => (context.management_actor(), false),
+                Ok(None)
+                | Err(crate::authz::AuthFailure::Missing)
+                | Err(crate::authz::AuthFailure::Invalid) => {
+                    return management_error(StatusCode::UNAUTHORIZED, "unauthorized");
+                }
+                Err(crate::authz::AuthFailure::Forbidden) => {
+                    return management_error(StatusCode::FORBIDDEN, "management permission denied");
+                }
+                Err(crate::authz::AuthFailure::Unavailable) => {
+                    return management_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authorization unavailable",
+                    );
+                }
+            }
+        };
+
+    if request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD {
+        if cookie_or_dashboard_token {
+            if let Err(denied) = dashboard_auth.authorize_mutation(request.headers()) {
+                return management_error(denied.status(), denied.message());
+            }
+        } else if !dashboard_auth.mutations_enabled() {
+            return management_error(StatusCode::FORBIDDEN, "dashboard mutations are disabled");
+        } else if request.headers().contains_key(header::ORIGIN)
+            && !dashboard_auth.origin_allowed(request.headers())
+        {
+            return management_error(
+                StatusCode::FORBIDDEN,
+                "cross-origin management request denied",
+            );
+        }
+    }
+
+    request.extensions_mut().insert(actor);
+    next.run(request).await
 }
 
-async fn auth_revoke_key(
-    State(gateway): State<Arc<Gateway>>,
-    Extension(dashboard_auth): Extension<Arc<DashboardAuth>>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(denied) = dashboard_auth.authorize_mutation(&headers) {
-        return (
-            denied.status(),
-            Json(serde_json::json!({ "error": denied.message() })),
-        )
-            .into_response();
-    }
-    match gateway.authz().revoke_key(&id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => AppError::not_found("API key not found or already revoked").into_response(),
-        Err(err) => AppError::internal(err).into_response(),
-    }
+fn management_error(status: StatusCode, message: &'static str) -> Response {
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 async fn require_inference_auth(

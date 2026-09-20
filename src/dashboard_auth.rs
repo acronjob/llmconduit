@@ -555,7 +555,7 @@ impl DashboardAuth {
     /// - If NO `PUBLIC_ORIGIN` is configured, the request's `Origin` must match
     ///   its `Host`. This fallback is enabled on loopback and in explicitly
     ///   insecure tokenless mode, preserving a same-origin CSWSH boundary.
-    fn origin_allowed(&self, headers: &HeaderMap) -> bool {
+    pub(crate) fn origin_allowed(&self, headers: &HeaderMap) -> bool {
         let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
             return true;
         };
