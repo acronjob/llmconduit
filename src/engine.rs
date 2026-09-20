@@ -931,10 +931,10 @@ impl Gateway {
             crate::usage_accounting::charge_for_usage(usage, rates)
         });
         let event = crate::usage_accounting::UsageEvent {
-            auth_request_id: context.auth_request_id,
+            auth_request_id: context.auth_request_id.clone(),
             api_call_id,
-            key_id: context.key_id,
-            principal_id: context.principal_id,
+            key_id: context.key_id.clone(),
+            principal_id: context.principal_id.clone(),
             endpoint: inference_endpoint_name(endpoint).to_string(),
             requested_model: Some(requested_model),
             served_model,
@@ -945,12 +945,7 @@ impl Gateway {
             charge,
             created_at_ms: chrono::Utc::now().timestamp_millis(),
         };
-        let authz = self.authz.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(err) = authz.record_usage_once(&event) {
-                tracing::error!(error = %err, "failed to persist authenticated usage event");
-            }
-        });
+        context.record_usage(event);
     }
 
     /// Attach the D7 dashboard auth context (built from the environment in the

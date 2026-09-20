@@ -7,6 +7,7 @@ pub mod store;
 use crate::config::{AuthConfig, AuthMode};
 use axum::http::HeaderMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use keys::{AuthPepper, digest_matches, generate_api_key, key_prefix};
@@ -25,6 +26,7 @@ pub struct AuthContext {
     pub principal_id: String,
     identity: PolicyIdentity,
     policy: Arc<PolicySnapshot>,
+    usage_admission: Option<UsageAdmission>,
 }
 
 impl AuthContext {
@@ -85,6 +87,12 @@ impl AuthContext {
         self.policy
             .effective_limits(&self.identity, chrono::Utc::now())
     }
+
+    pub(crate) fn record_usage(&self, event: crate::usage_accounting::UsageEvent) {
+        if let Some(admission) = &self.usage_admission {
+            admission.submit(event);
+        }
+    }
 }
 
 struct Inner {
@@ -94,9 +102,11 @@ struct Inner {
     effective_prices: RwLock<HashMap<String, crate::config::ModelPrice>>,
     session_limiter: SessionLimiter,
     session_persistence: SessionPersistence,
+    usage_persistence: UsagePersistence,
 }
 
 const SESSION_PERSISTENCE_QUEUE_CAPACITY: usize = 1024;
+const USAGE_PERSISTENCE_CAPACITY: usize = 1024;
 
 enum SessionPersistenceCommand {
     Insert {
@@ -175,6 +185,108 @@ impl SessionPersistence {
     }
 }
 
+struct UsagePersistenceCommand {
+    event: crate::usage_accounting::UsageEvent,
+    _capacity: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct UsagePersistence {
+    sender: std::sync::mpsc::Sender<UsagePersistenceCommand>,
+    capacity: Arc<tokio::sync::Semaphore>,
+}
+
+impl UsagePersistence {
+    fn start(store: Arc<std::sync::Mutex<store::AuthStore>>) -> Result<Self, String> {
+        let (sender, receiver) = std::sync::mpsc::channel::<UsagePersistenceCommand>();
+        std::thread::Builder::new()
+            .name("llmconduit-auth-usage".into())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    let result = store
+                        .lock()
+                        .map_err(|_| "auth store lock poisoned".to_string())
+                        .and_then(|store| store.record_usage_once(&command.event));
+                    if let Err(error) = result {
+                        tracing::error!(%error, "failed to persist authenticated usage event");
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to start auth usage persistence worker: {error}"))?;
+        Ok(Self {
+            sender,
+            capacity: Arc::new(tokio::sync::Semaphore::new(USAGE_PERSISTENCE_CAPACITY)),
+        })
+    }
+
+    fn admit(&self) -> Result<UsageAdmission, AuthFailure> {
+        let capacity = Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| AuthFailure::Unavailable)?;
+        Ok(UsageAdmission {
+            inner: Arc::new(UsageAdmissionInner {
+                sender: self.sender.clone(),
+                capacity: std::sync::Mutex::new(Some(capacity)),
+                submitted: AtomicBool::new(false),
+            }),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct UsageAdmission {
+    inner: Arc<UsageAdmissionInner>,
+}
+
+impl std::fmt::Debug for UsageAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UsageAdmission")
+            .field("submitted", &self.inner.submitted.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+struct UsageAdmissionInner {
+    sender: std::sync::mpsc::Sender<UsagePersistenceCommand>,
+    capacity: std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    submitted: AtomicBool,
+}
+
+impl UsageAdmission {
+    fn submit(&self, event: crate::usage_accounting::UsageEvent) {
+        if self
+            .inner
+            .submitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let capacity = self
+            .inner
+            .capacity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(capacity) = capacity else {
+            tracing::error!("authenticated usage admission lost its capacity permit");
+            return;
+        };
+        if self
+            .inner
+            .sender
+            .send(UsagePersistenceCommand {
+                event,
+                _capacity: capacity,
+            })
+            .is_err()
+        {
+            tracing::error!("authenticated usage persistence worker is unavailable");
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AuthzService {
     inner: Option<Arc<Inner>>,
@@ -226,6 +338,7 @@ impl AuthzService {
         let effective_prices = store.effective_prices()?;
         let store = Arc::new(std::sync::Mutex::new(store));
         let session_persistence = SessionPersistence::start(Arc::clone(&store))?;
+        let usage_persistence = UsagePersistence::start(Arc::clone(&store))?;
         Ok(Self {
             inner: Some(Arc::new(Inner {
                 pepper,
@@ -234,6 +347,7 @@ impl AuthzService {
                 effective_prices: RwLock::new(effective_prices),
                 session_limiter: SessionLimiter::default(),
                 session_persistence,
+                usage_persistence,
             })),
         })
     }
@@ -269,6 +383,7 @@ impl AuthzService {
             }
         }
         let credential = matched.ok_or(AuthFailure::Invalid)?;
+        let usage_admission = inner.usage_persistence.admit()?;
         let request_id = AuthRequestId::new();
         let identity = PolicyIdentity {
             request_id: request_id.clone(),
@@ -283,6 +398,7 @@ impl AuthzService {
             principal_id: identity.principal_id.clone(),
             identity,
             policy: Arc::clone(&authority.policy),
+            usage_admission: Some(usage_admission),
         }))
     }
 
@@ -940,6 +1056,7 @@ mod tests {
             principal_id: identity.principal_id.clone(),
             identity,
             policy,
+            usage_admission: None,
         };
 
         let scope = context
@@ -1017,6 +1134,112 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("cancelled leases were not drained by bounded persistence worker");
+    }
+
+    #[test]
+    fn usage_capacity_fails_closed_before_admitting_another_request() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-usage-capacity-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+        let service = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"usage-capacity-pepper".to_vec(),
+            Some(&bootstrap),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(&bootstrap).unwrap());
+
+        let admitted = (0..USAGE_PERSISTENCE_CAPACITY)
+            .map(|_| service.authenticate(&headers).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            service.authenticate(&headers),
+            Err(AuthFailure::Unavailable)
+        ));
+        drop(admitted);
+        assert!(service.authenticate(&headers).unwrap().is_some());
+        drop(service);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admitted_usage_is_queued_once_without_blocking_tokio() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-usage-runtime-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+        let service = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"usage-runtime-pepper".to_vec(),
+            Some(&bootstrap),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(&bootstrap).unwrap());
+        let context = service.authenticate(&headers).unwrap().unwrap();
+        let event = crate::usage_accounting::UsageEvent {
+            auth_request_id: context.auth_request_id.clone(),
+            api_call_id: None,
+            key_id: context.key_id.clone(),
+            principal_id: context.principal_id.clone(),
+            endpoint: "completions".into(),
+            requested_model: Some("requested".into()),
+            served_model: Some("served".into()),
+            provider: Some("primary".into()),
+            route: None,
+            status: "cancelled".into(),
+            usage: None,
+            charge: None,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let store = Arc::clone(&service.inner().unwrap().store);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        });
+        locked_rx.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        context.record_usage(event.clone());
+        context.clone().record_usage(event);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(75),
+            "usage persistence blocked the current-thread runtime"
+        );
+        blocker.join().unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let count = rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM auth_usage_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap();
+                if count == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("admitted usage persisted exactly once");
+        drop(context);
+        drop(service);
+        let _ = std::fs::remove_file(path);
     }
 
     async fn session_count(service: &AuthzService) -> usize {
