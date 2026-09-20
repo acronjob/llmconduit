@@ -8980,10 +8980,10 @@ mod tests {
                 AuthorizationScope::restricted(|_, _, _, _| false),
                 InferenceEndpoint::ChatCompletions,
             );
-        let err = failover
-            .stream_chat_completion(&backend)
-            .await
-            .expect_err("empty authorized set denies before network");
+        let err = match failover.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("empty authorized set must deny before network"),
+            Err(err) => err,
+        };
         assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
         assert_eq!(failover.provider_health()[0].failover_count, 0);
     }
