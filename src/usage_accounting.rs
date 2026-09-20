@@ -51,8 +51,7 @@ pub fn charge_for_usage(usage: FlowUsage, rates: UsageRates) -> Option<UsageChar
         .checked_mul(i128::from(rates.input_per_token.get()))?
         .checked_add(i128::from(cached).checked_mul(i128::from(cached_rate.get()))?)?
         .checked_add(
-            i128::from(usage.completion)
-                .checked_mul(i128::from(rates.output_per_token.get()))?,
+            i128::from(usage.completion).checked_mul(i128::from(rates.output_per_token.get()))?,
         )?;
     let nano_usd = i64::try_from(total).ok()?;
     let confidence = if usage.cached == Some(0) || rates.cached_per_token.is_some() {

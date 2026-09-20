@@ -322,7 +322,10 @@ mod tests {
     fn operator_override_wins_and_unknown_is_unavailable() {
         let imported = parse_endpoint_prices(RESPONSE).unwrap();
         let operator = ModelPrice::new(1.0, 2.0, 0.5);
-        assert_eq!(resolve_price(Some(operator), Some(&imported)), Some(operator));
+        assert_eq!(
+            resolve_price(Some(operator), Some(&imported)),
+            Some(operator)
+        );
         assert_eq!(resolve_price(None, None), None);
     }
 

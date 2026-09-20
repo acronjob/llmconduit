@@ -220,18 +220,20 @@ pub fn parse_provider_metrics(
     }
 
     let hits = sum(&samples, "vllm:prefix_cache_hits")
-        .zip_or(sum(&samples, "vllm:external_prefix_cache_hits"), |a, b| a + b);
+        .zip_or(sum(&samples, "vllm:external_prefix_cache_hits"), |a, b| {
+            a + b
+        });
     let queries = sum(&samples, "vllm:prefix_cache_queries").zip_or(
         sum(&samples, "vllm:external_prefix_cache_queries"),
         |a, b| a + b,
     );
-    let vllm_rate = hits.zip(queries).and_then(|(hits, queries)| {
-        (queries > 0.0).then_some((hits / queries).clamp(0.0, 1.0))
-    });
-    let sglang_rate = mean(&samples, "sglang:cache_hit_rate")
-        .filter(|value| (0.0..=1.0).contains(value));
-    let kv_cache_usage = mean(&samples, "vllm:kv_cache_usage_perc")
-        .filter(|value| (0.0..=1.0).contains(value));
+    let vllm_rate = hits
+        .zip(queries)
+        .and_then(|(hits, queries)| (queries > 0.0).then_some((hits / queries).clamp(0.0, 1.0)));
+    let sglang_rate =
+        mean(&samples, "sglang:cache_hit_rate").filter(|value| (0.0..=1.0).contains(value));
+    let kv_cache_usage =
+        mean(&samples, "vllm:kv_cache_usage_perc").filter(|value| (0.0..=1.0).contains(value));
 
     ProviderCacheMetrics {
         provider: provider.to_string(),
