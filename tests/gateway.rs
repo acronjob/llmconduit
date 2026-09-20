@@ -2703,6 +2703,13 @@ async fn ws_write_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
 async fn responses_ws_connect(
     router: axum::Router,
 ) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
+    responses_ws_connect_with_authorization(router, None).await
+}
+
+async fn responses_ws_connect_with_authorization(
+    router: axum::Router,
+    authorization: Option<&str>,
+) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2710,9 +2717,12 @@ async fn responses_ws_connect(
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, router.into_make_service()).await;
     });
-    let request = String::from(
+    let authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
         "GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
-         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{authorization}\r\n",
     );
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
@@ -7542,6 +7552,53 @@ async fn enforced_auth_rejects_responses_websocket_before_upgrade() {
 }
 
 #[tokio::test]
+async fn enforced_auth_allows_scoped_responses_websocket() {
+    let (authz, raw_key, store_path) = scoped_authz(&["responses"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-auth-ws", "allowed"))])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let authorization = format!("Bearer {raw_key}");
+    let (mut stream, server) =
+        responses_ws_connect_with_authorization(app, Some(&authorization)).await;
+
+    let mut request = base_request(vec![user_message("hello")]);
+    request.model = "public-model".into();
+    ws_write_text_frame(
+        &mut stream,
+        &serde_json::to_string(&request).expect("serialize request"),
+    )
+    .await;
+
+    let mut terminal = false;
+    for _ in 0..64 {
+        match ws_try_read_frame(&mut stream).await {
+            Some((0x1, payload)) => {
+                let event: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("event frame is JSON");
+                terminal |= event["type"] == "response.completed";
+            }
+            Some((0x8, _)) | None => break,
+            Some(_) => {}
+        }
+    }
+    drop(stream);
+    server.abort();
+
+    assert!(terminal, "authorized WebSocket turn must complete");
+    assert_eq!(upstream.requests().await.len(), 1);
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
 async fn enforced_auth_blocks_completions_and_count_tokens_endpoint_bypasses() {
     let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
     let upstream = MockUpstream::default();
@@ -7696,6 +7753,46 @@ async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
             1,
         )
     );
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_allows_scoped_anthropic_messages() {
+    let (authz, raw_key, store_path) = scoped_authz(&["messages"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-auth-messages", "allowed"))])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let response = llmconduit::build_app_from_gateway(gateway)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", &raw_key)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "public-model",
+                        "max_tokens": 64,
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(upstream.requests().await.len(), 1);
     remove_auth_store(&store_path);
 }
 
