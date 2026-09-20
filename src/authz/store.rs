@@ -1091,14 +1091,8 @@ impl AuthStore {
                             absolute_end_ms: window.absolute_end_ms,
                         })
                         .collect(),
-                    max_concurrent_sessions: self
-                        .query_limits(&id)
-                        .map_err(access_internal)?
-                        .max_concurrent_sessions,
-                    max_daily_session_starts: self
-                        .query_limits(&id)
-                        .map_err(access_internal)?
-                        .max_daily_session_starts,
+                    max_concurrent_sessions: limits.max_concurrent_sessions,
+                    max_daily_session_starts: limits.max_daily_session_starts,
                     management_permissions: self
                         .query_permissions(&id)
                         .map_err(access_internal)?
@@ -1213,15 +1207,7 @@ impl AuthStore {
         for window in body.time_windows {
             tx.execute(
                 "INSERT INTO auth_time_windows(id,policy_id,weekday_mask,start_minute,end_minute,absolute_start,absolute_end) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    format!("win_{}", Uuid::new_v4().simple()),
-                    id,
-                    window.weekday_mask,
-                    window.start_minute,
-                    window.end_minute,
-                    window.absolute_start_ms,
-                    window.absolute_end_ms
-                ],
+                params![format!("win_{}", Uuid::new_v4().simple()), id, window.weekday_mask, window.start_minute, window.end_minute, window.absolute_start_ms, window.absolute_end_ms],
             )
             .map_err(access_db)?;
         }
