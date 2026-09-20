@@ -1,9 +1,10 @@
-use super::{ApiKeySummary, AuthzService};
+use super::{AuthzService, ManagementPermission, keys::generate_api_key};
 use crate::dashboard_access::{
-    AccessApiKey, AccessBackend, AccessCounts, AccessError, AccessFuture, AccessOperation,
-    AccessResult, AccessSummary, ActorSummary, ManagementActor,
+    AccessApiKey, AccessBackend, AccessError, AccessFuture, AccessOperation, AccessResult,
+    CreatedAccessApiKey, ManagementActor, ManagementPermission as WirePermission,
 };
 use axum::http::StatusCode;
+use chrono::{DateTime, Utc};
 
 impl AccessBackend for AuthzService {
     fn dispatch<'a>(
@@ -22,132 +23,299 @@ impl AuthzService {
         actor: &ManagementActor,
         operation: AccessOperation,
     ) -> Result<AccessResult, AccessError> {
-        match operation {
-            AccessOperation::Summary => {
-                let keys = self.list_keys().map_err(internal)?;
-                Ok(AccessResult::Summary(AccessSummary {
-                    // The synchronous compatibility store increments its epoch
-                    // transactionally but does not yet project it through the
-                    // management DTO. Zero explicitly means unavailable here.
-                    policy_epoch: 0,
-                    actor: actor_summary(actor),
-                    counts: AccessCounts {
-                        api_keys: keys.len(),
-                        ..AccessCounts::default()
-                    },
-                }))
+        let inner = self.inner().map_err(internal)?;
+        let mut store = inner
+            .store
+            .lock()
+            .map_err(|_| internal("auth store lock poisoned".into()))?;
+        let mutates = matches!(
+            operation,
+            AccessOperation::CreateUser(_)
+                | AccessOperation::CreateGroup(_)
+                | AccessOperation::CreateRole(_)
+                | AccessOperation::CreatePolicy(_)
+                | AccessOperation::CreateApiKey(_)
+                | AccessOperation::RevokeApiKey(_)
+                | AccessOperation::RotateApiKey(_)
+                | AccessOperation::RevokeSession(_)
+                | AccessOperation::WritePricing(_)
+        );
+        let result = match operation {
+            AccessOperation::CreateApiKey(body) => {
+                let expires_at = body
+                    .expires_at
+                    .as_deref()
+                    .map(parse_timestamp)
+                    .transpose()?;
+                let generated = generate_api_key(&inner.pepper);
+                let raw = generated.expose_once();
+                let digest = inner.pepper.digest(&raw);
+                let created = store
+                    .create_key_for_principal(
+                        &body.principal_id,
+                        &body.name,
+                        &raw,
+                        &digest,
+                        expires_at,
+                        actor,
+                    )
+                    .map_err(internal)?;
+                Ok(AccessResult::CreatedApiKey(created_access(created, raw)))
             }
-            AccessOperation::ListApiKeys => Ok(AccessResult::ApiKeys(
-                self.list_keys()
-                    .map_err(internal)?
-                    .into_iter()
-                    .map(access_key)
-                    .collect(),
-            )),
-            AccessOperation::RevokeApiKey(id) => {
-                if !self.revoke_key(&id).map_err(internal)? {
-                    return Err(AccessError::new(
-                        StatusCode::NOT_FOUND,
-                        "API key not found or already revoked",
-                    ));
-                }
-                Ok(AccessResult::ApiKeys(
-                    self.list_keys()
-                        .map_err(internal)?
-                        .into_iter()
-                        .map(access_key)
-                        .collect(),
-                ))
+            AccessOperation::RotateApiKey(id) => {
+                let generated = generate_api_key(&inner.pepper);
+                let raw = generated.expose_once();
+                let digest = inner.pepper.digest(&raw);
+                let created = store
+                    .rotate_key(&id, &raw, &digest, actor)
+                    .map_err(internal)?;
+                Ok(AccessResult::CreatedApiKey(created_access(created, raw)))
             }
-            unsupported => Err(AccessError::new(
-                StatusCode::NOT_IMPLEMENTED,
-                format!(
-                    "{} is unavailable until the normalized management schema is migrated",
-                    operation_name(&unsupported)
-                ),
-            )),
+            operation => store.dispatch_access(actor, operation),
+        }?;
+        if mutates {
+            self.reload_locked(inner, &store).map_err(internal)?;
         }
+        Ok(result)
     }
+}
+
+fn created_access(created: super::CreatedApiKey, raw_key: String) -> CreatedAccessApiKey {
+    let key = created.summary;
+    CreatedAccessApiKey {
+        api_key: AccessApiKey {
+            id: key.id,
+            principal_id: key.principal_id,
+            name: key.name,
+            prefix: key.prefix,
+            enabled: key.enabled,
+            created_at: timestamp(key.created_at),
+            expires_at: key.expires_at.map(timestamp),
+            last_used_at: key.last_used_at.map(timestamp),
+        },
+        raw_key,
+    }
+}
+
+fn parse_timestamp(value: &str) -> Result<i64, AccessError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.timestamp())
+        .map_err(|_| {
+            AccessError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expires_at must be an RFC 3339 timestamp",
+            )
+        })
+}
+
+fn timestamp(seconds: i64) -> String {
+    DateTime::<Utc>::from_timestamp(seconds, 0)
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| seconds.to_string())
 }
 
 fn internal(message: String) -> AccessError {
     AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
-fn actor_summary(actor: &ManagementActor) -> ActorSummary {
-    match actor {
-        ManagementActor::Bootstrap => ActorSummary {
-            kind: "bootstrap".to_string(),
-            principal_id: None,
-            display_name: "Bootstrap administrator".to_string(),
-            permissions: Vec::new(),
-        },
-        ManagementActor::Delegated {
-            principal_id,
-            permissions,
-            ..
-        } => ActorSummary {
-            kind: "delegated".to_string(),
-            principal_id: Some(principal_id.clone()),
-            display_name: principal_id.clone(),
-            permissions: permissions.to_vec(),
-        },
-    }
-}
-
-fn access_key(key: ApiKeySummary) -> AccessApiKey {
-    AccessApiKey {
-        id: key.id,
-        principal_id: key.principal_id,
-        name: key.name,
-        prefix: key.prefix,
-        enabled: key.enabled,
-        created_at: timestamp(key.created_at),
-        expires_at: key.expires_at.map(timestamp),
-        last_used_at: key.last_used_at.map(timestamp),
-    }
-}
-
-fn timestamp(seconds: i64) -> String {
-    chrono::DateTime::from_timestamp(seconds, 0)
-        .map(|value| value.to_rfc3339())
-        .unwrap_or_else(|| seconds.to_string())
-}
-
-fn operation_name(operation: &AccessOperation) -> &'static str {
-    match operation {
-        AccessOperation::Summary => "summary",
-        AccessOperation::ListUsers => "user listing",
-        AccessOperation::CreateUser(_) => "user creation",
-        AccessOperation::ListGroups => "group listing",
-        AccessOperation::CreateGroup(_) => "group creation",
-        AccessOperation::ListRoles => "role listing",
-        AccessOperation::CreateRole(_) => "role creation",
-        AccessOperation::ListPolicies => "policy listing",
-        AccessOperation::CreatePolicy(_) => "policy creation",
-        AccessOperation::ListApiKeys => "API-key listing",
-        AccessOperation::CreateApiKey(_) => "API-key creation",
-        AccessOperation::RevokeApiKey(_) => "API-key revocation",
-        AccessOperation::RotateApiKey(_) => "API-key rotation",
-        AccessOperation::ListSessions => "session listing",
-        AccessOperation::RevokeSession(_) => "session revocation",
-        AccessOperation::Usage => "usage reporting",
-        AccessOperation::Audit => "audit reporting",
-        AccessOperation::Pricing => "pricing listing",
-        AccessOperation::WritePricing(_) => "pricing mutation",
-    }
+pub(crate) fn wire_permission(permission: ManagementPermission) -> Option<WirePermission> {
+    Some(match permission {
+        ManagementPermission::KeysRead => WirePermission::KeysRead,
+        ManagementPermission::KeysCreate => WirePermission::KeysCreate,
+        ManagementPermission::KeysRevoke => WirePermission::KeysRevoke,
+        ManagementPermission::KeysRotate => WirePermission::KeysRotate,
+        ManagementPermission::PrincipalsRead => WirePermission::PrincipalsRead,
+        ManagementPermission::PrincipalsWrite => WirePermission::PrincipalsWrite,
+        ManagementPermission::GroupsRead => WirePermission::GroupsRead,
+        ManagementPermission::GroupsWrite => WirePermission::GroupsWrite,
+        ManagementPermission::RolesRead => WirePermission::RolesRead,
+        ManagementPermission::RolesWrite => WirePermission::RolesWrite,
+        ManagementPermission::PoliciesRead => WirePermission::PoliciesRead,
+        ManagementPermission::PoliciesWrite => WirePermission::PoliciesWrite,
+        ManagementPermission::UsageRead => WirePermission::UsageRead,
+        ManagementPermission::AuditRead => WirePermission::AuditRead,
+        ManagementPermission::PricingRead => WirePermission::PricingRead,
+        ManagementPermission::PricingSync => WirePermission::PricingSync,
+        ManagementPermission::PricingWrite => WirePermission::PricingWrite,
+        ManagementPermission::SessionsRead => WirePermission::SessionsRead,
+        ManagementPermission::SessionsTerminate => WirePermission::SessionsTerminate,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuthConfig, AuthMode};
+    use crate::dashboard_access::{
+        AccessOperation, AccessPricingInput, AccessResult, CreateApiKeyRequest, CreateGroupRequest,
+        CreatePolicyRequest, CreateRoleRequest, CreateUserRequest, WritePricingRequest,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
 
-    #[test]
-    fn unsupported_operations_fail_explicitly() {
-        let error = AuthzService::default()
-            .dispatch_access(&ManagementActor::Bootstrap, AccessOperation::ListUsers)
-            .unwrap_err();
-        let response = axum::response::IntoResponse::into_response(error);
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    #[tokio::test]
+    async fn every_access_operation_is_backed_by_live_storage() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-access-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let service = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"access-test-pepper".to_vec(),
+            Some(&format!("llmc_{}", uuid::Uuid::new_v4().simple())),
+        )
+        .unwrap();
+        let actor = ManagementActor::Bootstrap;
+
+        assert!(matches!(
+            service.dispatch_access(&actor, AccessOperation::Summary),
+            Ok(AccessResult::Summary(_))
+        ));
+        let users = service
+            .dispatch_access(
+                &actor,
+                AccessOperation::CreateUser(CreateUserRequest {
+                    display_name: "agent".into(),
+                    kind: "service_account".into(),
+                }),
+            )
+            .unwrap();
+        let principal_id = match users {
+            AccessResult::Users(users) => {
+                users
+                    .into_iter()
+                    .find(|user| user.display_name == "agent")
+                    .unwrap()
+                    .id
+            }
+            _ => panic!("unexpected user result"),
+        };
+        assert!(matches!(
+            service.dispatch_access(
+                &actor,
+                AccessOperation::CreateGroup(CreateGroupRequest {
+                    name: "operators".into(),
+                    members: vec![principal_id.clone()],
+                })
+            ),
+            Ok(AccessResult::Groups(_))
+        ));
+        assert!(matches!(
+            service.dispatch_access(
+                &actor,
+                AccessOperation::CreateRole(CreateRoleRequest {
+                    name: "reader".into(),
+                    permissions: vec![WirePermission::KeysRead],
+                })
+            ),
+            Ok(AccessResult::Roles(_))
+        ));
+        assert!(matches!(
+            service.dispatch_access(
+                &actor,
+                AccessOperation::CreatePolicy(CreatePolicyRequest {
+                    name: "agent chat".into(),
+                    effect: "allow".into(),
+                    subjects: vec![format!("principal:{principal_id}")],
+                    endpoints: vec!["chat".into()],
+                    models: vec!["public-*".into()],
+                    providers: vec!["provider-a".into()],
+                })
+            ),
+            Ok(AccessResult::Policies(_))
+        ));
+
+        let created = service
+            .dispatch_access(
+                &actor,
+                AccessOperation::CreateApiKey(CreateApiKeyRequest {
+                    principal_id: principal_id.clone(),
+                    name: "primary".into(),
+                    expires_at: None,
+                }),
+            )
+            .unwrap();
+        let (key_id, raw) = match created {
+            AccessResult::CreatedApiKey(created) => (created.api_key.id, created.raw_key),
+            _ => panic!("unexpected create-key result"),
+        };
+        assert!(matches!(
+            service.dispatch_access(&actor, AccessOperation::ListApiKeys),
+            Ok(AccessResult::ApiKeys(_))
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(&raw).unwrap());
+        let context = service.authenticate(&headers).unwrap().unwrap();
+        assert!(context.allows_model("chat", "public-v1"));
+        let scope = context.authorization_scope();
+        assert!(scope.allows_candidate(
+            "provider-a",
+            None,
+            "public-v1",
+            crate::upstream::InferenceEndpoint::ChatCompletions
+        ));
+        assert!(!scope.allows_candidate(
+            "provider-b",
+            None,
+            "public-v1",
+            crate::upstream::InferenceEndpoint::ChatCompletions
+        ));
+        let lease = service.acquire_session(&context).unwrap().unwrap();
+        assert!(matches!(
+            service.dispatch_access(&actor, AccessOperation::ListSessions),
+            Ok(AccessResult::Sessions(ref sessions)) if sessions.iter().any(|session| session.id == lease.session_id())
+        ));
+        assert!(matches!(
+            service.dispatch_access(
+                &actor,
+                AccessOperation::RevokeSession(lease.session_id().to_string())
+            ),
+            Ok(AccessResult::Sessions(_))
+        ));
+        drop(lease);
+
+        let rotated = service
+            .dispatch_access(&actor, AccessOperation::RotateApiKey(key_id))
+            .unwrap();
+        let rotated_id = match rotated {
+            AccessResult::CreatedApiKey(created) => created.api_key.id,
+            _ => panic!("unexpected rotate-key result"),
+        };
+        assert!(matches!(
+            service.dispatch_access(&actor, AccessOperation::RevokeApiKey(rotated_id)),
+            Ok(AccessResult::ApiKeys(_))
+        ));
+        assert!(matches!(
+            service.dispatch_access(&actor, AccessOperation::Usage),
+            Ok(AccessResult::Usage(_))
+        ));
+        assert!(matches!(
+            service.dispatch_access(&actor, AccessOperation::Audit),
+            Ok(AccessResult::Audit(ref events)) if !events.is_empty()
+        ));
+        assert!(matches!(
+            service.dispatch_access(
+                &actor,
+                AccessOperation::WritePricing(WritePricingRequest {
+                    pricing: vec![AccessPricingInput {
+                        model: "model-a".into(),
+                        provider: "provider-a".into(),
+                        input_per_1k: "0.001".into(),
+                        output_per_1k: "0.002".into(),
+                    }],
+                })
+            ),
+            Ok(AccessResult::Pricing(ref prices)) if prices.len() == 1
+        ));
+        assert!(matches!(
+            service.dispatch_access(&actor, AccessOperation::Pricing),
+            Ok(AccessResult::Pricing(ref prices)) if prices.len() == 1
+        ));
+
+        drop(service);
+        let _ = std::fs::remove_file(path);
     }
 }

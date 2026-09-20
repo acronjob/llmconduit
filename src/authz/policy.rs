@@ -54,6 +54,18 @@ impl Endpoint {
             Self::Models => "models",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "responses" => Some(Self::Responses),
+            "chat" | "chat_completions" => Some(Self::ChatCompletions),
+            "messages" => Some(Self::Messages),
+            "count_tokens" => Some(Self::CountTokens),
+            "completions" => Some(Self::Completions),
+            "models" => Some(Self::Models),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +181,60 @@ pub enum ManagementPermission {
     SessionsRead,
     SessionsTerminate,
 }
+
+impl ManagementPermission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KeysRead => "auth.keys.read",
+            Self::KeysCreate => "auth.keys.create",
+            Self::KeysRevoke => "auth.keys.revoke",
+            Self::KeysRotate => "auth.keys.rotate",
+            Self::PrincipalsRead => "auth.principals.read",
+            Self::PrincipalsWrite => "auth.principals.write",
+            Self::GroupsRead => "auth.groups.read",
+            Self::GroupsWrite => "auth.groups.write",
+            Self::RolesRead => "auth.roles.read",
+            Self::RolesWrite => "auth.roles.write",
+            Self::PoliciesRead => "auth.policies.read",
+            Self::PoliciesWrite => "auth.policies.write",
+            Self::UsageRead => "auth.usage.read",
+            Self::AuditRead => "auth.audit.read",
+            Self::PricingRead => "auth.pricing.read",
+            Self::PricingSync => "auth.pricing.sync",
+            Self::PricingWrite => "auth.pricing.write",
+            Self::SessionsRead => "auth.sessions.read",
+            Self::SessionsTerminate => "auth.sessions.terminate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        ALL_MANAGEMENT_PERMISSIONS
+            .into_iter()
+            .find(|permission| permission.as_str() == value)
+    }
+}
+
+pub const ALL_MANAGEMENT_PERMISSIONS: [ManagementPermission; 19] = [
+    ManagementPermission::KeysRead,
+    ManagementPermission::KeysCreate,
+    ManagementPermission::KeysRevoke,
+    ManagementPermission::KeysRotate,
+    ManagementPermission::PrincipalsRead,
+    ManagementPermission::PrincipalsWrite,
+    ManagementPermission::GroupsRead,
+    ManagementPermission::GroupsWrite,
+    ManagementPermission::RolesRead,
+    ManagementPermission::RolesWrite,
+    ManagementPermission::PoliciesRead,
+    ManagementPermission::PoliciesWrite,
+    ManagementPermission::UsageRead,
+    ManagementPermission::AuditRead,
+    ManagementPermission::PricingRead,
+    ManagementPermission::PricingSync,
+    ManagementPermission::PricingWrite,
+    ManagementPermission::SessionsRead,
+    ManagementPermission::SessionsTerminate,
+];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LimitSet {
@@ -310,6 +376,22 @@ impl PolicySnapshot {
             .flat_map(|rule| rule.management_permissions.iter().copied())
             .filter(|permission| !denied.contains(permission))
             .collect()
+    }
+
+    pub fn effective_limits(&self, context: &PolicyIdentity, now: DateTime<Utc>) -> LimitSet {
+        let rules = self.applicable_rules(context, now);
+        LimitSet {
+            max_concurrent_sessions: minimum_limit(
+                rules
+                    .iter()
+                    .filter_map(|rule| rule.limits.max_concurrent_sessions),
+            ),
+            max_daily_session_starts: minimum_limit(
+                rules
+                    .iter()
+                    .filter_map(|rule| rule.limits.max_daily_session_starts),
+            ),
+        }
     }
 
     fn applicable_rules<'a>(

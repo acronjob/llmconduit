@@ -3,6 +3,8 @@ use chrono::{DateTime, Datelike, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
+type ReleaseHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionLimiter {
     state: Arc<Mutex<LimiterState>>,
@@ -38,6 +40,18 @@ impl SessionLimiter {
         limits: super::LimitSet,
         now: DateTime<Utc>,
     ) -> Result<SessionLease, AuthError> {
+        let session_id = format!("ses_{}", uuid::Uuid::new_v4().simple());
+        self.acquire_for_key_with_release(key_id, limits, now, session_id, None)
+    }
+
+    pub fn acquire_for_key_with_release(
+        &self,
+        key_id: &str,
+        limits: super::LimitSet,
+        now: DateTime<Utc>,
+        session_id: String,
+        on_release: Option<ReleaseHook>,
+    ) -> Result<SessionLease, AuthError> {
         let key_id = key_id.to_owned();
         let day = now.date_naive().num_days_from_ce();
         let mut state = self
@@ -65,6 +79,8 @@ impl SessionLimiter {
             inner: Arc::new(LeaseInner {
                 state: Arc::downgrade(&self.state),
                 key_id,
+                session_id,
+                on_release,
             }),
         })
     }
@@ -83,10 +99,20 @@ pub struct SessionLease {
     inner: Arc<LeaseInner>,
 }
 
-#[derive(Debug)]
 struct LeaseInner {
     state: Weak<Mutex<LimiterState>>,
     key_id: String,
+    session_id: String,
+    on_release: Option<ReleaseHook>,
+}
+
+impl std::fmt::Debug for LeaseInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseInner")
+            .field("key_id", &self.key_id)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for LeaseInner {
@@ -100,12 +126,20 @@ impl Drop for LeaseInner {
         if let Some(sessions) = state.by_key.get_mut(&self.key_id) {
             sessions.active = sessions.active.saturating_sub(1);
         }
+        drop(state);
+        if let Some(on_release) = &self.on_release {
+            on_release(&self.session_id);
+        }
     }
 }
 
 impl SessionLease {
     pub fn key_id(&self) -> &str {
         &self.inner.key_id
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.inner.session_id
     }
 }
 

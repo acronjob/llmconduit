@@ -1,24 +1,47 @@
-use chrono::Utc;
-use rusqlite::{Connection, params};
+use super::policy::{
+    ALL_MANAGEMENT_PERMISSIONS, Endpoint, LimitSet, ManagementPermission, PolicyBinding,
+    PolicyEffect, PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject, UtcWindow,
+};
+use crate::dashboard_access::{
+    AccessApiKey, AccessAuditEvent, AccessCounts, AccessError, AccessGroup, AccessOperation,
+    AccessPolicy, AccessPricingRow, AccessResult, AccessRole, AccessSession, AccessSummary,
+    AccessUsageRow, AccessUser, ActorSummary, ManagementActor,
+    ManagementPermission as WirePermission,
+};
+use axum::http::StatusCode;
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
+use uuid::Uuid;
 
 pub(crate) struct AuthStore {
     connection: Connection,
 }
 
-pub(crate) struct StoredGrant {
-    pub effect: String,
-    pub endpoint: String,
-    pub model_pattern: String,
-}
-
-pub(crate) struct StoredKey {
+#[derive(Debug, Clone)]
+pub(crate) struct StoredCredential {
     pub id: String,
     pub principal_id: String,
+    pub prefix: String,
     pub digest: [u8; 32],
-    pub grants: Vec<StoredGrant>,
+}
+
+pub(crate) struct StoredAuthority {
+    pub epoch: u64,
+    pub credentials: Vec<StoredCredential>,
+    pub policy: Arc<PolicySnapshot>,
+}
+
+pub(crate) struct StoredDashboardSession {
+    pub session_id: String,
+    pub principal_id: String,
+    pub key_id: String,
+    pub key_prefix: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,36 +85,7 @@ impl AuthStore {
         let connection = Connection::open(path)
             .map_err(|err| format!("failed to open auth store {}: {err}", path.display()))?;
         connection
-            .execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA foreign_keys=ON;
-                 CREATE TABLE IF NOT EXISTS auth_principals (
-                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT NOT NULL,
-                   enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS auth_api_keys (
-                   id TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES auth_principals(id),
-                   name TEXT NOT NULL, prefix TEXT NOT NULL, hmac_sha256_digest BLOB NOT NULL UNIQUE,
-                   enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
-                   expires_at INTEGER, last_used_at INTEGER
-                 );
-                 CREATE TABLE IF NOT EXISTS auth_policies (
-                   id TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES auth_api_keys(id),
-                   effect TEXT NOT NULL CHECK(effect IN ('allow','deny')),
-                   endpoint TEXT NOT NULL, model_pattern TEXT NOT NULL DEFAULT '*',
-                   created_at INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS auth_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
-                 CREATE TABLE IF NOT EXISTS auth_group_members (group_id TEXT NOT NULL, principal_id TEXT NOT NULL, PRIMARY KEY(group_id, principal_id));
-                 CREATE TABLE IF NOT EXISTS auth_roles (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
-                 CREATE TABLE IF NOT EXISTS auth_role_bindings (role_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, PRIMARY KEY(role_id, subject_type, subject_id));
-                 CREATE TABLE IF NOT EXISTS auth_management_permissions (role_id TEXT NOT NULL, permission TEXT NOT NULL, PRIMARY KEY(role_id, permission));
-                 CREATE TABLE IF NOT EXISTS auth_sessions (session_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, started_at INTEGER NOT NULL, endpoint TEXT NOT NULL, requested_model TEXT);
-                 CREATE TABLE IF NOT EXISTS auth_usage_events (auth_request_id TEXT PRIMARY KEY, api_call_id TEXT, key_id TEXT, principal_id TEXT, endpoint TEXT NOT NULL, requested_model TEXT, served_model TEXT, provider TEXT, status TEXT NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER, cost_nanos INTEGER, created_at INTEGER NOT NULL);
-                 CREATE TABLE IF NOT EXISTS auth_audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT, action TEXT NOT NULL, target_id TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL);
-                 CREATE TABLE IF NOT EXISTS auth_policy_epoch (singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL);
-                 INSERT OR IGNORE INTO auth_policy_epoch(singleton, epoch) VALUES (1, 0);",
-            )
+            .execute_batch(SCHEMA)
             .map_err(|err| format!("failed to migrate auth store: {err}"))?;
         Ok(Self { connection })
     }
@@ -99,30 +93,44 @@ impl AuthStore {
     pub fn key_count(&self) -> Result<u64, String> {
         self.connection
             .query_row("SELECT COUNT(*) FROM auth_api_keys", [], |row| row.get(0))
-            .map_err(|err| format!("failed to inspect auth store: {err}"))
+            .map_err(db)
     }
 
     pub fn insert_bootstrap_key(&mut self, raw: &str, digest: &[u8; 32]) -> Result<(), String> {
         let now = Utc::now().timestamp();
-        let tx = self
-            .connection
-            .transaction()
-            .map_err(|err| err.to_string())?;
+        let tx = self.connection.transaction().map_err(db)?;
         tx.execute(
-            "INSERT INTO auth_principals(id,kind,display_name,created_at) VALUES('usr_bootstrap','user','Bootstrap administrator',?1)",
+            "INSERT INTO auth_principals(id,kind,display_name,enabled,created_at) VALUES('usr_bootstrap','user','Bootstrap administrator',1,?1)",
             [now],
-        ).map_err(|err| format!("failed to create bootstrap principal: {err}"))?;
+        ).map_err(db)?;
         tx.execute(
-            "INSERT INTO auth_api_keys(id,principal_id,name,prefix,hmac_sha256_digest,created_at) VALUES('key_bootstrap','usr_bootstrap','Bootstrap key',?1,?2,?3)",
-            params![key_prefix(raw), digest.as_slice(), now],
-        ).map_err(|err| format!("failed to create bootstrap key: {err}"))?;
+            "INSERT INTO auth_api_keys(id,principal_id,name,prefix,hmac_sha256_digest,enabled,created_at) VALUES('key_bootstrap','usr_bootstrap','Bootstrap key',?1,?2,1,?3)",
+            params![display_prefix(raw), digest.as_slice(), now],
+        ).map_err(db)?;
         tx.execute(
-            "INSERT INTO auth_policies(id,key_id,effect,endpoint,model_pattern,created_at) VALUES('pol_bootstrap','key_bootstrap','allow','*','*',?1)",
+            "INSERT INTO auth_policies(id,name,effect,enabled,created_at,updated_at) VALUES('pol_bootstrap','Bootstrap full access','allow',1,?1,?1)",
             [now],
-        ).map_err(|err| format!("failed to create bootstrap policy: {err}"))?;
+        ).map_err(db)?;
+        tx.execute(
+            "INSERT INTO auth_policy_subjects(policy_id,subject_kind,subject_id) VALUES('pol_bootstrap','key','key_bootstrap')",
+            [],
+        ).map_err(db)?;
+        for permission in ALL_MANAGEMENT_PERMISSIONS {
+            tx.execute(
+                "INSERT INTO auth_management_permissions(policy_id,permission) VALUES('pol_bootstrap',?1)",
+                [permission.as_str()],
+            ).map_err(db)?;
+        }
         bump_epoch(&tx)?;
-        tx.commit()
-            .map_err(|err| format!("failed to commit bootstrap auth state: {err}"))
+        audit(
+            &tx,
+            "bootstrap",
+            "bootstrap.created",
+            "key_bootstrap",
+            "ok",
+            BTreeMap::new(),
+        )?;
+        tx.commit().map_err(db)
     }
 
     pub fn create_key(
@@ -134,171 +142,1203 @@ impl AuthStore {
         endpoints: &[String],
         models: &[String],
     ) -> Result<CreatedApiKey, String> {
-        let principal_name = required(principal_name, "principal_name")?;
-        let key_name = required(key_name, "name")?;
         let now = Utc::now().timestamp();
-        let principal_id = format!("usr_{}", uuid::Uuid::new_v4().simple());
-        let key_id = format!("key_{}", uuid::Uuid::new_v4().simple());
-        let prefix = key_prefix(raw);
-        let tx = self
-            .connection
-            .transaction()
-            .map_err(|err| err.to_string())?;
+        let tx = self.connection.transaction().map_err(db)?;
+        let principal_id = format!("usr_{}", Uuid::new_v4().simple());
         tx.execute(
-            "INSERT INTO auth_principals(id,kind,display_name,created_at) VALUES(?1,'service_account',?2,?3)",
-            params![principal_id, principal_name, now],
-        ).map_err(|err| format!("failed to create principal: {err}"))?;
+            "INSERT INTO auth_principals(id,kind,display_name,enabled,created_at) VALUES(?1,'service_account',?2,1,?3)",
+            params![principal_id, required(principal_name, "principal_name")?, now],
+        ).map_err(db)?;
+        let created = insert_key(&tx, &principal_id, key_name, raw, digest, None, now)?;
+        let policy_id = format!("pol_{}", Uuid::new_v4().simple());
         tx.execute(
-            "INSERT INTO auth_api_keys(id,principal_id,name,prefix,hmac_sha256_digest,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![key_id, principal_id, key_name, prefix, digest.as_slice(), now],
-        ).map_err(|err| format!("failed to create API key: {err}"))?;
-        let endpoints = if endpoints.is_empty() {
-            vec!["*".to_string()]
-        } else {
-            endpoints.to_vec()
-        };
-        let models = if models.is_empty() {
-            vec!["*".to_string()]
-        } else {
-            models.to_vec()
-        };
-        for endpoint in &endpoints {
-            for model in &models {
-                let policy_id = format!("pol_{}", uuid::Uuid::new_v4().simple());
+            "INSERT INTO auth_policies(id,name,effect,enabled,created_at,updated_at) VALUES(?1,?2,'allow',1,?3,?3)",
+            params![policy_id, format!("{} inference access", key_name.trim()), now],
+        ).map_err(db)?;
+        tx.execute(
+            "INSERT INTO auth_policy_subjects(policy_id,subject_kind,subject_id) VALUES(?1,'key',?2)",
+            params![policy_id, created.summary.id],
+        ).map_err(db)?;
+        for endpoint in nonempty_or_wildcard(endpoints) {
+            tx.execute(
+                "INSERT INTO auth_policy_scopes(policy_id,dimension,matcher) VALUES(?1,'endpoint',?2)",
+                params![policy_id, endpoint],
+            ).map_err(db)?;
+        }
+        for model in nonempty_or_wildcard(models) {
+            for dimension in ["requested_model", "served_model"] {
                 tx.execute(
-                    "INSERT INTO auth_policies(id,key_id,effect,endpoint,model_pattern,created_at) VALUES(?1,?2,'allow',?3,?4,?5)",
-                    params![policy_id, key_id, required(endpoint, "endpoint")?, required(model, "model")?, now],
-                ).map_err(|err| format!("failed to create API-key policy: {err}"))?;
+                    "INSERT INTO auth_policy_scopes(policy_id,dimension,matcher) VALUES(?1,?2,?3)",
+                    params![policy_id, dimension, model],
+                )
+                .map_err(db)?;
             }
         }
         bump_epoch(&tx)?;
+        audit(
+            &tx,
+            "bootstrap",
+            "key.created",
+            &created.summary.id,
+            "ok",
+            BTreeMap::new(),
+        )?;
+        tx.commit().map_err(db)?;
+        Ok(created)
+    }
+
+    pub fn create_key_for_principal(
+        &mut self,
+        principal_id: &str,
+        name: &str,
+        raw: &str,
+        digest: &[u8; 32],
+        expires_at: Option<i64>,
+        actor: &ManagementActor,
+    ) -> Result<CreatedApiKey, String> {
+        let now = Utc::now().timestamp();
+        if expires_at.is_some_and(|expiry| expiry <= now) {
+            return Err("API key expiry must be in the future".into());
+        }
+        let tx = self.connection.transaction().map_err(db)?;
+        let exists = tx
+            .query_row(
+                "SELECT enabled FROM auth_principals WHERE id=?1",
+                [principal_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(db)?;
+        if exists != Some(1) {
+            return Err("principal does not exist or is disabled".into());
+        }
+        let created = insert_key(&tx, principal_id, name, raw, digest, expires_at, now)?;
+        bump_epoch(&tx)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "key.created",
+            &created.summary.id,
+            "ok",
+            BTreeMap::new(),
+        )?;
+        tx.commit().map_err(db)?;
+        Ok(created)
+    }
+
+    pub fn rotate_key(
+        &mut self,
+        old_id: &str,
+        raw: &str,
+        digest: &[u8; 32],
+        actor: &ManagementActor,
+    ) -> Result<CreatedApiKey, String> {
+        let now = Utc::now().timestamp();
+        let tx = self.connection.transaction().map_err(db)?;
+        let old = query_key(&tx, old_id)?.ok_or_else(|| "API key not found".to_string())?;
+        if !old.enabled {
+            return Err("API key is revoked".into());
+        }
+        let created = insert_key(
+            &tx,
+            &old.principal_id,
+            &format!("{} (rotated)", old.name),
+            raw,
+            digest,
+            old.expires_at,
+            now,
+        )?;
         tx.execute(
-            "INSERT INTO auth_audit_events(actor_id,action,target_id,created_at) VALUES('bootstrap','key.created',?1,?2)",
-            params![key_id, now],
-        ).map_err(|err| format!("failed to audit API-key creation: {err}"))?;
-        tx.commit()
-            .map_err(|err| format!("failed to commit API-key creation: {err}"))?;
-        Ok(CreatedApiKey {
-            summary: ApiKeySummary {
-                id: key_id,
-                principal_id,
-                name: key_name.to_string(),
-                prefix,
-                enabled: true,
-                created_at: now,
-                expires_at: None,
-                last_used_at: None,
-            },
-            raw_key: None,
-        })
+            "UPDATE auth_policy_subjects SET subject_id=?2 WHERE subject_kind='key' AND subject_id=?1",
+            params![old_id, created.summary.id],
+        ).map_err(db)?;
+        tx.execute(
+            "UPDATE auth_api_keys SET enabled=0,revoked_at=?2 WHERE id=?1",
+            params![old_id, now],
+        )
+        .map_err(db)?;
+        tx.execute("UPDATE auth_dashboard_sessions SET revoked_at=?2,revoked_reason='key_rotated' WHERE key_id=?1 AND revoked_at IS NULL", params![old_id, now]).map_err(db)?;
+        bump_epoch(&tx)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "key.rotated",
+            old_id,
+            "ok",
+            BTreeMap::new(),
+        )?;
+        tx.commit().map_err(db)?;
+        Ok(created)
     }
 
     pub fn revoke_key(&mut self, key_id: &str) -> Result<bool, String> {
+        self.revoke_key_as(key_id, &ManagementActor::Bootstrap)
+    }
+
+    fn revoke_key_as(&mut self, key_id: &str, actor: &ManagementActor) -> Result<bool, String> {
         let now = Utc::now().timestamp();
-        let tx = self
-            .connection
-            .transaction()
-            .map_err(|err| err.to_string())?;
+        let tx = self.connection.transaction().map_err(db)?;
         let changed = tx
             .execute(
-                "UPDATE auth_api_keys SET enabled=0 WHERE id=?1 AND enabled=1",
-                [key_id],
+                "UPDATE auth_api_keys SET enabled=0,revoked_at=?2 WHERE id=?1 AND enabled=1",
+                params![key_id, now],
             )
-            .map_err(|err| format!("failed to revoke API key: {err}"))?
+            .map_err(db)?
             > 0;
         if changed {
+            tx.execute("UPDATE auth_dashboard_sessions SET revoked_at=?2,revoked_reason='key_revoked' WHERE key_id=?1 AND revoked_at IS NULL", params![key_id, now]).map_err(db)?;
+            tx.execute("DELETE FROM auth_sessions WHERE key_id=?1", [key_id])
+                .map_err(db)?;
             bump_epoch(&tx)?;
-            tx.execute("INSERT INTO auth_audit_events(actor_id,action,target_id,created_at) VALUES('bootstrap','key.revoked',?1,?2)", params![key_id, now])
-                .map_err(|err| format!("failed to audit API-key revocation: {err}"))?;
+            audit(
+                &tx,
+                &actor_name(actor),
+                "key.revoked",
+                key_id,
+                "ok",
+                BTreeMap::new(),
+            )?;
         }
-        tx.commit()
-            .map_err(|err| format!("failed to commit API-key revocation: {err}"))?;
+        tx.commit().map_err(db)?;
         Ok(changed)
     }
 
     pub fn list_keys(&self) -> Result<Vec<ApiKeySummary>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at FROM auth_api_keys ORDER BY created_at DESC"
-        ).map_err(|err| err.to_string())?;
+            "SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at FROM auth_api_keys ORDER BY created_at DESC,id"
+        ).map_err(db)?;
         statement
-            .query_map([], |row| {
-                Ok(ApiKeySummary {
-                    id: row.get(0)?,
-                    principal_id: row.get(1)?,
-                    name: row.get(2)?,
-                    prefix: row.get(3)?,
-                    enabled: row.get::<_, i64>(4)? != 0,
-                    created_at: row.get(5)?,
-                    expires_at: row.get(6)?,
-                    last_used_at: row.get(7)?,
-                })
-            })
-            .map_err(|err| err.to_string())?
+            .query_map([], map_key)
+            .map_err(db)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| err.to_string())
+            .map_err(db)
     }
 
-    pub fn load_active_keys(&self) -> Result<Vec<StoredKey>, String> {
+    pub fn load_authority(&self) -> Result<StoredAuthority, String> {
         let now = Utc::now().timestamp();
-        let mut statement = self.connection.prepare(
-            "SELECT id,principal_id,hmac_sha256_digest FROM auth_api_keys WHERE enabled=1 AND (expires_at IS NULL OR expires_at>?1)"
-        ).map_err(|err| err.to_string())?;
-        let rows = statement
+        let epoch = current_epoch(&self.connection)?;
+        let mut stmt = self.connection.prepare(
+            "SELECT id,principal_id,prefix,hmac_sha256_digest FROM auth_api_keys WHERE enabled=1 AND (expires_at IS NULL OR expires_at>?1)"
+        ).map_err(db)?;
+        let credentials = stmt
             .query_map([now], |row| {
-                let digest: Vec<u8> = row.get(2)?;
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, digest))
-            })
-            .map_err(|err| err.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| err.to_string())?;
-        let mut keys = Vec::with_capacity(rows.len());
-        for (id, principal_id, digest) in rows {
-            let digest: [u8; 32] = digest
-                .try_into()
-                .map_err(|_| format!("invalid digest length for {id}"))?;
-            let mut grants_statement = self.connection.prepare(
-                "SELECT effect,endpoint,model_pattern FROM auth_policies WHERE key_id=?1 ORDER BY CASE effect WHEN 'deny' THEN 0 ELSE 1 END"
-            ).map_err(|err| err.to_string())?;
-            let grants = grants_statement
-                .query_map([&id], |row| {
-                    Ok(StoredGrant {
-                        effect: row.get(0)?,
-                        endpoint: row.get(1)?,
-                        model_pattern: row.get(2)?,
-                    })
+                let bytes: Vec<u8> = row.get(3)?;
+                let digest: [u8; 32] = bytes.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        3,
+                        "hmac_sha256_digest".into(),
+                        rusqlite::types::Type::Blob,
+                    )
+                })?;
+                Ok(StoredCredential {
+                    id: row.get(0)?,
+                    principal_id: row.get(1)?,
+                    prefix: row.get(2)?,
+                    digest,
                 })
-                .map_err(|err| err.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|err| err.to_string())?;
-            keys.push(StoredKey {
-                id,
-                principal_id,
-                digest,
-                grants,
-            });
+            })
+            .map_err(db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)?;
+
+        let mut principal_groups: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut stmt = self
+            .connection
+            .prepare("SELECT principal_id,group_id FROM auth_group_members")
+            .map_err(db)?;
+        for row in stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db)?
+        {
+            let (principal, group) = row.map_err(db)?;
+            principal_groups.entry(principal).or_default().insert(group);
         }
-        Ok(keys)
+        let mut principal_roles: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut stmt = self.connection.prepare(
+            "SELECT subject_id,role_id FROM auth_role_bindings WHERE subject_kind='principal' UNION SELECT gm.principal_id,rb.role_id FROM auth_role_bindings rb JOIN auth_group_members gm ON rb.subject_kind='group' AND rb.subject_id=gm.group_id"
+        ).map_err(db)?;
+        for row in stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db)?
+        {
+            let (principal, role) = row.map_err(db)?;
+            principal_roles.entry(principal).or_default().insert(role);
+        }
+        let rules = self.load_rules()?;
+        Ok(StoredAuthority {
+            epoch,
+            credentials,
+            policy: Arc::new(PolicySnapshot::new(
+                epoch,
+                rules,
+                principal_groups,
+                principal_roles,
+            )),
+        })
+    }
+
+    fn load_rules(&self) -> Result<Vec<PolicyRule>, String> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id,effect FROM auth_policies WHERE enabled=1")
+            .map_err(db)?;
+        let policies = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)?;
+        let mut rules = Vec::new();
+        for (policy_id, effect) in policies {
+            let subjects = query_pairs(
+                &self.connection,
+                "SELECT subject_kind,subject_id FROM auth_policy_subjects WHERE policy_id=?1",
+                &policy_id,
+            )?;
+            let scopes = query_pairs(
+                &self.connection,
+                "SELECT dimension,matcher FROM auth_policy_scopes WHERE policy_id=?1",
+                &policy_id,
+            )?;
+            let mut endpoints = Vec::new();
+            let mut requested = Vec::new();
+            let mut served = Vec::new();
+            let mut providers = Vec::new();
+            let mut routes = Vec::new();
+            for (dimension, matcher) in scopes {
+                match dimension.as_str() {
+                    "endpoint" if matcher != "*" => endpoints.push(
+                        Endpoint::parse(&matcher)
+                            .ok_or_else(|| format!("invalid endpoint matcher {matcher}"))?,
+                    ),
+                    "requested_model" if matcher != "*" => requested.push(matcher),
+                    "served_model" if matcher != "*" => served.push(matcher),
+                    "provider" if matcher != "*" => providers.push(matcher),
+                    "route" if matcher != "*" => routes.push(matcher),
+                    _ => {}
+                }
+            }
+            let windows = self.query_windows(&policy_id)?;
+            let limits = self.query_limits(&policy_id)?;
+            let permissions = self.query_permissions(&policy_id)?;
+            for (kind, id) in subjects {
+                let mut subject_permissions = permissions.clone();
+                if kind == "role" {
+                    subject_permissions.extend(self.query_role_permissions(&id)?);
+                }
+                let subject = parse_subject(&kind, id)?;
+                rules.push(PolicyRule {
+                    id: format!("{policy_id}:{kind}"),
+                    effect: if effect == "deny" {
+                        PolicyEffect::Deny
+                    } else {
+                        PolicyEffect::Allow
+                    },
+                    binding: PolicyBinding { subject },
+                    matcher: PolicyMatcher::new(
+                        endpoints.clone(),
+                        requested.clone(),
+                        served.clone(),
+                        providers.clone(),
+                        routes.clone(),
+                    )
+                    .map_err(|err| err.to_string())?,
+                    windows: windows.clone(),
+                    limits,
+                    management_permissions: subject_permissions,
+                });
+            }
+        }
+        Ok(rules)
+    }
+
+    fn query_windows(&self, policy_id: &str) -> Result<Vec<UtcWindow>, String> {
+        let mut stmt = self.connection.prepare("SELECT weekday_mask,start_minute,end_minute,absolute_start,absolute_end FROM auth_time_windows WHERE policy_id=?1").map_err(db)?;
+        stmt.query_map([policy_id], |r| {
+            Ok(UtcWindow {
+                weekday_mask: r.get(0)?,
+                start_minute: r.get(1)?,
+                end_minute: r.get(2)?,
+                absolute_start_ms: r.get(3)?,
+                absolute_end_ms: r.get(4)?,
+            })
+        })
+        .map_err(db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db)
+    }
+
+    fn query_limits(&self, policy_id: &str) -> Result<LimitSet, String> {
+        self.connection.query_row("SELECT max_concurrent_sessions,max_daily_session_starts FROM auth_limits WHERE policy_id=?1", [policy_id], |r| Ok(LimitSet { max_concurrent_sessions: r.get(0)?, max_daily_session_starts: r.get(1)? })).optional().map_err(db).map(|v| v.unwrap_or_default())
+    }
+
+    fn query_permissions(&self, policy_id: &str) -> Result<HashSet<ManagementPermission>, String> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT permission FROM auth_management_permissions WHERE policy_id=?1")
+            .map_err(db)?;
+        let values = stmt
+            .query_map([policy_id], |r| r.get::<_, String>(0))
+            .map_err(db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)?;
+        Ok(values
+            .into_iter()
+            .filter_map(|value| ManagementPermission::parse(&value))
+            .collect())
+    }
+
+    fn query_role_permissions(
+        &self,
+        role_id: &str,
+    ) -> Result<HashSet<ManagementPermission>, String> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT permission FROM auth_role_permissions WHERE role_id=?1")
+            .map_err(db)?;
+        let values = stmt
+            .query_map([role_id], |row| row.get::<_, String>(0))
+            .map_err(db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)?;
+        Ok(values
+            .into_iter()
+            .filter_map(|value| ManagementPermission::parse(&value))
+            .collect())
+    }
+
+    pub fn insert_session(&mut self, id: &str, key_id: &str) -> Result<(), String> {
+        self.connection.execute("INSERT INTO auth_sessions(id,key_id,started_at,endpoint) VALUES(?1,?2,?3,'inference')", params![id,key_id,Utc::now().timestamp()]).map_err(db)?;
+        Ok(())
+    }
+
+    pub fn delete_session(&mut self, id: &str) -> Result<(), String> {
+        self.connection
+            .execute("DELETE FROM auth_sessions WHERE id=?1", [id])
+            .map_err(db)?;
+        Ok(())
+    }
+
+    pub fn create_dashboard_session(
+        &mut self,
+        principal_id: &str,
+        key_id: &str,
+        csrf_digest: &[u8],
+        expires_at: i64,
+        policy_epoch: u64,
+    ) -> Result<StoredDashboardSession, String> {
+        let now = Utc::now().timestamp();
+        if expires_at <= now {
+            return Err("dashboard session expiry must be in the future".into());
+        }
+        let session_id = format!("dsh_{}", Uuid::new_v4().simple());
+        self.connection.execute(
+            "INSERT INTO auth_dashboard_sessions(session_id,principal_id,key_id,csrf_secret_digest,created_at,expires_at,policy_epoch_at_login,last_seen_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?5)",
+            params![session_id,principal_id,key_id,csrf_digest,now,expires_at,i64::try_from(policy_epoch).map_err(|_|"policy epoch overflow")?],
+        ).map_err(db)?;
+        let key_prefix = self
+            .connection
+            .query_row(
+                "SELECT prefix FROM auth_api_keys WHERE id=?1",
+                [key_id],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        Ok(StoredDashboardSession {
+            session_id,
+            principal_id: principal_id.into(),
+            key_id: key_id.into(),
+            key_prefix,
+        })
+    }
+
+    pub fn load_dashboard_session(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<StoredDashboardSession>, String> {
+        let now = Utc::now().timestamp();
+        let session = self.connection.query_row(
+            "SELECT s.session_id,s.principal_id,s.key_id,k.prefix,s.expires_at FROM auth_dashboard_sessions s JOIN auth_api_keys k ON k.id=s.key_id JOIN auth_principals p ON p.id=s.principal_id WHERE s.session_id=?1 AND s.revoked_at IS NULL AND s.expires_at>?2 AND k.enabled=1 AND p.enabled=1",
+            params![session_id,now],
+            |row|Ok(StoredDashboardSession{session_id:row.get(0)?,principal_id:row.get(1)?,key_id:row.get(2)?,key_prefix:row.get(3)?}),
+        ).optional().map_err(db)?;
+        if session.is_some() {
+            self.connection
+                .execute(
+                    "UPDATE auth_dashboard_sessions SET last_seen_at=?2 WHERE session_id=?1",
+                    params![session_id, now],
+                )
+                .map_err(db)?;
+        }
+        Ok(session)
+    }
+
+    pub fn revoke_dashboard_session(
+        &mut self,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
+        self.connection.execute("UPDATE auth_dashboard_sessions SET revoked_at=?2,revoked_reason=?3 WHERE session_id=?1 AND revoked_at IS NULL",params![session_id,Utc::now().timestamp(),reason]).map(|changed|changed>0).map_err(db)
+    }
+
+    pub fn dispatch_access(
+        &mut self,
+        actor: &ManagementActor,
+        operation: AccessOperation,
+    ) -> Result<AccessResult, AccessError> {
+        match operation {
+            AccessOperation::Summary => self.access_summary(actor),
+            AccessOperation::ListUsers => self.list_users().map(AccessResult::Users),
+            AccessOperation::CreateUser(body) => {
+                self.create_user(actor, &body.kind, &body.display_name)?;
+                self.list_users().map(AccessResult::Users)
+            }
+            AccessOperation::ListGroups => self.list_groups().map(AccessResult::Groups),
+            AccessOperation::CreateGroup(body) => {
+                self.create_group(actor, &body.name, &body.members)?;
+                self.list_groups().map(AccessResult::Groups)
+            }
+            AccessOperation::ListRoles => self.list_roles().map(AccessResult::Roles),
+            AccessOperation::CreateRole(body) => {
+                self.create_role(actor, &body.name, &body.permissions)?;
+                self.list_roles().map(AccessResult::Roles)
+            }
+            AccessOperation::ListPolicies => self.list_policies().map(AccessResult::Policies),
+            AccessOperation::CreatePolicy(body) => {
+                self.create_policy(actor, body)?;
+                self.list_policies().map(AccessResult::Policies)
+            }
+            AccessOperation::ListApiKeys => self.list_access_keys().map(AccessResult::ApiKeys),
+            AccessOperation::RevokeApiKey(id) => {
+                if !self.revoke_key_as(&id, actor).map_err(access_internal)? {
+                    return Err(AccessError::new(
+                        StatusCode::NOT_FOUND,
+                        "API key not found or already revoked",
+                    ));
+                }
+                self.list_access_keys().map(AccessResult::ApiKeys)
+            }
+            AccessOperation::ListSessions => self.list_sessions().map(AccessResult::Sessions),
+            AccessOperation::RevokeSession(id) => {
+                self.revoke_session(actor, &id)?;
+                self.list_sessions().map(AccessResult::Sessions)
+            }
+            AccessOperation::Usage => self.usage().map(AccessResult::Usage),
+            AccessOperation::Audit => self.audit_events().map(AccessResult::Audit),
+            AccessOperation::Pricing => self.pricing().map(AccessResult::Pricing),
+            AccessOperation::WritePricing(body) => {
+                self.write_pricing(actor, body)?;
+                self.pricing().map(AccessResult::Pricing)
+            }
+            AccessOperation::CreateApiKey(_) | AccessOperation::RotateApiKey(_) => {
+                Err(AccessError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "key secret operation must be handled by AuthzService",
+                ))
+            }
+        }
+    }
+
+    fn access_summary(&self, actor: &ManagementActor) -> Result<AccessResult, AccessError> {
+        let count = |table: &str| -> Result<usize, AccessError> {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            self.connection
+                .query_row(&sql, [], |r| r.get::<_, i64>(0))
+                .map(|v| v as usize)
+                .map_err(access_db)
+        };
+        let (kind, principal_id, display_name, permissions) = match actor {
+            ManagementActor::Bootstrap => (
+                "bootstrap",
+                None,
+                "Bootstrap administrator".into(),
+                WirePermission::all(),
+            ),
+            ManagementActor::Delegated {
+                principal_id,
+                permissions,
+                ..
+            } => (
+                "delegated",
+                Some(principal_id.clone()),
+                principal_id.clone(),
+                permissions.to_vec(),
+            ),
+        };
+        Ok(AccessResult::Summary(AccessSummary {
+            policy_epoch: current_epoch(&self.connection).map_err(access_internal)?,
+            actor: ActorSummary {
+                kind: kind.into(),
+                principal_id,
+                display_name,
+                permissions,
+            },
+            counts: AccessCounts {
+                users: count("auth_principals")?,
+                groups: count("auth_groups")?,
+                roles: count("auth_roles")?,
+                policies: count("auth_policies")?,
+                api_keys: count("auth_api_keys")?,
+                active_sessions: count("auth_sessions")?,
+            },
+        }))
+    }
+
+    fn list_users(&self) -> Result<Vec<AccessUser>, AccessError> {
+        let mut stmt=self.connection.prepare("SELECT id,kind,display_name,enabled,created_at FROM auth_principals ORDER BY created_at,id").map_err(access_db)?;
+        stmt.query_map([], |r| {
+            Ok(AccessUser {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                display_name: r.get(2)?,
+                enabled: r.get::<_, i64>(3)? != 0,
+                created_at: timestamp(r.get(4)?),
+            })
+        })
+        .map_err(access_db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(access_db)
+    }
+
+    fn create_user(
+        &mut self,
+        actor: &ManagementActor,
+        kind: &str,
+        name: &str,
+    ) -> Result<(), AccessError> {
+        if !matches!(kind, "user" | "service_account") {
+            return Err(AccessError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "kind must be user or service_account",
+            ));
+        }
+        let now = Utc::now().timestamp();
+        let id = format!("usr_{}", Uuid::new_v4().simple());
+        let tx = self.connection.transaction().map_err(access_db)?;
+        tx.execute("INSERT INTO auth_principals(id,kind,display_name,enabled,created_at) VALUES(?1,?2,?3,1,?4)",params![id,kind,required(name,"display_name").map_err(access_internal)?,now]).map_err(access_db)?;
+        bump_epoch(&tx).map_err(access_internal)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "principal.created",
+            &id,
+            "ok",
+            BTreeMap::new(),
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
+    }
+
+    fn list_groups(&self) -> Result<Vec<AccessGroup>, AccessError> {
+        let mut stmt=self.connection.prepare("SELECT g.id,g.name,g.enabled,COUNT(m.principal_id) FROM auth_groups g LEFT JOIN auth_group_members m ON m.group_id=g.id GROUP BY g.id ORDER BY g.name").map_err(access_db)?;
+        stmt.query_map([], |r| {
+            Ok(AccessGroup {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                enabled: r.get::<_, i64>(2)? != 0,
+                member_count: r.get::<_, i64>(3)? as usize,
+            })
+        })
+        .map_err(access_db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(access_db)
+    }
+
+    fn create_group(
+        &mut self,
+        actor: &ManagementActor,
+        name: &str,
+        members: &[String],
+    ) -> Result<(), AccessError> {
+        let id = format!("grp_{}", Uuid::new_v4().simple());
+        let tx = self.connection.transaction().map_err(access_db)?;
+        tx.execute(
+            "INSERT INTO auth_groups(id,name,enabled,created_at) VALUES(?1,?2,1,?3)",
+            params![
+                id,
+                required(name, "name").map_err(access_internal)?,
+                Utc::now().timestamp()
+            ],
+        )
+        .map_err(access_db)?;
+        for member in members {
+            tx.execute(
+                "INSERT INTO auth_group_members(group_id,principal_id) VALUES(?1,?2)",
+                params![id, member],
+            )
+            .map_err(access_db)?;
+        }
+        bump_epoch(&tx).map_err(access_internal)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "group.created",
+            &id,
+            "ok",
+            BTreeMap::new(),
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
+    }
+
+    fn list_roles(&self) -> Result<Vec<AccessRole>, AccessError> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id,name,enabled FROM auth_roles ORDER BY name")
+            .map_err(access_db)?;
+        let base = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                ))
+            })
+            .map_err(access_db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(access_db)?;
+        base.into_iter()
+            .map(|(id, name, enabled)| {
+                let mut p = self
+                    .connection
+                    .prepare("SELECT permission FROM auth_role_permissions WHERE role_id=?1")
+                    .map_err(access_db)?;
+                let permissions = p
+                    .query_map([&id], |r| r.get::<_, String>(0))
+                    .map_err(access_db)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(access_db)?
+                    .into_iter()
+                    .filter_map(|v| wire_permission(&v))
+                    .collect();
+                Ok(AccessRole {
+                    id,
+                    name,
+                    enabled,
+                    permissions,
+                })
+            })
+            .collect()
+    }
+
+    fn create_role(
+        &mut self,
+        actor: &ManagementActor,
+        name: &str,
+        permissions: &[WirePermission],
+    ) -> Result<(), AccessError> {
+        let id = format!("rol_{}", Uuid::new_v4().simple());
+        let tx = self.connection.transaction().map_err(access_db)?;
+        tx.execute(
+            "INSERT INTO auth_roles(id,name,enabled,created_at) VALUES(?1,?2,1,?3)",
+            params![
+                id,
+                required(name, "name").map_err(access_internal)?,
+                Utc::now().timestamp()
+            ],
+        )
+        .map_err(access_db)?;
+        for permission in permissions {
+            tx.execute(
+                "INSERT INTO auth_role_permissions(role_id,permission) VALUES(?1,?2)",
+                params![id, wire_permission_name(*permission)],
+            )
+            .map_err(access_db)?;
+        }
+        bump_epoch(&tx).map_err(access_internal)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "role.created",
+            &id,
+            "ok",
+            BTreeMap::new(),
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
+    }
+
+    fn list_policies(&self) -> Result<Vec<AccessPolicy>, AccessError> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id,name,effect,enabled FROM auth_policies ORDER BY created_at,id")
+            .map_err(access_db)?;
+        let base = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            })
+            .map_err(access_db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(access_db)?;
+        base.into_iter()
+            .map(|(id, name, effect, enabled)| {
+                let subjects = query_pairs(
+                    &self.connection,
+                    "SELECT subject_kind,subject_id FROM auth_policy_subjects WHERE policy_id=?1",
+                    &id,
+                )
+                .map_err(access_internal)?
+                .into_iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect();
+                let scopes = query_pairs(
+                    &self.connection,
+                    "SELECT dimension,matcher FROM auth_policy_scopes WHERE policy_id=?1",
+                    &id,
+                )
+                .map_err(access_internal)?;
+                let dim = |d: &str| {
+                    scopes
+                        .iter()
+                        .filter(|(kind, _)| kind == d)
+                        .map(|(_, v)| v.clone())
+                        .collect()
+                };
+                Ok(AccessPolicy {
+                    id,
+                    name,
+                    effect,
+                    enabled,
+                    subjects,
+                    endpoints: dim("endpoint"),
+                    models: dim("requested_model"),
+                    providers: dim("provider"),
+                })
+            })
+            .collect()
+    }
+
+    fn create_policy(
+        &mut self,
+        actor: &ManagementActor,
+        body: crate::dashboard_access::CreatePolicyRequest,
+    ) -> Result<(), AccessError> {
+        if !matches!(body.effect.as_str(), "allow" | "deny") {
+            return Err(AccessError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "effect must be allow or deny",
+            ));
+        }
+        if body.subjects.is_empty() {
+            return Err(AccessError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "at least one subject is required",
+            ));
+        }
+        let id = format!("pol_{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        let tx = self.connection.transaction().map_err(access_db)?;
+        tx.execute("INSERT INTO auth_policies(id,name,effect,enabled,created_at,updated_at) VALUES(?1,?2,?3,1,?4,?4)",params![id,required(&body.name,"name").map_err(access_internal)?,body.effect,now]).map_err(access_db)?;
+        for subject in body.subjects {
+            let (kind, value) = subject.split_once(':').ok_or_else(|| {
+                AccessError::new(StatusCode::UNPROCESSABLE_ENTITY, "subject must be kind:id")
+            })?;
+            if !matches!(kind, "key" | "principal" | "group" | "role") {
+                return Err(AccessError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid subject kind",
+                ));
+            }
+            tx.execute("INSERT INTO auth_policy_subjects(policy_id,subject_kind,subject_id) VALUES(?1,?2,?3)",params![id,kind,value]).map_err(access_db)?;
+        }
+        for (endpoint, dimension) in body
+            .endpoints
+            .into_iter()
+            .map(|v| (v, "endpoint"))
+            .chain(
+                body.models
+                    .into_iter()
+                    .flat_map(|v| [(v.clone(), "requested_model"), (v, "served_model")]),
+            )
+            .chain(body.providers.into_iter().map(|v| (v, "provider")))
+        {
+            tx.execute(
+                "INSERT INTO auth_policy_scopes(policy_id,dimension,matcher) VALUES(?1,?2,?3)",
+                params![id, dimension, endpoint],
+            )
+            .map_err(access_db)?;
+        }
+        bump_epoch(&tx).map_err(access_internal)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "policy.created",
+            &id,
+            "ok",
+            BTreeMap::new(),
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
+    }
+
+    fn list_access_keys(&self) -> Result<Vec<AccessApiKey>, AccessError> {
+        Ok(self
+            .list_keys()
+            .map_err(access_internal)?
+            .into_iter()
+            .map(access_key)
+            .collect())
+    }
+
+    fn list_sessions(&self) -> Result<Vec<AccessSession>, AccessError> {
+        let mut stmt=self.connection.prepare("SELECT s.id,'inference',k.principal_id,s.key_id,s.endpoint,s.requested_model,s.started_at,s.expires_at FROM auth_sessions s JOIN auth_api_keys k ON k.id=s.key_id UNION ALL SELECT d.session_id,'dashboard',d.principal_id,d.key_id,NULL,NULL,d.created_at,d.expires_at FROM auth_dashboard_sessions d WHERE d.revoked_at IS NULL ORDER BY 7 DESC").map_err(access_db)?;
+        stmt.query_map([], |r| {
+            Ok(AccessSession {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                principal_id: r.get(2)?,
+                key_id: r.get(3)?,
+                endpoint: r.get(4)?,
+                requested_model: r.get(5)?,
+                started_at: timestamp(r.get(6)?),
+                expires_at: r.get::<_, Option<i64>>(7)?.map(timestamp),
+            })
+        })
+        .map_err(access_db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(access_db)
+    }
+    fn revoke_session(&mut self, actor: &ManagementActor, id: &str) -> Result<(), AccessError> {
+        let deleted = self
+            .connection
+            .execute("DELETE FROM auth_sessions WHERE id=?1", [id])
+            .map_err(access_db)?;
+        let revoked = self.connection.execute("UPDATE auth_dashboard_sessions SET revoked_at=?2,revoked_reason='admin_revoked' WHERE session_id=?1 AND revoked_at IS NULL",params![id,Utc::now().timestamp()]).map_err(access_db)?;
+        if deleted + revoked == 0 {
+            return Err(AccessError::new(StatusCode::NOT_FOUND, "session not found"));
+        }
+        let tx = self.connection.transaction().map_err(access_db)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "session.revoked",
+            id,
+            "ok",
+            BTreeMap::new(),
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
+    }
+
+    fn usage(&self) -> Result<Vec<AccessUsageRow>, AccessError> {
+        let mut stmt=self.connection.prepare("SELECT 'key',key_id,COUNT(*),SUM(prompt_tokens),SUM(completion_tokens),SUM(cached_tokens),SUM(reasoning_tokens),SUM(cost_nano_usd),CASE WHEN SUM(CASE WHEN cost_confidence='estimated' THEN 1 ELSE 0 END)>0 THEN 'estimated' WHEN SUM(CASE WHEN cost_confidence='confident' THEN 1 ELSE 0 END)>0 THEN 'confident' ELSE 'unavailable' END FROM auth_usage_events GROUP BY key_id ORDER BY COUNT(*) DESC").map_err(access_db)?;
+        stmt.query_map([], |r| {
+            Ok(AccessUsageRow {
+                dimension: r.get(0)?,
+                value: r.get(1)?,
+                requests: r.get::<_, i64>(2)? as u64,
+                prompt_tokens: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                completion_tokens: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                cached_tokens: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                reasoning_tokens: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                cost: r
+                    .get::<_, Option<i64>>(7)?
+                    .map(|v| v as f64 / 1_000_000_000.0),
+                cost_confidence: r.get(8)?,
+            })
+        })
+        .map_err(access_db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(access_db)
+    }
+
+    fn audit_events(&self) -> Result<Vec<AccessAuditEvent>, AccessError> {
+        let mut stmt=self.connection.prepare("SELECT id,created_at,actor,action,target,outcome,metadata_json FROM auth_audit_events ORDER BY created_at DESC,id DESC LIMIT 500").map_err(access_db)?;
+        stmt.query_map([], |r| {
+            let raw: String = r.get(6)?;
+            let metadata = serde_json::from_str(&raw).unwrap_or_default();
+            Ok(AccessAuditEvent {
+                id: r.get::<_, i64>(0)?.to_string(),
+                timestamp: timestamp(r.get(1)?),
+                actor: r.get(2)?,
+                action: r.get(3)?,
+                target: r.get(4)?,
+                outcome: r.get(5)?,
+                metadata,
+            })
+        })
+        .map_err(access_db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(access_db)
+    }
+    fn pricing(&self) -> Result<Vec<AccessPricingRow>, AccessError> {
+        let mut stmt=self.connection.prepare("SELECT model,provider,source,fetched_at,input_per_1k,output_per_1k,confidence FROM auth_price_snapshots ORDER BY model,provider").map_err(access_db)?;
+        stmt.query_map([], |r| {
+            Ok(AccessPricingRow {
+                model: r.get(0)?,
+                provider: r.get(1)?,
+                source: r.get(2)?,
+                fetched_at: timestamp(r.get(3)?),
+                input_per_1k: r.get(4)?,
+                output_per_1k: r.get(5)?,
+                confidence: r.get(6)?,
+            })
+        })
+        .map_err(access_db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(access_db)
+    }
+    fn write_pricing(
+        &mut self,
+        actor: &ManagementActor,
+        body: crate::dashboard_access::WritePricingRequest,
+    ) -> Result<(), AccessError> {
+        let now = Utc::now().timestamp();
+        let tx = self.connection.transaction().map_err(access_db)?;
+        for row in body.pricing {
+            validate_decimal(&row.input_per_1k)?;
+            validate_decimal(&row.output_per_1k)?;
+            tx.execute("INSERT INTO auth_price_snapshots(model,provider,source,fetched_at,input_per_1k,output_per_1k,confidence) VALUES(?1,?2,'operator',?3,?4,?5,'confident') ON CONFLICT(model,provider) DO UPDATE SET source='operator',fetched_at=excluded.fetched_at,input_per_1k=excluded.input_per_1k,output_per_1k=excluded.output_per_1k,confidence='confident'",params![row.model,row.provider,now,row.input_per_1k,row.output_per_1k]).map_err(access_db)?;
+        }
+        audit(
+            &tx,
+            &actor_name(actor),
+            "pricing.written",
+            "pricing",
+            "ok",
+            BTreeMap::new(),
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)
     }
 }
 
-fn bump_epoch(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+fn insert_key(
+    tx: &Transaction<'_>,
+    principal_id: &str,
+    name: &str,
+    raw: &str,
+    digest: &[u8; 32],
+    expires_at: Option<i64>,
+    now: i64,
+) -> Result<CreatedApiKey, String> {
+    let id = format!("key_{}", Uuid::new_v4().simple());
+    let prefix = display_prefix(raw);
+    tx.execute("INSERT INTO auth_api_keys(id,principal_id,name,prefix,hmac_sha256_digest,enabled,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,1,?6,?7)",params![id,principal_id,required(name,"name")?,prefix,digest.as_slice(),now,expires_at]).map_err(db)?;
+    Ok(CreatedApiKey {
+        summary: ApiKeySummary {
+            id,
+            principal_id: principal_id.into(),
+            name: name.trim().into(),
+            prefix,
+            enabled: true,
+            created_at: now,
+            expires_at,
+            last_used_at: None,
+        },
+        raw_key: None,
+    })
+}
+fn query_key(tx: &Transaction<'_>, id: &str) -> Result<Option<ApiKeySummary>, String> {
+    tx.query_row("SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at FROM auth_api_keys WHERE id=?1",[id],map_key).optional().map_err(db)
+}
+fn map_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeySummary> {
+    Ok(ApiKeySummary {
+        id: r.get(0)?,
+        principal_id: r.get(1)?,
+        name: r.get(2)?,
+        prefix: r.get(3)?,
+        enabled: r.get::<_, i64>(4)? != 0,
+        created_at: r.get(5)?,
+        expires_at: r.get(6)?,
+        last_used_at: r.get(7)?,
+    })
+}
+fn access_key(k: ApiKeySummary) -> AccessApiKey {
+    AccessApiKey {
+        id: k.id,
+        principal_id: k.principal_id,
+        name: k.name,
+        prefix: k.prefix,
+        enabled: k.enabled,
+        created_at: timestamp(k.created_at),
+        expires_at: k.expires_at.map(timestamp),
+        last_used_at: k.last_used_at.map(timestamp),
+    }
+}
+fn parse_subject(kind: &str, id: String) -> Result<PolicySubject, String> {
+    match kind {
+        "key" => Ok(PolicySubject::Key(id)),
+        "principal" => Ok(PolicySubject::Principal(id)),
+        "group" => Ok(PolicySubject::Group(id)),
+        "role" => Ok(PolicySubject::Role(id)),
+        _ => Err(format!("invalid subject kind {kind}")),
+    }
+}
+fn query_pairs(conn: &Connection, sql: &str, id: &str) -> Result<Vec<(String, String)>, String> {
+    let mut stmt = conn.prepare(sql).map_err(db)?;
+    stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db)
+}
+fn current_epoch(conn: &Connection) -> Result<u64, String> {
+    let v: i64 = conn
+        .query_row(
+            "SELECT epoch FROM auth_policy_epoch WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db)?;
+    u64::try_from(v).map_err(|_| "invalid policy epoch".into())
+}
+fn bump_epoch(tx: &Transaction<'_>) -> Result<(), String> {
     tx.execute(
         "UPDATE auth_policy_epoch SET epoch=epoch+1 WHERE singleton=1",
         [],
     )
     .map(|_| ())
-    .map_err(|err| format!("failed to increment auth policy epoch: {err}"))
+    .map_err(db)
 }
-
-fn key_prefix(raw: &str) -> String {
-    raw.chars().take(13).collect()
+fn audit(
+    tx: &Transaction<'_>,
+    actor: &str,
+    action: &str,
+    target: &str,
+    outcome: &str,
+    metadata: BTreeMap<String, Value>,
+) -> Result<(), String> {
+    tx.execute("INSERT INTO auth_audit_events(actor,action,target,outcome,metadata_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![actor,action,target,outcome,serde_json::to_string(&metadata).map_err(|e|e.to_string())?,Utc::now().timestamp()]).map(|_|()).map_err(db)
 }
-
-fn required<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
-    let value = value.trim();
-    if value.is_empty() {
+fn actor_name(actor: &ManagementActor) -> String {
+    match actor {
+        ManagementActor::Bootstrap => "bootstrap".into(),
+        ManagementActor::Delegated {
+            principal_id,
+            key_id,
+            ..
+        } => format!("{principal_id}:{key_id}"),
+    }
+}
+fn timestamp(seconds: i64) -> String {
+    DateTime::from_timestamp(seconds, 0)
+        .map(|v| v.to_rfc3339())
+        .unwrap_or_else(|| seconds.to_string())
+}
+fn display_prefix(raw: &str) -> String {
+    raw.chars().take(12).collect()
+}
+fn required<'a>(v: &'a str, field: &str) -> Result<&'a str, String> {
+    let v = v.trim();
+    if v.is_empty() {
         Err(format!("{field} must not be blank"))
     } else {
-        Ok(value)
+        Ok(v)
+    }
+}
+fn nonempty_or_wildcard(values: &[String]) -> Vec<String> {
+    if values.is_empty() {
+        vec!["*".into()]
+    } else {
+        values.to_vec()
+    }
+}
+fn db(e: rusqlite::Error) -> String {
+    e.to_string()
+}
+fn access_db(e: rusqlite::Error) -> AccessError {
+    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+fn access_internal(e: String) -> AccessError {
+    AccessError::new(StatusCode::INTERNAL_SERVER_ERROR, e)
+}
+fn validate_decimal(v: &str) -> Result<(), AccessError> {
+    if v.parse::<f64>()
+        .ok()
+        .is_some_and(|n| n.is_finite() && n >= 0.0)
+    {
+        Ok(())
+    } else {
+        Err(AccessError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "price must be a non-negative decimal",
+        ))
+    }
+}
+
+fn wire_permission_name(permission: WirePermission) -> &'static str {
+    match permission {
+        WirePermission::KeysRead => "auth.keys.read",
+        WirePermission::KeysCreate => "auth.keys.create",
+        WirePermission::KeysRevoke => "auth.keys.revoke",
+        WirePermission::KeysRotate => "auth.keys.rotate",
+        WirePermission::PrincipalsRead => "auth.principals.read",
+        WirePermission::PrincipalsWrite => "auth.principals.write",
+        WirePermission::GroupsRead => "auth.groups.read",
+        WirePermission::GroupsWrite => "auth.groups.write",
+        WirePermission::RolesRead => "auth.roles.read",
+        WirePermission::RolesWrite => "auth.roles.write",
+        WirePermission::PoliciesRead => "auth.policies.read",
+        WirePermission::PoliciesWrite => "auth.policies.write",
+        WirePermission::UsageRead => "auth.usage.read",
+        WirePermission::AuditRead => "auth.audit.read",
+        WirePermission::PricingRead => "auth.pricing.read",
+        WirePermission::PricingSync => "auth.pricing.sync",
+        WirePermission::PricingWrite => "auth.pricing.write",
+        WirePermission::SessionsRead => "auth.sessions.read",
+        WirePermission::SessionsTerminate => "auth.sessions.terminate",
+    }
+}
+fn wire_permission(v: &str) -> Option<WirePermission> {
+    WirePermission::all()
+        .into_iter()
+        .find(|p| wire_permission_name(*p) == v)
+}
+
+const SCHEMA: &str = r#"
+PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS auth_principals(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN('user','service_account')),display_name TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_api_keys(id TEXT PRIMARY KEY,principal_id TEXT NOT NULL REFERENCES auth_principals(id),name TEXT NOT NULL,prefix TEXT NOT NULL,hmac_sha256_digest BLOB NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,expires_at INTEGER,last_used_at INTEGER,revoked_at INTEGER);
+CREATE INDEX IF NOT EXISTS auth_api_keys_prefix_idx ON auth_api_keys(prefix);
+CREATE TABLE IF NOT EXISTS auth_groups(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_group_members(group_id TEXT NOT NULL REFERENCES auth_groups(id) ON DELETE CASCADE,principal_id TEXT NOT NULL REFERENCES auth_principals(id) ON DELETE CASCADE,PRIMARY KEY(group_id,principal_id));
+CREATE TABLE IF NOT EXISTS auth_roles(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_role_bindings(role_id TEXT NOT NULL REFERENCES auth_roles(id) ON DELETE CASCADE,subject_kind TEXT NOT NULL CHECK(subject_kind IN('principal','group')),subject_id TEXT NOT NULL,PRIMARY KEY(role_id,subject_kind,subject_id));
+CREATE TABLE IF NOT EXISTS auth_role_permissions(role_id TEXT NOT NULL REFERENCES auth_roles(id) ON DELETE CASCADE,permission TEXT NOT NULL,PRIMARY KEY(role_id,permission));
+CREATE TABLE IF NOT EXISTS auth_policies(id TEXT PRIMARY KEY,name TEXT NOT NULL,effect TEXT NOT NULL CHECK(effect IN('allow','deny')),enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_policy_subjects(policy_id TEXT NOT NULL REFERENCES auth_policies(id) ON DELETE CASCADE,subject_kind TEXT NOT NULL CHECK(subject_kind IN('key','principal','group','role')),subject_id TEXT NOT NULL,PRIMARY KEY(policy_id,subject_kind,subject_id));
+CREATE TABLE IF NOT EXISTS auth_policy_scopes(policy_id TEXT NOT NULL REFERENCES auth_policies(id) ON DELETE CASCADE,dimension TEXT NOT NULL CHECK(dimension IN('endpoint','requested_model','served_model','provider','route')),matcher TEXT NOT NULL,PRIMARY KEY(policy_id,dimension,matcher));
+CREATE TABLE IF NOT EXISTS auth_management_permissions(policy_id TEXT NOT NULL REFERENCES auth_policies(id) ON DELETE CASCADE,permission TEXT NOT NULL,PRIMARY KEY(policy_id,permission));
+CREATE TABLE IF NOT EXISTS auth_time_windows(id TEXT PRIMARY KEY,policy_id TEXT NOT NULL REFERENCES auth_policies(id) ON DELETE CASCADE,weekday_mask INTEGER NOT NULL DEFAULT 0,start_minute INTEGER NOT NULL DEFAULT 0,end_minute INTEGER NOT NULL DEFAULT 0,absolute_start INTEGER,absolute_end INTEGER);
+CREATE TABLE IF NOT EXISTS auth_limits(policy_id TEXT PRIMARY KEY REFERENCES auth_policies(id) ON DELETE CASCADE,max_concurrent_sessions INTEGER,max_daily_session_starts INTEGER,max_tokens_per_day INTEGER,max_cost_nanos_per_day INTEGER);
+CREATE TABLE IF NOT EXISTS auth_sessions(id TEXT PRIMARY KEY,key_id TEXT NOT NULL REFERENCES auth_api_keys(id),started_at INTEGER NOT NULL,expires_at INTEGER,endpoint TEXT NOT NULL,requested_model TEXT);
+CREATE TABLE IF NOT EXISTS auth_dashboard_sessions(session_id TEXT PRIMARY KEY,principal_id TEXT NOT NULL REFERENCES auth_principals(id),key_id TEXT NOT NULL REFERENCES auth_api_keys(id),csrf_secret_digest BLOB NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,policy_epoch_at_login INTEGER NOT NULL,revoked_at INTEGER,revoked_reason TEXT,last_seen_at INTEGER);
+CREATE TABLE IF NOT EXISTS auth_usage_events(auth_request_id TEXT PRIMARY KEY,api_call_id TEXT,key_id TEXT NOT NULL,principal_id TEXT NOT NULL,endpoint TEXT NOT NULL,requested_model TEXT,served_model TEXT,provider TEXT,route TEXT,status TEXT NOT NULL,prompt_tokens INTEGER,completion_tokens INTEGER,total_tokens INTEGER,cached_tokens INTEGER,reasoning_tokens INTEGER,cost_nano_usd INTEGER,cost_confidence TEXT NOT NULL DEFAULT 'unavailable',created_at_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,actor TEXT NOT NULL,action TEXT NOT NULL,target TEXT NOT NULL,outcome TEXT NOT NULL,metadata_json TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_price_snapshots(model TEXT NOT NULL,provider TEXT NOT NULL,source TEXT NOT NULL,fetched_at INTEGER NOT NULL,input_per_1k TEXT NOT NULL,output_per_1k TEXT NOT NULL,confidence TEXT NOT NULL,PRIMARY KEY(model,provider));
+CREATE TABLE IF NOT EXISTS auth_policy_epoch(singleton INTEGER PRIMARY KEY CHECK(singleton=1),epoch INTEGER NOT NULL);
+INSERT OR IGNORE INTO auth_policy_epoch(singleton,epoch) VALUES(1,1);
+"#;
+
+trait WirePermissionSet {
+    fn all() -> Vec<WirePermission>;
+}
+impl WirePermissionSet for WirePermission {
+    fn all() -> Vec<WirePermission> {
+        vec![
+            WirePermission::KeysRead,
+            WirePermission::KeysCreate,
+            WirePermission::KeysRevoke,
+            WirePermission::KeysRotate,
+            WirePermission::PrincipalsRead,
+            WirePermission::PrincipalsWrite,
+            WirePermission::GroupsRead,
+            WirePermission::GroupsWrite,
+            WirePermission::RolesRead,
+            WirePermission::RolesWrite,
+            WirePermission::PoliciesRead,
+            WirePermission::PoliciesWrite,
+            WirePermission::UsageRead,
+            WirePermission::AuditRead,
+            WirePermission::PricingRead,
+            WirePermission::PricingSync,
+            WirePermission::PricingWrite,
+            WirePermission::SessionsRead,
+            WirePermission::SessionsTerminate,
+        ]
     }
 }

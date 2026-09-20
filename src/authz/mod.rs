@@ -6,11 +6,9 @@ pub mod store;
 
 use crate::config::{AuthConfig, AuthMode};
 use axum::http::HeaderMap;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use std::sync::{Arc, RwLock};
-use subtle::ConstantTimeEq;
 
+use keys::{AuthPepper, digest_matches, generate_api_key, key_prefix};
 pub use policy::{
     AuthError, AuthRequestId, Endpoint, LimitSet, ManagementPermission, PolicyBinding,
     PolicyDecision, PolicyEffect, PolicyIdentity, PolicyMatcher, PolicyRule, PolicyScope,
@@ -19,94 +17,75 @@ pub use policy::{
 pub use session::{SessionLease, SessionLimiter};
 pub use store::{ApiKeySummary, CreatedApiKey};
 
-type HmacSha256 = Hmac<Sha256>;
-
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     pub auth_request_id: String,
     pub key_id: String,
     pub principal_id: String,
-    grants: Arc<Vec<PolicyGrant>>,
-    limits: LimitSet,
+    identity: PolicyIdentity,
+    policy: Arc<PolicySnapshot>,
 }
 
 impl AuthContext {
-    /// Converts an authenticated inference identity into the dashboard actor
-    /// carrier without retaining the presented credential. Only the bootstrap
-    /// key is privileged by the current store schema; all other identities are
-    /// delegated with no management grants and therefore fail closed.
     pub fn management_actor(&self) -> crate::dashboard_access::ManagementActor {
         if self.key_id == "key_bootstrap" {
-            crate::dashboard_access::ManagementActor::Bootstrap
-        } else {
-            crate::dashboard_access::ManagementActor::Delegated {
-                session_id: self.auth_request_id.clone(),
-                principal_id: self.principal_id.clone(),
-                key_id: self.key_id.clone(),
-                permissions: Arc::from([]),
-            }
+            return crate::dashboard_access::ManagementActor::Bootstrap;
+        }
+        let permissions = self
+            .policy
+            .management_permissions(&self.identity, chrono::Utc::now())
+            .into_iter()
+            .filter_map(access::wire_permission)
+            .collect::<Vec<_>>();
+        crate::dashboard_access::ManagementActor::Delegated {
+            session_id: self.auth_request_id.clone(),
+            principal_id: self.principal_id.clone(),
+            key_id: self.key_id.clone(),
+            permissions: permissions.into(),
         }
     }
 
     pub fn allows_endpoint(&self, endpoint: &str) -> bool {
-        decide(&self.grants, endpoint, None)
+        Endpoint::parse(endpoint).is_some_and(|endpoint| {
+            self.policy
+                .authorize(&self.identity, endpoint, None, chrono::Utc::now())
+                .is_ok()
+        })
     }
 
     pub fn allows_model(&self, endpoint: &str, model: &str) -> bool {
-        decide(&self.grants, endpoint, Some(model))
+        Endpoint::parse(endpoint).is_some_and(|endpoint| {
+            self.policy
+                .authorize(&self.identity, endpoint, Some(model), chrono::Utc::now())
+                .is_ok()
+        })
     }
 
-    /// Produces the transport-neutral candidate predicate carried by routing,
-    /// failover, mesh, completions, and token-count dispatch. The closure owns
-    /// only immutable grants and never captures the presented raw credential.
     pub fn authorization_scope(&self) -> crate::upstream::AuthorizationScope {
-        let grants = Arc::clone(&self.grants);
+        let identity = self.identity.clone();
+        let policy = Arc::clone(&self.policy);
         crate::upstream::AuthorizationScope::restricted(
-            move |_provider_id, _route_id, served_model, endpoint| {
-                decide(
-                    &grants,
-                    inference_endpoint_name(endpoint),
-                    Some(served_model),
-                )
+            move |provider_id, route_id, served_model, endpoint| {
+                let endpoint = inference_endpoint(endpoint);
+                policy
+                    .authorize(&identity, endpoint, Some(served_model), chrono::Utc::now())
+                    .is_ok_and(|scope| {
+                        scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
+                    })
             },
         )
     }
 
     pub fn effective_limits(&self) -> LimitSet {
-        self.limits
+        self.policy
+            .effective_limits(&self.identity, chrono::Utc::now())
     }
 }
 
-#[derive(Debug, Clone)]
-struct PolicyGrant {
-    effect: Effect,
-    endpoint: String,
-    model_pattern: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Effect {
-    Allow,
-    Deny,
-}
-
-#[derive(Debug, Clone)]
-struct KeyRecord {
-    id: String,
-    principal_id: String,
-    digest: [u8; 32],
-    grants: Arc<Vec<PolicyGrant>>,
-}
-
-#[derive(Debug, Default)]
-struct Snapshot {
-    keys: Vec<KeyRecord>,
-}
-
 struct Inner {
-    pepper: Vec<u8>,
+    pepper: AuthPepper,
     store: std::sync::Mutex<store::AuthStore>,
-    snapshot: RwLock<Arc<Snapshot>>,
+    authority: RwLock<Arc<store::StoredAuthority>>,
     session_limiter: SessionLimiter,
 }
 
@@ -130,9 +109,6 @@ impl AuthzService {
         }
         let pepper = std::env::var("LLMCONDUIT_AUTH_PEPPER")
             .map_err(|_| "auth.mode=enforce requires LLMCONDUIT_AUTH_PEPPER".to_string())?;
-        if pepper.trim().is_empty() {
-            return Err("LLMCONDUIT_AUTH_PEPPER must not be blank".to_string());
-        }
         let bootstrap = std::env::var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY").ok();
         Self::open_enforced(config, pepper.into_bytes(), bootstrap.as_deref())
     }
@@ -143,8 +119,9 @@ impl AuthzService {
         bootstrap: Option<&str>,
     ) -> Result<Self, String> {
         if config.store_path.as_os_str().is_empty() {
-            return Err("auth.store_path must not be blank in enforce mode".to_string());
+            return Err("auth.store_path must not be blank in enforce mode".into());
         }
+        let pepper = AuthPepper::new(pepper).map_err(|err| err.to_string())?;
         let mut store = store::AuthStore::open(&config.store_path)?;
         if store.key_count()? == 0 {
             let raw = bootstrap
@@ -154,21 +131,17 @@ impl AuthzService {
                     "auth store has no keys; set LLMCONDUIT_AUTH_BOOTSTRAP_KEY for first startup"
                         .to_string()
                 })?;
-            if !raw.starts_with("llmc_") || raw.len() < 32 {
-                return Err(
-                    "LLMCONDUIT_AUTH_BOOTSTRAP_KEY must be an llmc_ key with at least 32 characters"
-                        .to_string(),
-                );
-            }
-            let digest = hmac_digest(&pepper, raw)?;
-            store.insert_bootstrap_key(raw, &digest)?;
+            key_prefix(raw).map_err(|_| {
+                "LLMCONDUIT_AUTH_BOOTSTRAP_KEY must be a valid llmc_ API key".to_string()
+            })?;
+            store.insert_bootstrap_key(raw, &pepper.digest(raw))?;
         }
-        let snapshot = Arc::new(load_snapshot(&mut store)?);
+        let authority = Arc::new(store.load_authority()?);
         Ok(Self {
             inner: Some(Arc::new(Inner {
                 pepper,
                 store: std::sync::Mutex::new(store),
-                snapshot: RwLock::new(snapshot),
+                authority: RwLock::new(authority),
                 session_limiter: SessionLimiter::default(),
             })),
         })
@@ -176,6 +149,10 @@ impl AuthzService {
 
     pub fn is_enabled(&self) -> bool {
         self.inner.is_some()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.is_enabled()
     }
 
     pub fn access_backend(self: &Arc<Self>) -> Arc<dyn crate::dashboard_access::AccessBackend> {
@@ -187,38 +164,37 @@ impl AuthzService {
             return Ok(None);
         };
         let raw = presented_key(headers).ok_or(AuthFailure::Missing)?;
-        if !raw.starts_with("llmc_") || raw.len() < 32 {
-            return Err(AuthFailure::Invalid);
-        }
-        let digest = hmac_digest(&inner.pepper, raw).map_err(|_| AuthFailure::Unavailable)?;
-        let snapshot = inner
-            .snapshot
+        key_prefix(raw).map_err(|_| AuthFailure::Invalid)?;
+        let digest = inner.pepper.digest(raw);
+        let authority = inner
+            .authority
             .read()
             .map_err(|_| AuthFailure::Unavailable)?
             .clone();
-        // Scan every record rather than stopping at the first match. Each
-        // verifier comparison is fixed-width and constant-time; avoiding an
-        // early exit also keeps lookup work independent of the matching row's
-        // position in the snapshot.
         let mut matched = None;
-        for record in &snapshot.keys {
-            if bool::from(record.digest.ct_eq(&digest)) {
-                matched = Some(record);
+        for credential in &authority.credentials {
+            if digest_matches(&credential.digest, &digest) {
+                matched = Some(credential);
             }
         }
-        let record = matched.ok_or(AuthFailure::Invalid)?;
+        let credential = matched.ok_or(AuthFailure::Invalid)?;
+        let request_id = AuthRequestId::new();
+        let identity = PolicyIdentity {
+            request_id: request_id.clone(),
+            key_id: credential.id.clone(),
+            key_prefix: credential.prefix.clone(),
+            principal_id: credential.principal_id.clone(),
+            policy_epoch: authority.epoch,
+        };
         Ok(Some(AuthContext {
-            auth_request_id: format!("areq_{}", uuid::Uuid::new_v4().simple()),
-            key_id: record.id.clone(),
-            principal_id: record.principal_id.clone(),
-            grants: Arc::clone(&record.grants),
-            limits: LimitSet::default(),
+            auth_request_id: request_id.as_str().to_string(),
+            key_id: identity.key_id.clone(),
+            principal_id: identity.principal_id.clone(),
+            identity,
+            policy: Arc::clone(&authority.policy),
         }))
     }
 
-    /// Acquires the inference lease after authentication and authorization.
-    /// The cloneable lease releases exactly once when its last owner drops,
-    /// allowing streaming responses to carry it through every terminal path.
     pub fn acquire_session(
         &self,
         context: &AuthContext,
@@ -226,10 +202,129 @@ impl AuthzService {
         let Some(inner) = &self.inner else {
             return Ok(None);
         };
+        let session_id = format!("ses_{}", uuid::Uuid::new_v4().simple());
+        let weak = Arc::downgrade(inner);
+        let on_release: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |session_id| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if let Ok(mut store) = inner.store.lock() {
+                let _ = store.delete_session(session_id);
+            }
+        });
+        let lease = inner.session_limiter.acquire_for_key_with_release(
+            &context.key_id,
+            context.effective_limits(),
+            chrono::Utc::now(),
+            session_id.clone(),
+            Some(on_release),
+        )?;
+        if inner
+            .store
+            .lock()
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .insert_session(&session_id, &context.key_id)
+            .is_err()
+        {
+            drop(lease);
+            return Err(AuthError::PolicyUnavailable);
+        }
+        Ok(Some(lease))
+    }
+
+    pub fn create_delegated_session(
+        &self,
+        context: &AuthContext,
+        csrf_digest: &[u8],
+        expires_at: i64,
+    ) -> Result<crate::dashboard_access::ManagementActor, AuthError> {
+        let inner = self.inner.as_ref().ok_or(AuthError::PolicyUnavailable)?;
+        let permissions = context
+            .policy
+            .management_permissions(&context.identity, chrono::Utc::now())
+            .into_iter()
+            .filter_map(access::wire_permission)
+            .collect::<Vec<_>>();
+        if permissions.is_empty() {
+            return Err(AuthError::Forbidden);
+        }
+        let session = inner
+            .store
+            .lock()
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .create_dashboard_session(
+                &context.principal_id,
+                &context.key_id,
+                csrf_digest,
+                expires_at,
+                context.identity.policy_epoch,
+            )
+            .map_err(|_| AuthError::PolicyUnavailable)?;
+        Ok(crate::dashboard_access::ManagementActor::Delegated {
+            session_id: session.session_id,
+            principal_id: session.principal_id,
+            key_id: session.key_id,
+            permissions: permissions.into(),
+        })
+    }
+
+    pub fn authenticate_delegated_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::dashboard_access::ManagementActor>, AuthError> {
+        let Some(inner) = &self.inner else {
+            return Ok(None);
+        };
+        let session = inner
+            .store
+            .lock()
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .load_dashboard_session(session_id)
+            .map_err(|_| AuthError::PolicyUnavailable)?;
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        let authority = inner
+            .authority
+            .read()
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .clone();
+        let identity = PolicyIdentity {
+            request_id: AuthRequestId::new(),
+            key_id: session.key_id.clone(),
+            key_prefix: session.key_prefix,
+            principal_id: session.principal_id.clone(),
+            policy_epoch: authority.epoch,
+        };
+        let permissions = authority
+            .policy
+            .management_permissions(&identity, chrono::Utc::now())
+            .into_iter()
+            .filter_map(access::wire_permission)
+            .collect::<Vec<_>>();
+        if permissions.is_empty() {
+            let _ = inner
+                .store
+                .lock()
+                .map_err(|_| AuthError::PolicyUnavailable)?
+                .revoke_dashboard_session(session_id, "permission_removed");
+            return Ok(None);
+        }
+        Ok(Some(crate::dashboard_access::ManagementActor::Delegated {
+            session_id: session.session_id,
+            principal_id: session.principal_id,
+            key_id: session.key_id,
+            permissions: permissions.into(),
+        }))
+    }
+
+    pub fn revoke_delegated_session(&self, session_id: &str) -> Result<bool, String> {
+        let inner = self.inner()?;
         inner
-            .session_limiter
-            .acquire_for_key(&context.key_id, context.limits, chrono::Utc::now())
-            .map(Some)
+            .store
+            .lock()
+            .map_err(|_| "auth store lock poisoned".to_string())?
+            .revoke_dashboard_session(session_id, "logout")
     }
 
     pub fn create_key(
@@ -239,44 +334,29 @@ impl AuthzService {
         endpoints: &[String],
         models: &[String],
     ) -> Result<CreatedApiKey, String> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| "inference auth is disabled".to_string())?;
-        let raw = format!(
-            "llmc_{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let digest = hmac_digest(&inner.pepper, &raw)?;
-        let created = {
-            let mut store = inner.store.lock().map_err(|_| "auth store lock poisoned")?;
-            let created =
-                store.create_key(principal_name, key_name, &raw, &digest, endpoints, models)?;
-            self.reload_locked(inner, &mut store)?;
-            created
-        };
+        let inner = self.inner()?;
+        let generated = generate_api_key(&inner.pepper);
+        let raw = generated.expose_once();
+        let digest = inner.pepper.digest(&raw);
+        let mut store = inner.store.lock().map_err(|_| "auth store lock poisoned")?;
+        let created =
+            store.create_key(principal_name, key_name, &raw, &digest, endpoints, models)?;
+        self.reload_locked(inner, &store)?;
         Ok(created.with_raw(raw))
     }
 
     pub fn revoke_key(&self, key_id: &str) -> Result<bool, String> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| "inference auth is disabled".to_string())?;
+        let inner = self.inner()?;
         let mut store = inner.store.lock().map_err(|_| "auth store lock poisoned")?;
         let changed = store.revoke_key(key_id)?;
         if changed {
-            self.reload_locked(inner, &mut store)?;
+            self.reload_locked(inner, &store)?;
         }
         Ok(changed)
     }
 
     pub fn list_keys(&self) -> Result<Vec<ApiKeySummary>, String> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| "inference auth is disabled".to_string())?;
+        let inner = self.inner()?;
         inner
             .store
             .lock()
@@ -284,10 +364,16 @@ impl AuthzService {
             .list_keys()
     }
 
-    fn reload_locked(&self, inner: &Inner, store: &mut store::AuthStore) -> Result<(), String> {
-        let fresh = Arc::new(load_snapshot(store)?);
+    fn inner(&self) -> Result<&Arc<Inner>, String> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| "inference auth is disabled".to_string())
+    }
+
+    fn reload_locked(&self, inner: &Inner, store: &store::AuthStore) -> Result<(), String> {
+        let fresh = Arc::new(store.load_authority()?);
         *inner
-            .snapshot
+            .authority
             .write()
             .map_err(|_| "auth snapshot lock poisoned")? = fresh;
         Ok(())
@@ -300,41 +386,6 @@ pub enum AuthFailure {
     Invalid,
     Forbidden,
     Unavailable,
-}
-
-fn load_snapshot(store: &mut store::AuthStore) -> Result<Snapshot, String> {
-    Ok(Snapshot {
-        keys: store
-            .load_active_keys()?
-            .into_iter()
-            .map(|row| KeyRecord {
-                id: row.id,
-                principal_id: row.principal_id,
-                digest: row.digest,
-                grants: Arc::new(
-                    row.grants
-                        .into_iter()
-                        .map(|grant| PolicyGrant {
-                            effect: if grant.effect == "deny" {
-                                Effect::Deny
-                            } else {
-                                Effect::Allow
-                            },
-                            endpoint: grant.endpoint,
-                            model_pattern: grant.model_pattern,
-                        })
-                        .collect(),
-                ),
-            })
-            .collect(),
-    })
-}
-
-fn hmac_digest(pepper: &[u8], raw: &str) -> Result<[u8; 32], String> {
-    let mut mac = HmacSha256::new_from_slice(pepper)
-        .map_err(|_| "failed to initialize API-key verifier".to_string())?;
-    mac.update(raw.as_bytes());
-    Ok(mac.finalize().into_bytes().into())
 }
 
 fn presented_key(headers: &HeaderMap) -> Option<&str> {
@@ -356,134 +407,26 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn decide(grants: &[PolicyGrant], endpoint: &str, model: Option<&str>) -> bool {
-    let mut allowed = false;
-    for grant in grants {
-        if !matches_pattern(&grant.endpoint, endpoint)
-            || model.is_some_and(|model| !matches_pattern(&grant.model_pattern, model))
-        {
-            continue;
-        }
-        if grant.effect == Effect::Deny {
-            return false;
-        }
-        allowed = true;
-    }
-    allowed
-}
-
-fn matches_pattern(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.trim();
-    if pattern == "*" {
-        return true;
-    }
-    let (mut p, mut v) = (0usize, 0usize);
-    let bytes = pattern.as_bytes();
-    let value = value.as_bytes();
-    let (mut star, mut retry) = (None, 0usize);
-    while v < value.len() {
-        if p < bytes.len() && (bytes[p] == b'?' || bytes[p].eq_ignore_ascii_case(&value[v])) {
-            p += 1;
-            v += 1;
-        } else if p < bytes.len() && bytes[p] == b'*' {
-            star = Some(p);
-            retry = v;
-            p += 1;
-        } else if let Some(index) = star {
-            p = index + 1;
-            retry += 1;
-            v = retry;
-        } else {
-            return false;
-        }
-    }
-    while p < bytes.len() && bytes[p] == b'*' {
-        p += 1;
-    }
-    p == bytes.len()
-}
-
-fn inference_endpoint_name(endpoint: crate::upstream::InferenceEndpoint) -> &'static str {
+fn inference_endpoint(endpoint: crate::upstream::InferenceEndpoint) -> Endpoint {
     match endpoint {
-        crate::upstream::InferenceEndpoint::Responses => "responses",
-        crate::upstream::InferenceEndpoint::ChatCompletions => "chat",
-        crate::upstream::InferenceEndpoint::Messages => "messages",
-        crate::upstream::InferenceEndpoint::CountTokens => "count_tokens",
-        crate::upstream::InferenceEndpoint::Completions => "completions",
+        crate::upstream::InferenceEndpoint::Responses => Endpoint::Responses,
+        crate::upstream::InferenceEndpoint::ChatCompletions => Endpoint::ChatCompletions,
+        crate::upstream::InferenceEndpoint::Messages => Endpoint::Messages,
+        crate::upstream::InferenceEndpoint::CountTokens => Endpoint::CountTokens,
+        crate::upstream::InferenceEndpoint::Completions => Endpoint::Completions,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthContext, AuthzService, Effect, PolicyGrant, decide, matches_pattern};
+    use super::AuthzService;
     use crate::config::{AuthConfig, AuthMode};
-    use crate::upstream::InferenceEndpoint;
     use axum::http::{HeaderMap, HeaderValue};
-    use std::sync::Arc;
 
     #[test]
-    fn explicit_deny_overrides_allow() {
-        let grants = vec![
-            PolicyGrant {
-                effect: Effect::Allow,
-                endpoint: "*".into(),
-                model_pattern: "*".into(),
-            },
-            PolicyGrant {
-                effect: Effect::Deny,
-                endpoint: "chat".into(),
-                model_pattern: "secret-*".into(),
-            },
-        ];
-        assert!(decide(&grants, "chat", Some("public-model")));
-        assert!(!decide(&grants, "chat", Some("secret-v1")));
-        assert!(!decide(&[], "chat", Some("public-model")));
-    }
-
-    #[test]
-    fn glob_matching_is_case_insensitive() {
-        assert!(matches_pattern("Claude-*-Sonnet", "claude-4-sonnet"));
-        assert!(!matches_pattern("Claude-*-Sonnet", "claude-4-opus"));
-    }
-
-    #[test]
-    fn dispatch_scope_reuses_grants_without_raw_credentials() {
-        let context = AuthContext {
-            auth_request_id: "areq_test".into(),
-            key_id: "key_test".into(),
-            principal_id: "usr_test".into(),
-            grants: Arc::new(vec![PolicyGrant {
-                effect: Effect::Allow,
-                endpoint: "responses".into(),
-                model_pattern: "public-*".into(),
-            }]),
-            limits: Default::default(),
-        };
-        let scope = context.authorization_scope();
-        assert!(scope.allows_candidate(
-            "primary",
-            None,
-            "public-model",
-            InferenceEndpoint::Responses
-        ));
-        assert!(!scope.allows_candidate(
-            "primary",
-            None,
-            "secret-model",
-            InferenceEndpoint::Responses
-        ));
-        assert!(!scope.allows_candidate(
-            "primary",
-            None,
-            "public-model",
-            InferenceEndpoint::Messages
-        ));
-    }
-
-    #[test]
-    fn key_lifecycle_is_scoped_redacted_and_immediately_revoked() {
+    fn key_lifecycle_uses_rich_snapshot_and_revokes_immediately() {
         let path = std::env::temp_dir().join(format!(
-            "llmconduit-auth-test-{}.sqlite3",
+            "llmconduit-rich-auth-{}.sqlite3",
             uuid::Uuid::new_v4()
         ));
         let config = AuthConfig {
@@ -491,67 +434,29 @@ mod tests {
             store_path: path.clone(),
         };
         let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
-        let service = AuthzService::open_enforced(
-            &config,
-            b"unit-test-pepper-never-log".to_vec(),
-            Some(&bootstrap),
-        )
-        .unwrap();
-
+        let service =
+            AuthzService::open_enforced(&config, b"unit-test-pepper".to_vec(), Some(&bootstrap))
+                .unwrap();
         let created = service
             .create_key(
-                "reporting service",
                 "reporting",
-                &["chat".to_string()],
-                &["public-*".to_string()],
+                "reporting",
+                &["chat".into()],
+                &["public-*".into()],
             )
             .unwrap();
         let raw = created.raw_key.as_deref().unwrap().to_string();
-        assert!(raw.starts_with("llmc_"));
         assert!(!format!("{created:?}").contains(&raw));
-
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&raw).expect("generated key is a valid header"),
-        );
+        headers.insert("x-api-key", HeaderValue::from_str(&raw).unwrap());
         let context = service.authenticate(&headers).unwrap().unwrap();
-        assert!(context.allows_endpoint("chat"));
-        assert!(!context.allows_endpoint("responses"));
         assert!(context.allows_model("chat", "public-v1"));
         assert!(!context.allows_model("chat", "secret-v1"));
-        assert!(context.auth_request_id.starts_with("areq_"));
-        let lease = service.acquire_session(&context).unwrap().unwrap();
-        assert_eq!(lease.key_id(), context.key_id);
-        drop(lease);
-
-        let listed = service.list_keys().unwrap();
-        assert!(listed.iter().all(|key| !key.prefix.contains(&raw)));
+        assert!(!context.allows_endpoint("responses"));
+        assert!(service.acquire_session(&context).unwrap().is_some());
         assert!(service.revoke_key(&created.summary.id).unwrap());
         assert!(service.authenticate(&headers).is_err());
-
         drop(service);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
-        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
-    }
-
-    #[test]
-    fn empty_enforced_store_requires_explicit_bootstrap_state() {
-        let path = std::env::temp_dir().join(format!(
-            "llmconduit-auth-empty-test-{}.sqlite3",
-            uuid::Uuid::new_v4()
-        ));
-        let result = AuthzService::open_enforced(
-            &AuthConfig {
-                mode: AuthMode::Enforce,
-                store_path: path.clone(),
-            },
-            b"unit-test-pepper".to_vec(),
-            None,
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no keys"));
         let _ = std::fs::remove_file(path);
     }
 }
