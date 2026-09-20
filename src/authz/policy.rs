@@ -140,6 +140,17 @@ impl PolicyMatcher {
             && matches_names(&self.requested_models, requested_model)
     }
 
+    fn matches_endpoint(&self, endpoint: Endpoint) -> bool {
+        matches_set(&self.endpoints, &endpoint)
+    }
+
+    fn is_endpoint_wide(&self) -> bool {
+        self.requested_models.is_empty()
+            && self.served_models.is_empty()
+            && self.providers.is_empty()
+            && self.routes.is_empty()
+    }
+
     fn matches_candidate(
         &self,
         endpoint: Endpoint,
@@ -356,6 +367,28 @@ impl PolicySnapshot {
             endpoint,
             requested_model: requested_model.map(str::to_owned),
             evaluated_at: now,
+        })
+    }
+
+    /// Coarse middleware gate used before a request body/model is available.
+    /// Model/provider/route-specific denies are deferred to the richer checks;
+    /// only an endpoint-wide deny can reject at this stage.
+    pub fn permits_endpoint(
+        &self,
+        context: &PolicyIdentity,
+        endpoint: Endpoint,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if context.policy_epoch != self.epoch {
+            return false;
+        }
+        let rules = self.applicable_rules(context, now);
+        !rules.iter().any(|rule| {
+            rule.effect == PolicyEffect::Deny
+                && rule.matcher.is_endpoint_wide()
+                && rule.matcher.matches_endpoint(endpoint)
+        }) && rules.iter().any(|rule| {
+            rule.effect == PolicyEffect::Allow && rule.matcher.matches_endpoint(endpoint)
         })
     }
 

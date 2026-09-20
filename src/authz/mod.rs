@@ -48,8 +48,7 @@ impl AuthContext {
     pub fn allows_endpoint(&self, endpoint: &str) -> bool {
         Endpoint::parse(endpoint).is_some_and(|endpoint| {
             self.policy
-                .authorize(&self.identity, endpoint, None, chrono::Utc::now())
-                .is_ok()
+                .permits_endpoint(&self.identity, endpoint, chrono::Utc::now())
         })
     }
 
@@ -364,9 +363,6 @@ impl AuthzService {
             .list_keys()
     }
 
-    /// Persist one terminal inference event. Disabled auth is a no-op; enabled
-    /// auth uses the same store mutex as key mutations so SQLite is never used
-    /// concurrently from multiple runtime workers.
     pub fn record_usage_once(
         &self,
         event: &crate::usage_accounting::UsageEvent,
@@ -381,8 +377,14 @@ impl AuthzService {
             .record_usage_once(event)
     }
 
-    fn reload_locked(&self, inner: &Inner, store: &mut store::AuthStore) -> Result<(), String> {
-        let fresh = Arc::new(load_snapshot(store)?);
+    fn inner(&self) -> Result<&Arc<Inner>, String> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| "inference auth is disabled".to_string())
+    }
+
+    fn reload_locked(&self, inner: &Inner, store: &store::AuthStore) -> Result<(), String> {
+        let fresh = Arc::new(store.load_authority()?);
         *inner
             .authority
             .write()
