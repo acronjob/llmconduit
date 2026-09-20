@@ -659,25 +659,74 @@ async fn write_pricing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
-    struct KeysBackend;
+    #[derive(Default)]
+    struct RouteBackend {
+        dispatches: AtomicUsize,
+    }
 
-    impl AccessBackend for KeysBackend {
+    impl AccessBackend for RouteBackend {
         fn dispatch<'a>(
             &'a self,
-            _actor: &'a ManagementActor,
+            actor: &'a ManagementActor,
             operation: AccessOperation,
         ) -> AccessFuture<'a> {
+            self.dispatches.fetch_add(1, Ordering::Relaxed);
             Box::pin(async move {
                 match operation {
                     AccessOperation::ListApiKeys => Ok(AccessResult::ApiKeys(Vec::new())),
+                    AccessOperation::Summary => Ok(AccessResult::Summary(AccessSummary {
+                        policy_epoch: 7,
+                        actor: ActorSummary {
+                            kind: "delegated".into(),
+                            principal_id: match actor {
+                                ManagementActor::Delegated { principal_id, .. } => {
+                                    Some(principal_id.clone())
+                                }
+                                ManagementActor::Bootstrap => None,
+                            },
+                            display_name: "route test".into(),
+                            permissions: Vec::new(),
+                        },
+                        counts: AccessCounts::default(),
+                    })),
+                    AccessOperation::CreateApiKey(body) => {
+                        Ok(AccessResult::CreatedApiKey(CreatedAccessApiKey {
+                            api_key: AccessApiKey {
+                                id: "key_created".into(),
+                                principal_id: body.principal_id,
+                                name: body.name,
+                                prefix: "llmc_test".into(),
+                                enabled: true,
+                                created_at: "now".into(),
+                                expires_at: body.expires_at,
+                                last_used_at: None,
+                            },
+                            raw_key: "llmc_secret_once".into(),
+                        }))
+                    }
                     _ => Err(AccessError::contract()),
                 }
             })
         }
+    }
+
+    fn delegated(permissions: impl IntoIterator<Item = ManagementPermission>) -> ManagementActor {
+        ManagementActor::Delegated {
+            session_id: "sess_1".into(),
+            principal_id: "usr_1".into(),
+            key_id: "key_1".into(),
+            permissions: permissions.into_iter().collect::<Vec<_>>().into(),
+        }
+    }
+
+    async fn json_body(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[test]
@@ -719,14 +768,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_checks_named_permission_before_dispatch() {
-        let actor = ManagementActor::Delegated {
-            session_id: "sess_1".into(),
-            principal_id: "usr_1".into(),
-            key_id: "key_1".into(),
-            permissions: Arc::from([ManagementPermission::UsageRead]),
-        };
-        let app = routes::<()>(Arc::new(KeysBackend)).layer(Extension(actor));
+    async fn route_denies_wrong_named_permission_without_dispatch() {
+        let backend = Arc::new(RouteBackend::default());
+        let app = routes::<()>(backend.clone())
+            .layer(Extension(delegated([ManagementPermission::UsageRead])));
         let response = app
             .oneshot(
                 Request::builder()
@@ -737,11 +782,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(backend.dispatches.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
-    async fn bootstrap_actor_bypasses_named_permission_gate() {
-        let app = routes::<()>(Arc::new(KeysBackend)).layer(Extension(ManagementActor::Bootstrap));
+    async fn route_allows_matching_named_permission() {
+        let backend = Arc::new(RouteBackend::default());
+        let app = routes::<()>(backend.clone())
+            .layer(Extension(delegated([ManagementPermission::KeysRead])));
         let response = app
             .oneshot(
                 Request::builder()
@@ -752,5 +800,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(backend.dispatches.load(Ordering::Relaxed), 1);
+        assert_eq!(json_body(response).await, json!({ "api_keys": [] }));
+    }
+
+    #[tokio::test]
+    async fn summary_requires_principals_read_permission() {
+        for permissions in [Vec::new(), vec![ManagementPermission::AuditRead]] {
+            let backend = Arc::new(RouteBackend::default());
+            let response = routes::<()>(backend.clone())
+                .layer(Extension(delegated(permissions)))
+                .oneshot(
+                    Request::builder()
+                        .uri("/dashboard/api/auth/summary")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(backend.dispatches.load(Ordering::Relaxed), 0);
+        }
+
+        let backend = Arc::new(RouteBackend::default());
+        let response = routes::<()>(backend.clone())
+            .layer(Extension(delegated([ManagementPermission::PrincipalsRead])))
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/api/auth/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(backend.dispatches.load(Ordering::Relaxed), 1);
+        assert_eq!(json_body(response).await["policy_epoch"], 7);
+    }
+
+    #[tokio::test]
+    async fn create_key_route_returns_flattened_copy_once_secret() {
+        let app = routes::<()>(Arc::new(RouteBackend::default()))
+            .layer(Extension(delegated([ManagementPermission::KeysCreate])));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/dashboard/api/auth/api-keys")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"principal_id":"usr_target","name":"automation","expires_at":null}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await,
+            json!({
+                "id": "key_created",
+                "principal_id": "usr_target",
+                "name": "automation",
+                "prefix": "llmc_test",
+                "enabled": true,
+                "created_at": "now",
+                "expires_at": null,
+                "last_used_at": null,
+                "raw_key": "llmc_secret_once"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn route_without_management_actor_is_rejected_before_dispatch() {
+        let backend = Arc::new(RouteBackend::default());
+        let response = routes::<()>(backend.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/api/auth/api-keys")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(backend.dispatches.load(Ordering::Relaxed), 0);
     }
 }

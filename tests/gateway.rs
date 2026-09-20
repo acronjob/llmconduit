@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::Request;
 use futures::StreamExt;
 use futures::stream;
 use llmconduit::config::Config;
