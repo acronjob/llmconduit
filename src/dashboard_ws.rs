@@ -971,22 +971,7 @@ pub async fn dashboard_ws(
             );
         }
     };
-    let exp = if let Some(exp) = auth.authenticate_ws(&headers) {
-        Some(exp)
-    } else if auth.origin_allowed(&headers) {
-        auth.delegated_session(&headers)
-            .and_then(|(session_id, exp)| {
-                gateway
-                    .authz()
-                    .authenticate_delegated_session(&session_id)
-                    .ok()
-                    .flatten()
-                    .map(|_| exp)
-            })
-    } else {
-        None
-    };
-    let Some(exp) = exp else {
+    let Some(exp) = auth.authenticate_ws(&headers) else {
         return crate::dashboard_auth::no_store(
             (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         );

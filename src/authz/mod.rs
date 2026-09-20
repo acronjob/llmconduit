@@ -80,30 +80,6 @@ impl AuthContext {
         ))
     }
 
-    /// Bind candidate authorization to the client-requested model before any
-    /// provider remap. This preserves the requested/served model distinction.
-    pub fn authorization_scope_for(
-        &self,
-        endpoint: &str,
-        requested_model: Option<&str>,
-    ) -> Option<crate::upstream::AuthorizationScope> {
-        let endpoint = Endpoint::parse(endpoint)?;
-        let scope = self
-            .policy
-            .authorize(
-                &self.identity,
-                endpoint,
-                requested_model,
-                chrono::Utc::now(),
-            )
-            .ok()?;
-        Some(crate::upstream::AuthorizationScope::restricted(
-            move |provider_id, route_id, served_model, _endpoint| {
-                scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
-            },
-        ))
-    }
-
     pub fn effective_limits(&self) -> LimitSet {
         self.policy
             .effective_limits(&self.identity, chrono::Utc::now())
@@ -432,9 +408,6 @@ impl AuthzService {
             .revoke_dashboard_session(session_id, "logout")
     }
 
-<<<<<<< HEAD
-    pub fn verify_delegated_csrf(&self, session_id: &str, digest: &[u8]) -> Result<bool, String> {
-=======
     /// Verify the caller-provided digest of the delegated session's CSRF
     /// secret. The raw CSRF token never enters the authorization store.
     pub fn verify_delegated_csrf_digest(
@@ -442,17 +415,12 @@ impl AuthzService {
         session_id: &str,
         presented_digest: &[u8],
     ) -> Result<bool, String> {
->>>>>>> master
         let inner = self.inner()?;
         inner
             .store
             .lock()
             .map_err(|_| "auth store lock poisoned".to_string())?
-<<<<<<< HEAD
-            .dashboard_session_csrf_matches(session_id, digest)
-=======
             .verify_dashboard_csrf_digest(session_id, presented_digest)
->>>>>>> master
     }
 
     pub fn create_key(
