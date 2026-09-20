@@ -1406,6 +1406,14 @@ impl Gateway {
             if let Some(guard) = &capture_guard {
                 guard.finalize("failed", Some(&err.to_string()));
             }
+            self.record_authenticated_usage(
+                auth_context.clone(),
+                api_call_id.clone(),
+                endpoint,
+                model_requested.clone(),
+                "failed",
+                &serving_token,
+            );
             err
         };
 
