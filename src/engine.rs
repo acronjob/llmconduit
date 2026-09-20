@@ -170,6 +170,10 @@ pub struct Gateway {
     /// (NOT the middleware); the 5 s snapshot task reads it under the fixed
     /// FlowStore→Metrics lock order.
     metrics: crate::metrics::MetricsLayer,
+    /// Optional provider-level cache observability. This registry contains only
+    /// aggregate operator-configured scrape results and is never used for
+    /// per-request/key accounting.
+    provider_metrics: crate::provider_metrics::ProviderMetricsRegistry,
     /// F1 (Topic F) durable per-turn capture handle (see `turn_capture.rs`).
     /// `TurnCapture::disabled()` when `turn_capture_dir` is unset -- every op
     /// a no-op (no thread, no alloc, no fs). Unlike the FlowStore/metrics/
@@ -732,6 +736,7 @@ impl Gateway {
             // D5: disabled by default (zero overhead); the DI root attaches an
             // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
             metrics: crate::metrics::MetricsLayer::disabled(),
+            provider_metrics: crate::provider_metrics::ProviderMetricsRegistry::default(),
             // F1: disabled by default (zero overhead); the DI root attaches an
             // enabled sink via `with_turn_capture` when `turn_capture_dir` is
             // configured -- independent of `--with-debug-ui`.
@@ -792,6 +797,18 @@ impl Gateway {
     /// off, in which case every metrics op is a no-op (zero lock, zero work).
     pub fn metrics(&self) -> &crate::metrics::MetricsLayer {
         &self.metrics
+    }
+
+    pub fn with_provider_metrics(
+        mut self,
+        provider_metrics: crate::provider_metrics::ProviderMetricsRegistry,
+    ) -> Self {
+        self.provider_metrics = provider_metrics;
+        self
+    }
+
+    pub fn provider_metrics(&self) -> crate::provider_metrics::ProviderMetricsRegistry {
+        self.provider_metrics.clone()
     }
 
     /// Attach the F1 [`TurnCapture`](crate::turn_capture::TurnCapture) sink (built in
