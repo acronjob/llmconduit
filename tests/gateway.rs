@@ -7466,10 +7466,16 @@ async fn enforced_auth_filters_model_catalog_for_the_authenticated_key() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .unwrap();
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "unexpected models response: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let ids = body["data"]
         .as_array()
