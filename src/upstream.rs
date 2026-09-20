@@ -5422,8 +5422,10 @@ mod tests {
 
     use super::BackendChatRequest;
     use super::BackendFinalizationPolicies;
+    use super::AuthorizationScope;
     use super::FailoverUpstreamClient;
     use super::FailoverUpstreamProvider;
+    use super::InferenceEndpoint;
     use super::ModelFamily;
     use super::ProviderStatus;
     use super::UpstreamClient as _;
@@ -5434,6 +5436,7 @@ mod tests {
     use serde_json::Map as JsonMap;
     use serde_json::json;
     use std::sync::Arc;
+    use std::time::Duration;
 
     /// Minimal request for family-injection tests. `model` is the FINAL provider
     /// model the leaf sees (after any routing/failover/alias rewrite).
