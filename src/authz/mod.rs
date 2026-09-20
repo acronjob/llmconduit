@@ -75,6 +75,30 @@ impl AuthContext {
         )
     }
 
+    /// Bind candidate authorization to the client-requested model before any
+    /// provider remap. This preserves the requested/served model distinction.
+    pub fn authorization_scope_for(
+        &self,
+        endpoint: &str,
+        requested_model: Option<&str>,
+    ) -> Option<crate::upstream::AuthorizationScope> {
+        let endpoint = Endpoint::parse(endpoint)?;
+        let scope = self
+            .policy
+            .authorize(
+                &self.identity,
+                endpoint,
+                requested_model,
+                chrono::Utc::now(),
+            )
+            .ok()?;
+        Some(crate::upstream::AuthorizationScope::restricted(
+            move |provider_id, route_id, served_model, _endpoint| {
+                scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
+            },
+        ))
+    }
+
     pub fn effective_limits(&self) -> LimitSet {
         self.policy
             .effective_limits(&self.identity, chrono::Utc::now())

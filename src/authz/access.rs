@@ -286,7 +286,9 @@ mod tests {
         headers.insert("x-api-key", HeaderValue::from_str(&raw).unwrap());
         let context = service.authenticate(&headers).unwrap().unwrap();
         assert!(context.allows_model("chat", "public-v1"));
-        let scope = context.authorization_scope();
+        let scope = context
+            .authorization_scope_for("chat", Some("public-v1"))
+            .unwrap();
         assert!(scope.allows_candidate(
             "provider-a",
             Some("primary"),
