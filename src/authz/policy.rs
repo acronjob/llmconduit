@@ -729,4 +729,109 @@ mod tests {
             AuthError::PolicyUnavailable
         );
     }
+
+    #[test]
+    fn management_permission_registry_is_complete_and_unique() {
+        let unique = ALL_MANAGEMENT_PERMISSIONS
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(ALL_MANAGEMENT_PERMISSIONS.len(), 19);
+        assert_eq!(unique.len(), ALL_MANAGEMENT_PERMISSIONS.len());
+        assert!(ALL_MANAGEMENT_PERMISSIONS.into_iter().all(
+            |permission| ManagementPermission::parse(permission.as_str()) == Some(permission)
+        ));
+    }
+
+    #[test]
+    fn requested_and_served_model_dimensions_are_independent() {
+        let matcher = PolicyMatcher::new(
+            [Endpoint::ChatCompletions],
+            ["public-alias".into()],
+            ["backend/model-v2".into()],
+            ["provider-a".into()],
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        let snapshot = Arc::new(PolicySnapshot::new(
+            1,
+            vec![rule(
+                "allow-remap",
+                PolicyEffect::Allow,
+                PolicySubject::Principal("usr_a".into()),
+                matcher,
+            )],
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        let scope = snapshot
+            .authorize(
+                &context(1),
+                Endpoint::ChatCompletions,
+                Some("public-alias"),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(scope.allows_candidate(Some("provider-a"), None, Some("backend/model-v2")));
+        assert!(!scope.allows_candidate(Some("provider-a"), None, Some("public-alias")));
+    }
+
+    #[test]
+    fn utc_windows_gate_rules_and_effective_limits_choose_the_strictest() {
+        let now = Utc::now();
+        let mut expired = rule(
+            "expired",
+            PolicyEffect::Allow,
+            PolicySubject::Principal("usr_a".into()),
+            PolicyMatcher::all(),
+        );
+        expired.windows.push(UtcWindow {
+            weekday_mask: 0,
+            start_minute: 0,
+            end_minute: 0,
+            absolute_start_ms: None,
+            absolute_end_ms: Some(now.timestamp_millis() - 1),
+        });
+        let expired_snapshot = Arc::new(PolicySnapshot::new(
+            1,
+            vec![expired],
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        assert_eq!(
+            expired_snapshot
+                .authorize(&context(1), Endpoint::Responses, Some("model"), now)
+                .unwrap_err(),
+            AuthError::Forbidden
+        );
+
+        let mut first = rule(
+            "first",
+            PolicyEffect::Allow,
+            PolicySubject::Principal("usr_a".into()),
+            PolicyMatcher::all(),
+        );
+        first.limits = LimitSet {
+            max_concurrent_sessions: Some(5),
+            max_daily_session_starts: Some(20),
+        };
+        let mut second = first.clone();
+        second.id = "second".into();
+        second.limits = LimitSet {
+            max_concurrent_sessions: Some(2),
+            max_daily_session_starts: Some(10),
+        };
+        let snapshot = Arc::new(PolicySnapshot::new(
+            1,
+            vec![first, second],
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        assert_eq!(
+            snapshot.effective_limits(&context(1), now),
+            LimitSet {
+                max_concurrent_sessions: Some(2),
+                max_daily_session_starts: Some(10),
+            }
+        );
+    }
 }

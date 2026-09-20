@@ -1,0 +1,55 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { AccessView } from './AccessView';
+import { renderWithQuery, resetWorld } from '../../components/testHarness';
+
+beforeEach(() => resetWorld({ mock: true }));
+afterEach(cleanup);
+
+describe('AccessView management lifecycle', () => {
+  it('rotates a key with copy-once disclosure and then forgets the raw secret', async () => {
+    renderWithQuery(<AccessView />);
+    await screen.findByTestId('access-view');
+
+    const rotate = screen.getAllByRole('button', { name: 'Rotate' })[0];
+    expect(rotate).toBeDefined();
+    fireEvent.click(rotate!);
+    const dialog = await screen.findByRole('dialog', { name: /copy api key/i });
+    const raw = within(dialog).getByTestId('raw-api-key').textContent;
+    expect(raw).toMatch(/^llmc_/);
+    fireEvent.click(within(dialog).getByRole('button', { name: /i stored it/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /copy api key/i })).not.toBeInTheDocument());
+    expect(screen.queryByText(raw!)).not.toBeInTheDocument();
+  });
+
+  it('revokes a key and disables further rotate/revoke actions', async () => {
+    renderWithQuery(<AccessView />);
+    await screen.findByTestId('access-view');
+
+    const revoke = screen.getAllByRole('button', { name: 'Revoke' })[0];
+    expect(revoke).toBeDefined();
+    const row = revoke!.closest('tr');
+    expect(row).not.toBeNull();
+    fireEvent.click(revoke!);
+
+    await waitFor(() => expect(row).toHaveTextContent(/disabled/i));
+    expect(within(row!).getByRole('button', { name: 'Rotate' })).toBeDisabled();
+    expect(within(row!).getByRole('button', { name: 'Revoke' })).toBeDisabled();
+    expect(within(row!).queryByText(/^llmc_.*copy_once$/)).not.toBeInTheDocument();
+  });
+
+  it('makes an explicit deny visible in the effective policy preview before save', async () => {
+    renderWithQuery(<AccessView />);
+    await screen.findByTestId('access-view');
+
+    fireEvent.change(screen.getByLabelText('Policy effect'), { target: { value: 'deny' } });
+    fireEvent.change(screen.getByLabelText('Policy models'), { target: { value: 'secret-*, internal-*' } });
+    fireEvent.change(screen.getByLabelText('Policy providers'), { target: { value: 'private-a' } });
+
+    const preview = screen.getByText('Effective preview').parentElement?.parentElement;
+    expect(preview).toHaveTextContent(/deny/i);
+    expect(preview).toHaveTextContent('secret-*, internal-*');
+    expect(preview).toHaveTextContent('private-a');
+  });
+});

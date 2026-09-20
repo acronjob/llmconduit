@@ -60,19 +60,24 @@ impl AuthContext {
         })
     }
 
-    pub fn authorization_scope(&self) -> crate::upstream::AuthorizationScope {
-        let identity = self.identity.clone();
-        let policy = Arc::clone(&self.policy);
-        crate::upstream::AuthorizationScope::restricted(
-            move |provider_id, route_id, served_model, endpoint| {
-                let endpoint = inference_endpoint(endpoint);
-                policy
-                    .authorize(&identity, endpoint, Some(served_model), chrono::Utc::now())
-                    .is_ok_and(|scope| {
-                        scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
-                    })
+    pub fn authorization_scope(
+        &self,
+        endpoint: crate::upstream::InferenceEndpoint,
+        requested_model: &str,
+    ) -> Result<crate::upstream::AuthorizationScope, AuthError> {
+        let policy_endpoint = inference_endpoint(endpoint);
+        let scope = self.policy.authorize(
+            &self.identity,
+            policy_endpoint,
+            Some(requested_model),
+            chrono::Utc::now(),
+        )?;
+        Ok(crate::upstream::AuthorizationScope::restricted(
+            move |provider_id, route_id, served_model, candidate_endpoint| {
+                inference_endpoint(candidate_endpoint) == policy_endpoint
+                    && scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
             },
-        )
+        ))
     }
 
     /// Bind candidate authorization to the client-requested model before any
@@ -107,9 +112,89 @@ impl AuthContext {
 
 struct Inner {
     pepper: AuthPepper,
-    store: std::sync::Mutex<store::AuthStore>,
+    store: Arc<std::sync::Mutex<store::AuthStore>>,
     authority: RwLock<Arc<store::StoredAuthority>>,
     session_limiter: SessionLimiter,
+    session_persistence: SessionPersistence,
+}
+
+const SESSION_PERSISTENCE_QUEUE_CAPACITY: usize = 1024;
+
+enum SessionPersistenceCommand {
+    Insert {
+        session_id: String,
+        key_id: String,
+        result: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Delete(String),
+}
+
+#[derive(Clone)]
+struct SessionPersistence {
+    sender: std::sync::mpsc::SyncSender<SessionPersistenceCommand>,
+}
+
+impl SessionPersistence {
+    fn start(store: Arc<std::sync::Mutex<store::AuthStore>>) -> Result<Self, String> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(SESSION_PERSISTENCE_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("llmconduit-auth-sessions".into())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        SessionPersistenceCommand::Insert {
+                            session_id,
+                            key_id,
+                            result,
+                        } => {
+                            let inserted = store
+                                .lock()
+                                .map_err(|_| "auth store lock poisoned".to_string())
+                                .and_then(|mut store| {
+                                    store.insert_session(&session_id, &key_id)
+                                });
+                            let _ = result.send(inserted);
+                        }
+                        SessionPersistenceCommand::Delete(session_id) => {
+                            let deleted = store
+                                .lock()
+                                .map_err(|_| "auth store lock poisoned".to_string())
+                                .and_then(|mut store| store.delete_session(&session_id));
+                            if let Err(error) = deleted {
+                                tracing::warn!(%session_id, %error, "failed to persist session release");
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to start auth session persistence worker: {error}"))?;
+        Ok(Self { sender })
+    }
+
+    async fn insert(&self, session_id: String, key_id: String) -> Result<(), AuthError> {
+        let (result, result_rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .try_send(SessionPersistenceCommand::Insert {
+                session_id,
+                key_id,
+                result,
+            })
+            .map_err(|_| AuthError::PolicyUnavailable)?;
+        result_rx
+            .await
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .map_err(|_| AuthError::PolicyUnavailable)
+    }
+
+    fn delete(&self, session_id: &str) {
+        if self
+            .sender
+            .try_send(SessionPersistenceCommand::Delete(session_id.to_owned()))
+            .is_err()
+        {
+            tracing::warn!(%session_id, "auth session release queue is unavailable or full");
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -160,12 +245,15 @@ impl AuthzService {
             store.insert_bootstrap_key(raw, &pepper.digest(raw))?;
         }
         let authority = Arc::new(store.load_authority()?);
+        let store = Arc::new(std::sync::Mutex::new(store));
+        let session_persistence = SessionPersistence::start(Arc::clone(&store))?;
         Ok(Self {
             inner: Some(Arc::new(Inner {
                 pepper,
-                store: std::sync::Mutex::new(store),
+                store,
                 authority: RwLock::new(authority),
                 session_limiter: SessionLimiter::default(),
+                session_persistence,
             })),
         })
     }
@@ -218,7 +306,7 @@ impl AuthzService {
         }))
     }
 
-    pub fn acquire_session(
+    pub async fn acquire_session(
         &self,
         context: &AuthContext,
     ) -> Result<Option<SessionLease>, AuthError> {
@@ -226,14 +314,9 @@ impl AuthzService {
             return Ok(None);
         };
         let session_id = format!("ses_{}", uuid::Uuid::new_v4().simple());
-        let weak = Arc::downgrade(inner);
+        let session_persistence = inner.session_persistence.clone();
         let on_release: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |session_id| {
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            if let Ok(mut store) = inner.store.lock() {
-                let _ = store.delete_session(session_id);
-            }
+            session_persistence.delete(session_id);
         });
         let lease = inner.session_limiter.acquire_for_key_with_release(
             &context.key_id,
@@ -243,10 +326,9 @@ impl AuthzService {
             Some(on_release),
         )?;
         if inner
-            .store
-            .lock()
-            .map_err(|_| AuthError::PolicyUnavailable)?
-            .insert_session(&session_id, &context.key_id)
+            .session_persistence
+            .insert(session_id, context.key_id.clone())
+            .await
             .is_err()
         {
             drop(lease);
@@ -350,13 +432,27 @@ impl AuthzService {
             .revoke_dashboard_session(session_id, "logout")
     }
 
+<<<<<<< HEAD
     pub fn verify_delegated_csrf(&self, session_id: &str, digest: &[u8]) -> Result<bool, String> {
+=======
+    /// Verify the caller-provided digest of the delegated session's CSRF
+    /// secret. The raw CSRF token never enters the authorization store.
+    pub fn verify_delegated_csrf_digest(
+        &self,
+        session_id: &str,
+        presented_digest: &[u8],
+    ) -> Result<bool, String> {
+>>>>>>> master
         let inner = self.inner()?;
         inner
             .store
             .lock()
             .map_err(|_| "auth store lock poisoned".to_string())?
+<<<<<<< HEAD
             .dashboard_session_csrf_matches(session_id, digest)
+=======
+            .verify_dashboard_csrf_digest(session_id, presented_digest)
+>>>>>>> master
     }
 
     pub fn create_key(
@@ -465,12 +561,18 @@ fn inference_endpoint(endpoint: crate::upstream::InferenceEndpoint) -> Endpoint 
 
 #[cfg(test)]
 mod tests {
-    use super::AuthzService;
+    use super::{
+        AuthContext, AuthRequestId, AuthzService, Endpoint, LimitSet, PolicyBinding, PolicyEffect,
+        PolicyIdentity, PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject,
+    };
     use crate::config::{AuthConfig, AuthMode};
+    use crate::dashboard_access::{AccessBackend, AccessOperation, AccessResult, ManagementActor};
     use axum::http::{HeaderMap, HeaderValue};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
-    #[test]
-    fn key_lifecycle_uses_rich_snapshot_and_revokes_immediately() {
+    #[tokio::test]
+    async fn key_lifecycle_uses_rich_snapshot_and_revokes_immediately() {
         let path = std::env::temp_dir().join(format!(
             "llmconduit-rich-auth-{}.sqlite3",
             uuid::Uuid::new_v4()
@@ -499,10 +601,201 @@ mod tests {
         assert!(context.allows_model("chat", "public-v1"));
         assert!(!context.allows_model("chat", "secret-v1"));
         assert!(!context.allows_endpoint("responses"));
-        assert!(service.acquire_session(&context).unwrap().is_some());
+        assert!(service.acquire_session(&context).await.unwrap().is_some());
         assert!(service.revoke_key(&created.summary.id).unwrap());
         assert!(service.authenticate(&headers).is_err());
         drop(service);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delegated_dashboard_sessions_verify_csrf_and_revoke_immediately() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-dashboard-session-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+        let service = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"dashboard-session-pepper".to_vec(),
+            Some(&bootstrap),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(&bootstrap).unwrap());
+        let context = service.authenticate(&headers).unwrap().unwrap();
+        let csrf_digest = [7u8; 32];
+        let actor = service
+            .create_delegated_session(&context, &csrf_digest, chrono::Utc::now().timestamp() + 300)
+            .unwrap();
+        let session_id = match actor {
+            ManagementActor::Delegated { session_id, .. } => session_id,
+            ManagementActor::Bootstrap => panic!("delegated session returned bootstrap actor"),
+        };
+        assert!(
+            service
+                .verify_delegated_csrf_digest(&session_id, &csrf_digest)
+                .unwrap()
+        );
+        assert!(
+            !service
+                .verify_delegated_csrf_digest(&session_id, &[8u8; 32])
+                .unwrap()
+        );
+        assert!(
+            service
+                .authenticate_delegated_session(&session_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(service.revoke_delegated_session(&session_id).unwrap());
+        assert!(
+            service
+                .authenticate_delegated_session(&session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !service
+                .verify_delegated_csrf_digest(&session_id, &csrf_digest)
+                .unwrap()
+        );
+        drop(service);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn requested_alias_and_served_backend_are_authorized_in_separate_dimensions() {
+        let identity = PolicyIdentity {
+            request_id: AuthRequestId::new(),
+            key_id: "key_alias".into(),
+            key_prefix: "llmc_alias".into(),
+            principal_id: "usr_alias".into(),
+            policy_epoch: 1,
+        };
+        let rule = PolicyRule {
+            id: "allow-alias-remap".into(),
+            effect: PolicyEffect::Allow,
+            binding: PolicyBinding {
+                subject: PolicySubject::Principal(identity.principal_id.clone()),
+            },
+            matcher: PolicyMatcher::new(
+                [Endpoint::ChatCompletions],
+                ["public-alias".into()],
+                ["provider/backend-model".into()],
+                ["provider-a".into()],
+                Vec::<String>::new(),
+            )
+            .unwrap(),
+            windows: Vec::new(),
+            limits: LimitSet::default(),
+            management_permissions: HashSet::new(),
+        };
+        let policy = Arc::new(PolicySnapshot::new(
+            1,
+            vec![rule],
+            HashMap::new(),
+            HashMap::new(),
+        ));
+        let context = AuthContext {
+            auth_request_id: identity.request_id.as_str().to_string(),
+            key_id: identity.key_id.clone(),
+            principal_id: identity.principal_id.clone(),
+            identity,
+            policy,
+        };
+
+        let scope = context
+            .authorization_scope(
+                crate::upstream::InferenceEndpoint::ChatCompletions,
+                "public-alias",
+            )
+            .expect("the original requested alias is authorized");
+
+        assert!(scope.allows_candidate(
+            "provider-a",
+            None,
+            "provider/backend-model",
+            crate::upstream::InferenceEndpoint::ChatCompletions,
+        ));
+        assert!(!scope.allows_candidate(
+            "provider-a",
+            None,
+            "public-alias",
+            crate::upstream::InferenceEndpoint::ChatCompletions,
+        ));
+        assert!(!scope.allows_candidate(
+            "provider-b",
+            None,
+            "provider/backend-model",
+            crate::upstream::InferenceEndpoint::ChatCompletions,
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_session_load_releases_persistence_without_blocking_runtime() {
+        const SESSION_COUNT: usize = 128;
+
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-session-load-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+        let service = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"session-load-pepper".to_vec(),
+            Some(&bootstrap),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(&bootstrap).unwrap());
+        let context = service.authenticate(&headers).unwrap().unwrap();
+        let ready = Arc::new(tokio::sync::Barrier::new(SESSION_COUNT + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..SESSION_COUNT {
+            let service = service.clone();
+            let context = context.clone();
+            let ready = Arc::clone(&ready);
+            tasks.spawn(async move {
+                let _lease = service.acquire_session(&context).await.unwrap().unwrap();
+                ready.wait().await;
+                std::future::pending::<()>().await;
+            });
+        }
+        ready.wait().await;
+
+        assert_eq!(session_count(&service).await, SESSION_COUNT);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+
+        for _ in 0..100 {
+            if session_count(&service).await == 0 {
+                drop(service);
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("cancelled leases were not drained by bounded persistence worker");
+    }
+
+    async fn session_count(service: &AuthzService) -> usize {
+        match AccessBackend::dispatch(
+            service,
+            &ManagementActor::Bootstrap,
+            AccessOperation::ListSessions,
+        )
+        .await
+        .unwrap()
+        {
+            AccessResult::Sessions(sessions) => sessions.len(),
+            _ => panic!("unexpected session-list result"),
+        }
     }
 }

@@ -417,3 +417,60 @@ impl ResourceState {
         self.gate.set_limit(value.effective_capacity);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AvailabilitySchedule;
+    use crate::mesh::protocol::PROTOCOL_VERSION;
+    use iroh::SecretKey;
+
+    #[test]
+    fn authorization_predicate_runs_before_mesh_capacity_reservation() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            WorkerAdvertisement {
+                protocol_version: PROTOCOL_VERSION,
+                node_name: None,
+                agent_version: "test".into(),
+                resources: vec![ResourceAdvertisement {
+                    resource_id: "primary".into(),
+                    models: vec![ModelAdvertisement {
+                        id: "mesh-model".into(),
+                        context_limit: None,
+                    }],
+                    availability: AvailabilitySchedule::default(),
+                    effective_capacity: 1,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                }],
+            },
+        );
+
+        let denied = registry.reserve_excluding_where(
+            "mesh-model",
+            &HashSet::new(),
+            |candidate_endpoint, resource_id| {
+                let candidate = registry
+                    .candidates("mesh-model")
+                    .into_iter()
+                    .find(|candidate| {
+                        candidate.endpoint_id == candidate_endpoint
+                            && candidate.resource_id == resource_id
+                    })
+                    .expect("authorization sees a registered candidate");
+                assert_eq!(candidate.active, 0, "capacity was reserved before authz");
+                false
+            },
+        );
+        assert!(denied.is_none());
+
+        let reservation = registry
+            .reserve("mesh-model")
+            .expect("denial did not consume the only capacity permit");
+        assert_eq!(reservation.resource.endpoint_id, endpoint);
+    }
+}
