@@ -153,7 +153,7 @@ pub struct Gateway {
     /// Inference API-key authorization. Disabled by default for tests and
     /// legacy configurations; the DI root attaches the validated enforce-mode
     /// service before the router is built.
-    authz: crate::authz::AuthzService,
+    authz: Arc<crate::authz::AuthzService>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
     /// D4 published topology health: the latest versioned
     /// `Arc<ProviderHealthSnapshot>`, swapped by the publication task (1 s tick +
@@ -716,7 +716,7 @@ impl Gateway {
             flow_store,
             abort_hub,
             dashboard_auth: None,
-            authz: crate::authz::AuthzService::default(),
+            authz: Arc::new(crate::authz::AuthzService::default()),
             upstream_model_catalog: Arc::new(Mutex::new(None)),
             provider_health: ProviderHealthPublisher::default(),
             // D5: disabled by default (zero overhead); the DI root attaches an
@@ -873,12 +873,16 @@ impl Gateway {
     }
 
     pub fn with_authz(mut self, authz: crate::authz::AuthzService) -> Self {
-        self.authz = authz;
+        self.authz = Arc::new(authz);
         self
     }
 
     pub fn authz(&self) -> &crate::authz::AuthzService {
         &self.authz
+    }
+
+    pub fn authz_arc(&self) -> Arc<crate::authz::AuthzService> {
+        Arc::clone(&self.authz)
     }
 
     /// Access the dashboard FlowStore (D1). `is_enabled()` is `false` when the
