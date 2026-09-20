@@ -67,6 +67,7 @@ use axum::routing::get;
 use axum::routing::on;
 use axum::routing::post;
 use futures::SinkExt;
+use futures::Stream;
 use futures::StreamExt;
 use http_body::Frame;
 use http_body::SizeHint;
@@ -2224,20 +2225,30 @@ async fn post_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
-    let authorization = if let Some(context) = auth.as_ref() {
-        let model = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| AppError::bad_request("request body must include a model"))?;
+    let request_metadata = auth
+        .as_ref()
+        .map(|_| {
+            let value = serde_json::from_slice::<Value>(&body)
+                .map_err(|_| AppError::bad_request("request body must be valid JSON"))?;
+            let model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| AppError::bad_request("request body must include a model"))?;
+            let streaming = value
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Ok::<_, AppError>((model, streaming))
+        })
+        .transpose()?;
+    let authorization = if let (Some(context), Some((model, _))) =
+        (auth.as_ref(), request_metadata.as_ref())
+    {
         authorize_inference(
             Some(&context.0),
             crate::upstream::InferenceEndpoint::Completions,
-            &model,
+            model,
         )?
     } else {
         crate::upstream::AuthorizationScope::unrestricted()
@@ -2251,7 +2262,16 @@ async fn post_completions(
                 .with_authorization(authorization),
         )
         .await?;
-    Ok(proxy_upstream_response(response, lease))
+    let accounting = request_metadata.map(|(model, streaming)| {
+        RawCompletionAccounting::new(
+            Arc::clone(&gateway),
+            auth,
+            model,
+            streaming,
+            response.status().is_success(),
+        )
+    });
+    Ok(proxy_upstream_response(response, lease, accounting))
 }
 
 async fn handle_post_messages(
@@ -2573,6 +2593,7 @@ fn stream_anthropic_response(
 fn proxy_upstream_response(
     response: reqwest::Response,
     lease: Option<crate::authz::SessionLease>,
+    accounting: Option<RawCompletionAccounting>,
 ) -> Response {
     let status = response.status();
     let upstream_headers = response.headers().clone();
@@ -2580,13 +2601,251 @@ fn proxy_upstream_response(
     if let Some(headers) = builder.headers_mut() {
         copy_proxy_response_headers(&upstream_headers, headers);
     }
-    let stream = response.bytes_stream().map(move |item| {
+    let mut upstream = Box::pin(response.bytes_stream());
+    let mut accounting = accounting;
+    let stream = futures::stream::poll_fn(move |cx| {
         let _keep_lease_alive = &lease;
-        item
+        match upstream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                if let Some(accounting) = accounting.as_mut() {
+                    accounting.push(&bytes);
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(accounting) = accounting.as_mut() {
+                    accounting.finish("failed");
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                if let Some(accounting) = accounting.as_mut() {
+                    accounting.finish(if accounting.upstream_success {
+                        "completed"
+                    } else {
+                        "failed"
+                    });
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     });
     builder
         .body(Body::from_stream(stream))
         .expect("valid upstream proxy response")
+}
+
+const COMPLETIONS_USAGE_PARSE_LIMIT_BYTES: usize = 256 * 1024;
+
+struct RawCompletionAccounting {
+    gateway: Arc<Gateway>,
+    context: Option<crate::authz::AuthContext>,
+    requested_model: String,
+    parser: RawCompletionUsageParser,
+    upstream_success: bool,
+}
+
+impl RawCompletionAccounting {
+    fn new(
+        gateway: Arc<Gateway>,
+        context: Option<crate::authz::AuthContext>,
+        requested_model: String,
+        streaming: bool,
+        upstream_success: bool,
+    ) -> Self {
+        Self {
+            gateway,
+            context,
+            requested_model,
+            parser: RawCompletionUsageParser::new(streaming),
+            upstream_success,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.parser.push(bytes);
+    }
+
+    fn finish(&mut self, status: &'static str) {
+        let Some(context) = self.context.take() else {
+            return;
+        };
+        let (served_model, usage) = self.parser.finish();
+        self.gateway.record_authenticated_usage_values(
+            Some(context),
+            None,
+            crate::upstream::InferenceEndpoint::Completions,
+            self.requested_model.clone(),
+            status,
+            served_model,
+            None,
+            None,
+            usage,
+        );
+    }
+}
+
+impl Drop for RawCompletionAccounting {
+    fn drop(&mut self) {
+        self.finish("cancelled");
+    }
+}
+
+enum RawCompletionUsageParser {
+    Json {
+        body: Vec<u8>,
+        overflowed: bool,
+    },
+    Sse {
+        pending: Vec<u8>,
+        overflowed_line: bool,
+        served_model: Option<String>,
+        usage: Option<crate::dashboard_flow::FlowUsage>,
+    },
+}
+
+impl RawCompletionUsageParser {
+    fn new(streaming: bool) -> Self {
+        if streaming {
+            Self::Sse {
+                pending: Vec::new(),
+                overflowed_line: false,
+                served_model: None,
+                usage: None,
+            }
+        } else {
+            Self::Json {
+                body: Vec::new(),
+                overflowed: false,
+            }
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Json { body, overflowed } => {
+                if *overflowed {
+                    return;
+                }
+                let remaining = COMPLETIONS_USAGE_PARSE_LIMIT_BYTES.saturating_sub(body.len());
+                if bytes.len() > remaining {
+                    body.clear();
+                    *overflowed = true;
+                } else {
+                    body.extend_from_slice(bytes);
+                }
+            }
+            Self::Sse {
+                pending,
+                overflowed_line,
+                served_model,
+                usage,
+            } => {
+                for &byte in bytes {
+                    if byte == b'\n' {
+                        if !*overflowed_line {
+                            parse_completion_sse_line(pending, served_model, usage);
+                        }
+                        pending.clear();
+                        *overflowed_line = false;
+                    } else if !*overflowed_line {
+                        if pending.len() == COMPLETIONS_USAGE_PARSE_LIMIT_BYTES {
+                            pending.clear();
+                            *overflowed_line = true;
+                        } else {
+                            pending.push(byte);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) -> (Option<String>, Option<crate::dashboard_flow::FlowUsage>) {
+        match self {
+            Self::Json { body, overflowed } => {
+                if *overflowed {
+                    return (None, None);
+                }
+                serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .map(|value| completion_usage_from_value(&value))
+                    .unwrap_or_default()
+            }
+            Self::Sse {
+                pending,
+                overflowed_line,
+                served_model,
+                usage,
+            } => {
+                if !*overflowed_line && !pending.is_empty() {
+                    parse_completion_sse_line(pending, served_model, usage);
+                }
+                (served_model.take(), usage.take())
+            }
+        }
+    }
+}
+
+fn parse_completion_sse_line(
+    line: &[u8],
+    served_model: &mut Option<String>,
+    usage: &mut Option<crate::dashboard_flow::FlowUsage>,
+) {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let Some(data) = line.strip_prefix(b"data:") else {
+        return;
+    };
+    let data = data.strip_prefix(b" ").unwrap_or(data);
+    if data == b"[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(data) else {
+        return;
+    };
+    let (model, parsed_usage) = completion_usage_from_value(&value);
+    if model.is_some() {
+        *served_model = model;
+    }
+    if parsed_usage.is_some() {
+        *usage = parsed_usage;
+    }
+}
+
+fn completion_usage_from_value(
+    value: &Value,
+) -> (Option<String>, Option<crate::dashboard_flow::FlowUsage>) {
+    let served_model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let usage = value.get("usage").and_then(|usage| {
+        let prompt = usage.get("prompt_tokens")?.as_i64()?;
+        let completion = usage.get("completion_tokens")?.as_i64()?;
+        let total = usage.get("total_tokens")?.as_i64()?;
+        if prompt < 0 || completion < 0 || total < 0 {
+            return None;
+        }
+        let cached = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0);
+        let reasoning = usage
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0);
+        Some(crate::dashboard_flow::FlowUsage {
+            prompt,
+            completion,
+            total,
+            cached,
+            reasoning,
+        })
+    });
+    (served_model, usage)
 }
 
 fn copy_proxy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
@@ -3353,5 +3612,52 @@ mod tests {
         );
         // Unknown encoding ⇒ Err (caller returns 415, not a silent 400 JSON parse).
         assert!(super::decode_content_encoding(&body, "snappy").is_err());
+    }
+
+    #[test]
+    fn raw_completions_nonstream_usage_preserves_optional_breakdowns() {
+        let mut parser = super::RawCompletionUsageParser::new(false);
+        parser.push(
+            br#"{"model":"served-v1","usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#,
+        );
+        let (model, usage) = parser.finish();
+        assert_eq!(model.as_deref(), Some("served-v1"));
+        assert_eq!(
+            usage,
+            Some(crate::dashboard_flow::FlowUsage {
+                prompt: 12,
+                completion: 5,
+                total: 17,
+                cached: Some(3),
+                reasoning: Some(2),
+            })
+        );
+    }
+
+    #[test]
+    fn raw_completions_stream_usage_survives_arbitrary_chunking() {
+        let wire = b"data: {\"model\":\"served-v2\",\"choices\":[{\"text\":\"ok\"}]}\r\n\r\ndata: {\"model\":\"served-v2\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\ndata: [DONE]\n\n";
+        for split in 0..=wire.len() {
+            let mut parser = super::RawCompletionUsageParser::new(true);
+            parser.push(&wire[..split]);
+            parser.push(&wire[split..]);
+            let (model, usage) = parser.finish();
+            assert_eq!(model.as_deref(), Some("served-v2"), "split={split}");
+            assert_eq!(usage.unwrap().total, 10, "split={split}");
+        }
+    }
+
+    #[test]
+    fn raw_completions_bounded_parser_reports_oversize_as_unavailable() {
+        let mut nonstream = super::RawCompletionUsageParser::new(false);
+        nonstream.push(&vec![b'x'; super::COMPLETIONS_USAGE_PARSE_LIMIT_BYTES + 1]);
+        assert_eq!(nonstream.finish(), (None, None));
+
+        let mut streaming = super::RawCompletionUsageParser::new(true);
+        streaming.push(&vec![b'x'; super::COMPLETIONS_USAGE_PARSE_LIMIT_BYTES + 1]);
+        streaming.push(b"\ndata: {\"model\":\"recovered\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n");
+        let (model, usage) = streaming.finish();
+        assert_eq!(model.as_deref(), Some("recovered"));
+        assert_eq!(usage.unwrap().total, 2);
     }
 }

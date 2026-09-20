@@ -892,11 +892,37 @@ impl Gateway {
         status: &'static str,
         serving: &crate::upstream::ServingToken,
     ) {
+        let (route, provider) = serving.snapshot();
+        let (served_model, usage) = serving.metrics_snapshot();
+        self.record_authenticated_usage_values(
+            context,
+            api_call_id,
+            endpoint,
+            requested_model,
+            status,
+            served_model,
+            provider,
+            route,
+            usage,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_authenticated_usage_values(
+        &self,
+        context: Option<crate::authz::AuthContext>,
+        api_call_id: Option<String>,
+        endpoint: crate::upstream::InferenceEndpoint,
+        requested_model: String,
+        status: &'static str,
+        served_model: Option<String>,
+        provider: Option<String>,
+        route: Option<String>,
+        usage: Option<crate::dashboard_flow::FlowUsage>,
+    ) {
         let Some(context) = context else {
             return;
         };
-        let (route, provider) = serving.snapshot();
-        let (served_model, usage) = serving.metrics_snapshot();
         let charge = usage.and_then(|usage| {
             let price = served_model
                 .as_deref()
