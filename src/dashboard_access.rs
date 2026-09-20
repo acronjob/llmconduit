@@ -76,6 +76,11 @@ impl ManagementActor {
         matches!(self, Self::Bootstrap)
             || matches!(self, Self::Delegated { permissions, .. } if permissions.contains(&permission))
     }
+
+    fn has_management_access(&self) -> bool {
+        matches!(self, Self::Bootstrap)
+            || matches!(self, Self::Delegated { permissions, .. } if !permissions.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -486,14 +491,47 @@ async fn summary(
     backend: Extension<Arc<dyn AccessBackend>>,
     actor: Extension<ManagementActor>,
 ) -> Result<Json<AccessSummary>, AccessError> {
+    let Extension(backend) = backend;
+    let Extension(actor) = actor;
+    if !actor.has_management_access() {
+        return Err(AccessError::forbidden());
+    }
+    match backend.dispatch(&actor, AccessOperation::Summary).await? {
+        AccessResult::Summary(value) => Ok(Json(value)),
+        _ => Err(AccessError::contract()),
+    }
+}
+
+async fn create_group(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Json(body): Json<CreateGroupRequest>,
+) -> Result<Json<Value>, AccessError> {
     match execute(
         (backend, actor),
-        ManagementPermission::PrincipalsRead,
-        AccessOperation::Summary,
+        ManagementPermission::GroupsWrite,
+        AccessOperation::CreateGroup(body),
     )
     .await?
     {
-        AccessResult::Summary(value) => Ok(Json(value)),
+        AccessResult::Groups(value) => Ok(Json(json!({ "groups": value }))),
+        _ => Err(AccessError::contract()),
+    }
+}
+
+async fn create_role(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Json(body): Json<CreateRoleRequest>,
+) -> Result<Json<Value>, AccessError> {
+    match execute(
+        (backend, actor),
+        ManagementPermission::RolesWrite,
+        AccessOperation::CreateRole(body),
+    )
+    .await?
+    {
+        AccessResult::Roles(value) => Ok(Json(json!({ "roles": value }))),
         _ => Err(AccessError::contract()),
     }
 }
