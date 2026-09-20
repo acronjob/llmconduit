@@ -9,6 +9,7 @@ use crate::dashboard_api::dashboard_catalog;
 use crate::dashboard_api::dashboard_flow_detail;
 use crate::dashboard_api::dashboard_flows;
 use crate::dashboard_api::dashboard_metrics;
+use crate::dashboard_api::dashboard_providers;
 use crate::dashboard_api::dashboard_snapshot;
 use crate::dashboard_api::dashboard_topology;
 use crate::dashboard_auth::AuthSession;
@@ -202,6 +203,7 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         .route("/dashboard/api/metrics", get(dashboard_metrics))
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
+        .route("/dashboard/api/providers", get(dashboard_providers))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
         .merge(crate::provider_metrics::dashboard_routes::<Arc<Gateway>>(
             gateway.provider_metrics(),

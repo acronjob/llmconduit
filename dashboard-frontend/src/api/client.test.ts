@@ -76,6 +76,18 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     expect(unavailable?.context_limit ?? null).toBeNull();
     expect(unavailable?.context_limit).not.toBe(0);
   });
+
+  it('providers() and providerMetrics() return exact provider inventory and cache samples', async () => {
+    const client = new DashboardClient({ fetchImpl: mockFetch });
+    const providers = await client.providers();
+    expect(providers.providers.find((provider) => provider.provider_id === 'vllm-a')?.models.map((model) => model.id)).toContain('llama-3.1-70b');
+    expect(providers.providers.find((provider) => provider.provider_id === 'vllm-a')?.availability?.timezone).toBe('America/Chicago');
+
+    const metrics = await client.providerMetrics();
+    const vllm = metrics.providers.find((provider) => provider.provider === 'vllm-a');
+    expect(vllm?.source).toBe('vllm');
+    expect(vllm?.cache_hit_rate).toBeGreaterThan(0);
+  });
 });
 
 describe('DashboardClient — access management runtime validation', () => {

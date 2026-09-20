@@ -24,6 +24,8 @@ export const queryKeys = {
   flowDetail: (id: string) => ['flows', id] as const,
   metrics: ['metrics'] as const,
   topology: ['topology'] as const,
+  providers: ['providers'] as const,
+  providerMetrics: ['provider-metrics'] as const,
   catalog: ['catalog'] as const,
 } as const;
 

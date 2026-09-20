@@ -6,6 +6,7 @@ import { TopologyView } from './TopologyView';
 import { SankeyView } from './SankeyView';
 import { TheaterView } from './TheaterView';
 import { OverviewView } from './overview/OverviewView';
+import { ProvidersView } from './providers/ProvidersView';
 import { AccessView } from './access/AccessView';
 
 export const VIEW_BY_ROUTE: Record<RouteName, ComponentType> = {
@@ -14,5 +15,6 @@ export const VIEW_BY_ROUTE: Record<RouteName, ComponentType> = {
   sankey: SankeyView,
   theater: TheaterView,
   overview: OverviewView,
+  providers: ProvidersView,
   access: AccessView,
 };

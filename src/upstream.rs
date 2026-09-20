@@ -1,4 +1,4 @@
-use crate::config::merge_json_maps;
+use crate::config::{AvailabilitySchedule, merge_json_maps};
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::error::FailoverDisposition;
@@ -466,10 +466,28 @@ impl ProxyCompletionsRequest {
 /// `/v1/models` snapshot so they always describe the same provider/state (G3:
 /// a separate context-limit fetch could otherwise pair one provider's ids with
 /// another's limits under failover).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpstreamModelEntry {
     pub id: String,
     pub context_limit: Option<i64>,
+}
+
+/// One concrete provider resource advertised to the gateway. Unlike the union
+/// model catalog, this preserves which provider/resource owns each model and,
+/// for dynamic transports such as the mesh, its schedule and current capacity.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderInventoryEntry {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub resource_id: Option<String>,
+    pub route: Option<String>,
+    pub base_url: String,
+    pub models: Vec<UpstreamModelEntry>,
+    pub availability: Option<AvailabilitySchedule>,
+    pub capacity_limit: Option<u32>,
+    pub active_requests: Option<u32>,
+    pub accepting_requests: bool,
+    pub healthy: bool,
 }
 
 /// Transport-neutral `/v1/models` response. Model catalogs can originate from
@@ -553,6 +571,25 @@ pub trait UpstreamClient: Send + Sync {
     async fn supported_model_catalog(&self) -> AppResult<Vec<UpstreamModelEntry>> {
         let response = self.list_models().await?;
         collect_supported_model_catalog(response).await
+    }
+
+    /// Provider-scoped catalog and capacity data for administrative surfaces.
+    /// A bare upstream has one implicit provider; composites and dynamic
+    /// transports override this to retain their real provider boundaries.
+    async fn provider_inventory(&self) -> AppResult<Vec<ProviderInventoryEntry>> {
+        Ok(vec![ProviderInventoryEntry {
+            provider_id: "upstream".to_string(),
+            provider_name: "Upstream".to_string(),
+            resource_id: None,
+            route: None,
+            base_url: self.provider_base_url(),
+            models: self.supported_model_catalog().await?,
+            availability: None,
+            capacity_limit: None,
+            active_requests: None,
+            accepting_requests: true,
+            healthy: true,
+        }])
     }
 
     /// Every backend model `requested_model` could ACTUALLY be served by
@@ -3209,6 +3246,61 @@ impl UpstreamClient for FailoverUpstreamClient {
         BackendCandidatePlan { candidates }
     }
 
+    async fn provider_inventory(&self) -> AppResult<Vec<ProviderInventoryEntry>> {
+        let health = self.provider_health_with_route(None, CatalogMeta::default());
+        let mut entries = Vec::new();
+        for (index, provider) in self.providers.iter().enumerate() {
+            let mut provider_entries = provider
+                .client
+                .provider_inventory()
+                .await
+                .unwrap_or_else(|_| Vec::new());
+            if provider_entries.is_empty() {
+                provider_entries.push(ProviderInventoryEntry {
+                    provider_id: provider.name.clone(),
+                    provider_name: provider.name.clone(),
+                    resource_id: None,
+                    route: None,
+                    base_url: provider.client.provider_base_url(),
+                    models: Vec::new(),
+                    availability: None,
+                    capacity_limit: None,
+                    active_requests: None,
+                    accepting_requests: true,
+                    healthy: true,
+                });
+            }
+            let state = health.get(index);
+            for entry in &mut provider_entries {
+                // The trait default describes a bare leaf with a placeholder id.
+                // Composite clients (notably mesh) return real nested resources,
+                // which must survive this failover wrapper unchanged.
+                if entry.provider_id == "upstream" && entry.resource_id.is_none() {
+                    entry.provider_id.clone_from(&provider.name);
+                    entry.provider_name.clone_from(&provider.name);
+                }
+                if let Some(model) = provider.upstream_model.as_deref() {
+                    entry
+                        .models
+                        .retain(|candidate| candidate.id.eq_ignore_ascii_case(model));
+                    if entry.models.is_empty() {
+                        entry.models.push(UpstreamModelEntry {
+                            id: model.to_string(),
+                            context_limit: None,
+                        });
+                    }
+                }
+                let outer_accepting =
+                    state.is_none_or(|value| value.status == ProviderStatus::Healthy);
+                let outer_healthy = state.is_none_or(|value| value.status != ProviderStatus::Down);
+                entry.accepting_requests &= outer_accepting;
+                entry.healthy &= outer_healthy;
+            }
+            entries.extend(provider_entries);
+        }
+        Ok(entries)
+    }
+
     /// D4: a bare failover chain (no routing wrapper) reports each provider with
     /// no `route` and no catalog metadata (a failover chain loads no per-chain
     /// `/v1/models` snapshot — only the routing client populates catalog meta).
@@ -3547,6 +3639,25 @@ impl UpstreamClient for RoutingUpstreamClient {
                 UpstreamModelEntry { id, context_limit }
             })
             .collect())
+    }
+
+    async fn provider_inventory(&self) -> AppResult<Vec<ProviderInventoryEntry>> {
+        let mut entries = Vec::new();
+        for provider in &self.providers {
+            let mut provider_entries = provider.client.provider_inventory().await?;
+            for entry in &mut provider_entries {
+                entry.route = Some(provider.name.clone());
+            }
+            entries.extend(provider_entries);
+        }
+        for provider in &self.route_providers {
+            let mut provider_entries = provider.client.provider_inventory().await?;
+            for entry in &mut provider_entries {
+                entry.route = Some(provider.name.clone());
+            }
+            entries.extend(provider_entries);
+        }
+        Ok(entries)
     }
 
     fn model_catalog_cache_ttl(&self) -> Duration {

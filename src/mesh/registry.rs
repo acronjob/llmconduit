@@ -4,6 +4,7 @@ use crate::mesh::capacity::{CapacityGate, CapacityPermit};
 use crate::mesh::protocol::{
     Heartbeat, ModelAdvertisement, ResourceAdvertisement, WorkerAdvertisement,
 };
+use crate::upstream::ProviderInventoryEntry;
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use serde_json::Value;
@@ -50,6 +51,7 @@ pub(crate) struct ResourceSnapshot {
 struct ResourceState {
     resource_id: String,
     models: Vec<ModelAdvertisement>,
+    availability: crate::config::AvailabilitySchedule,
     healthy: bool,
     accepting_requests: bool,
     revision: u64,
@@ -241,6 +243,62 @@ impl MeshRegistry {
         models
     }
 
+    /// Snapshot every connected mesh resource for the administrative provider
+    /// inventory. Stale sessions remain visible as unavailable so operators can
+    /// distinguish a disconnected provider from one that was never configured.
+    pub(crate) fn provider_inventory(&self) -> Vec<ProviderInventoryEntry> {
+        let now = Instant::now();
+        let sessions: Vec<_> = self
+            .inner
+            .lock()
+            .expect("mesh registry lock poisoned")
+            .workers
+            .values()
+            .cloned()
+            .collect();
+        let mut entries = Vec::new();
+        for session in sessions {
+            let stale = session.is_stale(now, self.heartbeat_timeout);
+            let provider_id = format!("mesh:{}", session.endpoint_id);
+            let resources = session
+                .resources
+                .lock()
+                .expect("mesh worker resources lock poisoned");
+            for resource in resources.values() {
+                let capacity = resource.gate.snapshot();
+                entries.push(ProviderInventoryEntry {
+                    provider_id: provider_id.clone(),
+                    provider_name: resource.resource_id.clone(),
+                    resource_id: Some(resource.resource_id.clone()),
+                    route: Some(resource.resource_id.clone()),
+                    base_url: format!("mesh://{}/{}", session.endpoint_id, resource.resource_id),
+                    models: resource
+                        .models
+                        .iter()
+                        .map(|model| crate::upstream::UpstreamModelEntry {
+                            id: model.id.clone(),
+                            context_limit: model.context_limit,
+                        })
+                        .collect(),
+                    availability: Some(resource.availability.clone()),
+                    capacity_limit: Some(capacity.limit),
+                    active_requests: Some(capacity.active),
+                    accepting_requests: !stale
+                        && resource.healthy
+                        && resource.accepting_requests
+                        && capacity.active < capacity.limit,
+                    healthy: !stale && resource.healthy,
+                });
+            }
+        }
+        entries.sort_by(|left, right| {
+            left.provider_id
+                .cmp(&right.provider_id)
+                .then_with(|| left.resource_id.cmp(&right.resource_id))
+        });
+        entries
+    }
+
     pub(crate) fn models_body(&self) -> Value {
         let data: Vec<Value> = self
             .model_catalog()
@@ -400,6 +458,7 @@ impl From<ResourceAdvertisement> for ResourceState {
         Self {
             resource_id: value.resource_id,
             models: value.models,
+            availability: value.availability,
             healthy: value.healthy,
             accepting_requests: value.accepting_requests,
             revision: value.revision,
@@ -411,6 +470,7 @@ impl From<ResourceAdvertisement> for ResourceState {
 impl ResourceState {
     fn apply(&mut self, value: ResourceAdvertisement) {
         self.models = value.models;
+        self.availability = value.availability;
         self.healthy = value.healthy;
         self.accepting_requests = value.accepting_requests;
         self.revision = value.revision;
@@ -472,5 +532,50 @@ mod tests {
             .reserve("mesh-model")
             .expect("denial did not consume the only capacity permit");
         assert_eq!(reservation.resource.endpoint_id, endpoint);
+    }
+
+    #[test]
+    fn provider_inventory_preserves_models_schedule_and_live_capacity() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        let availability = AvailabilitySchedule {
+            timezone: "America/Chicago".into(),
+            default_capacity: 2,
+            weekly: Vec::new(),
+            exceptions: Vec::new(),
+        };
+        registry.register_test(
+            endpoint,
+            WorkerAdvertisement {
+                protocol_version: PROTOCOL_VERSION,
+                node_name: Some("workstation".into()),
+                agent_version: "test".into(),
+                resources: vec![ResourceAdvertisement {
+                    resource_id: "vllm".into(),
+                    models: vec![ModelAdvertisement {
+                        id: "local-model".into(),
+                        context_limit: Some(32_768),
+                    }],
+                    availability: availability.clone(),
+                    effective_capacity: 2,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                }],
+            },
+        );
+
+        let reservation = registry.reserve("local-model").expect("resource available");
+        let inventory = registry.provider_inventory();
+        let provider = inventory.first().expect("provider inventory row");
+        assert_eq!(provider.provider_id, format!("mesh:{endpoint}"));
+        assert_eq!(provider.resource_id.as_deref(), Some("vllm"));
+        assert_eq!(provider.models[0].id, "local-model");
+        assert_eq!(provider.models[0].context_limit, Some(32_768));
+        assert_eq!(provider.availability.as_ref(), Some(&availability));
+        assert_eq!(provider.capacity_limit, Some(2));
+        assert_eq!(provider.active_requests, Some(1));
+        assert!(provider.accepting_requests);
+        drop(reservation);
     }
 }

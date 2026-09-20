@@ -8,6 +8,7 @@ const LABELS: Record<RouteName, string> = {
   sankey: 'Sankey',
   theater: 'Theater',
   overview: 'Overview',
+  providers: 'Providers',
   access: 'Access',
 };
 

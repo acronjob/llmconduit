@@ -27,7 +27,9 @@ import type {
   FlowsResponse,
   MetricsResponse,
   MonitorPayload,
+  ProviderCacheMetrics,
   ProviderHealth,
+  ProviderInventoryEntry,
   ProviderLatency,
   SnapshotFrame,
   SnapshotResponse,
@@ -118,6 +120,64 @@ const CATALOG: CatalogEntry[] = [
   // gap 06: a model whose upstream advertises NO window ⇒ `null` (unavailable),
   // distinct from a real `0`. Renderers show `—`, never `0`.
   { id: 'mystery-model', context_limit: null },
+];
+
+const PROVIDERS: ProviderInventoryEntry[] = [
+  {
+    provider_id: 'vllm-a',
+    provider_name: 'vllm-a',
+    resource_id: 'gpu-a',
+    route: null,
+    base_url: 'http://localhost:8001',
+    models: [
+      { id: 'llama-3.1-70b', context_limit: 131072 },
+      { id: 'qwen2.5-coder-32b', context_limit: 32768 },
+    ],
+    availability: {
+      timezone: 'America/Chicago',
+      default_capacity: 0,
+      weekly: [{ days: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'], start_local: '08:00', end_local: '18:00', capacity: 8 }],
+      exceptions: [],
+    },
+    capacity_limit: 8,
+    active_requests: 2,
+    accepting_requests: true,
+    healthy: true,
+  },
+  {
+    provider_id: 'vllm-b',
+    provider_name: 'vllm-b',
+    resource_id: 'gpu-b',
+    route: null,
+    base_url: 'http://localhost:8002',
+    models: [
+      { id: 'gpt-4o', context_limit: 128000 },
+      { id: 'mystery-model', context_limit: null },
+    ],
+    availability: null,
+    capacity_limit: 4,
+    active_requests: 4,
+    accepting_requests: false,
+    healthy: false,
+  },
+  {
+    provider_id: 'openai',
+    provider_name: 'openai-proxy',
+    resource_id: null,
+    route: 'cloud',
+    base_url: 'https://api.openai.com',
+    models: [{ id: 'gpt-4o', context_limit: 128000 }],
+    availability: null,
+    capacity_limit: null,
+    active_requests: null,
+    accepting_requests: false,
+    healthy: false,
+  },
+];
+
+const PROVIDER_METRICS: ProviderCacheMetrics[] = [
+  { provider: 'vllm-a', source: 'vllm', fetched_at_ms: Date.now() - 4000, cache_hits: 820, cache_queries: 1200, cache_hit_rate: 0.683, kv_cache_usage: 0.42, data_quality: 'derived' },
+  { provider: 'vllm-b', source: 'sglang', fetched_at_ms: Date.now() - 9000, cache_hits: null, cache_queries: null, cache_hit_rate: 0.31, kv_cache_usage: 0.91, data_quality: 'derived' },
 ];
 
 /**
@@ -529,6 +589,8 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   }
   if (path === '/dashboard/api/metrics') return json(buildMetrics());
   if (path === '/dashboard/api/topology') return json(buildTopology());
+  if (path === '/dashboard/api/providers') return json({ providers: PROVIDERS });
+  if (path === '/dashboard/api/provider-metrics') return json({ generated_at_ms: Date.now(), providers: PROVIDER_METRICS });
   if (path === '/dashboard/api/catalog') return json(CATALOG);
   if (path === '/dashboard/api/snapshot') {
     const atMs = Number(qs.get('at') ?? Date.now());

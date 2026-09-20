@@ -836,6 +836,67 @@ export interface CatalogEntry {
   context_limit?: number | null;
 }
 
+export interface ProviderInventoryModel {
+  id: string;
+  context_limit?: number | null;
+}
+
+export interface AvailabilitySchedule {
+  timezone: string;
+  default_capacity: number;
+  weekly: AvailabilityWeeklyWindow[];
+  exceptions: AvailabilityException[];
+}
+
+export interface AvailabilityWeeklyWindow {
+  days: string[];
+  start_local: string;
+  end_local: string;
+  capacity: number;
+}
+
+export interface AvailabilityException {
+  start: string;
+  end: string;
+  capacity: number;
+}
+
+export interface ProviderInventoryEntry {
+  provider_id: string;
+  provider_name: string;
+  resource_id: string | null;
+  route: string | null;
+  base_url: string;
+  models: ProviderInventoryModel[];
+  availability: AvailabilitySchedule | null;
+  capacity_limit: number | null;
+  active_requests: number | null;
+  accepting_requests: boolean;
+  healthy: boolean;
+}
+
+export interface ProvidersResponse {
+  providers: ProviderInventoryEntry[];
+}
+
+export type ProviderMetricsSource = 'vllm' | 'sglang';
+
+export interface ProviderCacheMetrics {
+  provider: string;
+  source: ProviderMetricsSource;
+  fetched_at_ms: number;
+  cache_hits: number | null;
+  cache_queries: number | null;
+  cache_hit_rate: number | null;
+  kv_cache_usage: number | null;
+  data_quality: 'derived';
+}
+
+export interface ProviderMetricsResponse {
+  generated_at_ms: number;
+  providers: ProviderCacheMetrics[];
+}
+
 /** `GET /dashboard/api/snapshot?at=<unix_ms>` */
 export interface SnapshotResponse {
   cursors: SeqCursors;
@@ -1145,6 +1206,40 @@ export function isCreatedAuthApiKey(v: unknown): v is CreatedAuthApiKey {
   const rawKey = (v as unknown as Record<string, unknown>).raw_key;
   return isStr(rawKey) && rawKey.startsWith('llmc_');
 }
+
+function isAvailabilitySchedule(v: unknown): v is AvailabilitySchedule {
+  return isObj(v) && isStr(v.timezone) && isUint(v.default_capacity)
+    && Array.isArray(v.weekly) && v.weekly.every((window) => isObj(window)
+      && isStringArray(window.days) && isStr(window.start_local) && isStr(window.end_local)
+      && isUint(window.capacity))
+    && Array.isArray(v.exceptions) && v.exceptions.every((exception) => isObj(exception)
+      && isStr(exception.start) && isStr(exception.end) && isUint(exception.capacity));
+}
+
+function isProviderInventoryModel(v: unknown): v is ProviderInventoryModel {
+  return isObj(v) && isStr(v.id) && isOptUint(v.context_limit);
+}
+
+function isProviderInventoryEntry(v: unknown): v is ProviderInventoryEntry {
+  return isObj(v) && isStr(v.provider_id) && isStr(v.provider_name)
+    && isNullableStr(v.resource_id) && isNullableStr(v.route) && isStr(v.base_url)
+    && Array.isArray(v.models) && v.models.every(isProviderInventoryModel)
+    && (v.availability === null || isAvailabilitySchedule(v.availability))
+    && isNullableUint(v.capacity_limit) && isNullableUint(v.active_requests)
+    && typeof v.accepting_requests === 'boolean'
+    && typeof v.healthy === 'boolean';
+}
+
+function isProviderCacheMetrics(v: unknown): v is ProviderCacheMetrics {
+  return isObj(v) && isStr(v.provider) && isOneOf(v.source, ['vllm', 'sglang'] as const)
+    && isUint(v.fetched_at_ms) && isOptNum(v.cache_hits) && isOptNum(v.cache_queries)
+    && isOptNum(v.cache_hit_rate) && isOptNum(v.kv_cache_usage)
+    && v.data_quality === 'derived';
+}
+
+export const isProvidersResponse = (v: unknown): v is ProvidersResponse => isArrayEnvelope(v, 'providers', isProviderInventoryEntry);
+export const isProviderMetricsResponse = (v: unknown): v is ProviderMetricsResponse =>
+  isObj(v) && isUint(v.generated_at_ms) && Array.isArray(v.providers) && v.providers.every(isProviderCacheMetrics);
 
 // ---------------------------------------------------------------------------
 // Runtime validation (the WS pipe must NOT trust the wire — findings 4/5/6).

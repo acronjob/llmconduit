@@ -46,7 +46,7 @@ use crate::metrics::MetricsView;
 use crate::metrics::StatusClass;
 use crate::metrics::WindowReport;
 use crate::monitor::DebugWsMessage;
-use crate::upstream::ProviderHealthSnapshot;
+use crate::upstream::{ProviderHealthSnapshot, ProviderInventoryEntry};
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
@@ -384,6 +384,14 @@ pub struct CatalogEntry {
     /// real `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_limit: Option<i64>,
+}
+
+/// `GET /dashboard/api/providers` — concrete provider resources and their
+/// advertised model/capacity metadata. Kept separate from topology so graph
+/// snapshots remain small and provider inventory can carry schedules.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvidersBody {
+    pub providers: Vec<ProviderInventoryEntry>,
 }
 
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut. Mirrors
@@ -1127,6 +1135,18 @@ pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response 
         Err(_) => Vec::new(),
     };
     json_no_store(StatusCode::OK, &entries)
+}
+
+/// `GET /dashboard/api/providers` — provider-scoped model catalogs, availability
+/// schedules, and current capacity. A failed inventory refresh returns an empty
+/// list so the rest of the dashboard remains usable while an upstream is down.
+pub async fn dashboard_providers(State(gateway): State<Arc<Gateway>>) -> Response {
+    let providers = gateway
+        .upstream_client()
+        .provider_inventory()
+        .await
+        .unwrap_or_default();
+    json_no_store(StatusCode::OK, &ProvidersBody { providers })
 }
 
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut from the D5
@@ -2238,6 +2258,42 @@ mod tests {
             catalog_fetched_ms: None,
             catalog_size: None,
         }
+    }
+
+    #[test]
+    fn providers_body_preserves_provider_scoped_models_schedule_and_capacity() {
+        let body = ProvidersBody {
+            providers: vec![crate::upstream::ProviderInventoryEntry {
+                provider_id: "mesh:worker-a".into(),
+                provider_name: "local-vllm".into(),
+                resource_id: Some("gpu-0".into()),
+                route: Some("gpu-0".into()),
+                base_url: "mesh://worker-a/gpu-0".into(),
+                models: vec![crate::upstream::UpstreamModelEntry {
+                    id: "local-model".into(),
+                    context_limit: Some(32_768),
+                }],
+                availability: Some(crate::config::AvailabilitySchedule {
+                    timezone: "America/Chicago".into(),
+                    default_capacity: 2,
+                    weekly: Vec::new(),
+                    exceptions: Vec::new(),
+                }),
+                capacity_limit: Some(2),
+                active_requests: Some(1),
+                accepting_requests: true,
+                healthy: true,
+            }],
+        };
+
+        let value = serde_json::to_value(body).expect("serialize providers body");
+        let provider = &value["providers"][0];
+        assert_eq!(provider["provider_id"], "mesh:worker-a");
+        assert_eq!(provider["models"][0]["id"], "local-model");
+        assert_eq!(provider["models"][0]["context_limit"], 32_768);
+        assert_eq!(provider["availability"]["timezone"], "America/Chicago");
+        assert_eq!(provider["capacity_limit"], 2);
+        assert_eq!(provider["active_requests"], 1);
     }
 
     /// Gap 12 (AGENTS.md changed-wire-field rule): the per-provider latency/error metrics

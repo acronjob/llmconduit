@@ -8,9 +8,9 @@ use crate::mesh::registry::MeshRegistry;
 use crate::models::chat::{ChatCompletionChunk, ChatCompletionRequest};
 use crate::upstream::{
     BackendCandidate, BackendCandidatePlan, BackendChatRequest, BackendFinalizationPolicies,
-    UpstreamClient, UpstreamModelEntry, UpstreamModelsResponse, UpstreamStream,
-    finalize_request_for_backend, offload_redacted_upstream_request_bytes, sanitize_chat_request,
-    stamp_header_byte,
+    ProviderHealth, ProviderInventoryEntry, ProviderStatus, UpstreamClient, UpstreamModelEntry,
+    UpstreamModelsResponse, UpstreamStream, finalize_request_for_backend,
+    offload_redacted_upstream_request_bytes, sanitize_chat_request, stamp_header_byte,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -202,6 +202,10 @@ impl UpstreamClient for MeshUpstreamClient {
             .collect())
     }
 
+    async fn provider_inventory(&self) -> AppResult<Vec<ProviderInventoryEntry>> {
+        Ok(self.registry.provider_inventory())
+    }
+
     async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         let candidates = self
             .registry
@@ -218,6 +222,40 @@ impl UpstreamClient for MeshUpstreamClient {
 
     fn provider_base_url(&self) -> String {
         "mesh://workers".to_string()
+    }
+
+    fn provider_health(&self) -> Vec<ProviderHealth> {
+        let mut by_provider = BTreeMap::<String, (bool, HashSet<String>)>::new();
+        for entry in self.registry.provider_inventory() {
+            let aggregate = by_provider
+                .entry(entry.provider_id)
+                .or_insert_with(|| (false, HashSet::new()));
+            aggregate.0 |= entry.healthy;
+            aggregate
+                .1
+                .extend(entry.models.into_iter().map(|model| model.id));
+        }
+        by_provider
+            .into_iter()
+            .map(|(id, (healthy, models))| ProviderHealth {
+                name: id.clone(),
+                id: id.clone(),
+                route: None,
+                base_url: id.replacen("mesh:", "mesh://", 1),
+                status: if healthy {
+                    ProviderStatus::Healthy
+                } else {
+                    ProviderStatus::Down
+                },
+                cooling_until_ms: None,
+                last_error: (!healthy).then(|| "mesh worker is unavailable".to_string()),
+                served_count: 0,
+                failover_count: 0,
+                consecutive_failures: 0,
+                catalog_fetched_ms: None,
+                catalog_size: Some(models.len() as u64),
+            })
+            .collect()
     }
 
     fn model_catalog_cache_ttl(&self) -> std::time::Duration {
@@ -590,6 +628,64 @@ mod tests {
             },
         ]);
         assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_wrapper_preserves_mesh_resource_inventory() {
+        let registry = Arc::new(MeshRegistry::new(Duration::from_secs(30)));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            WorkerAdvertisement {
+                protocol_version: PROTOCOL_VERSION,
+                node_name: Some("workstation".into()),
+                agent_version: "test".into(),
+                resources: vec![ResourceAdvertisement {
+                    resource_id: "local-vllm".into(),
+                    models: vec![ModelAdvertisement {
+                        id: "local-model".into(),
+                        context_limit: Some(32_768),
+                    }],
+                    availability: AvailabilitySchedule {
+                        timezone: "America/Chicago".into(),
+                        default_capacity: 3,
+                        weekly: Vec::new(),
+                        exceptions: Vec::new(),
+                    },
+                    effective_capacity: 3,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                }],
+            },
+        );
+        let mesh = MeshUpstreamClient::new(
+            registry,
+            BackendFinalizationPolicies::default(),
+            true,
+            1024 * 1024,
+            crate::dashboard_flow::DashboardFlowStore::disabled(),
+        );
+        let wrapped = crate::upstream::FailoverUpstreamClient::new(
+            vec![crate::upstream::FailoverUpstreamProvider::new(
+                "mesh",
+                mesh,
+                None,
+                None,
+                serde_json::Map::new(),
+            )],
+            Duration::from_secs(30),
+        );
+
+        let inventory = wrapped.provider_inventory().await.expect("inventory");
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].provider_id, format!("mesh:{endpoint}"));
+        assert_eq!(inventory[0].resource_id.as_deref(), Some("local-vllm"));
+        assert_eq!(inventory[0].capacity_limit, Some(3));
+        assert_eq!(
+            inventory[0].availability.as_ref().unwrap().default_capacity,
+            3
+        );
     }
 
     #[tokio::test]

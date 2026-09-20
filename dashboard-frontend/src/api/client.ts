@@ -31,6 +31,8 @@ import type {
   KillResponse,
   LoginRequest,
   MetricsResponse,
+  ProviderMetricsResponse,
+  ProvidersResponse,
   SnapshotResponse,
   TopologyResponse,
 } from './types';
@@ -46,6 +48,8 @@ import {
   isAuthUsageResponse,
   isAuthUsersResponse,
   isCreatedAuthApiKey,
+  isProviderMetricsResponse,
+  isProvidersResponse,
 } from './types';
 
 export type FetchImpl = typeof fetch;
@@ -173,6 +177,14 @@ export class DashboardClient {
 
   topology(): Promise<TopologyResponse> {
     return this.request<TopologyResponse>('/topology');
+  }
+
+  providers(): Promise<ProvidersResponse> {
+    return this.request('/providers', undefined, isProvidersResponse);
+  }
+
+  providerMetrics(): Promise<ProviderMetricsResponse> {
+    return this.request('/provider-metrics', undefined, isProviderMetricsResponse);
   }
 
   /** Bare array — no cursor (D13: static-ish catalog read). */
