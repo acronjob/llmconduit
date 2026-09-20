@@ -7675,6 +7675,13 @@ async fn enforced_auth_allows_scoped_legacy_completions() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "cmpl-auth",
             "object": "text_completion",
+            "model": "public-model",
+            "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "total_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 2}
+            },
             "choices": [{"text": "allowed", "index": 0, "finish_reason": "stop"}]
         })))
         .expect(1)
@@ -7684,6 +7691,10 @@ async fn enforced_auth_allows_scoped_legacy_completions() {
     let mut config = test_config();
     config.upstream_base_url = format!("{}/v1/", server.uri()).parse().unwrap();
     config.upstream_api_key = Some("upstream-secret".into());
+    config.price_table.insert(
+        "public-model".to_string(),
+        llmconduit::config::ModelPrice::new(2.0, 6.0, 0.5),
+    );
     let upstream = llmconduit::upstream::ReqwestUpstreamClient::new(
         reqwest::Client::new(),
         config.upstream_base_url.clone(),
@@ -7731,6 +7742,201 @@ async fn enforced_auth_allows_scoped_legacy_completions() {
         .unwrap();
 
     assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let usage = wait_for_auth_usage(&store_path).await;
+    assert_eq!(usage.0, "completions");
+    assert_eq!(usage.1, "completed");
+    assert_eq!(usage.2, Some(7));
+    assert_eq!(usage.3, Some(3));
+    assert_eq!(usage.4, Some(10));
+    assert_eq!(usage.5, Some(2));
+    assert_eq!(usage.6, None);
+    assert_eq!(usage.7, 1);
+    remove_auth_store(&store_path);
+}
+
+async fn wait_for_auth_usage(
+    store_path: &std::path::Path,
+) -> (
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let connection = rusqlite::Connection::open(store_path).expect("open auth store");
+            let row = connection.query_row(
+                "SELECT endpoint,status,prompt_tokens,completion_tokens,total_tokens,cached_tokens,reasoning_tokens,
+                        (SELECT COUNT(*) FROM auth_usage_events)
+                 FROM auth_usage_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            );
+            if let Ok(row) = row {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal usage persisted in bounded time")
+}
+
+#[tokio::test]
+async fn legacy_completions_stream_error_and_cancel_account_once() {
+    let (authz, raw_key, store_path) = scoped_authz(&["completions"], &["public-*"]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_json(json!({
+            "model": "public-model",
+            "prompt": "stream",
+            "stream": true
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    "data: {\"model\":\"public-model\",\"choices\":[{\"text\":\"ok\"}]}\n\n\
+                     data: {\"model\":\"public-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n\
+                     data: [DONE]\n\n",
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_json(json!({
+            "model": "public-model",
+            "prompt": "error",
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream failed"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_json(json!({
+            "model": "public-model",
+            "prompt": "cancel",
+            "stream": true
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    "data: {\"choices\":[{\"text\":\"pending\"}]}\n\n",
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().unwrap();
+    let upstream = llmconduit::upstream::ReqwestUpstreamClient::new(
+        reqwest::Client::new(),
+        config.upstream_base_url.clone(),
+        None,
+        None,
+        config.flatten_content,
+        config.min_completion_tokens,
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    let gateway = Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(16),
+            Arc::new(upstream),
+            Arc::new(MockSearch::default()),
+            vision,
+            image_cache,
+            MonitorHub::disabled(),
+            None,
+            llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+        .with_authz(authz),
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let request = |prompt: &'static str, stream: bool| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", format!("Bearer {raw_key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"public-model","prompt":prompt,"stream":stream}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    let streamed = app.clone().oneshot(request("stream", true)).await.unwrap();
+    assert_eq!(streamed.status(), axum::http::StatusCode::OK);
+    let _ = axum::body::to_bytes(streamed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let failed = app.clone().oneshot(request("error", false)).await.unwrap();
+    assert_eq!(
+        failed.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let _ = axum::body::to_bytes(failed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let cancelled = app.oneshot(request("cancel", true)).await.unwrap();
+    assert_eq!(cancelled.status(), axum::http::StatusCode::OK);
+    drop(cancelled);
+
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let connection = rusqlite::Connection::open(&store_path).expect("open auth store");
+            let rows = connection
+                .prepare("SELECT status,total_tokens FROM auth_usage_events ORDER BY status")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap();
+            if rows.len() == 3 {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all terminal outcomes persisted in bounded time");
+    assert_eq!(
+        rows,
+        vec![
+            ("cancelled".to_string(), None),
+            ("completed".to_string(), Some(6)),
+            ("failed".to_string(), None),
+        ]
+    );
     remove_auth_store(&store_path);
 }
 

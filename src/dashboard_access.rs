@@ -398,6 +398,14 @@ impl AccessError {
     }
 }
 
+impl std::fmt::Display for AccessError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AccessError {}
+
 impl IntoResponse for AccessError {
     fn into_response(self) -> Response {
         (self.status, Json(json!({ "error": self.message }))).into_response()

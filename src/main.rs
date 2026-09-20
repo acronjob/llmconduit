@@ -6,6 +6,8 @@ use llmconduit::cli::Commands;
 use llmconduit::cli::JoinKeyCommands;
 use llmconduit::cli::MeshCommands;
 use llmconduit::cli::NodeCommands;
+use llmconduit::cli::PricingCommands;
+use llmconduit::cli::PricingSource;
 use llmconduit::cli::resolve_config_path;
 use llmconduit::cli::run_configure_flow;
 use llmconduit::config::Config;
@@ -83,6 +85,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Mesh { config, command }) => {
             let path = resolve_config_path(config)?;
             run_mesh_command(&path, command).await?;
+            Ok(())
+        }
+        Some(Commands::Pricing { config, command }) => {
+            let path = resolve_config_path(config)?;
+            let config = Config::from_env_and_file(Some(&path))?;
+            match command {
+                PricingCommands::Sync {
+                    source: PricingSource::Openrouter,
+                    models,
+                } => {
+                    let authz = llmconduit::authz::AuthzService::from_config(&config.auth)?;
+                    let pricing = authz.sync_openrouter_pricing_models(models).await?;
+                    println!("{}", serde_json::to_string_pretty(&pricing)?);
+                }
+            }
             Ok(())
         }
         None => {
