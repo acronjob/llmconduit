@@ -1,4 +1,4 @@
-use super::{AuthError, AuthorizationScope};
+use super::policy::{AuthError, PolicyScope};
 use chrono::{DateTime, Datelike, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -23,7 +23,7 @@ struct KeySessions {
 impl SessionLimiter {
     pub fn acquire(
         &self,
-        scope: &AuthorizationScope,
+        scope: &PolicyScope,
         now: DateTime<Utc>,
     ) -> Result<SessionLease, AuthError> {
         let key_id = scope.context().key_id.clone();
@@ -101,13 +101,13 @@ impl SessionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authz::{
-        AuthContext, AuthRequestId, Endpoint, LimitSet, PolicyBinding, PolicyEffect, PolicyMatcher,
-        PolicyRule, PolicySnapshot, PolicySubject,
+    use crate::authz::policy::{
+        AuthRequestId, Endpoint, LimitSet, PolicyBinding, PolicyEffect, PolicyIdentity,
+        PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject,
     };
     use std::collections::{HashMap, HashSet};
 
-    fn scope(max_concurrent: u32, max_daily: u32) -> AuthorizationScope {
+    fn scope(max_concurrent: u32, max_daily: u32) -> PolicyScope {
         let rule = PolicyRule {
             id: "pol_limit".into(),
             effect: PolicyEffect::Allow,
@@ -130,7 +130,7 @@ mod tests {
         ));
         snapshot
             .authorize(
-                &AuthContext {
+                &PolicyIdentity {
                     request_id: AuthRequestId::new(),
                     key_id: "key_a".into(),
                     key_prefix: "llmc_example".into(),

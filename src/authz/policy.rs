@@ -25,7 +25,7 @@ impl Default for AuthRequestId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthContext {
+pub struct PolicyIdentity {
     pub request_id: AuthRequestId,
     pub key_id: String,
     pub key_prefix: String,
@@ -263,11 +263,11 @@ impl PolicySnapshot {
 
     pub fn authorize(
         self: &Arc<Self>,
-        context: &AuthContext,
+        context: &PolicyIdentity,
         endpoint: Endpoint,
         requested_model: Option<&str>,
         now: DateTime<Utc>,
-    ) -> Result<AuthorizationScope, AuthError> {
+    ) -> Result<PolicyScope, AuthError> {
         if context.policy_epoch != self.epoch {
             return Err(AuthError::PolicyUnavailable);
         }
@@ -284,7 +284,7 @@ impl PolicySnapshot {
         if coarse_deny || !possible_allow {
             return Err(AuthError::Forbidden);
         }
-        Ok(AuthorizationScope {
+        Ok(PolicyScope {
             context: context.clone(),
             snapshot: Arc::clone(self),
             endpoint,
@@ -295,7 +295,7 @@ impl PolicySnapshot {
 
     pub fn management_permissions(
         &self,
-        context: &AuthContext,
+        context: &PolicyIdentity,
         now: DateTime<Utc>,
     ) -> HashSet<ManagementPermission> {
         let rules = self.applicable_rules(context, now);
@@ -314,7 +314,7 @@ impl PolicySnapshot {
 
     fn applicable_rules<'a>(
         &'a self,
-        context: &AuthContext,
+        context: &PolicyIdentity,
         now: DateTime<Utc>,
     ) -> Vec<&'a PolicyRule> {
         let groups = self.principal_groups.get(&context.principal_id);
@@ -333,16 +333,16 @@ impl PolicySnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct AuthorizationScope {
-    context: AuthContext,
+pub struct PolicyScope {
+    context: PolicyIdentity,
     snapshot: Arc<PolicySnapshot>,
     endpoint: Endpoint,
     requested_model: Option<String>,
     evaluated_at: DateTime<Utc>,
 }
 
-impl AuthorizationScope {
-    pub fn context(&self) -> &AuthContext {
+impl PolicyScope {
+    pub fn context(&self) -> &PolicyIdentity {
         &self.context
     }
 
@@ -515,8 +515,8 @@ fn minimum_limit(values: impl Iterator<Item = u32>) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn context(epoch: u64) -> AuthContext {
-        AuthContext {
+    fn context(epoch: u64) -> PolicyIdentity {
+        PolicyIdentity {
             request_id: AuthRequestId::new(),
             key_id: "key_a".into(),
             key_prefix: "llmc_example".into(),

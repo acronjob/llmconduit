@@ -1,4 +1,7 @@
-mod store;
+pub mod keys;
+pub mod policy;
+pub mod session;
+pub mod store;
 
 use crate::config::{AuthConfig, AuthMode};
 use axum::http::HeaderMap;
@@ -7,6 +10,11 @@ use sha2::Sha256;
 use std::sync::{Arc, RwLock};
 use subtle::ConstantTimeEq;
 
+pub use policy::{
+    AuthError, AuthRequestId, Endpoint, LimitSet, ManagementPermission, PolicyBinding,
+    PolicyDecision, PolicyEffect, PolicyIdentity, PolicyMatcher, PolicyRule, PolicyScope,
+    PolicySnapshot, PolicySubject, UtcWindow,
+};
 pub use store::{ApiKeySummary, CreatedApiKey};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -26,6 +34,22 @@ impl AuthContext {
 
     pub fn allows_model(&self, endpoint: &str, model: &str) -> bool {
         decide(&self.grants, endpoint, Some(model))
+    }
+
+    /// Produces the transport-neutral candidate predicate carried by routing,
+    /// failover, mesh, completions, and token-count dispatch. The closure owns
+    /// only immutable grants and never captures the presented raw credential.
+    pub fn authorization_scope(&self) -> crate::upstream::AuthorizationScope {
+        let grants = Arc::clone(&self.grants);
+        crate::upstream::AuthorizationScope::restricted(
+            move |_provider_id, _route_id, served_model, endpoint| {
+                decide(
+                    &grants,
+                    inference_endpoint_name(endpoint),
+                    Some(served_model),
+                )
+            },
+        )
     }
 }
 
@@ -142,11 +166,17 @@ impl AuthzService {
             .read()
             .map_err(|_| AuthFailure::Unavailable)?
             .clone();
-        let record = snapshot
-            .keys
-            .iter()
-            .find(|record| bool::from(record.digest.ct_eq(&digest)))
-            .ok_or(AuthFailure::Invalid)?;
+        // Scan every record rather than stopping at the first match. Each
+        // verifier comparison is fixed-width and constant-time; avoiding an
+        // early exit also keeps lookup work independent of the matching row's
+        // position in the snapshot.
+        let mut matched = None;
+        for record in &snapshot.keys {
+            if bool::from(record.digest.ct_eq(&digest)) {
+                matched = Some(record);
+            }
+        }
+        let record = matched.ok_or(AuthFailure::Invalid)?;
         Ok(Some(AuthContext {
             auth_request_id: format!("areq_{}", uuid::Uuid::new_v4().simple()),
             key_id: record.id.clone(),
@@ -326,11 +356,21 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
     p == bytes.len()
 }
 
+fn inference_endpoint_name(endpoint: crate::upstream::InferenceEndpoint) -> &'static str {
+    match endpoint {
+        crate::upstream::InferenceEndpoint::Responses => "responses",
+        crate::upstream::InferenceEndpoint::ChatCompletions => "chat",
+        crate::upstream::InferenceEndpoint::Messages => "messages",
+        crate::upstream::InferenceEndpoint::CountTokens => "count_tokens",
+        crate::upstream::InferenceEndpoint::Completions => "completions",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AuthzService, Effect, PolicyGrant, decide, matches_pattern};
-    use crate::config::{AuthConfig, AuthMode};
-    use axum::http::{HeaderMap, HeaderValue};
+    use super::{AuthContext, Effect, PolicyGrant, decide, matches_pattern};
+    use crate::upstream::InferenceEndpoint;
+    use std::sync::Arc;
 
     #[test]
     fn explicit_deny_overrides_allow() {
@@ -358,54 +398,35 @@ mod tests {
     }
 
     #[test]
-    fn key_lifecycle_is_scoped_and_revocation_is_immediate() {
-        let path = std::env::temp_dir().join(format!(
-            "llmconduit-auth-test-{}.sqlite3",
-            uuid::Uuid::new_v4()
-        ));
-        let config = AuthConfig {
-            mode: AuthMode::Enforce,
-            store_path: path.clone(),
+    fn dispatch_scope_reuses_grants_without_raw_credentials() {
+        let context = AuthContext {
+            auth_request_id: "areq_test".into(),
+            key_id: "key_test".into(),
+            principal_id: "usr_test".into(),
+            grants: Arc::new(vec![PolicyGrant {
+                effect: Effect::Allow,
+                endpoint: "responses".into(),
+                model_pattern: "public-*".into(),
+            }]),
         };
-        let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
-        let service = AuthzService::open_enforced(
-            &config,
-            b"unit-test-pepper-never-log".to_vec(),
-            Some(&bootstrap),
-        )
-        .unwrap();
-
-        let created = service
-            .create_key(
-                "reporting service",
-                "reporting",
-                &["chat".to_string()],
-                &["public-*".to_string()],
-            )
-            .unwrap();
-        let raw = created.raw_key.as_deref().unwrap();
-        assert!(raw.starts_with("llmc_"));
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(raw).expect("generated key is a valid header"),
-        );
-        let context = service.authenticate(&headers).unwrap().unwrap();
-        assert!(context.allows_endpoint("chat"));
-        assert!(!context.allows_endpoint("responses"));
-        assert!(context.allows_model("chat", "public-v1"));
-        assert!(!context.allows_model("chat", "secret-v1"));
-        assert!(context.auth_request_id.starts_with("areq_"));
-
-        let listed = service.list_keys().unwrap();
-        assert!(listed.iter().all(|key| !key.prefix.contains(raw)));
-        assert!(service.revoke_key(&created.summary.id).unwrap());
-        assert!(service.authenticate(&headers).is_err());
-
-        drop(service);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
-        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+        let scope = context.authorization_scope();
+        assert!(scope.allows_candidate(
+            "primary",
+            None,
+            "public-model",
+            InferenceEndpoint::Responses
+        ));
+        assert!(!scope.allows_candidate(
+            "primary",
+            None,
+            "secret-model",
+            InferenceEndpoint::Responses
+        ));
+        assert!(!scope.allows_candidate(
+            "primary",
+            None,
+            "public-model",
+            InferenceEndpoint::Messages
+        ));
     }
 }

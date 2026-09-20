@@ -45,6 +45,7 @@ impl GeneratedApiKey {
         self.raw
     }
 
+    #[cfg(test)]
     pub(crate) fn raw(&self) -> &str {
         &self.raw
     }

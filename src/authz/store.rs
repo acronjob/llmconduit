@@ -1,120 +1,105 @@
 use chrono::Utc;
 use rusqlite::{Connection, params};
 use serde::Serialize;
+use std::fmt;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrincipalKind {
-    User,
-    ServiceAccount,
+pub(crate) struct AuthStore {
+    connection: Connection,
 }
 
-impl PrincipalKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::ServiceAccount => "service_account",
-        }
-    }
+pub(crate) struct StoredGrant {
+    pub effect: String,
+    pub endpoint: String,
+    pub model_pattern: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrincipalRecord {
+pub(crate) struct StoredKey {
     pub id: String,
-    pub kind: PrincipalKind,
-    pub display_name: String,
-    pub enabled: bool,
-    pub created_at_ms: i64,
+    pub principal_id: String,
+    pub digest: [u8; 32],
+    pub grants: Vec<StoredGrant>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiKeyRecord {
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeySummary {
     pub id: String,
     pub principal_id: String,
     pub name: String,
     pub prefix: String,
     pub enabled: bool,
-    pub created_at_ms: i64,
-    pub expires_at_ms: Option<i64>,
-    pub last_used_at_ms: Option<i64>,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub last_used_at: Option<i64>,
 }
 
+#[derive(Clone, Serialize)]
 pub struct CreatedApiKey {
-    pub record: ApiKeyRecord,
-    raw_key: String,
-}
-
-impl CreatedApiKey {
-    /// Consumes the creation response so plaintext cannot be fetched again.
-    pub fn expose_once(self) -> String {
-        self.raw_key
-    }
-
-    pub fn raw_key(&self) -> &str {
-        &self.raw_key
-    }
+    #[serde(flatten)]
+    pub summary: ApiKeySummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_key: Option<String>,
 }
 
 impl fmt::Debug for CreatedApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CreatedApiKey")
-            .field("record", &self.record)
-            .field("raw_key", &"[REDACTED]")
+            .field("summary", &self.summary)
+            .field("raw_key", &self.raw_key.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SnapshotRecords {
-    pub epoch: u64,
-    pub principal_groups: HashMap<String, HashSet<String>>,
-    pub principal_roles: HashMap<String, HashSet<String>>,
-}
-
-impl SnapshotRecords {
-    pub fn compile(self, rules: Vec<PolicyRule>) -> Arc<PolicySnapshot> {
-        Arc::new(PolicySnapshot::new(
-            self.epoch,
-            rules,
-            self.principal_groups,
-            self.principal_roles,
-        ))
+impl CreatedApiKey {
+    pub(crate) fn with_raw(mut self, raw: String) -> Self {
+        self.raw_key = Some(raw);
+        self
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct AuthStore {
-    path: PathBuf,
-    pepper: AuthPepper,
 }
 
 impl AuthStore {
-    pub async fn open(path: impl AsRef<Path>, pepper: AuthPepper) -> Result<Self, AuthStoreError> {
-        if let Some(parent) = path.as_ref().parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let store = Self {
-            path: path.as_ref().to_path_buf(),
-            pepper,
-        };
-        store
-            .with_conn(|conn| {
-                conn.execute_batch(SCHEMA)?;
-                let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-                if version > SCHEMA_VERSION {
-                    return Err(AuthStoreError::UnsupportedSchema(version));
-                }
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                Ok(())
-            })
-            .await?;
-        Ok(store)
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let connection = Connection::open(path)
+            .map_err(|err| format!("failed to open auth store {}: {err}", path.display()))?;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE IF NOT EXISTS auth_principals (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT NOT NULL,
+                   enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS auth_api_keys (
+                   id TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES auth_principals(id),
+                   name TEXT NOT NULL, prefix TEXT NOT NULL, hmac_sha256_digest BLOB NOT NULL UNIQUE,
+                   enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+                   expires_at INTEGER, last_used_at INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS auth_policies (
+                   id TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES auth_api_keys(id),
+                   effect TEXT NOT NULL CHECK(effect IN ('allow','deny')),
+                   endpoint TEXT NOT NULL, model_pattern TEXT NOT NULL DEFAULT '*',
+                   created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS auth_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
+                 CREATE TABLE IF NOT EXISTS auth_group_members (group_id TEXT NOT NULL, principal_id TEXT NOT NULL, PRIMARY KEY(group_id, principal_id));
+                 CREATE TABLE IF NOT EXISTS auth_roles (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
+                 CREATE TABLE IF NOT EXISTS auth_role_bindings (role_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, PRIMARY KEY(role_id, subject_type, subject_id));
+                 CREATE TABLE IF NOT EXISTS auth_management_permissions (role_id TEXT NOT NULL, permission TEXT NOT NULL, PRIMARY KEY(role_id, permission));
+                 CREATE TABLE IF NOT EXISTS auth_sessions (session_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, started_at INTEGER NOT NULL, endpoint TEXT NOT NULL, requested_model TEXT);
+                 CREATE TABLE IF NOT EXISTS auth_usage_events (auth_request_id TEXT PRIMARY KEY, api_call_id TEXT, key_id TEXT, principal_id TEXT, endpoint TEXT NOT NULL, requested_model TEXT, served_model TEXT, provider TEXT, status TEXT NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER, cost_nanos INTEGER, created_at INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS auth_audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT, action TEXT NOT NULL, target_id TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS auth_policy_epoch (singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL);
+                 INSERT OR IGNORE INTO auth_policy_epoch(singleton, epoch) VALUES (1, 0);",
+            )
+            .map_err(|err| format!("failed to migrate auth store: {err}"))?;
+        Ok(Self { connection })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn key_count(&self) -> Result<u64, String> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM auth_api_keys", [], |row| row.get(0))
+            .map_err(|err| format!("failed to inspect auth store: {err}"))
     }
 
     pub fn insert_bootstrap_key(&mut self, raw: &str, digest: &[u8; 32]) -> Result<(), String> {
@@ -305,18 +290,8 @@ fn bump_epoch(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     .map_err(|err| format!("failed to increment auth policy epoch: {err}"))
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum AuthStoreError {
-    #[error("filesystem error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-    #[error("blocking task failed: {0}")]
-    Join(#[from] tokio::task::JoinError),
-    #[error("auth store schema version {0} is newer than supported")]
-    UnsupportedSchema(i64),
-    #[error("invalid auth store input: {0}")]
-    InvalidInput(&'static str),
+fn key_prefix(raw: &str) -> String {
+    raw.chars().take(13).collect()
 }
 
 fn required<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
