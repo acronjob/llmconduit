@@ -41,8 +41,8 @@ pub struct CreatedApiKey {
     pub raw_key: Option<String>,
 }
 
-impl fmt::Debug for CreatedApiKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for CreatedApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreatedApiKey")
             .field("summary", &self.summary)
             .field("raw_key", &self.raw_key.as_ref().map(|_| "[REDACTED]"))

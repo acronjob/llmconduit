@@ -460,7 +460,7 @@ mod tests {
             .unwrap();
         let raw = created.raw_key.as_deref().unwrap().to_string();
         assert!(raw.starts_with("llmc_"));
-        assert!(!format!("{created:?}").contains(&raw));
+        assert!(!format!("{created:?}").contains(raw));
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -483,5 +483,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn empty_enforced_store_requires_explicit_bootstrap_state() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-auth-empty-test-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let result = AuthzService::open_enforced(
+            &AuthConfig {
+                mode: AuthMode::Enforce,
+                store_path: path.clone(),
+            },
+            b"unit-test-pepper".to_vec(),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no keys"));
+        let _ = std::fs::remove_file(path);
     }
 }
