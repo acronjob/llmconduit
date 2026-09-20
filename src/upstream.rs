@@ -1700,10 +1700,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
         backend.authorization.ensure_candidate(
-            backend
-                .authorization_provider
-                .as_deref()
-                .unwrap_or("primary"),
+            backend.authorization_provider.as_deref().unwrap_or("primary"),
             backend.authorization_route.as_deref(),
             &backend.request.model,
             backend.endpoint,
@@ -1827,10 +1824,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
         backend.authorization.ensure_candidate(
-            backend
-                .authorization_provider
-                .as_deref()
-                .unwrap_or("primary"),
+            backend.authorization_provider.as_deref().unwrap_or("primary"),
             backend.authorization_route.as_deref(),
             &backend.request.model,
             InferenceEndpoint::CountTokens,

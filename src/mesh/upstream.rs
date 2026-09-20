@@ -94,17 +94,19 @@ impl UpstreamClient for MeshUpstreamClient {
                     )
                 },
             ) else {
-                let any_authorized =
-                    self.registry
-                        .has_candidate_where(&model, |endpoint_id, resource_id| {
-                            authorization.allows_candidate(
-                                &format!("mesh:{endpoint_id}"),
-                                route.as_deref().or(Some(resource_id)),
-                                &model,
-                                backend.endpoint,
-                            )
-                        });
-                if !any_authorized && self.registry.has_candidate_where(&model, |_, _| true) {
+                let any_authorized = self.registry.has_candidate_where(
+                    &model,
+                    |endpoint_id, resource_id| {
+                        authorization.allows_candidate(
+                            &format!("mesh:{endpoint_id}"),
+                            route.as_deref().or(Some(resource_id)),
+                            &model,
+                            backend.endpoint,
+                        )
+                    },
+                );
+                if !any_authorized && self.registry.has_candidate_where(&model, |_, _| true)
+                {
                     return Err(AppError::forbidden(
                         "no authorized mesh resource is available for this request",
                     ));
