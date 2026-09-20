@@ -2599,8 +2599,7 @@ impl FailoverUpstreamClient {
     async fn proxy_completions_from_provider(
         &self,
         provider_index: usize,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
         if provider_index >= self.providers.len() {
             return Err(AppError::internal(
@@ -2610,23 +2609,38 @@ impl FailoverUpstreamClient {
         if !self.provider_is_available(provider_index) {
             return Err(self.cooldown_error());
         }
-        self.proxy_completions_with_provider_indices(vec![provider_index], headers, body)
+        self.proxy_completions_with_provider_indices(vec![provider_index], request)
             .await
     }
 
     async fn proxy_completions_with_provider_indices(
         &self,
         provider_indices: Vec<usize>,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
         let mut last_error = None;
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
-            let provider_body = proxy_body_for_provider(provider, &body);
+            let provider_body = proxy_body_for_provider(provider, &request.body);
+            let model = proxy_body_model(&provider_body).unwrap_or_default();
+            if !request.authorization.allows_candidate(
+                &provider.name,
+                request.authorization_route.as_deref(),
+                &model,
+                InferenceEndpoint::Completions,
+            ) {
+                continue;
+            }
+            let provider_request = ProxyCompletionsRequest {
+                headers: request.headers.clone(),
+                body: provider_body,
+                authorization: request.authorization.clone(),
+                authorization_route: request.authorization_route.clone(),
+                authorization_provider: Some(provider.name.clone()),
+            };
             match self.providers[provider_index]
                 .client
-                .proxy_completions(headers.clone(), provider_body)
+                .proxy_completions(provider_request)
                 .await
             {
                 Ok(response) => {
@@ -2649,7 +2663,7 @@ impl FailoverUpstreamClient {
             }
         }
         Err(last_error.unwrap_or_else(|| {
-            AppError::upstream("all upstream providers failed to proxy completions")
+            AppError::forbidden("no authorized upstream candidate can proxy completions")
         }))
     }
 }
@@ -3132,14 +3146,28 @@ impl UpstreamClient for FailoverUpstreamClient {
 
     async fn proxy_completions(
         &self,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
+        let any_authorized = self.providers.iter().any(|provider| {
+            let body = proxy_body_for_provider(provider, &request.body);
+            let model = proxy_body_model(&body).unwrap_or_default();
+            request.authorization.allows_candidate(
+                &provider.name,
+                request.authorization_route.as_deref(),
+                &model,
+                InferenceEndpoint::Completions,
+            )
+        });
+        if !any_authorized {
+            return Err(AppError::forbidden(
+                "no authorized upstream candidate can proxy completions",
+            ));
+        }
         let provider_indices = self.available_provider_indices();
         if provider_indices.is_empty() {
             return Err(self.cooldown_error());
         }
-        self.proxy_completions_with_provider_indices(provider_indices, headers, body)
+        self.proxy_completions_with_provider_indices(provider_indices, request)
             .await
     }
 
@@ -3436,11 +3464,10 @@ impl UpstreamClient for RoutingUpstreamClient {
 
     async fn proxy_completions(
         &self,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
         let catalog = self.load_catalog().await?;
-        let requested_model = proxy_body_model(&body).unwrap_or_default();
+        let requested_model = proxy_body_model(&request.body).unwrap_or_default();
         let (resolution, match_kind) = catalog.resolve(&requested_model).ok_or_else(|| {
             tracing::warn!(
                 requested_model = %requested_model,
@@ -3455,8 +3482,10 @@ impl UpstreamClient for RoutingUpstreamClient {
         {
             let provider = self.route_provider(*route_provider_index)?;
             log_model_resolution(&requested_model, model_id, &provider.name, match_kind);
-            let body = proxy_body_with_model(body, model_id);
-            return provider.client.proxy_completions(headers, body).await;
+            let mut routed = request;
+            routed.body = proxy_body_with_model(routed.body, model_id);
+            routed.authorization_route = Some(provider.name.clone());
+            return provider.client.proxy_completions(routed).await;
         }
         let RoutingResolution::Catalog(resolution) = resolution else {
             unreachable!("route resolution handled above");
@@ -3473,15 +3502,17 @@ impl UpstreamClient for RoutingUpstreamClient {
             &provider.name,
             match_kind,
         );
-        let body = proxy_body_with_model(body, &resolution.model_id);
+        let mut routed = request;
+        routed.body = proxy_body_with_model(routed.body, &resolution.model_id);
+        routed.authorization_route = Some(provider.name.clone());
         match resolution.target {
-            RoutingModelTarget::Primary => provider.client.proxy_completions(headers, body).await,
+            RoutingModelTarget::Primary => provider.client.proxy_completions(routed).await,
             RoutingModelTarget::Fallback {
                 failover_provider_index,
             } => {
                 provider
                     .client
-                    .proxy_completions_from_provider(failover_provider_index, headers, body)
+                    .proxy_completions_from_provider(failover_provider_index, routed)
                     .await
             }
         }
