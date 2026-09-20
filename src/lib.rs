@@ -309,6 +309,8 @@ pub fn build_app_with_gateway_and_options(
     // a non-loopback bind without a token + validated https origin REFUSES to
     // register the protected routes (logged), unless `ALLOW_INSECURE=1`.
     let bind_addr = config.bind_addr;
+    let authz = crate::authz::AuthzService::from_config(&config.auth)
+        .unwrap_or_else(|err| panic!("inference auth startup validation failed: {err}"));
     let (dashboard_auth, register_protected_routes) = if options.with_debug_ui {
         build_dashboard_auth(bind_addr)
     } else {
@@ -335,6 +337,7 @@ pub fn build_app_with_gateway_and_options(
             flow_store,
         )
         .with_dashboard_auth(dashboard_auth)
+        .with_authz(authz)
         .with_metrics(metrics)
         .with_turn_capture(turn_capture),
     );

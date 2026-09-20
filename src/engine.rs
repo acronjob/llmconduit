@@ -150,6 +150,10 @@ pub struct Gateway {
     /// case the auth-gated routes are simply not registered. NEVER built from
     /// the persisted `Config` (secrets are read from the environment).
     dashboard_auth: Option<Arc<crate::dashboard_auth::DashboardAuth>>,
+    /// Inference API-key authorization. Disabled by default for tests and
+    /// legacy configurations; the DI root attaches the validated enforce-mode
+    /// service before the router is built.
+    authz: crate::authz::AuthzService,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
     /// D4 published topology health: the latest versioned
     /// `Arc<ProviderHealthSnapshot>`, swapped by the publication task (1 s tick +
@@ -712,6 +716,7 @@ impl Gateway {
             flow_store,
             abort_hub,
             dashboard_auth: None,
+            authz: crate::authz::AuthzService::default(),
             upstream_model_catalog: Arc::new(Mutex::new(None)),
             provider_health: ProviderHealthPublisher::default(),
             // D5: disabled by default (zero overhead); the DI root attaches an
@@ -865,6 +870,15 @@ impl Gateway {
     /// refused registration.
     pub fn dashboard_auth(&self) -> Option<Arc<crate::dashboard_auth::DashboardAuth>> {
         self.dashboard_auth.clone()
+    }
+
+    pub fn with_authz(mut self, authz: crate::authz::AuthzService) -> Self {
+        self.authz = authz;
+        self
+    }
+
+    pub fn authz(&self) -> &crate::authz::AuthzService {
+        &self.authz
     }
 
     /// Access the dashboard FlowStore (D1). `is_enabled()` is `false` when the

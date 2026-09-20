@@ -112,7 +112,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
     // 10 MiB) so oversized inbound bodies are the operator's choice, not a
     // silent framework default.
     let max_request_body_bytes = gateway.config().max_request_body_bytes;
-    let router = Router::new()
+    let inference_routes = Router::new()
         .route("/v1/responses", post(post_responses).get(get_responses))
         .route("/v1/messages", post(post_messages))
         .route("/v1/messages/count_tokens", post(post_count_tokens))
@@ -121,6 +121,12 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/completions", post(post_completions))
         .route("/v1/models", get(get_models))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            require_inference_auth,
+        ));
+    let router = Router::new()
+        .merge(inference_routes)
         .route("/health", get(get_health))
         .route("/", get(get_root));
 
@@ -231,6 +237,106 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).
         .layer(Extension(auth))
+}
+
+async fn require_inference_auth(
+    State(gateway): State<Arc<Gateway>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if !gateway.authz().is_enabled() {
+        return next.run(request).await;
+    }
+    let endpoint = auth_endpoint(request.uri().path());
+    let context = match gateway.authz().authenticate(request.headers()) {
+        Ok(Some(context)) => context,
+        Ok(None) => return next.run(request).await,
+        Err(failure) => return auth_failure_response(request.uri().path(), failure),
+    };
+    if !context.allows_endpoint(endpoint) {
+        return auth_failure_response(request.uri().path(), crate::authz::AuthFailure::Forbidden);
+    }
+    request.extensions_mut().insert(context);
+    next.run(request).await
+}
+
+fn auth_endpoint(path: &str) -> &'static str {
+    match path {
+        "/v1/responses" => "responses",
+        "/v1/chat/completions" => "chat",
+        "/v1/messages" => "messages",
+        "/v1/messages/count_tokens" => "count_tokens",
+        "/v1/completions" => "completions",
+        "/v1/models" => "models",
+        _ => "unknown",
+    }
+}
+
+fn auth_failure_response(path: &str, failure: crate::authz::AuthFailure) -> Response {
+    let (status, message) = match failure {
+        crate::authz::AuthFailure::Missing => (StatusCode::UNAUTHORIZED, "missing API key"),
+        crate::authz::AuthFailure::Invalid => (StatusCode::UNAUTHORIZED, "invalid API key"),
+        crate::authz::AuthFailure::Forbidden => (
+            StatusCode::FORBIDDEN,
+            "the API key is not authorized for this request",
+        ),
+        crate::authz::AuthFailure::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authorization service unavailable",
+        ),
+    };
+    let mut response = if path.starts_with("/v1/messages") {
+        (
+            status,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": if status == StatusCode::UNAUTHORIZED { "authentication_error" } else { "permission_error" },
+                    "message": message
+                }
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            status,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": if status == StatusCode::UNAUTHORIZED { "invalid_request_error" } else { "permission_denied" },
+                    "code": if status == StatusCode::UNAUTHORIZED { "invalid_api_key" } else { "permission_denied" }
+                }
+            })),
+        )
+            .into_response()
+    };
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"llmconduit\""),
+        );
+    }
+    response
+}
+
+fn authorize_model(
+    context: Option<&crate::authz::AuthContext>,
+    endpoint: &str,
+    requested: &str,
+    served: &str,
+) -> AppResult<()> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    if context.allows_model(endpoint, requested)
+        && (served.eq_ignore_ascii_case(requested) || context.allows_model(endpoint, served))
+    {
+        Ok(())
+    } else {
+        Err(AppError::forbidden(
+            "the API key is not authorized for the requested model",
+        ))
+    }
 }
 
 /// Route-level response middleware (D13 R1 MED): stamp `no-store` + the dashboard

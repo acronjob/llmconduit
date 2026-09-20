@@ -82,6 +82,28 @@ impl AppError {
         }
     }
 
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        let msg = message.into();
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            client_message: msg.clone(),
+            message: msg,
+            code: Some("invalid_api_key".to_string()),
+            failover: FailoverDisposition::default(),
+        }
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        let msg = message.into();
+        Self {
+            status: StatusCode::FORBIDDEN,
+            client_message: msg.clone(),
+            message: msg,
+            code: Some("permission_denied".to_string()),
+            failover: FailoverDisposition::default(),
+        }
+    }
+
     pub fn upstream(message: impl Into<String>) -> Self {
         let msg = message.into();
         Self {
