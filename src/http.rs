@@ -273,9 +273,18 @@ struct CreateApiKeyRequest {
 
 async fn auth_create_key(
     State(gateway): State<Arc<Gateway>>,
+    Extension(dashboard_auth): Extension<Arc<DashboardAuth>>,
+    headers: HeaderMap,
     Json(request): Json<CreateApiKeyRequest>,
-) -> AppResult<(StatusCode, Json<Value>)> {
-    let created = gateway
+) -> Response {
+    if let Err(denied) = dashboard_auth.authorize_mutation(&headers) {
+        return (
+            denied.status(),
+            Json(serde_json::json!({ "error": denied.message() })),
+        )
+            .into_response();
+    }
+    let created = match gateway
         .authz()
         .create_key(
             &request.principal_name,
@@ -283,27 +292,39 @@ async fn auth_create_key(
             &request.endpoints,
             &request.models,
         )
-        .map_err(AppError::bad_request)?;
-    Ok((
+    {
+        Ok(created) => created,
+        Err(err) => return AppError::bad_request(err).into_response(),
+    };
+    (
         StatusCode::CREATED,
-        Json(serde_json::to_value(created).map_err(|err| {
-            AppError::internal(format!("failed to serialize created API key: {err}"))
-        })?),
-    ))
+        Json(serde_json::to_value(created).unwrap_or_else(|_| {
+            serde_json::json!({ "error": "failed to serialize created API key" })
+        })),
+    )
+        .into_response()
 }
 
 async fn auth_revoke_key(
     State(gateway): State<Arc<Gateway>>,
+    Extension(dashboard_auth): Extension<Arc<DashboardAuth>>,
     Path(id): Path<String>,
-) -> AppResult<Response> {
-    if gateway
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = dashboard_auth.authorize_mutation(&headers) {
+        return (
+            denied.status(),
+            Json(serde_json::json!({ "error": denied.message() })),
+        )
+            .into_response();
+    }
+    match gateway
         .authz()
         .revoke_key(&id)
-        .map_err(AppError::internal)?
     {
-        Ok(StatusCode::NO_CONTENT.into_response())
-    } else {
-        Err(AppError::not_found("API key not found or already revoked"))
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => AppError::not_found("API key not found or already revoked").into_response(),
+        Err(err) => AppError::internal(err).into_response(),
     }
 }
 
