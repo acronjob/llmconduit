@@ -15,7 +15,7 @@ describe('AccessView', () => {
     expect(screen.getByText(/^api keys$/i)).toBeInTheDocument();
     expect(screen.getByText(/groups and roles/i)).toBeInTheDocument();
     expect(screen.getByText(/policy editor/i)).toBeInTheDocument();
-    expect(screen.getByText(/active sessions/i)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /active sessions/i })).toBeInTheDocument();
     expect(screen.getByText(/audit log/i)).toBeInTheDocument();
     expect(screen.getAllByText('deny').length).toBeGreaterThan(0);
     expect(screen.getByText('unavailable')).toBeInTheDocument();
