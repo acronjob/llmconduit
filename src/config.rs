@@ -559,7 +559,7 @@ pub enum AuthMode {
     Enforce,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthConfig {
     pub mode: AuthMode,
     pub store_path: PathBuf,
