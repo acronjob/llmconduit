@@ -153,9 +153,9 @@ async fn management_key_list_and_revoke_are_permissioned_and_never_recover_raw_s
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
     let created = json(created).await;
-    let key_id = created["id"].as_str().unwrap().to_owned();
-    let raw = created["raw_key"].as_str().unwrap().to_owned();
-    assert!(raw.starts_with("llmc_"));
+    let created_key_id = created["id"].as_str().unwrap().to_owned();
+    let created_raw = created["raw_key"].as_str().unwrap().to_owned();
+    assert!(created_raw.starts_with("llmc_"));
     assert!(created.get("api_key").is_none(), "created key is flattened");
 
     let list_response = routes::<()>(service.access_backend())
@@ -178,10 +178,48 @@ async fn management_key_list_and_revoke_are_permissioned_and_never_recover_raw_s
             .as_array()
             .unwrap()
             .iter()
-            .any(|key| key["id"] == key_id)
+            .any(|key| key["id"] == created_key_id)
     );
-    assert!(!listed_wire.contains(&raw));
+    assert!(!listed_wire.contains(&created_raw));
     assert!(!listed_wire.contains("raw_key"));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(&created_raw).expect("generated key is a valid header"),
+    );
+    assert!(service.authenticate(&headers).unwrap().is_some());
+
+    let rotated = routes::<()>(service.access_backend())
+        .layer(axum::extract::Extension(delegated(
+            ManagementPermission::KeysRotate,
+        )))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/dashboard/api/auth/api-keys/{created_key_id}/rotate"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::OK);
+    let rotated = json(rotated).await;
+    let key_id = rotated["id"].as_str().unwrap().to_owned();
+    let raw = rotated["raw_key"].as_str().unwrap().to_owned();
+    assert_ne!(key_id, created_key_id);
+    assert_ne!(raw, created_raw);
+    assert!(matches!(
+        service.authenticate(&headers),
+        Err(AuthFailure::Invalid)
+    ));
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(&raw).expect("rotated key is a valid header"),
+    );
+    assert!(service.authenticate(&headers).unwrap().is_some());
 
     let denied = routes::<()>(service.access_backend())
         .layer(axum::extract::Extension(delegated(
@@ -197,13 +235,6 @@ async fn management_key_list_and_revoke_are_permissioned_and_never_recover_raw_s
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-api-key",
-        HeaderValue::from_str(&raw).expect("generated key is a valid header"),
-    );
-    assert!(service.authenticate(&headers).unwrap().is_some());
 
     let revoked = routes::<()>(service.access_backend())
         .layer(axum::extract::Extension(delegated(
@@ -261,9 +292,12 @@ async fn management_key_list_and_revoke_are_permissioned_and_never_recover_raw_s
         .unwrap();
     assert_eq!(audit.status(), StatusCode::OK);
     let audit = json(audit).await;
-    assert!(!audit.to_string().contains(&raw));
+    let audit_wire = audit.to_string();
+    assert!(!audit_wire.contains(&created_raw));
+    assert!(!audit_wire.contains(&raw));
 
     drop(service);
+    assert_store_files_do_not_contain(&path, &created_raw);
     assert_store_files_do_not_contain(&path, &raw);
     remove_store(&path);
 }
