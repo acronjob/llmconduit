@@ -7378,7 +7378,7 @@ async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
         )
         .await
         .unwrap();
-    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthenticated.status().as_u16(), 401);
     assert_eq!(
         unauthenticated
             .headers()
@@ -7402,7 +7402,7 @@ async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
         )
         .await
         .unwrap();
-    assert_eq!(summary.status(), StatusCode::OK);
+    assert_eq!(summary.status().as_u16(), 200);
     let summary_body = d13_json(summary).await;
     assert_eq!(summary_body["actor"]["kind"], "bootstrap");
     assert!(summary_body["counts"]["api_keys"].as_u64().unwrap() >= 2);
@@ -7421,7 +7421,7 @@ async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
         )
         .await
         .unwrap();
-    assert_eq!(delegated.status(), StatusCode::FORBIDDEN);
+    assert_eq!(delegated.status().as_u16(), 403);
 
     let missing_csrf = app
         .clone()
@@ -7438,7 +7438,7 @@ async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
         )
         .await
         .unwrap();
-    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+    assert_eq!(missing_csrf.status().as_u16(), 403);
 
     remove_auth_store(&store_path);
 }
