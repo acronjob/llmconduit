@@ -663,6 +663,26 @@ async fn write_pricing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    struct KeysBackend;
+
+    impl AccessBackend for KeysBackend {
+        fn dispatch<'a>(
+            &'a self,
+            _actor: &'a ManagementActor,
+            operation: AccessOperation,
+        ) -> AccessFuture<'a> {
+            Box::pin(async move {
+                match operation {
+                    AccessOperation::ListApiKeys => Ok(AccessResult::ApiKeys(Vec::new())),
+                    _ => Err(AccessError::contract()),
+                }
+            })
+        }
+    }
 
     #[test]
     fn created_key_debug_never_contains_secret() {
@@ -682,6 +702,11 @@ mod tests {
         let debug = format!("{created:?}");
         assert!(!debug.contains("extremely_secret"));
         assert!(debug.contains("[REDACTED]"));
+
+        let wire = serde_json::to_value(created).unwrap();
+        assert_eq!(wire["id"], "key_1");
+        assert_eq!(wire["raw_key"], "llmc_extremely_secret");
+        assert!(wire.get("api_key").is_none());
     }
 
     #[test]
@@ -695,5 +720,41 @@ mod tests {
         assert!(actor.allows(ManagementPermission::KeysRead));
         assert!(!actor.allows(ManagementPermission::KeysRevoke));
         assert!(ManagementActor::Bootstrap.allows(ManagementPermission::KeysRevoke));
+    }
+
+    #[tokio::test]
+    async fn route_checks_named_permission_before_dispatch() {
+        let actor = ManagementActor::Delegated {
+            session_id: "sess_1".into(),
+            principal_id: "usr_1".into(),
+            key_id: "key_1".into(),
+            permissions: Arc::from([ManagementPermission::UsageRead]),
+        };
+        let app = routes::<()>(Arc::new(KeysBackend)).layer(Extension(actor));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/api/auth/api-keys")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_actor_bypasses_named_permission_gate() {
+        let app = routes::<()>(Arc::new(KeysBackend)).layer(Extension(ManagementActor::Bootstrap));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/api/auth/api-keys")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
