@@ -26,13 +26,20 @@ describe('AccessView', () => {
     renderWithQuery(<AccessView />);
     await screen.findByTestId('access-view');
 
+    expect(screen.getByText(/direct access/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /people & groups/i }));
     expect(screen.getByText(/users and service accounts/i)).toBeInTheDocument();
-    expect(screen.getByText(/^api keys$/i)).toBeInTheDocument();
     expect(screen.getByText(/groups and roles/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /^api keys$/i }));
+    expect(screen.getByRole('heading', { name: /^api keys$/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /policies/i }));
     expect(screen.getByText(/policy editor/i)).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: /active sessions/i })).toBeInTheDocument();
-    expect(screen.getByText(/audit log/i)).toBeInTheDocument();
     expect(screen.getAllByText('deny').length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole('tab', { name: /sessions/i }));
+    expect(screen.getByRole('heading', { name: /active sessions/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /audit & cost/i }));
+    expect(screen.getByText(/audit log/i)).toBeInTheDocument();
     expect(screen.getByText('unavailable')).toBeInTheDocument();
   });
 
@@ -40,6 +47,8 @@ describe('AccessView', () => {
     renderWithQuery(<AccessView />);
     await screen.findByTestId('access-view');
 
+    fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /^api keys$/i }));
     fireEvent.change(screen.getByLabelText('Key name'), { target: { value: 'temporary key' } });
     fireEvent.click(screen.getByRole('button', { name: 'Create key' }));
 
@@ -51,10 +60,31 @@ describe('AccessView', () => {
     expect(screen.queryByText(/llmc_mock_.*copy_once/)).not.toBeInTheDocument();
   });
 
+  it('guides a new service identity through policy, limits, review, and copy-once key creation', async () => {
+    renderWithQuery(<AccessView />);
+    await screen.findByTestId('access-view');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Service' }));
+    fireEvent.change(screen.getByLabelText('Wizard display name'), { target: { value: 'Nightly evaluator' } });
+    fireEvent.change(screen.getByLabelText('Wizard key name'), { target: { value: 'nightly runner' } });
+    fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+    expect(screen.getByLabelText('Wizard models')).toHaveValue('gpt-*');
+    fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+    expect(screen.getByLabelText('Wizard max concurrent sessions')).toHaveValue(4);
+    fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+    expect(screen.getByText(/nightly evaluator \(service_account\)/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^create access$/i }));
+
+    const dialog = await screen.findByRole('dialog', { name: /copy api key/i });
+    expect(dialog).toHaveTextContent(/^.*llmc_/s);
+  });
+
   it('creates groups and roles and previews the exact non-hardcoded policy payload', async () => {
     renderWithQuery(<AccessView />);
     await screen.findByTestId('access-view');
 
+    fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /people & groups/i }));
     fireEvent.change(screen.getByLabelText('Group name'), { target: { value: 'Canary operators' } });
     const members = screen.getByLabelText('Group members') as HTMLSelectElement;
     members.options[0]!.selected = true;
@@ -69,6 +99,7 @@ describe('AccessView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create role' }));
     await screen.findByText('Policy reader');
 
+    fireEvent.click(screen.getByRole('tab', { name: /policies/i }));
     const subjects = screen.getByLabelText('Policy subjects') as HTMLSelectElement;
     Array.from(subjects.options).find((option) => option.value === 'principal:usr_ops')!.selected = true;
     fireEvent.change(subjects);

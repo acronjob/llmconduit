@@ -11,6 +11,8 @@ describe('AccessView management lifecycle', () => {
     renderWithQuery(<AccessView />);
     await screen.findByTestId('access-view');
 
+    fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /^api keys$/i }));
     const rotate = screen.getAllByRole('button', { name: 'Rotate' })[0];
     expect(rotate).toBeDefined();
     fireEvent.click(rotate!);
@@ -27,6 +29,8 @@ describe('AccessView management lifecycle', () => {
     renderWithQuery(<AccessView />);
     await screen.findByTestId('access-view');
 
+    fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /^api keys$/i }));
     const revoke = screen.getAllByRole('button', { name: 'Revoke' })[0];
     expect(revoke).toBeDefined();
     const row = revoke!.closest('tr');
@@ -43,6 +47,8 @@ describe('AccessView management lifecycle', () => {
     renderWithQuery(<AccessView />);
     await screen.findByTestId('access-view');
 
+    fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /policies/i }));
     fireEvent.change(screen.getByLabelText('Policy effect'), { target: { value: 'deny' } });
     fireEvent.change(screen.getByLabelText('Policy models'), { target: { value: 'secret-*, internal-*' } });
     fireEvent.change(screen.getByLabelText('Policy providers'), { target: { value: 'private-a' } });
