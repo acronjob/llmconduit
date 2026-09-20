@@ -326,7 +326,12 @@ mod tests {
                 if policies.iter().any(|policy| policy.time_windows.len() == 1
                     && policy.max_daily_session_starts == Some(10))
         ));
-        let scope = context.authorization_scope("chat", "public-v1");
+        let scope = context
+            .authorization_scope(
+                crate::upstream::InferenceEndpoint::ChatCompletions,
+                "public-v1",
+            )
+            .unwrap();
         assert!(scope.allows_candidate(
             "provider-a",
             None,
