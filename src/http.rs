@@ -2242,17 +2242,16 @@ async fn post_completions(
             Ok::<_, AppError>((model, streaming))
         })
         .transpose()?;
-    let authorization = if let (Some(context), Some((model, _))) =
-        (auth.as_ref(), request_metadata.as_ref())
-    {
-        authorize_inference(
-            Some(&context.0),
-            crate::upstream::InferenceEndpoint::Completions,
-            model,
-        )?
-    } else {
-        crate::upstream::AuthorizationScope::unrestricted()
-    };
+    let authorization =
+        if let (Some(context), Some((model, _))) = (auth.as_ref(), request_metadata.as_ref()) {
+            authorize_inference(
+                Some(&context.0),
+                crate::upstream::InferenceEndpoint::Completions,
+                model,
+            )?
+        } else {
+            crate::upstream::AuthorizationScope::unrestricted()
+        };
     let auth = auth.map(|value| value.0);
     let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let response = gateway
