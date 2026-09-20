@@ -162,7 +162,7 @@ impl UpstreamClient for MockUpstream {
         Ok(Box::pin(stream::iter(chunks)))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, AppError> {
+    async fn list_models(&self) -> Result<llmconduit::upstream::UpstreamModelsResponse, AppError> {
         Err(AppError::internal("unused in this test"))
     }
 
@@ -517,6 +517,7 @@ pub fn test_config() -> Config {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        mesh: llmconduit::config::MeshConfig::default(),
     }
 }
 

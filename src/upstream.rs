@@ -82,7 +82,7 @@ fn now_epoch_ms_u128() -> u128 {
 /// No-op when no token is threaded (tests / non-engine paths). Called by the leaf right
 /// after `logged_send_chat_request` returns, for BOTH a 2xx and a non-2xx response, so the
 /// failover loop / bare-leaf reads the TRUE wire TTFB even for an HTTP-status failure.
-fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
+pub(crate) fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
     if let Some(serving) = serving {
         serving.stamp_attempt_header_byte(now_epoch_ms_u128());
     }
@@ -371,6 +371,16 @@ pub struct UpstreamModelEntry {
     pub context_limit: Option<i64>,
 }
 
+/// Transport-neutral `/v1/models` response. Model catalogs can originate from
+/// HTTP providers or the in-memory mesh registry without manufacturing a
+/// `reqwest::Response`.
+#[derive(Debug, Clone)]
+pub struct UpstreamModelsResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
 const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
 /// One pre-first-chunk serving backend: its FINAL model id (after any
@@ -417,7 +427,7 @@ pub trait UpstreamClient: Send + Sync {
         let stream = self.stream_chat_completion(request).await?;
         Ok(timeout_upstream_stream(stream, request_timeout))
     }
-    async fn list_models(&self) -> AppResult<reqwest::Response>;
+    async fn list_models(&self) -> AppResult<UpstreamModelsResponse>;
     async fn proxy_completions(
         &self,
         _headers: HeaderMap,
@@ -497,7 +507,21 @@ pub trait UpstreamClient: Send + Sync {
     fn provider_health(&self) -> Vec<ProviderHealth> {
         Vec::new()
     }
+
+    fn provider_base_url(&self) -> String {
+        "synthetic://upstream".to_string()
+    }
+
+    /// How long callers may cache this client's model catalog. Static HTTP
+    /// providers keep the historical five-minute window; dynamic transports
+    /// such as the mesh can request a shorter refresh without bypassing the
+    /// existing catalog abstraction.
+    fn model_catalog_cache_ttl(&self) -> Duration {
+        Duration::from_secs(ROUTING_MODEL_CATALOG_TTL_SECS)
+    }
 }
+
+pub type DynUpstreamClient = Arc<dyn UpstreamClient>;
 
 #[derive(Debug, Clone)]
 pub struct ReqwestUpstreamClient {
@@ -538,10 +562,10 @@ pub struct ReqwestUpstreamClient {
     tag_primary_provider: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FailoverUpstreamProvider {
     name: String,
-    client: ReqwestUpstreamClient,
+    client: DynUpstreamClient,
     upstream_model: Option<String>,
     exposed_model: Option<String>,
     upstream_chat_kwargs: JsonMap<String, Value>,
@@ -555,7 +579,23 @@ pub struct FailoverUpstreamProvider {
 impl FailoverUpstreamProvider {
     pub fn new(
         name: impl Into<String>,
-        client: ReqwestUpstreamClient,
+        client: impl UpstreamClient + 'static,
+        upstream_model: Option<String>,
+        exposed_model: Option<String>,
+        upstream_chat_kwargs: JsonMap<String, Value>,
+    ) -> Self {
+        Self::from_dyn(
+            name,
+            Arc::new(client),
+            upstream_model,
+            exposed_model,
+            upstream_chat_kwargs,
+        )
+    }
+
+    pub fn from_dyn(
+        name: impl Into<String>,
+        client: DynUpstreamClient,
         upstream_model: Option<String>,
         exposed_model: Option<String>,
         upstream_chat_kwargs: JsonMap<String, Value>,
@@ -571,6 +611,16 @@ impl FailoverUpstreamProvider {
     }
 }
 
+impl std::fmt::Debug for FailoverUpstreamProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailoverUpstreamProvider")
+            .field("name", &self.name)
+            .field("upstream_model", &self.upstream_model)
+            .field("exposed_model", &self.exposed_model)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FailoverUpstreamClient {
     providers: Vec<FailoverUpstreamProvider>,
@@ -578,10 +628,10 @@ pub struct FailoverUpstreamClient {
     states: Arc<Mutex<Vec<ProviderCooldownState>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RoutingUpstreamProvider {
     name: String,
-    primary_client: ReqwestUpstreamClient,
+    primary_client: DynUpstreamClient,
     primary_upstream_model: Option<String>,
     fallback_exposed_models: Vec<RoutingFallbackExposedModel>,
     client: FailoverUpstreamClient,
@@ -590,16 +640,34 @@ pub struct RoutingUpstreamProvider {
 impl RoutingUpstreamProvider {
     pub fn new(
         name: impl Into<String>,
-        primary_client: ReqwestUpstreamClient,
+        primary_client: impl UpstreamClient + 'static,
+        primary_upstream_model: Option<String>,
+        primary_upstream_chat_kwargs: JsonMap<String, Value>,
+        fallback_providers: Vec<FailoverUpstreamProvider>,
+        cooldown: Duration,
+    ) -> Self {
+        Self::from_dyn(
+            name,
+            Arc::new(primary_client),
+            primary_upstream_model,
+            primary_upstream_chat_kwargs,
+            fallback_providers,
+            cooldown,
+        )
+    }
+
+    pub fn from_dyn(
+        name: impl Into<String>,
+        primary_client: DynUpstreamClient,
         primary_upstream_model: Option<String>,
         primary_upstream_chat_kwargs: JsonMap<String, Value>,
         fallback_providers: Vec<FailoverUpstreamProvider>,
         cooldown: Duration,
     ) -> Self {
         let name = name.into();
-        let mut providers = vec![FailoverUpstreamProvider::new(
+        let mut providers = vec![FailoverUpstreamProvider::from_dyn(
             name.clone(),
-            primary_client.clone(),
+            Arc::clone(&primary_client),
             primary_upstream_model.clone(),
             None,
             primary_upstream_chat_kwargs,
@@ -637,6 +705,16 @@ impl RoutingUpstreamProvider {
     }
 }
 
+impl std::fmt::Debug for RoutingUpstreamProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutingUpstreamProvider")
+            .field("name", &self.name)
+            .field("primary_upstream_model", &self.primary_upstream_model)
+            .field("fallback_exposed_models", &self.fallback_exposed_models)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A synthetic upstream backing one or more ad-hoc model routes (G7). Unlike a
 /// catalog provider, a route provider is matched by request-model *name* (in
 /// `ModelRouteSpec`), never enumerated into the `/v1/models` union, so routes
@@ -649,12 +727,24 @@ pub struct RouteUpstreamProvider {
 }
 
 impl RouteUpstreamProvider {
-    pub fn new(name: impl Into<String>, client: ReqwestUpstreamClient, cooldown: Duration) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        client: impl UpstreamClient + 'static,
+        cooldown: Duration,
+    ) -> Self {
+        Self::from_dyn(name, Arc::new(client), cooldown)
+    }
+
+    pub fn from_dyn(
+        name: impl Into<String>,
+        client: DynUpstreamClient,
+        cooldown: Duration,
+    ) -> Self {
         let name = name.into();
         Self {
             name: name.clone(),
             client: FailoverUpstreamClient::new(
-                vec![FailoverUpstreamProvider::new(
+                vec![FailoverUpstreamProvider::from_dyn(
                     name,
                     client,
                     None,
@@ -881,7 +971,7 @@ fn estimate_request_text_len(request: &ChatCompletionRequest) -> usize {
 /// `replace` lands well before the finalize barrier reads the section (no race, no
 /// hang). `None` ONLY on a `spawn_blocking` join failure (runtime shutdown) — the
 /// caller then leaves the section ABSENT (don't-lie-with-zeros), never a panic.
-async fn offload_redacted_upstream_request_bytes(
+pub(crate) async fn offload_redacted_upstream_request_bytes(
     request: &ChatCompletionRequest,
 ) -> Option<Vec<u8>> {
     if estimate_request_text_len(request) <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
@@ -1678,7 +1768,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         Ok(value.get("count").and_then(Value::as_u64))
     }
 
-    async fn list_models(&self) -> AppResult<reqwest::Response> {
+    async fn list_models(&self) -> AppResult<UpstreamModelsResponse> {
         let url = self.endpoint_url("models")?;
         let response = self
             .with_auth(self.client.get(url))
@@ -1693,7 +1783,16 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 redact_and_truncate_error_body(&body, 500)
             )));
         }
-        Ok(response)
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await.map_err(|err| {
+            AppError::upstream(format!("failed to read upstream /models body: {err}"))
+        })?;
+        Ok(UpstreamModelsResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     async fn proxy_completions(
@@ -1706,6 +1805,10 @@ impl UpstreamClient for ReqwestUpstreamClient {
         self.with_auth(request).send().await.map_err(|err| {
             AppError::upstream(format!("upstream completions request failed: {err}"))
         })
+    }
+
+    fn provider_base_url(&self) -> String {
+        self.base_url_string()
     }
 }
 
@@ -1820,7 +1923,7 @@ impl FailoverUpstreamClient {
                     id: provider.name.clone(),
                     name: provider.name.clone(),
                     route: route.map(ToString::to_string),
-                    base_url: provider.client.base_url_string(),
+                    base_url: provider.client.provider_base_url(),
                     status,
                     cooling_until_ms,
                     last_error,
@@ -2429,7 +2532,7 @@ impl RoutingUpstreamClient {
     async fn load_catalog(&self) -> AppResult<RoutingModelCatalog> {
         let mut cache = self.catalog.lock().await;
         if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS
+            && cached.fetched_at.elapsed() < self.model_catalog_cache_ttl()
         {
             return Ok(cached.catalog.clone());
         }
@@ -2449,10 +2552,14 @@ impl RoutingUpstreamClient {
         let mut ids_by_key: HashMap<String, Vec<RoutingModelCandidate>> = HashMap::new();
         let mut seen_union_ids = HashSet::new();
         let mut last_error = None;
+        let mut catalog_loaded = false;
 
         for (provider_index, provider) in self.providers.iter().enumerate() {
             let entries = match primary_provider_model_entries(provider).await {
-                Ok(entries) => entries,
+                Ok(entries) => {
+                    catalog_loaded = true;
+                    entries
+                }
                 Err(err) => {
                     tracing::warn!(
                         provider = %provider.name,
@@ -2507,10 +2614,10 @@ impl RoutingUpstreamClient {
             });
         }
 
-        // With ad-hoc routes (G7), an empty union is still a usable catalog:
-        // routes resolve by name without a live model listing. Only error when
-        // there are neither catalog models nor routes to dispatch to.
-        if union_ids.is_empty() && self.routes.is_empty() {
+        // A successfully loaded empty catalog is a valid snapshot (notably when
+        // a mesh has no healthy workers yet). Only surface an upstream failure
+        // when every provider catalog failed and no ad-hoc route can dispatch.
+        if union_ids.is_empty() && self.routes.is_empty() && !catalog_loaded {
             return Err(last_error.unwrap_or_else(|| {
                 AppError::upstream("no models are currently available from configured upstreams")
             }));
@@ -2808,7 +2915,7 @@ impl UpstreamClient for FailoverUpstreamClient {
             .await
     }
 
-    async fn list_models(&self) -> AppResult<reqwest::Response> {
+    async fn list_models(&self) -> AppResult<UpstreamModelsResponse> {
         let mut last_error = None;
         let provider_indices = self.available_provider_indices();
         if provider_indices.is_empty() {
@@ -3129,7 +3236,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         }
     }
 
-    async fn list_models(&self) -> AppResult<reqwest::Response> {
+    async fn list_models(&self) -> AppResult<UpstreamModelsResponse> {
         let catalog = self.load_catalog().await?;
         json_response(catalog.union_body())
     }
@@ -3202,6 +3309,14 @@ impl UpstreamClient for RoutingUpstreamClient {
                 UpstreamModelEntry { id, context_limit }
             })
             .collect())
+    }
+
+    fn model_catalog_cache_ttl(&self) -> Duration {
+        self.providers
+            .iter()
+            .map(|provider| provider.primary_client.model_catalog_cache_ttl())
+            .min()
+            .unwrap_or_else(|| Duration::from_secs(ROUTING_MODEL_CATALOG_TTL_SECS))
     }
 }
 
@@ -4696,58 +4811,62 @@ fn normalize_sparse_tool_call_types(value: &mut Value) -> bool {
 }
 
 pub async fn collect_models_response(
-    response: reqwest::Response,
+    response: UpstreamModelsResponse,
 ) -> AppResult<(StatusCode, Value, Option<String>)> {
-    let status = response.status();
+    let status = response.status;
     let etag = response
-        .headers()
+        .headers
         .get(http::header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
-    let body = response
-        .json::<Value>()
-        .await
+    let body = serde_json::from_slice::<Value>(&response.body)
         .map_err(|err| AppError::upstream(format!("invalid upstream /models JSON: {err}")))?;
     Ok((status, body, etag))
 }
 
 pub async fn collect_supported_model_catalog(
-    response: reqwest::Response,
+    response: UpstreamModelsResponse,
 ) -> AppResult<Vec<UpstreamModelEntry>> {
     let (_, body, _) = collect_models_response(response).await?;
     Ok(extract_supported_model_catalog(&body))
 }
 
 async fn filter_models_response(
-    response: reqwest::Response,
+    response: UpstreamModelsResponse,
     model: &str,
-) -> AppResult<reqwest::Response> {
-    let status = response.status();
-    let body = response
-        .json::<Value>()
-        .await
+) -> AppResult<UpstreamModelsResponse> {
+    let status = response.status;
+    let body = serde_json::from_slice::<Value>(&response.body)
         .map_err(|err| AppError::upstream(format!("invalid upstream /models JSON: {err}")))?;
     let body = filter_models_body(body, model);
-    let body = serde_json::to_string(&body).map_err(|err| {
+    let body = serde_json::to_vec(&body).map_err(|err| {
         AppError::internal(format!("failed to serialize /models response: {err}"))
     })?;
-    let response = http::Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .map_err(|err| AppError::internal(format!("failed to build /models response: {err}")))?;
-    Ok(reqwest::Response::from(response))
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    Ok(UpstreamModelsResponse {
+        status,
+        headers,
+        body: Bytes::from(body),
+    })
 }
 
-fn json_response(body: Value) -> AppResult<reqwest::Response> {
-    let body = serde_json::to_string(&body)
+fn json_response(body: Value) -> AppResult<UpstreamModelsResponse> {
+    let body = serde_json::to_vec(&body)
         .map_err(|err| AppError::internal(format!("failed to serialize JSON response: {err}")))?;
-    let response = http::Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .map_err(|err| AppError::internal(format!("failed to build JSON response: {err}")))?;
-    Ok(reqwest::Response::from(response))
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    Ok(UpstreamModelsResponse {
+        status: StatusCode::OK,
+        headers,
+        body: Bytes::from(body),
+    })
 }
 
 fn filter_models_body(body: Value, model: &str) -> Value {

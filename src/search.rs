@@ -161,6 +161,7 @@ fn format_search_results(payload: &BraveSearchResponse) -> String {
 mod tests {
     use super::BraveSearchClient;
     use crate::config::Config;
+    use crate::config::MeshConfig;
     use crate::config::UnsupportedImagePolicy;
 
     use super::BraveSearchResponse;
@@ -276,6 +277,7 @@ mod tests {
                 image_cache_ttl_secs: 300,
                 unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
                 price_table: std::collections::HashMap::new(),
+                mesh: MeshConfig::default(),
             },
         );
 
@@ -327,6 +329,7 @@ mod tests {
                 image_cache_ttl_secs: 300,
                 unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
                 price_table: std::collections::HashMap::new(),
+                mesh: MeshConfig::default(),
             },
         );
 

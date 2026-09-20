@@ -3138,7 +3138,7 @@ impl Gateway {
     async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {
         let mut cache = self.upstream_model_catalog.lock().await;
         if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < UPSTREAM_MODEL_CATALOG_TTL_SECS
+            && cached.fetched_at.elapsed() < self.upstream.model_catalog_cache_ttl()
         {
             return Ok(cached.catalog.clone());
         }

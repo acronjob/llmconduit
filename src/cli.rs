@@ -60,6 +60,78 @@ pub enum Commands {
         #[arg(long, default_value_t = 10)]
         pairs: usize,
     },
+    /// Run a mesh worker sidecar.
+    Worker {
+        /// Path to the worker config file. Defaults to ~/.config/llmconduit/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// One-shot enrollment key. If omitted, LLMCONDUIT_MESH_JOIN_KEY is used.
+        #[arg(long = "join-key")]
+        join_key: Option<String>,
+    },
+    /// Manage mesh controller state.
+    Mesh {
+        /// Path to the controller config file. Defaults to ~/.config/llmconduit/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: MeshCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MeshCommands {
+    /// Show controller mesh identity and state information.
+    Info,
+    /// Manage enrollment join keys.
+    JoinKey {
+        #[command(subcommand)]
+        command: JoinKeyCommands,
+    },
+    /// Manage enrolled worker nodes.
+    Node {
+        #[command(subcommand)]
+        command: NodeCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JoinKeyCommands {
+    /// Create a join token. The plaintext token is printed exactly once.
+    Create {
+        /// Optional operator-facing label.
+        #[arg(long)]
+        label: Option<String>,
+        /// Maximum number of successful enrollments allowed.
+        #[arg(long = "max-uses")]
+        max_uses: Option<i64>,
+        /// Relative expiry such as 30m, 12h, or 7d.
+        #[arg(long = "expires-in")]
+        expires_in: Option<String>,
+    },
+    /// List join keys without exposing plaintext tokens.
+    List,
+    /// Disable a join key by id.
+    Revoke {
+        /// Join-key id, for example jk_<uuid>.
+        key_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NodeCommands {
+    /// List enrolled worker nodes.
+    List,
+    /// Disable a worker node by endpoint id.
+    Revoke {
+        /// Worker Iroh endpoint id.
+        endpoint_id: String,
+    },
+    /// Re-enable a worker node by endpoint id.
+    Enable {
+        /// Worker Iroh endpoint id.
+        endpoint_id: String,
+    },
 }
 
 pub fn resolve_config_path(path: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -204,6 +276,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         image_cache_ttl_secs: existing.image_cache_ttl_secs,
         unsupported_image_policy: existing.unsupported_image_policy,
         price_table: existing.price_table.clone(),
+        mesh: existing.mesh.clone(),
     };
 
     let should_write = Confirm::with_theme(&theme)
@@ -217,4 +290,76 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
 
     write_persisted_config(&path, &config)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_worker_command_with_join_key() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "worker",
+            "--config",
+            "/etc/llmconduit/worker.yaml",
+            "--join-key",
+            "llmc_join_secret",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worker {
+                config: Some(_),
+                join_key: Some(_),
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_mesh_join_key_create_command() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "mesh",
+            "--config",
+            "/etc/llmconduit/config.yaml",
+            "join-key",
+            "create",
+            "--label",
+            "community",
+            "--max-uses",
+            "20",
+            "--expires-in",
+            "7d",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Mesh {
+                command: MeshCommands::JoinKey {
+                    command: JoinKeyCommands::Create {
+                        label: Some(_),
+                        max_uses: Some(20),
+                        expires_in: Some(_),
+                    }
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_mesh_node_enable_command() {
+        let cli = Cli::parse_from(["llmconduit", "mesh", "node", "enable", "endpoint-id"]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Mesh {
+                command: MeshCommands::Node {
+                    command: NodeCommands::Enable { endpoint_id },
+                },
+                ..
+            }) if endpoint_id == "endpoint-id"
+        ));
+    }
 }

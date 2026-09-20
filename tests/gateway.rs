@@ -154,7 +154,9 @@ impl UpstreamClient for MockUpstream {
         Ok(Box::pin(stream::iter(chunks)))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
@@ -246,7 +248,9 @@ impl UpstreamClient for PendingChunkUpstream {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
@@ -306,7 +310,9 @@ impl UpstreamClient for ChunkThenPendingUpstream {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
@@ -370,7 +376,9 @@ impl UpstreamClient for FloodThenParkUpstream {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
@@ -686,6 +694,7 @@ async fn uses_configured_upstream_model_override() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            mesh: llmconduit::config::MeshConfig::default(),
         },
     );
 
@@ -775,6 +784,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            mesh: llmconduit::config::MeshConfig::default(),
         },
     );
 
@@ -1129,6 +1139,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            mesh: llmconduit::config::MeshConfig::default(),
         },
     );
 
@@ -1206,6 +1217,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            mesh: llmconduit::config::MeshConfig::default(),
         },
     );
 
@@ -3033,6 +3045,42 @@ async fn fallback_models_endpoint_filters_to_provider_model_override() {
 }
 
 #[tokio::test]
+async fn mesh_only_models_endpoint_does_not_poll_legacy_primary() {
+    let temp = std::env::temp_dir().join(format!(
+        "llmconduit-mesh-models-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&temp).expect("create tempdir");
+    let mut config = test_config();
+    config.upstream_base_url = "http://127.0.0.1:9/v1".parse().expect("url");
+    config.mesh.controller.enabled = true;
+    config.mesh.controller.bind_addr = "127.0.0.1:0".parse().expect("socket addr");
+    config.mesh.controller.identity_path = Some(temp.join("controller.key"));
+    config.mesh.controller.state_path = Some(temp.join("mesh.db"));
+
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("json body"),
+        json!({"object": "list", "data": []})
+    );
+    std::fs::remove_dir_all(temp).expect("remove tempdir");
+}
+
+#[tokio::test]
 async fn fallback_models_endpoint_without_provider_model_override_passes_list_through() {
     let primary = MockServer::start().await;
     let fallback = MockServer::start().await;
@@ -3146,6 +3194,7 @@ async fn proxies_models_endpoint_with_etag() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3224,6 +3273,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3308,6 +3358,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3395,6 +3446,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3487,6 +3539,7 @@ async fn proxies_completions_endpoint_passthrough() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -7283,6 +7336,7 @@ fn test_config() -> Config {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        mesh: llmconduit::config::MeshConfig::default(),
     }
 }
 
@@ -10390,6 +10444,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     // The image agent is off here, so the vision client is inert; a real
     // `ReqwestVisionClient` that is never called satisfies the constructor
@@ -12510,7 +12565,9 @@ impl UpstreamClient for RepairRoundPendingUpstream {
         }
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 

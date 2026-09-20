@@ -11,6 +11,7 @@ pub mod engine;
 pub mod error;
 pub mod http;
 pub mod log_rotation;
+pub mod mesh;
 pub mod metrics;
 pub mod models;
 pub mod monitor;
@@ -54,6 +55,7 @@ use crate::config::Config;
 use crate::engine::Gateway;
 use crate::http::RouterOptions;
 use crate::http::build_router;
+use crate::mesh::MeshUpstreamClient;
 use crate::monitor::MonitorHub;
 use crate::raw::RawOutput;
 use crate::replay::ReplayStore;
@@ -129,10 +131,19 @@ pub fn build_app_with_gateway_and_options(
         Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),
         None => crate::turn_capture::TurnCapture::disabled(),
     };
+    let mesh_registry = if config.mesh.controller.enabled {
+        Some(
+            crate::mesh::controller::spawn_controller(&config.mesh.controller)
+                .expect("validated mesh controller configuration"),
+        )
+    } else {
+        None
+    };
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
     // client so route-name/glob matching applies.
-    let routing_mode = !config.upstreams.is_empty() || !config.model_routes.is_empty();
+    let routing_mode =
+        !config.upstreams.is_empty() || !config.model_routes.is_empty() || mesh_registry.is_some();
     // Per-backend-model finalization policies (effort map, `template_family`
     // override, `upstream_chat_kwargs`), shared (cheap clone) across all leaf
     // clients so each resolves against the FINAL provider model (T1). Built once
@@ -161,42 +172,60 @@ pub fn build_app_with_gateway_and_options(
             .with_flow_store(flow_store.clone())
         };
     let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
-        let providers = config
-            .upstreams
-            .iter()
-            .map(|provider| {
-                let primary_client = make_upstream_client(
-                    provider.upstream_base_url.clone(),
-                    provider.upstream_api_key.clone(),
-                    provider.upstream_request_log_path.clone(),
-                );
-                let fallback_providers = provider
-                    .fallback_upstreams
-                    .iter()
-                    .map(|fallback| {
-                        FailoverUpstreamProvider::new(
-                            fallback.name.clone(),
-                            make_upstream_client(
-                                fallback.upstream_base_url.clone(),
-                                fallback.upstream_api_key.clone(),
-                                fallback.upstream_request_log_path.clone(),
-                            ),
-                            fallback.upstream_model.clone(),
-                            fallback.exposed_model.clone(),
-                            fallback.upstream_chat_kwargs.clone(),
-                        )
-                    })
-                    .collect();
-                RoutingUpstreamProvider::new(
-                    provider.name.clone(),
-                    primary_client,
-                    provider.upstream_model.clone(),
-                    provider.upstream_chat_kwargs.clone(),
-                    fallback_providers,
-                    Duration::from_secs(config.upstream_failure_cooldown_secs),
-                )
-            })
-            .collect();
+        let mut providers = Vec::new();
+        if let Some(registry) = mesh_registry {
+            providers.push(RoutingUpstreamProvider::new(
+                "mesh",
+                MeshUpstreamClient::new(
+                    registry,
+                    finalization_policies.clone(),
+                    flatten_content,
+                    max_sse_frame_bytes,
+                    flow_store.clone(),
+                ),
+                None,
+                serde_json::Map::new(),
+                Vec::new(),
+                Duration::from_secs(config.upstream_failure_cooldown_secs),
+            ));
+        }
+        // Enabling the controller alone is mesh-only mode. The persisted
+        // `upstream_base_url` always has a legacy default, so treating it as an
+        // implicit provider would make an empty mesh catalog fail by polling an
+        // unrelated HTTP endpoint. Operators that want direct providers beside
+        // the mesh opt in through `upstreams` below.
+        providers.extend(config.upstreams.iter().map(|provider| {
+            let primary_client = make_upstream_client(
+                provider.upstream_base_url.clone(),
+                provider.upstream_api_key.clone(),
+                provider.upstream_request_log_path.clone(),
+            );
+            let fallback_providers = provider
+                .fallback_upstreams
+                .iter()
+                .map(|fallback| {
+                    FailoverUpstreamProvider::new(
+                        fallback.name.clone(),
+                        make_upstream_client(
+                            fallback.upstream_base_url.clone(),
+                            fallback.upstream_api_key.clone(),
+                            fallback.upstream_request_log_path.clone(),
+                        ),
+                        fallback.upstream_model.clone(),
+                        fallback.exposed_model.clone(),
+                        fallback.upstream_chat_kwargs.clone(),
+                    )
+                })
+                .collect();
+            RoutingUpstreamProvider::new(
+                provider.name.clone(),
+                primary_client,
+                provider.upstream_model.clone(),
+                provider.upstream_chat_kwargs.clone(),
+                fallback_providers,
+                Duration::from_secs(config.upstream_failure_cooldown_secs),
+            )
+        }));
         // Build a synthetic provider + spec per ad-hoc route (G7). Each route is
         // a single-upstream client keyed by request-model name/glob; the glob
         // matcher was compiled at config time.

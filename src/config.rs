@@ -1,3 +1,5 @@
+use chrono::DateTime;
+use chrono::FixedOffset;
 use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
@@ -634,6 +636,156 @@ pub struct Config {
     /// default — an absent model simply has no price (cost stays `None`/0), which
     /// is contract-valid (the frontend only requires finite rates when present).
     pub price_table: HashMap<String, ModelPrice>,
+    pub mesh: MeshConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MeshConfig {
+    pub controller: MeshControllerConfig,
+    pub worker: MeshWorkerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshControllerConfig {
+    pub enabled: bool,
+    pub bind_addr: SocketAddr,
+    pub identity_path: Option<PathBuf>,
+    pub state_path: Option<PathBuf>,
+    pub heartbeat_timeout_secs: u64,
+}
+
+impl Default for MeshControllerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "0.0.0.0:4433"
+                .parse()
+                .expect("default mesh controller bind address is valid"),
+            identity_path: None,
+            state_path: None,
+            heartbeat_timeout_secs: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshWorkerConfig {
+    pub controller_addr: Option<String>,
+    pub controller_endpoint_id: Option<String>,
+    pub identity_path: Option<PathBuf>,
+    pub heartbeat_interval_secs: u64,
+    pub resources: Vec<MeshWorkerResourceConfig>,
+}
+
+impl Default for MeshWorkerConfig {
+    fn default() -> Self {
+        Self {
+            controller_addr: None,
+            controller_endpoint_id: None,
+            identity_path: None,
+            heartbeat_interval_secs: 10,
+            resources: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshWorkerResourceConfig {
+    pub id: String,
+    pub target: SocketAddr,
+    pub model_refresh_secs: u64,
+    pub availability: AvailabilitySchedule,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AvailabilitySchedule {
+    pub timezone: String,
+    pub default_capacity: u32,
+    pub weekly: Vec<WeeklyCapacityWindow>,
+    pub exceptions: Vec<CapacityException>,
+}
+
+impl Default for AvailabilitySchedule {
+    fn default() -> Self {
+        Self {
+            timezone: "UTC".to_string(),
+            default_capacity: 0,
+            weekly: Vec::new(),
+            exceptions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeeklyCapacityWindow {
+    pub days: Vec<MeshWeekday>,
+    pub start_local: LocalTime,
+    pub end_local: LocalTime,
+    pub capacity: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapacityException {
+    pub start: DateTime<FixedOffset>,
+    pub end: DateTime<FixedOffset>,
+    pub capacity: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshWeekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+impl MeshWeekday {
+    fn index(self) -> usize {
+        match self {
+            Self::Mon => 0,
+            Self::Tue => 1,
+            Self::Wed => 2,
+            Self::Thu => 3,
+            Self::Fri => 4,
+            Self::Sat => 5,
+            Self::Sun => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalTime {
+    hour: u8,
+    minute: u8,
+}
+
+impl LocalTime {
+    fn minutes_since_midnight(self) -> u16 {
+        u16::from(self.hour) * 60 + u16::from(self.minute)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalTime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_local_time(&value).map_err(DeError::custom)
+    }
+}
+
+impl Serialize for LocalTime {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("{:02}:{:02}", self.hour, self.minute))
+    }
 }
 
 /// One model's billing rates (T13/D13), per 1k tokens. Field names mirror the
@@ -1258,6 +1410,137 @@ pub struct PersistedConfig {
     /// `upstream_chat_kwargs` env-JSON pattern). Empty by default.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub price_table: HashMap<String, ModelPrice>,
+    #[serde(default, skip_serializing_if = "PersistedMeshConfig::is_default")]
+    pub mesh: PersistedMeshConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PersistedMeshConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedMeshControllerConfig::is_default"
+    )]
+    pub controller: PersistedMeshControllerConfig,
+    #[serde(default, skip_serializing_if = "PersistedMeshWorkerConfig::is_default")]
+    pub worker: PersistedMeshWorkerConfig,
+}
+
+impl PersistedMeshConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedMeshControllerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mesh_controller_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<String>,
+    #[serde(default = "default_mesh_heartbeat_timeout_secs")]
+    pub heartbeat_timeout_secs: u64,
+}
+
+impl Default for PersistedMeshControllerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_mesh_controller_bind_addr(),
+            identity_path: None,
+            state_path: None,
+            heartbeat_timeout_secs: default_mesh_heartbeat_timeout_secs(),
+        }
+    }
+}
+
+impl PersistedMeshControllerConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedMeshWorkerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_path: Option<String>,
+    #[serde(default = "default_mesh_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<PersistedMeshWorkerResourceConfig>,
+}
+
+impl Default for PersistedMeshWorkerConfig {
+    fn default() -> Self {
+        Self {
+            controller_addr: None,
+            controller_endpoint_id: None,
+            identity_path: None,
+            heartbeat_interval_secs: default_mesh_heartbeat_interval_secs(),
+            resources: Vec::new(),
+        }
+    }
+}
+
+impl PersistedMeshWorkerConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedMeshWorkerResourceConfig {
+    pub id: String,
+    pub target: String,
+    #[serde(default = "default_mesh_model_refresh_secs")]
+    pub model_refresh_secs: u64,
+    #[serde(default)]
+    pub availability: PersistedAvailabilitySchedule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedAvailabilitySchedule {
+    #[serde(default = "default_mesh_timezone")]
+    pub timezone: String,
+    #[serde(default)]
+    pub default_capacity: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weekly: Vec<PersistedWeeklyCapacityWindow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions: Vec<PersistedCapacityException>,
+}
+
+impl Default for PersistedAvailabilitySchedule {
+    fn default() -> Self {
+        Self {
+            timezone: default_mesh_timezone(),
+            default_capacity: 0,
+            weekly: Vec::new(),
+            exceptions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedWeeklyCapacityWindow {
+    pub days: Vec<MeshWeekday>,
+    pub start: LocalTime,
+    pub end: LocalTime,
+    pub capacity: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedCapacityException {
+    pub start: DateTime<FixedOffset>,
+    pub end: DateTime<FixedOffset>,
+    pub capacity: u32,
 }
 
 fn default_bind_addr() -> String {
@@ -1266,6 +1549,26 @@ fn default_bind_addr() -> String {
 
 fn default_upstream_base_url() -> String {
     "http://127.0.0.1:8000/v1".to_string()
+}
+
+fn default_mesh_controller_bind_addr() -> String {
+    "0.0.0.0:4433".to_string()
+}
+
+fn default_mesh_heartbeat_timeout_secs() -> u64 {
+    30
+}
+
+fn default_mesh_heartbeat_interval_secs() -> u64 {
+    10
+}
+
+fn default_mesh_model_refresh_secs() -> u64 {
+    60
+}
+
+fn default_mesh_timezone() -> String {
+    "UTC".to_string()
 }
 
 fn default_brave_base_url() -> String {
@@ -1377,6 +1680,7 @@ impl Default for PersistedConfig {
             image_cache_ttl_secs: default_image_cache_ttl_secs(),
             unsupported_image_policy: default_unsupported_image_policy(),
             price_table: HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         }
     }
 }
@@ -1516,6 +1820,7 @@ impl Config {
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
         let model_routes = resolve_model_routes(&config.model_routes)?;
+        let mesh = parse_mesh_config(&config.mesh)?;
         let vision_url = match trim_nonempty(config.vision_url.as_deref()) {
             Some(url) => {
                 Some(Url::parse(&url).map_err(|err| format!("invalid vision_url: {err}"))?)
@@ -1595,6 +1900,7 @@ impl Config {
                 retain_finite_prices(&mut table);
                 table
             },
+            mesh,
         })
     }
 
@@ -1906,6 +2212,281 @@ impl ResolvedModelProfile {
 /// a pattern. Mirrors claude-relay's `_is_glob_pattern` (`*`, `?`, `[`).
 pub(crate) fn is_glob_pattern(value: &str) -> bool {
     value.contains(['*', '?', '['])
+}
+
+const MAX_MESH_CONFIGURED_CAPACITY: u32 = 65_535;
+const MAX_MESH_RESOURCE_ID_BYTES: usize = 128;
+
+fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String> {
+    let controller_bind_addr = config
+        .controller
+        .bind_addr
+        .parse()
+        .map_err(|err| format!("invalid mesh.controller.bind_addr: {err}"))?;
+    let controller_identity_path =
+        trim_nonempty(config.controller.identity_path.as_deref()).map(PathBuf::from);
+    let controller_state_path =
+        trim_nonempty(config.controller.state_path.as_deref()).map(PathBuf::from);
+    if config.controller.enabled {
+        if controller_identity_path.is_none() {
+            return Err(
+                "mesh.controller.identity_path is required when controller is enabled".to_string(),
+            );
+        }
+        if controller_state_path.is_none() {
+            return Err(
+                "mesh.controller.state_path is required when controller is enabled".to_string(),
+            );
+        }
+        if config.controller.heartbeat_timeout_secs == 0 {
+            return Err(
+                "mesh.controller.heartbeat_timeout_secs must be greater than zero".to_string(),
+            );
+        }
+    }
+
+    let worker_configured = config.worker.controller_addr.is_some()
+        || config.worker.controller_endpoint_id.is_some()
+        || config.worker.identity_path.is_some()
+        || !config.worker.resources.is_empty()
+        || config.worker.heartbeat_interval_secs != default_mesh_heartbeat_interval_secs();
+    let worker_controller_addr = trim_nonempty(config.worker.controller_addr.as_deref());
+    let worker_controller_endpoint_id =
+        trim_nonempty(config.worker.controller_endpoint_id.as_deref());
+    let worker_identity_path =
+        trim_nonempty(config.worker.identity_path.as_deref()).map(PathBuf::from);
+    if worker_configured {
+        if worker_controller_addr.is_none() {
+            return Err("mesh.worker.controller_addr is required for worker mode".to_string());
+        }
+        if worker_controller_endpoint_id.is_none() {
+            return Err(
+                "mesh.worker.controller_endpoint_id is required for worker mode".to_string(),
+            );
+        }
+        if worker_identity_path.is_none() {
+            return Err("mesh.worker.identity_path is required for worker mode".to_string());
+        }
+        if config.worker.resources.is_empty() {
+            return Err(
+                "mesh.worker.resources must contain at least one resource for worker mode"
+                    .to_string(),
+            );
+        }
+        if config.worker.heartbeat_interval_secs == 0 {
+            return Err(
+                "mesh.worker.heartbeat_interval_secs must be greater than zero".to_string(),
+            );
+        }
+    }
+
+    let resources = config
+        .worker
+        .resources
+        .iter()
+        .enumerate()
+        .map(parse_mesh_worker_resource)
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(MeshConfig {
+        controller: MeshControllerConfig {
+            enabled: config.controller.enabled,
+            bind_addr: controller_bind_addr,
+            identity_path: controller_identity_path,
+            state_path: controller_state_path,
+            heartbeat_timeout_secs: config.controller.heartbeat_timeout_secs,
+        },
+        worker: MeshWorkerConfig {
+            controller_addr: worker_controller_addr,
+            controller_endpoint_id: worker_controller_endpoint_id,
+            identity_path: worker_identity_path,
+            heartbeat_interval_secs: config.worker.heartbeat_interval_secs,
+            resources,
+        },
+    })
+}
+
+fn parse_mesh_worker_resource(
+    (index, resource): (usize, &PersistedMeshWorkerResourceConfig),
+) -> Result<MeshWorkerResourceConfig, String> {
+    let id = resource.id.trim();
+    if id.is_empty() {
+        return Err(format!(
+            "mesh.worker.resources[{index}].id must not be blank"
+        ));
+    }
+    if id.len() > MAX_MESH_RESOURCE_ID_BYTES {
+        return Err(format!(
+            "mesh.worker.resources[{index}].id must be at most {MAX_MESH_RESOURCE_ID_BYTES} bytes"
+        ));
+    }
+    if resource.model_refresh_secs == 0 {
+        return Err(format!(
+            "mesh.worker.resources[{index}].model_refresh_secs must be greater than zero"
+        ));
+    }
+    let target = resource
+        .target
+        .trim()
+        .parse()
+        .map_err(|err| format!("invalid mesh.worker.resources[{index}].target: {err}"))?;
+    let availability = parse_availability_schedule(
+        &resource.availability,
+        &format!("mesh.worker.resources[{index}].availability"),
+    )?;
+    Ok(MeshWorkerResourceConfig {
+        id: id.to_string(),
+        target,
+        model_refresh_secs: resource.model_refresh_secs,
+        availability,
+    })
+}
+
+fn parse_availability_schedule(
+    schedule: &PersistedAvailabilitySchedule,
+    path: &str,
+) -> Result<AvailabilitySchedule, String> {
+    let timezone = trim_nonempty(Some(&schedule.timezone))
+        .ok_or_else(|| format!("{path}.timezone must not be blank"))?;
+    timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|err| format!("{path}.timezone is not a valid IANA timezone: {err}"))?;
+    validate_mesh_capacity(
+        schedule.default_capacity,
+        &format!("{path}.default_capacity"),
+    )?;
+
+    let weekly = schedule
+        .weekly
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            if window.days.is_empty() {
+                return Err(format!("{path}.weekly[{index}].days must not be empty"));
+            }
+            if window.start == window.end {
+                return Err(format!(
+                    "{path}.weekly[{index}] must not have a zero-length window"
+                ));
+            }
+            validate_mesh_capacity(window.capacity, &format!("{path}.weekly[{index}].capacity"))?;
+            Ok(WeeklyCapacityWindow {
+                days: window.days.clone(),
+                start_local: window.start,
+                end_local: window.end,
+                capacity: window.capacity,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    validate_weekly_capacity_windows(&weekly, path)?;
+
+    let exceptions = schedule
+        .exceptions
+        .iter()
+        .enumerate()
+        .map(|(index, exception)| {
+            if exception.end <= exception.start {
+                return Err(format!(
+                    "{path}.exceptions[{index}].end must be after start"
+                ));
+            }
+            validate_mesh_capacity(
+                exception.capacity,
+                &format!("{path}.exceptions[{index}].capacity"),
+            )?;
+            Ok(CapacityException {
+                start: exception.start,
+                end: exception.end,
+                capacity: exception.capacity,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    validate_capacity_exceptions(&exceptions, path)?;
+
+    Ok(AvailabilitySchedule {
+        timezone,
+        default_capacity: schedule.default_capacity,
+        weekly,
+        exceptions,
+    })
+}
+
+fn validate_mesh_capacity(capacity: u32, path: &str) -> Result<(), String> {
+    if capacity > MAX_MESH_CONFIGURED_CAPACITY {
+        return Err(format!("{path} must be <= {MAX_MESH_CONFIGURED_CAPACITY}"));
+    }
+    Ok(())
+}
+
+fn validate_weekly_capacity_windows(
+    weekly: &[WeeklyCapacityWindow],
+    path: &str,
+) -> Result<(), String> {
+    let mut by_day: [Vec<(u16, u16, usize)>; 7] = Default::default();
+    for (index, window) in weekly.iter().enumerate() {
+        let start = window.start_local.minutes_since_midnight();
+        let end = window.end_local.minutes_since_midnight();
+        for day in &window.days {
+            let day_index = day.index();
+            if end > start {
+                by_day[day_index].push((start, end, index));
+            } else {
+                by_day[day_index].push((start, 24 * 60, index));
+                by_day[(day_index + 1) % 7].push((0, end, index));
+            }
+        }
+    }
+    for windows in &mut by_day {
+        windows.sort_by_key(|(start, end, _)| (*start, *end));
+        for pair in windows.windows(2) {
+            let (_, prev_end, prev_index) = pair[0];
+            let (next_start, _, next_index) = pair[1];
+            if prev_end > next_start {
+                return Err(format!(
+                    "{path}.weekly[{prev_index}] overlaps mesh availability window weekly[{next_index}]"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_capacity_exceptions(
+    exceptions: &[CapacityException],
+    path: &str,
+) -> Result<(), String> {
+    let mut ranges = exceptions
+        .iter()
+        .enumerate()
+        .map(|(index, exception)| (exception.start, exception.end, index))
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|(start, end, _)| (*start, *end));
+    for pair in ranges.windows(2) {
+        let (_, prev_end, prev_index) = pair[0];
+        let (next_start, _, next_index) = pair[1];
+        if prev_end > next_start {
+            return Err(format!(
+                "{path}.exceptions[{prev_index}] overlaps mesh availability exception exceptions[{next_index}]"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_local_time(value: &str) -> Result<LocalTime, String> {
+    let (hour, minute) = value
+        .split_once(':')
+        .ok_or_else(|| format!("local time {value:?} must use HH:MM"))?;
+    let hour = hour
+        .parse::<u8>()
+        .map_err(|_| format!("local time {value:?} has invalid hour"))?;
+    let minute = minute
+        .parse::<u8>()
+        .map_err(|_| format!("local time {value:?} has invalid minute"))?;
+    if hour > 23 || minute > 59 {
+        return Err(format!("local time {value:?} must be within 00:00..23:59"));
+    }
+    Ok(LocalTime { hour, minute })
 }
 
 /// Translate a glob pattern into an anchored, case-insensitive `Regex`,
@@ -2534,6 +3115,7 @@ mod tests {
     use super::OrderedModelRoutes;
     use super::PersistedConfig;
     use super::PersistedFallbackUpstream;
+    use super::PersistedMeshConfig;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
     use super::RolesConfig;
@@ -3318,6 +3900,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
@@ -3389,6 +3972,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3568,6 +4152,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3643,6 +4228,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3748,6 +4334,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3853,6 +4440,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -4249,6 +4837,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -4310,6 +4899,7 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -4731,5 +5321,151 @@ model_profiles:
             "an explicit flag wins even with cached_per_1k omitted"
         );
         assert_eq!(flag_only.cached_per_1k, 0.0);
+    }
+
+    #[test]
+    fn mesh_absent_defaults_without_changing_existing_configs() {
+        let config = Config::from_persisted(&PersistedConfig::default()).expect("config");
+
+        assert!(!config.mesh.controller.enabled);
+        assert_eq!(
+            config.mesh.controller.bind_addr,
+            "0.0.0.0:4433".parse().expect("addr")
+        );
+        assert!(config.mesh.controller.identity_path.is_none());
+        assert!(config.mesh.controller.state_path.is_none());
+        assert!(config.mesh.worker.resources.is_empty());
+
+        let yaml = serde_yaml::to_string(&PersistedConfig::default()).expect("serialize");
+        assert!(
+            !yaml.contains("mesh:"),
+            "default persisted config omits mesh so old configs round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn mesh_worker_schedule_loads_and_round_trips() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "primary"
+        target: "127.0.0.1:8000"
+        availability:
+          timezone: "America/Chicago"
+          default_capacity: 0
+          weekly:
+            - days: [mon, tue, wed, thu, fri]
+              start: "00:00"
+              end: "08:00"
+              capacity: 32
+            - days: [mon, tue, wed, thu, fri]
+              start: "18:00"
+              end: "00:00"
+              capacity: 16
+          exceptions:
+            - start: "2026-12-24T00:00:00-06:00"
+              end: "2026-12-26T00:00:00-06:00"
+              capacity: 0
+"#,
+        )
+        .expect("yaml");
+        let yaml = serde_yaml::to_string(&persisted).expect("serialize");
+        let reparsed: PersistedConfig = serde_yaml::from_str(&yaml).expect("reparse");
+        assert_eq!(reparsed.mesh, persisted.mesh);
+
+        let config = Config::from_persisted(&persisted).expect("config");
+        let resource = &config.mesh.worker.resources[0];
+        assert_eq!(resource.id, "primary");
+        assert_eq!(resource.model_refresh_secs, 60);
+        assert_eq!(resource.availability.timezone, "America/Chicago");
+        assert_eq!(resource.availability.weekly.len(), 2);
+        assert_eq!(resource.availability.exceptions.len(), 1);
+    }
+
+    #[test]
+    fn mesh_controller_enabled_requires_identity_and_state_paths() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  controller:
+    enabled: true
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("missing paths rejected");
+        assert!(err.contains("mesh.controller.identity_path"));
+
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  controller:
+    enabled: true
+    identity_path: "/var/lib/llmconduit/controller.key"
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("missing state rejected");
+        assert!(err.contains("mesh.controller.state_path"));
+    }
+
+    #[test]
+    fn mesh_weekly_overlap_is_rejected_including_cross_midnight_spillover() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "primary"
+        target: "127.0.0.1:8000"
+        availability:
+          timezone: "UTC"
+          weekly:
+            - days: [mon]
+              start: "20:00"
+              end: "02:00"
+              capacity: 8
+            - days: [tue]
+              start: "01:00"
+              end: "03:00"
+              capacity: 4
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("overlap rejected");
+        assert!(err.contains("overlaps mesh availability window"));
+    }
+
+    #[test]
+    fn mesh_zero_length_weekly_window_is_rejected() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "primary"
+        target: "127.0.0.1:8000"
+        availability:
+          timezone: "UTC"
+          weekly:
+            - days: [mon]
+              start: "08:00"
+              end: "08:00"
+              capacity: 4
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("zero-length window rejected");
+        assert!(err.contains("zero-length window"));
     }
 }
