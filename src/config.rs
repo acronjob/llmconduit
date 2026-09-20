@@ -565,6 +565,15 @@ pub struct AuthConfig {
     pub store_path: PathBuf,
 }
 
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::Disabled,
+            store_path: PathBuf::from("llmconduit-auth.sqlite3"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PersistedAuthConfig {
