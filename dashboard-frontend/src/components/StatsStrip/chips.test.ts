@@ -31,8 +31,18 @@ describe('chips', () => {
     expect(byKey.reqs_per_sec).toBe('4.2');
     expect(byKey.p95).toBe('920');
     expect(byKey.error_pct).toBe('1.1');
-    expect(byKey.tokens_per_sec).toBe('1.5k'); // fmtTokens compaction
+    expect(byKey.tokens_per_sec).toBe('1.5k');
     expect(byKey.cost_per_min).toBe('0.21');
+  });
+
+  it('caps tok/s at two decimal places without padding trailing zeroes', () => {
+    const precise = deriveChips(win({ tokens_per_sec: 142.345 }), null)
+      .find((c) => c.key === 'tokens_per_sec')!;
+    const compact = deriveChips(win({ tokens_per_sec: 1_500.123 }), null)
+      .find((c) => c.key === 'tokens_per_sec')!;
+
+    expect(precise.value).toBe('142.35');
+    expect(compact.value).toBe('1.5k');
   });
 
   it('renders "—" for every chip when there is no sample', () => {
