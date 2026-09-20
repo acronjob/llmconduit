@@ -172,4 +172,20 @@ mod tests {
         assert_eq!(limiter.active_for_key("key_a"), 0);
         assert!(limiter.acquire(&scope, now).is_ok());
     }
+
+    #[tokio::test]
+    async fn aborted_stream_task_releases_lease() {
+        let limiter = SessionLimiter::default();
+        let scope = scope(1, 2);
+        let lease = limiter.acquire(&scope, Utc::now()).unwrap();
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(limiter.active_for_key("key_a"), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(limiter.active_for_key("key_a"), 0);
+    }
 }

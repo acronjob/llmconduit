@@ -7404,6 +7404,77 @@ async fn enforced_auth_rejects_missing_invalid_and_wrong_endpoint_before_dispatc
 }
 
 #[tokio::test]
+async fn enforced_auth_rejects_responses_websocket_before_upgrade() {
+    let (authz, _raw_key, store_path) = scoped_authz(&["responses"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let response = llmconduit::build_app_from_gateway(gateway)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/responses")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert!(upstream.requests().await.is_empty());
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_blocks_completions_and_count_tokens_endpoint_bypasses() {
+    let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    for (path, body) in [
+        (
+            "/v1/completions",
+            json!({"model": "public-model", "prompt": "hello"}),
+        ),
+        (
+            "/v1/messages/count_tokens",
+            json!({"model": "public-model", "messages": []}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {raw_key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+    assert!(upstream.requests().await.is_empty());
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
 async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
     let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
     let upstream = MockUpstream::default();

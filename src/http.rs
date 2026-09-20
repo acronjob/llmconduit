@@ -784,7 +784,7 @@ async fn log_api_call(
     // `Content-Encoding` (already decoded) and fix `Content-Length` so the
     // axum extractors and any downstream reader see the true decoded size.
     parts.headers.remove(header::CONTENT_ENCODING);
-    if let Some(len) = HeaderValue::from_str(&body_bytes.len().to_string()).ok() {
+    if let Ok(len) = HeaderValue::from_str(&body_bytes.len().to_string()) {
         parts.headers.insert(header::CONTENT_LENGTH, len);
     }
 
