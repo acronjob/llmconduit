@@ -1027,6 +1027,14 @@ export interface CreateAuthApiKeyRequest {
   name: string;
   expires_at?: string | null;
 }
+export interface CreateAuthPolicyRequest {
+  name: string;
+  effect: AuthPolicy['effect'];
+  subjects: string[];
+  endpoints: string[];
+  models: string[];
+  providers: string[];
+}
 
 export function isAuthSummary(v: unknown): v is AuthSummary {
   if (!isObj(v) || !isUint(v.policy_epoch) || !isObj(v.actor) || !isObj(v.counts)) return false;

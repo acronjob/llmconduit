@@ -48,7 +48,7 @@ const AUTH_GROUPS: AuthGroup[] = [
 const AUTH_ROLES: AuthRole[] = [
   { id: 'role_operator', name: 'Operator', enabled: true, permissions: ['auth.keys.read', 'auth.keys.create', 'auth.usage.read', 'auth.sessions.read'] },
 ];
-const AUTH_POLICIES: AuthPolicy[] = [
+let AUTH_POLICIES: AuthPolicy[] = [
   { id: 'pol_prod', name: 'Production models', effect: 'allow', enabled: true, subjects: ['grp_prod'], endpoints: ['responses', 'chat'], models: ['gpt-*'], providers: ['openai'] },
   { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], models: ['*'], providers: ['vllm-b'] },
 ];
@@ -428,8 +428,25 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       raw_key: 'llmc_mock_copy_once_secret',
     }, 201);
   }
-  if (/^\/dashboard\/api\/auth\/api-keys\/[^/]+\/revoke$/.test(path) && method === 'POST') {
-    return new Response(null, { status: 204 });
+  if (path === '/dashboard/api/auth/groups') return json({ groups: AUTH_GROUPS });
+  if (path === '/dashboard/api/auth/roles') return json({ roles: AUTH_ROLES });
+  if (path === '/dashboard/api/auth/policies') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as Omit<AuthPolicy, 'id' | 'enabled'>;
+      if (!body.name || !['allow', 'deny'].includes(body.effect)) return json({ error: 'invalid policy' }, 400);
+      AUTH_POLICIES = [...AUTH_POLICIES, { ...body, id: `pol_${AUTH_POLICIES.length + 1}`, enabled: true }];
+    }
+    return json({ policies: AUTH_POLICIES });
+  }
+  if (path === '/dashboard/api/auth/api-keys') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { principal_id?: string; name?: string; expires_at?: string | null };
+      if (!body.principal_id || !body.name) return json({ error: 'invalid key' }, 400);
+      const apiKey: AuthApiKey = { id: `key_${AUTH_KEYS.length + 1}`, principal_id: body.principal_id, name: body.name, prefix: 'llmc_demo', enabled: true, created_at: new Date().toISOString(), expires_at: body.expires_at ?? null, last_used_at: null };
+      AUTH_KEYS = [...AUTH_KEYS, apiKey];
+      return json({ api_key: apiKey, raw_key: `llmc_mock_${apiKey.id}_copy_once` });
+    }
+    return json({ api_keys: AUTH_KEYS });
   }
 
   // -- Kill (CSRF) -- `:id` == api_call_id ONLY (D13 contract). CSRF checked first

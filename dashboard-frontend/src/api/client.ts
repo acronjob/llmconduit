@@ -20,6 +20,7 @@ import type {
   AuthUsersResponse,
   CatalogEntry,
   CreateAuthApiKeyRequest,
+  CreateAuthPolicyRequest,
   CreateAuthUserRequest,
   CreatedAuthApiKey,
   FlowDetail,
@@ -223,6 +224,9 @@ export class DashboardClient {
   }
   createAuthApiKey(body: CreateAuthApiKeyRequest): Promise<CreatedAuthApiKey> {
     return this.authMutation('/auth/api-keys', body, isCreatedAuthApiKey);
+  }
+  createAuthPolicy(body: CreateAuthPolicyRequest): Promise<AuthPoliciesResponse> {
+    return this.authMutation('/auth/policies', body, isAuthPoliciesResponse);
   }
   revokeAuthApiKey(id: string): Promise<AuthApiKeysResponse> {
     return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/revoke`, undefined, isAuthApiKeysResponse);

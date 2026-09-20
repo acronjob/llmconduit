@@ -63,6 +63,7 @@ export function AccessView() {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [draftEffect, setDraftEffect] = useState<AuthPolicy['effect']>('allow');
+  const [draftName, setDraftName] = useState('New policy');
   const [draftModels, setDraftModels] = useState('gpt-*');
   const [draftProviders, setDraftProviders] = useState('openai');
 
@@ -135,9 +136,11 @@ export function AccessView() {
         <Section title="Policy editor and effective preview" count={data.policies.policies.length}>
           <div className="grid gap-3 p-3 lg:grid-cols-2">
             <div className="space-y-2 text-xs">
+              <label className="block">Name<input aria-label="Policy name" value={draftName} onChange={(event) => setDraftName(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
               <label className="block">Effect<select aria-label="Policy effect" value={draftEffect} onChange={(event) => setDraftEffect(event.target.value as AuthPolicy['effect'])} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5"><option value="allow">Allow</option><option value="deny">Deny</option></select></label>
               <label className="block">Models<input aria-label="Policy models" value={draftModels} onChange={(event) => setDraftModels(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
               <label className="block">Providers<input aria-label="Policy providers" value={draftProviders} onChange={(event) => setDraftProviders(event.target.value)} className="mt-1 w-full rounded border border-line bg-bg px-2 py-1.5" /></label>
+              <Button disabled={busy || !draftName.trim()} onClick={() => void run(() => client.createAuthPolicy({ name: draftName.trim(), effect: draftEffect, subjects: ['grp_prod'], endpoints: ['*'], models: draftPreview.models, providers: draftPreview.providers }))}>Save reviewed policy</Button>
             </div>
             <div className={cn('rounded border p-3 text-xs', draftEffect === 'deny' ? 'border-status-down/50 bg-status-down/10' : 'border-status-healthy/40 bg-status-healthy/10')}>
               <div className="flex items-center justify-between"><span className="font-semibold uppercase tracking-wide">Effective preview</span><span className={cn('rounded px-1.5 py-0.5 font-bold uppercase', draftEffect === 'deny' ? 'bg-status-down/20 text-status-down' : 'bg-status-healthy/20 text-status-healthy')}>{draftEffect}</span></div>
