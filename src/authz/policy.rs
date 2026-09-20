@@ -334,7 +334,7 @@ impl PolicySnapshot {
 
 #[derive(Debug, Clone)]
 pub struct PolicyScope {
-    context: PolicyIdentity,
+    context: AuthContext,
     snapshot: Arc<PolicySnapshot>,
     endpoint: Endpoint,
     requested_model: Option<String>,

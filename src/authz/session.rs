@@ -1,4 +1,4 @@
-use super::policy::{AuthError, PolicyScope};
+use super::{AuthError, PolicyScope};
 use chrono::{DateTime, Datelike, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -101,9 +101,9 @@ impl SessionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authz::policy::{
-        AuthRequestId, Endpoint, LimitSet, PolicyBinding, PolicyEffect, PolicyIdentity,
-        PolicyMatcher, PolicyRule, PolicySnapshot, PolicySubject,
+    use crate::authz::{
+        AuthRequestId, PolicyIdentity, Endpoint, LimitSet, PolicyBinding, PolicyEffect, PolicyMatcher,
+        PolicyRule, PolicySnapshot, PolicySubject,
     };
     use std::collections::{HashMap, HashSet};
 
