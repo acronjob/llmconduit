@@ -7283,6 +7283,22 @@ fn test_gateway_with_config_and_raw_output(
     config: Config,
     raw_output: Option<RawOutput>,
 ) -> Arc<Gateway> {
+    test_gateway_with_config_raw_output_and_authz(
+        upstream,
+        search,
+        config,
+        raw_output,
+        llmconduit::authz::AuthzService::default(),
+    )
+}
+
+fn test_gateway_with_config_raw_output_and_authz(
+    upstream: MockUpstream,
+    search: MockSearch,
+    config: Config,
+    raw_output: Option<RawOutput>,
+    authz: llmconduit::authz::AuthzService,
+) -> Arc<Gateway> {
     // Build the leaf finalization policies from the test config so the mock's
     // leaf-mirror applies the SAME profile/family/effort kwargs the production
     // leaf would (T1 moved profile resolution from the engine to the leaf).
@@ -7297,17 +7313,20 @@ fn test_gateway_with_config_and_raw_output(
         llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
     );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
-    Arc::new(Gateway::new(
-        config,
-        ReplayStore::new(1000),
-        Arc::new(upstream),
-        Arc::new(search),
-        vision,
-        image_cache,
-        MonitorHub::new(128),
-        raw_output,
-        llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
-    ))
+    Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(1000),
+            Arc::new(upstream),
+            Arc::new(search),
+            vision,
+            image_cache,
+            MonitorHub::new(128),
+            raw_output,
+            llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+        .with_authz(authz),
+    )
 }
 
 fn test_config() -> Config {
