@@ -8,7 +8,20 @@
  * a `csrfToken` getter so the mock backend + tests can inject their own.
  */
 import type {
+  AuthApiKeysResponse,
+  AuthAuditResponse,
+  AuthGroupsResponse,
+  AuthPoliciesResponse,
+  AuthPricingResponse,
+  AuthRolesResponse,
+  AuthSessionsResponse,
+  AuthSummary,
+  AuthUsageResponse,
+  AuthUsersResponse,
   CatalogEntry,
+  CreateAuthApiKeyRequest,
+  CreateAuthUserRequest,
+  CreatedAuthApiKey,
   FlowDetail,
   FlowsQuery,
   FlowsResponse,
@@ -17,6 +30,19 @@ import type {
   MetricsResponse,
   SnapshotResponse,
   TopologyResponse,
+} from './types';
+import {
+  isAuthApiKeysResponse,
+  isAuthAuditResponse,
+  isAuthGroupsResponse,
+  isAuthPoliciesResponse,
+  isAuthPricingResponse,
+  isAuthRolesResponse,
+  isAuthSessionsResponse,
+  isAuthSummary,
+  isAuthUsageResponse,
+  isAuthUsersResponse,
+  isCreatedAuthApiKey,
 } from './types';
 
 export type FetchImpl = typeof fetch;
@@ -54,7 +80,7 @@ export class DashboardClient {
     this.onUnauthorized = opts.onUnauthorized;
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async request<T>(path: string, init?: RequestInit, guard?: (value: unknown) => value is T): Promise<T> {
     const res = await this.fetchImpl(`${this.basePath}${path}`, {
       credentials: 'include',
       ...init,
@@ -69,7 +95,9 @@ export class DashboardClient {
     }
     // 204/empty bodies decode to `undefined as T` at the call sites that allow it.
     const text = await res.text();
-    return (text ? JSON.parse(text) : undefined) as T;
+    const value: unknown = text ? JSON.parse(text) : undefined;
+    if (guard && !guard(value)) throw new Error(`${path} returned an invalid response`);
+    return value as T;
   }
 
   // -- Auth -----------------------------------------------------------------
@@ -87,9 +115,25 @@ export class DashboardClient {
     }
   }
 
-  /** `POST /dashboard/logout` — clears the session cookie. */
+  /** Delegated management login backed by an API key. */
+  async keyLogin(apiKey: string): Promise<void> {
+    const res = await this.fetchImpl('/dashboard/auth/key-login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: apiKey }),
+    });
+    if (!res.ok) throw new Error(`key login failed: ${res.status}`);
+  }
+
+  /** `POST /dashboard/auth/logout` — revokes delegated sessions and clears cookies. */
   async logout(): Promise<void> {
-    await this.fetchImpl('/dashboard/logout', { method: 'POST', credentials: 'include' });
+    const csrf = this.getCsrfToken();
+    await this.fetchImpl('/dashboard/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+      headers: csrf ? { 'X-CSRF-Token': csrf } : undefined,
+    });
   }
 
   /**
@@ -135,6 +179,70 @@ export class DashboardClient {
 
   snapshot(atMs: number): Promise<SnapshotResponse> {
     return this.request<SnapshotResponse>(`/snapshot?at=${encodeURIComponent(String(atMs))}`);
+  }
+
+  // -- Access management ----------------------------------------------------
+
+  authSummary(): Promise<AuthSummary> {
+    return this.request('/auth/summary', undefined, isAuthSummary);
+  }
+  authUsers(): Promise<AuthUsersResponse> {
+    return this.request('/auth/users', undefined, isAuthUsersResponse);
+  }
+  authGroups(): Promise<AuthGroupsResponse> {
+    return this.request('/auth/groups', undefined, isAuthGroupsResponse);
+  }
+  authRoles(): Promise<AuthRolesResponse> {
+    return this.request('/auth/roles', undefined, isAuthRolesResponse);
+  }
+  authPolicies(): Promise<AuthPoliciesResponse> {
+    return this.request('/auth/policies', undefined, isAuthPoliciesResponse);
+  }
+  authApiKeys(): Promise<AuthApiKeysResponse> {
+    return this.request('/auth/api-keys', undefined, isAuthApiKeysResponse);
+  }
+  authSessions(): Promise<AuthSessionsResponse> {
+    return this.request('/auth/sessions', undefined, isAuthSessionsResponse);
+  }
+  authUsage(): Promise<AuthUsageResponse> {
+    return this.request('/auth/usage', undefined, isAuthUsageResponse);
+  }
+  authAudit(): Promise<AuthAuditResponse> {
+    return this.request('/auth/audit', undefined, isAuthAuditResponse);
+  }
+  authPricing(): Promise<AuthPricingResponse> {
+    return this.request('/auth/pricing', undefined, isAuthPricingResponse);
+  }
+
+  createAuthUser(body: CreateAuthUserRequest): Promise<AuthUsersResponse> {
+    return this.authMutation('/auth/users', body, isAuthUsersResponse);
+  }
+  createAuthApiKey(body: CreateAuthApiKeyRequest): Promise<CreatedAuthApiKey> {
+    return this.authMutation('/auth/api-keys', body, isCreatedAuthApiKey);
+  }
+  revokeAuthApiKey(id: string): Promise<AuthApiKeysResponse> {
+    return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/revoke`, undefined, isAuthApiKeysResponse);
+  }
+  rotateAuthApiKey(id: string): Promise<CreatedAuthApiKey> {
+    return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/rotate`, undefined, isCreatedAuthApiKey);
+  }
+  revokeAuthSession(id: string): Promise<AuthSessionsResponse> {
+    return this.authMutation(`/auth/sessions/${encodeURIComponent(id)}/revoke`, undefined, isAuthSessionsResponse);
+  }
+
+  private authMutation<T>(
+    path: string,
+    body: unknown,
+    guard: (value: unknown) => value is T,
+  ): Promise<T> {
+    const csrf = this.getCsrfToken();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+    return this.request(path, {
+      method: 'POST',
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }, guard);
   }
 
   // -- Mutation (CSRF-gated) ------------------------------------------------

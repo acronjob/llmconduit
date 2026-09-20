@@ -872,6 +872,234 @@ export interface DashboardBootstrap {
 }
 
 // ---------------------------------------------------------------------------
+// Access management shapes (RBAC dashboard)
+// ---------------------------------------------------------------------------
+
+export type ManagementPermission =
+  | 'auth.keys.read'
+  | 'auth.keys.create'
+  | 'auth.keys.revoke'
+  | 'auth.keys.rotate'
+  | 'auth.principals.read'
+  | 'auth.principals.write'
+  | 'auth.groups.read'
+  | 'auth.groups.write'
+  | 'auth.roles.read'
+  | 'auth.roles.write'
+  | 'auth.policies.read'
+  | 'auth.policies.write'
+  | 'auth.usage.read'
+  | 'auth.audit.read'
+  | 'auth.pricing.read'
+  | 'auth.pricing.sync'
+  | 'auth.pricing.write'
+  | 'auth.sessions.read'
+  | 'auth.sessions.terminate';
+
+export interface AuthSummary {
+  policy_epoch: number;
+  actor: {
+    kind: 'bootstrap' | 'delegated';
+    principal_id: string | null;
+    display_name: string;
+    permissions: ManagementPermission[];
+  };
+  counts: {
+    users: number;
+    groups: number;
+    roles: number;
+    policies: number;
+    api_keys: number;
+    active_sessions: number;
+  };
+}
+
+export interface AuthUser {
+  id: string;
+  kind: 'user' | 'service_account';
+  display_name: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface AuthGroup {
+  id: string;
+  name: string;
+  enabled: boolean;
+  member_count: number;
+}
+
+export interface AuthRole {
+  id: string;
+  name: string;
+  enabled: boolean;
+  permissions: ManagementPermission[];
+}
+
+export interface AuthPolicy {
+  id: string;
+  name: string;
+  effect: 'allow' | 'deny';
+  enabled: boolean;
+  subjects: string[];
+  endpoints: string[];
+  models: string[];
+  providers: string[];
+}
+
+export interface AuthApiKey {
+  id: string;
+  principal_id: string;
+  name: string;
+  prefix: string;
+  enabled: boolean;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+}
+
+/** Returned only by create/rotate. `raw_key` must never be persisted or fetched later. */
+export interface CreatedAuthApiKey {
+  api_key: AuthApiKey;
+  raw_key: string;
+}
+
+export interface AuthSession {
+  id: string;
+  kind: 'inference' | 'dashboard';
+  principal_id: string;
+  key_id: string;
+  endpoint: string | null;
+  requested_model: string | null;
+  started_at: string;
+  expires_at: string | null;
+}
+
+export interface AuthUsageRow {
+  dimension: string;
+  value: string;
+  requests: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cached_tokens: number | null;
+  reasoning_tokens: number | null;
+  cost: number | null;
+  cost_confidence: CostConfidence;
+}
+
+export interface AuthAuditEvent {
+  id: string;
+  timestamp: string;
+  actor: string;
+  action: string;
+  target: string;
+  outcome: 'allowed' | 'denied' | 'error';
+  metadata: Record<string, unknown>;
+}
+
+export interface AuthPricingRow {
+  model: string;
+  provider: string;
+  source: string;
+  fetched_at: string;
+  input_per_1k: string;
+  output_per_1k: string;
+  confidence: CostConfidence;
+}
+
+export interface AuthUsersResponse { users: AuthUser[] }
+export interface AuthGroupsResponse { groups: AuthGroup[] }
+export interface AuthRolesResponse { roles: AuthRole[] }
+export interface AuthPoliciesResponse { policies: AuthPolicy[] }
+export interface AuthApiKeysResponse { api_keys: AuthApiKey[] }
+export interface AuthSessionsResponse { sessions: AuthSession[] }
+export interface AuthUsageResponse { usage: AuthUsageRow[] }
+export interface AuthAuditResponse { events: AuthAuditEvent[] }
+export interface AuthPricingResponse { pricing: AuthPricingRow[] }
+
+export interface KeyLoginRequest { api_key: string }
+export interface CreateAuthUserRequest {
+  display_name: string;
+  kind: AuthUser['kind'];
+}
+export interface CreateAuthApiKeyRequest {
+  principal_id: string;
+  name: string;
+  expires_at?: string | null;
+}
+
+export function isAuthSummary(v: unknown): v is AuthSummary {
+  if (!isObj(v) || !isUint(v.policy_epoch) || !isObj(v.actor) || !isObj(v.counts)) return false;
+  const actor = v.actor;
+  const counts = v.counts;
+  return isOneOf(actor.kind, ['bootstrap', 'delegated'] as const)
+    && isNullableStr(actor.principal_id)
+    && isStr(actor.display_name)
+    && isStringArray(actor.permissions)
+    && ['users', 'groups', 'roles', 'policies', 'api_keys', 'active_sessions'].every((k) => isUint(counts[k]));
+}
+
+function isAuthUser(v: unknown): v is AuthUser {
+  return isObj(v) && isStr(v.id) && isOneOf(v.kind, ['user', 'service_account'] as const)
+    && isStr(v.display_name) && typeof v.enabled === 'boolean' && isStr(v.created_at);
+}
+function isAuthGroup(v: unknown): v is AuthGroup {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && typeof v.enabled === 'boolean' && isUint(v.member_count);
+}
+function isAuthRole(v: unknown): v is AuthRole {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && typeof v.enabled === 'boolean' && isStringArray(v.permissions);
+}
+function isAuthPolicy(v: unknown): v is AuthPolicy {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && isOneOf(v.effect, ['allow', 'deny'] as const)
+    && typeof v.enabled === 'boolean' && isStringArray(v.subjects) && isStringArray(v.endpoints)
+    && isStringArray(v.models) && isStringArray(v.providers);
+}
+function isAuthApiKey(v: unknown): v is AuthApiKey {
+  return isObj(v) && isStr(v.id) && isStr(v.principal_id) && isStr(v.name) && isStr(v.prefix)
+    && typeof v.enabled === 'boolean' && isStr(v.created_at) && isNullableStr(v.expires_at)
+    && isNullableStr(v.last_used_at);
+}
+function isAuthSession(v: unknown): v is AuthSession {
+  return isObj(v) && isStr(v.id) && isOneOf(v.kind, ['inference', 'dashboard'] as const)
+    && isStr(v.principal_id) && isStr(v.key_id) && isNullableStr(v.endpoint)
+    && isNullableStr(v.requested_model) && isStr(v.started_at) && isNullableStr(v.expires_at);
+}
+function isAuthUsageRow(v: unknown): v is AuthUsageRow {
+  return isObj(v) && isStr(v.dimension) && isStr(v.value) && isUint(v.requests)
+    && isNullableUint(v.prompt_tokens) && isNullableUint(v.completion_tokens)
+    && isNullableUint(v.cached_tokens) && isNullableUint(v.reasoning_tokens)
+    && (v.cost === null || isNum(v.cost)) && isOneOf(v.cost_confidence, COST_CONFIDENCES);
+}
+function isAuthAuditEvent(v: unknown): v is AuthAuditEvent {
+  return isObj(v) && isStr(v.id) && isStr(v.timestamp) && isStr(v.actor) && isStr(v.action)
+    && isStr(v.target) && isOneOf(v.outcome, ['allowed', 'denied', 'error'] as const) && isObj(v.metadata);
+}
+function isAuthPricingRow(v: unknown): v is AuthPricingRow {
+  return isObj(v) && isStr(v.model) && isStr(v.provider) && isStr(v.source) && isStr(v.fetched_at)
+    && isStr(v.input_per_1k) && isStr(v.output_per_1k) && isOneOf(v.confidence, COST_CONFIDENCES);
+}
+
+function isArrayEnvelope(v: unknown, key: string, guard: (item: unknown) => boolean): boolean {
+  return isObj(v) && Array.isArray(v[key]) && v[key].every(guard);
+}
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every(isStr);
+}
+
+export const isAuthUsersResponse = (v: unknown): v is AuthUsersResponse => isArrayEnvelope(v, 'users', isAuthUser);
+export const isAuthGroupsResponse = (v: unknown): v is AuthGroupsResponse => isArrayEnvelope(v, 'groups', isAuthGroup);
+export const isAuthRolesResponse = (v: unknown): v is AuthRolesResponse => isArrayEnvelope(v, 'roles', isAuthRole);
+export const isAuthPoliciesResponse = (v: unknown): v is AuthPoliciesResponse => isArrayEnvelope(v, 'policies', isAuthPolicy);
+export const isAuthApiKeysResponse = (v: unknown): v is AuthApiKeysResponse => isArrayEnvelope(v, 'api_keys', isAuthApiKey);
+export const isAuthSessionsResponse = (v: unknown): v is AuthSessionsResponse => isArrayEnvelope(v, 'sessions', isAuthSession);
+export const isAuthUsageResponse = (v: unknown): v is AuthUsageResponse => isArrayEnvelope(v, 'usage', isAuthUsageRow);
+export const isAuthAuditResponse = (v: unknown): v is AuthAuditResponse => isArrayEnvelope(v, 'events', isAuthAuditEvent);
+export const isAuthPricingResponse = (v: unknown): v is AuthPricingResponse => isArrayEnvelope(v, 'pricing', isAuthPricingRow);
+export function isCreatedAuthApiKey(v: unknown): v is CreatedAuthApiKey {
+  return isObj(v) && isAuthApiKey(v.api_key) && isStr(v.raw_key) && v.raw_key.startsWith('llmc_');
+}
+
+// ---------------------------------------------------------------------------
 // Runtime validation (the WS pipe must NOT trust the wire — findings 4/5/6).
 // A frame is validated WHOLLY (envelope + every payload arm, exact enums, unsigned-int
 // seq, domain↔payload compatibility) BEFORE the socket touches any cursor or store.
