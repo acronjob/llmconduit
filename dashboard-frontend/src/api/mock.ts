@@ -42,15 +42,15 @@ let AUTH_USERS: AuthUser[] = [
   { id: 'usr_ops', kind: 'user', display_name: 'Operations', enabled: true, created_at: '2026-06-01T09:00:00Z' },
   { id: 'usr_batch', kind: 'service_account', display_name: 'Batch inference', enabled: true, created_at: '2026-06-02T12:00:00Z' },
 ];
-let AUTH_GROUPS: AuthGroup[] = [
+const AUTH_GROUPS: AuthGroup[] = [
   { id: 'grp_prod', name: 'Production', enabled: true, member_count: 2 },
 ];
-let AUTH_ROLES: AuthRole[] = [
+const AUTH_ROLES: AuthRole[] = [
   { id: 'role_operator', name: 'Operator', enabled: true, permissions: ['auth.keys.read', 'auth.keys.create', 'auth.usage.read', 'auth.sessions.read'] },
 ];
 let AUTH_POLICIES: AuthPolicy[] = [
-  { id: 'pol_prod', name: 'Production models', effect: 'allow', enabled: true, subjects: ['grp_prod'], endpoints: ['responses', 'chat'], requested_models: ['gpt-*'], served_models: ['gpt-4.1'], providers: ['openai'], routes: ['cloud'], time_windows: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri'], start_utc: '08:00', end_utc: '18:00' }], max_concurrent_sessions: 4, daily_session_starts: 100 },
-  { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], requested_models: ['*'], served_models: ['*'], providers: ['vllm-b'], routes: ['local'], time_windows: [], max_concurrent_sessions: null, daily_session_starts: null },
+  { id: 'pol_prod', name: 'Production models', effect: 'allow', enabled: true, subjects: ['grp_prod'], endpoints: ['responses', 'chat'], models: ['gpt-*'], providers: ['openai'] },
+  { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], models: ['*'], providers: ['vllm-b'] },
 ];
 let AUTH_KEYS: AuthApiKey[] = [
   { id: 'key_ops', principal_id: 'usr_ops', name: 'operator laptop', prefix: 'llmc_7ad2', enabled: true, created_at: '2026-06-03T10:00:00Z', expires_at: null, last_used_at: '2026-06-21T14:19:40Z' },
@@ -434,22 +434,8 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     }
     return json({ users: AUTH_USERS });
   }
-  if (path === '/dashboard/api/auth/groups') {
-    if (method === 'POST') {
-      const body = JSON.parse(String(init?.body ?? '{}')) as { name?: string; members?: string[] };
-      if (!body.name || !Array.isArray(body.members)) return json({ error: 'invalid group' }, 400);
-      AUTH_GROUPS = [...AUTH_GROUPS, { id: `grp_${AUTH_GROUPS.length + 1}`, name: body.name, enabled: true, member_count: body.members.length }];
-    }
-    return json({ groups: AUTH_GROUPS });
-  }
-  if (path === '/dashboard/api/auth/roles') {
-    if (method === 'POST') {
-      const body = JSON.parse(String(init?.body ?? '{}')) as { name?: string; permissions?: AuthRole['permissions'] };
-      if (!body.name || !Array.isArray(body.permissions)) return json({ error: 'invalid role' }, 400);
-      AUTH_ROLES = [...AUTH_ROLES, { id: `role_${AUTH_ROLES.length + 1}`, name: body.name, enabled: true, permissions: body.permissions }];
-    }
-    return json({ roles: AUTH_ROLES });
-  }
+  if (path === '/dashboard/api/auth/groups') return json({ groups: AUTH_GROUPS });
+  if (path === '/dashboard/api/auth/roles') return json({ roles: AUTH_ROLES });
   if (path === '/dashboard/api/auth/policies') {
     if (method === 'POST') {
       const body = JSON.parse(String(init?.body ?? '{}')) as Omit<AuthPolicy, 'id' | 'enabled'>;
