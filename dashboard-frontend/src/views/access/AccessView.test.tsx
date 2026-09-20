@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
-import { AccessView, validatePolicy } from './AccessView';
+import { AccessView } from './AccessView';
+import { validatePolicy } from './policyEditorModel';
 import { renderWithQuery, resetWorld } from '../../components/testHarness';
 
 beforeEach(() => resetWorld({ mock: true }));
@@ -9,10 +10,10 @@ afterEach(cleanup);
 describe('AccessView', () => {
   it('validates policy subjects, UTC windows, and positive session limits', () => {
     expect(validatePolicy({
-      name: '', effect: 'allow', subjects: [], endpoints: [], requested_models: [],
+      name: '', effect: 'allow', subjects: [], endpoints: [], models: [], requested_models: [],
       served_models: [], providers: [], routes: [],
-      time_windows: [{ days: [], start_utc: '25:00', end_utc: '25:00' }],
-      max_concurrent_sessions: 0, daily_session_starts: 1.5,
+      time_windows: [{ weekday_mask: 0, start_minute: 1500, end_minute: 1500, absolute_start_ms: null, absolute_end_ms: null }],
+      max_concurrent_sessions: 0, max_daily_session_starts: 1.5, management_permissions: [],
     })).toEqual([
       'Policy name is required.', 'Select at least one real subject.',
       'Enter at least one endpoint.', 'Max concurrent sessions must be a positive integer.',
@@ -69,7 +70,7 @@ describe('AccessView', () => {
     await screen.findByText('Policy reader');
 
     const subjects = screen.getByLabelText('Policy subjects') as HTMLSelectElement;
-    Array.from(subjects.options).find((option) => option.value === 'usr_ops')!.selected = true;
+    Array.from(subjects.options).find((option) => option.value === 'principal:usr_ops')!.selected = true;
     fireEvent.change(subjects);
     fireEvent.change(screen.getByLabelText('Policy endpoints'), { target: { value: 'responses,chat' } });
     fireEvent.change(screen.getByLabelText('Policy requested models'), { target: { value: 'alias-*' } });
@@ -79,7 +80,7 @@ describe('AccessView', () => {
 
     const preview = screen.getByTestId('policy-payload-preview');
     expect(preview).toHaveTextContent('"subjects": [');
-    expect(preview).toHaveTextContent('"usr_ops"');
+    expect(preview).toHaveTextContent('"principal:usr_ops"');
     expect(preview).toHaveTextContent('"requested_models": [');
     expect(preview).toHaveTextContent('"served_models": [');
     expect(preview).toHaveTextContent('"routes": [');
