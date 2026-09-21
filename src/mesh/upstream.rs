@@ -397,6 +397,8 @@ fn parse_sse_stream(
         let mut frame_guard = crate::sse_guard::SseFrameGuard::new(max_frame_bytes);
         let mut event = String::new();
         let mut line_buf = Vec::new();
+        let mut saw_done = false;
+        let mut saw_finish_reason = false;
         while let Some(bytes) = stream.next_body_bytes().await? {
             if let Some(capture) = capture.as_ref() {
                 if !capture_started {
@@ -429,8 +431,15 @@ fn parse_sse_stream(
                 if line.is_empty() {
                     if !event.is_empty() {
                         let data = std::mem::take(&mut event);
-                        if data != "[DONE]" {
-                            yield parse_chat_completion_chunk(&data)?;
+                        if data == "[DONE]" {
+                            saw_done = true;
+                        } else {
+                            let chunk = parse_chat_completion_chunk(&data)?;
+                            saw_finish_reason |= chunk
+                                .choices
+                                .iter()
+                                .any(|choice| choice.finish_reason.is_some());
+                            yield chunk;
                         }
                     }
                 } else if let Some(data) = line.strip_prefix("data:") {
@@ -452,11 +461,28 @@ fn parse_sse_stream(
                 event.push_str(data.trim_start());
             }
         }
-        if !event.is_empty() && event != "[DONE]" {
-            yield parse_chat_completion_chunk(&event)?;
+        if event == "[DONE]" {
+            saw_done = true;
+        } else if !event.is_empty() {
+            let chunk = parse_chat_completion_chunk(&event)?;
+            saw_finish_reason |= chunk
+                .choices
+                .iter()
+                .any(|choice| choice.finish_reason.is_some());
+            yield chunk;
         }
         frame_guard.finish()?;
         stream.finish_writer().await?;
+        if !saw_done {
+            Err(AppError::upstream(
+                "mesh upstream SSE ended before the [DONE] marker",
+            ))?;
+        }
+        if !saw_finish_reason {
+            Err(AppError::upstream(
+                "mesh upstream SSE ended without a terminal finish_reason",
+            ))?;
+        }
         if let Some(capture) = capture.as_ref() {
             capture.mark_upstream_response_streamed();
         }
@@ -514,7 +540,9 @@ impl MeshHttpStream {
                         AppError::upstream(format!("failed to read mesh response body: {err}"))
                     })?;
                 if read == 0 {
-                    return Ok(None);
+                    return Err(AppError::upstream(
+                        "mesh chunked response ended before its terminator",
+                    ));
                 }
                 let max_buffered = MAX_HTTP_CHUNK_LINE_BYTES
                     .checked_add(2)
@@ -542,10 +570,23 @@ impl MeshHttpStream {
                 AppError::upstream(format!("failed to read mesh response body: {err}"))
             })?;
         if read == 0 {
+            if let Some(remaining) = self.remaining_content_length
+                && remaining > 0
+            {
+                return Err(AppError::upstream(format!(
+                    "mesh response body ended with {remaining} Content-Length bytes remaining"
+                )));
+            }
             return Ok(None);
         }
         if let Some(remaining) = self.remaining_content_length.as_mut() {
-            *remaining = remaining.saturating_sub(read);
+            if read > *remaining {
+                return Err(AppError::upstream(format!(
+                    "mesh response body exceeded Content-Length by {} bytes",
+                    read - *remaining
+                )));
+            }
+            *remaining -= read;
         }
         Ok(Some(Bytes::copy_from_slice(&buf[..read])))
     }
@@ -651,7 +692,36 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_test_request(socket: &mut TcpStream, buf: &mut [u8]) {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let read = socket.read(buf).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buf[..read]);
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(str::to_owned)
+            })
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let read = socket.read(buf).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buf[..read]);
+        }
+    }
 
     #[test]
     fn sparse_tool_calls_are_normalized() {
@@ -806,7 +876,7 @@ mod tests {
             socket.write_all(b"data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n").await.unwrap();
             socket.flush().await.unwrap();
             tokio::time::sleep(Duration::from_millis(30)).await;
-            socket.write_all(b"data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\ndata: [DONE]\n\n").await.unwrap();
+            socket.write_all(b"data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").await.unwrap();
             drop(socket);
 
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -848,6 +918,49 @@ mod tests {
                 .await
                 .unwrap();
             socket.write_all(error_body).await.unwrap();
+            drop(socket);
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_test_request(&mut socket, &mut buf).await;
+            let event = b"data: {\"id\":\"chunked-cut\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket
+                .write_all(format!("{:x}\r\n", event.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(event).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            drop(socket);
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_test_request(&mut socket, &mut buf).await;
+            let event = b"data: {\"id\":\"length-cut\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        event.len() + 32
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(event).await.unwrap();
+            drop(socket);
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_test_request(&mut socket, &mut buf).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"id\":\"missing-done\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n").await.unwrap();
+            drop(socket);
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_test_request(&mut socket, &mut buf).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"id\":\"missing-finish\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n").await.unwrap();
             drop(socket);
 
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -951,7 +1064,7 @@ mod tests {
             .await,
         );
         let worker_task = tokio::spawn(async move {
-            for _ in 0..3 {
+            for _ in 0..7 {
                 let (send, recv) = worker_connection.accept_bi().await.unwrap();
                 let _ = handle_request(send, recv, Arc::clone(&runtime)).await;
             }
@@ -1025,6 +1138,67 @@ mod tests {
                 .to_string()
                 .contains("Unexpected reasoning effort high")
         );
+
+        for (prompt, expected_error) in [
+            (
+                "truncate chunked",
+                "chunked response ended before its terminator",
+            ),
+            ("truncate content length", "response body ended with"),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "mesh-model",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": true
+            }))
+            .unwrap();
+            let mut stream = client
+                .stream_chat_completion(&BackendChatRequest::new(request, None, None, None))
+                .await
+                .unwrap();
+            assert_eq!(
+                stream.next().await.unwrap().unwrap().choices[0]
+                    .delta
+                    .content
+                    .as_deref(),
+                Some("partial")
+            );
+            let error = stream
+                .next()
+                .await
+                .expect("truncation error")
+                .expect_err("truncated body must fail");
+            assert!(error.to_string().contains(expected_error), "{error}");
+        }
+
+        for (prompt, expected_error) in [
+            ("missing done", "[DONE]"),
+            ("missing finish", "finish_reason"),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "mesh-model",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": true
+            }))
+            .unwrap();
+            let mut stream = client
+                .stream_chat_completion(&BackendChatRequest::new(request, None, None, None))
+                .await
+                .unwrap();
+            assert_eq!(
+                stream.next().await.unwrap().unwrap().choices[0]
+                    .delta
+                    .content
+                    .as_deref(),
+                Some("partial")
+            );
+            let error = stream
+                .next()
+                .await
+                .expect("terminal protocol error")
+                .expect_err("incomplete terminal protocol must fail");
+            assert!(error.to_string().contains(expected_error), "{error}");
+        }
 
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "mesh-model",

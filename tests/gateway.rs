@@ -9716,7 +9716,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "second"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -9819,7 +9819,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "first"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -9940,7 +9940,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "fallback"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -10060,7 +10060,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "fallback alias"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -10194,7 +10194,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                             "delta": {
                                 "content": "fallback ok"
                             },
-                            "finish_reason": null
+                            "finish_reason": "stop"
                         }
                     ],
                     "usage": null

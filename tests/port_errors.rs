@@ -375,7 +375,7 @@ mod integration {
             "choices": [{
                 "index": 0,
                 "delta": {"role": "assistant", "content": "hello after retry"},
-                "finish_reason": null
+                "finish_reason": "stop"
             }],
             "usage": null
         });

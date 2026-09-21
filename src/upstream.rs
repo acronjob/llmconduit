@@ -5310,25 +5310,55 @@ async fn stream_success_response(
     // `AppError` before the parser can over-accumulate. The configured request-body
     // cap in `http.rs` is inbound-only and does NOT cover this response path.
     let bounded = bounded_sse_byte_stream(byte_stream, max_sse_frame_bytes);
-    let stream = bounded.eventsource().filter_map(|result| async move {
-        match result {
-            Ok(event) if event.data == "[DONE]" => None,
-            Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
-                AppError::upstream(format!(
-                    "failed to parse upstream chat chunk: {err}; payload={}",
-                    redact_and_truncate_error_body(&event.data, 500)
-                ))
-            })),
-            // The bounded adapter surfaces the frame-cap rejection through the
-            // transport-error channel as an already-formed `AppError` (its
-            // `Display` carries the cap message); other transport errors are
-            // wrapped here. Either way the model output is never silently
-            // truncated — the stream ends in an error item.
-            Err(err) => Some(Err(AppError::upstream(format!(
-                "failed to read upstream SSE: {err}"
-            )))),
+    let stream = async_stream::stream! {
+        let events = bounded.eventsource();
+        futures::pin_mut!(events);
+        let mut saw_done = false;
+        let mut saw_finish_reason = false;
+        while let Some(result) = events.next().await {
+            match result {
+                Ok(event) if event.data == "[DONE]" => {
+                    saw_done = true;
+                }
+                Ok(event) => match parse_chat_completion_chunk(&event.data) {
+                    Ok(chunk) => {
+                        saw_finish_reason |= chunk
+                            .choices
+                            .iter()
+                            .any(|choice| choice.finish_reason.is_some());
+                        yield Ok(chunk);
+                    }
+                    Err(err) => {
+                        yield Err(AppError::upstream(format!(
+                            "failed to parse upstream chat chunk: {err}; payload={}",
+                            redact_and_truncate_error_body(&event.data, 500)
+                        )));
+                        return;
+                    }
+                },
+                // The bounded adapter surfaces the frame-cap rejection through the
+                // transport-error channel as an already-formed `AppError` (its
+                // `Display` carries the cap message); other transport errors are
+                // wrapped here. Either way the model output is never silently
+                // truncated — the stream ends in an error item.
+                Err(err) => {
+                    yield Err(AppError::upstream(format!(
+                        "failed to read upstream SSE: {err}"
+                    )));
+                    return;
+                }
+            }
         }
-    });
+        if !saw_done {
+            yield Err(AppError::upstream(
+                "upstream SSE ended before the [DONE] marker",
+            ));
+        } else if !saw_finish_reason {
+            yield Err(AppError::upstream(
+                "upstream SSE ended without a terminal finish_reason",
+            ));
+        }
+    };
     Ok(Box::pin(stream))
 }
 
@@ -7510,7 +7540,7 @@ mod tests {
     /// it, so `stream_chat_completion` returns Ok and the capture is observable).
     fn d2_sse_ok_body() -> String {
         "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\
-         \"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+         \"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
          data: [DONE]\n\n"
             .to_string()
     }
@@ -10142,6 +10172,54 @@ mod f1e_upstream_response_truthful_tests {
             "2xx headers then cancel before the first byte must leave upstream_response \
              ABSENT, never an empty partial:false complete: {artifact}"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_success_rejects_eof_without_done_marker() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .body(
+                    b"data: {\"id\":\"chat-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                        .to_vec(),
+                )
+                .expect("build response"),
+        );
+        let mut stream = stream_success_response(response, 1024 * 1024, None)
+            .await
+            .expect("stream built");
+
+        assert!(stream.next().await.expect("terminal chunk").is_ok());
+        let error = stream
+            .next()
+            .await
+            .expect("missing done error")
+            .expect_err("EOF without [DONE] must fail");
+        assert!(error.to_string().contains("[DONE]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stream_success_rejects_done_without_finish_reason() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .body(
+                    b"data: {\"id\":\"chat-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n"
+                        .to_vec(),
+                )
+                .expect("build response"),
+        );
+        let mut stream = stream_success_response(response, 1024 * 1024, None)
+            .await
+            .expect("stream built");
+
+        assert!(stream.next().await.expect("content chunk").is_ok());
+        let error = stream
+            .next()
+            .await
+            .expect("missing finish reason error")
+            .expect_err("[DONE] without finish_reason must fail");
+        assert!(error.to_string().contains("finish_reason"), "{error}");
     }
 
     /// Finding 2 (truthful-empty case): a 2xx upstream response with a CLEAN end-of-

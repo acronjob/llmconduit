@@ -420,7 +420,9 @@ async fn preflight_defers_estimated_context_exhaustion_to_upstream() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string("data: [DONE]\n\n"),
+                .set_body_string(
+                    "data: {\"id\":\"chat-empty\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                ),
         )
         .mount(&server)
         .await;
