@@ -399,6 +399,18 @@ struct DashboardKeyLogin {
     api_key: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/dashboard/auth/key-login",
+    tag = "dashboard-auth",
+    request_body(content = serde_json::Value, content_type = "application/json"),
+    responses(
+        (status = 200, body = serde_json::Value, description = "Creates a delegated dashboard session for a management-enabled API key."),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    )
+)]
 async fn dashboard_key_login(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
@@ -452,6 +464,17 @@ async fn dashboard_key_login(
     delegated_login_response(&auth, &session_id, &csrf, exp)
 }
 
+#[utoipa::path(
+    post,
+    path = "/dashboard/auth/logout",
+    tag = "dashboard-auth",
+    responses(
+        (status = 204, description = "Revokes a delegated session when present and clears dashboard cookies."),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
 async fn dashboard_auth_logout(
     State(gateway): State<Arc<Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,

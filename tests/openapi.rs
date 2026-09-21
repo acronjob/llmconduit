@@ -6,6 +6,7 @@
 //! 2. every path+operation in the document is answered by the router (never
 //!    404 "no such route" / 405 "no such method"), probed against an app
 //!    with the dashboard registered.
+//!
 //! Plus: `/openapi.json` serves the document.
 
 mod common;

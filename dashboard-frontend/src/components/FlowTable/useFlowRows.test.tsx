@@ -418,8 +418,8 @@ describe('useFlowRows — session facts merge (live-first, REST-backfilled)', ()
     const { result } = renderRows();
     await waitFor(() => expect(result.current.rows[0]?.harness).toBe('claude-code'));
     const row = result.current.rows[0]!;
-    // Live wins on status; REST backfills the immutable session facts.
-    expect(row.status).toBe('open');
+    // Terminal state is monotonic across transports; REST backfills immutable session facts.
+    expect(row.status).toBe('completed');
     expect(row.session_id).toBe('sess_1');
     expect(row.chain_parent_request_id).toBe('api_s0');
     expect(row.divergence_kind).toBe('append');

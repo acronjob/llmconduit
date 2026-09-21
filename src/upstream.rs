@@ -10185,7 +10185,7 @@ mod f1e_upstream_response_truthful_tests {
                 )
                 .expect("build response"),
         );
-        let mut stream = stream_success_response(response, 1024 * 1024, None)
+        let mut stream = stream_success_response(response, 1024 * 1024, None, None)
             .await
             .expect("stream built");
 
@@ -10209,7 +10209,7 @@ mod f1e_upstream_response_truthful_tests {
                 )
                 .expect("build response"),
         );
-        let mut stream = stream_success_response(response, 1024 * 1024, None)
+        let mut stream = stream_success_response(response, 1024 * 1024, None, None)
             .await
             .expect("stream built");
 

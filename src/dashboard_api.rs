@@ -1369,6 +1369,16 @@ pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response 
 /// `GET /dashboard/api/providers` — provider-scoped model catalogs, availability
 /// schedules, and current capacity. A failed inventory refresh returns an empty
 /// list so the rest of the dashboard remains usable while an upstream is down.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/providers",
+    tag = "dashboard",
+    responses(
+        (status = 200, body = serde_json::Value, description = "Configured provider inventory and current mesh capacity."),
+        (status = 401, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
 pub async fn dashboard_providers(State(gateway): State<Arc<Gateway>>) -> Response {
     let providers = gateway
         .upstream_client()
