@@ -88,6 +88,25 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     expect(vllm?.source).toBe('vllm');
     expect(vllm?.cache_hit_rate).toBeGreaterThan(0);
   });
+
+  it('mesh admin methods validate reads and send CSRF for mutations', async () => {
+    const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
+    const mesh = await client.mesh();
+    expect(mesh.join_keys.length).toBeGreaterThan(0);
+    expect(mesh.nodes.find((node) => node.endpoint_id === 'vllm-a')?.enabled).toBe(true);
+
+    const created = await client.createMeshJoinKey({ label: 'fixture', max_uses: 1, expires_in_secs: 3600 });
+    expect(created.token).toContain(created.join_key.id);
+
+    const node = await client.setMeshNodeEnabled('vllm-a', false);
+    expect(node).toMatchObject({ endpoint_id: 'vllm-a', enabled: false, evicted: true });
+
+    const disabled = await client.setMeshModelDisabled({ endpoint_id: 'vllm-a', resource_id: 'gpu-a', model: 'llama-3.1-70b' }, true);
+    expect(disabled.disabled).toBe(true);
+
+    const revoked = await client.revokeMeshJoinKey(created.join_key.id);
+    expect(revoked.updated).toBe(true);
+  });
 });
 
 describe('DashboardClient — access management runtime validation', () => {

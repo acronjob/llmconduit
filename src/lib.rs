@@ -12,6 +12,7 @@ pub mod dashboard_access;
 pub mod dashboard_api;
 pub mod dashboard_auth;
 pub mod dashboard_flow;
+pub mod dashboard_mesh;
 pub mod dashboard_ui;
 pub mod dashboard_ws;
 pub mod debug_ui;
@@ -319,7 +320,7 @@ pub fn build_app_with_gateway_control_plane_runtime(
         Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),
         None => crate::turn_capture::TurnCapture::disabled(),
     };
-    let mesh_registry = if config.mesh.controller.enabled {
+    let mesh_admin = if config.mesh.controller.enabled {
         Some(
             crate::mesh::controller::spawn_controller(&config.mesh.controller)
                 .expect("validated mesh controller configuration"),
@@ -327,7 +328,7 @@ pub fn build_app_with_gateway_control_plane_runtime(
     } else {
         None
     };
-    let mesh_enabled = mesh_registry.is_some();
+    let mesh_enabled = mesh_admin.is_some();
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
     // client so route-name/glob matching applies.
@@ -364,11 +365,11 @@ pub fn build_app_with_gateway_control_plane_runtime(
         };
     let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
         let mut providers = Vec::new();
-        if let Some(registry) = mesh_registry {
+        if let Some(admin) = mesh_admin.clone() {
             providers.push(RoutingUpstreamProvider::new(
                 "mesh",
                 MeshUpstreamClient::new(
-                    registry,
+                    admin.registry(),
                     finalization_policies.clone(),
                     flatten_content,
                     max_sse_frame_bytes,
@@ -604,6 +605,7 @@ pub fn build_app_with_gateway_control_plane_runtime(
     .with_session_hub(session_hub)
     .with_provider_metrics(provider_metrics.clone())
     .with_turn_capture(turn_capture)
+    .with_mesh_admin(mesh_admin)
     .with_operational_models(operational_models, unknown_model_policy);
     if let Some(client_auth) = client_auth {
         gateway = gateway.with_client_auth(client_auth);

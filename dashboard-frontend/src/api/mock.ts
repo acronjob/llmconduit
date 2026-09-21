@@ -31,6 +31,10 @@ import type {
   FlowsResponse,
   HistoryMetricsResponse,
   HistoryRequest,
+  MeshAdminState,
+  MeshDisabledModel,
+  MeshJoinKey,
+  MeshNode,
   MetricSample,
   MetricsResponse,
   MonitorPayload,
@@ -86,6 +90,20 @@ const AUTH_AUDIT: AuthAuditEvent[] = [
 ];
 const AUTH_PRICING: AuthPricingRow[] = [
   { model: 'gpt-4.1', provider: 'openai', source: 'operator', fetched_at: '2026-06-20T00:00:00Z', input_per_1k: '0.002', output_per_1k: '0.008', confidence: 'confident' },
+];
+
+let MESH_JOIN_KEYS: MeshJoinKey[] = [
+  { id: 'jk_mock_used', label: 'ops laptop', enabled: true, created_at_ms: Date.now() - 3_600_000, expires_at_ms: Date.now() + 86_400_000, max_uses: 2, use_count: 1 },
+  { id: 'jk_mock_spare', label: 'new provider', enabled: true, created_at_ms: Date.now() - 120_000, max_uses: 1, use_count: 0 },
+];
+
+let MESH_NODES: MeshNode[] = [
+  { endpoint_id: 'vllm-a', label: 'mesh worker a', enabled: true, joined_at_ms: Date.now() - 3_300_000, join_key_id: 'jk_mock_used', last_seen_at_ms: Date.now() - 5_000 },
+  { endpoint_id: 'vllm-b', label: 'mesh worker b', enabled: true, joined_at_ms: Date.now() - 2_400_000, join_key_id: 'jk_mock_spare', last_seen_at_ms: Date.now() - 45_000 },
+];
+
+let MESH_DISABLED_MODELS: MeshDisabledModel[] = [
+  { endpoint_id: 'vllm-b', resource_id: 'gpu-b', model: 'gpt-4o', disabled_at_ms: Date.now() - 60_000 },
 ];
 
 // ---------------------------------------------------------------------------
@@ -689,6 +707,77 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     if (id === MOCK_KILL_UNAUTHORIZED_ID) return json({ error: 'unauthorized' }, 401);
     if (!isSeededApiCallId(id)) return json({ error: 'unknown api_call_id' }, 404);
     return json({ api_call_id: id, killed: true });
+  }
+
+  if (path === '/dashboard/api/mesh') {
+    const resp: MeshAdminState = { join_keys: MESH_JOIN_KEYS, nodes: MESH_NODES, disabled_models: MESH_DISABLED_MODELS };
+    return json(resp);
+  }
+  if (path === '/dashboard/api/mesh/join-keys' && method === 'POST') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const body = JSON.parse(String(init?.body ?? '{}')) as { label?: string; max_uses?: number; expires_in_secs?: number };
+    const id = `jk_mock_${MESH_JOIN_KEYS.length + 1}`;
+    const joinKey: MeshJoinKey = {
+      id,
+      label: body.label?.trim() || undefined,
+      enabled: true,
+      created_at_ms: Date.now(),
+      expires_at_ms: body.expires_in_secs ? Date.now() + body.expires_in_secs * 1000 : undefined,
+      max_uses: body.max_uses,
+      use_count: 0,
+    };
+    MESH_JOIN_KEYS = [joinKey, ...MESH_JOIN_KEYS];
+    return json({ join_key: joinKey, token: `llmconduit-mesh.${id}.shown-once` });
+  }
+  const revokeMeshKeyMatch = path.match(/^\/dashboard\/api\/mesh\/join-keys\/([^/]+)\/revoke$/);
+  if (revokeMeshKeyMatch && method === 'POST') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(revokeMeshKeyMatch[1] ?? '');
+    let updated = false;
+    MESH_JOIN_KEYS = MESH_JOIN_KEYS.map((key) => {
+      if (key.id !== id || !key.enabled) return key;
+      updated = true;
+      return { ...key, enabled: false };
+    });
+    const disabled: string[] = [];
+    MESH_NODES = MESH_NODES.map((node) => {
+      if (node.join_key_id !== id || !node.enabled) return node;
+      disabled.push(node.endpoint_id);
+      return { ...node, enabled: false };
+    });
+    return json({ updated, disabled_endpoint_ids: disabled, evicted_endpoint_ids: disabled });
+  }
+  const meshNodeMatch = path.match(/^\/dashboard\/api\/mesh\/nodes\/([^/]+)\/(disable|enable)$/);
+  if (meshNodeMatch && method === 'POST') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const endpointId = decodeURIComponent(meshNodeMatch[1] ?? '');
+    const enabled = meshNodeMatch[2] === 'enable';
+    let updated = false;
+    MESH_NODES = MESH_NODES.map((node) => {
+      if (node.endpoint_id !== endpointId) return node;
+      updated = true;
+      return { ...node, enabled };
+    });
+    return updated ? json({ updated, endpoint_id: endpointId, enabled, evicted: !enabled }) : json({ error: 'mesh node not found' }, 404);
+  }
+  const meshModelMatch = path.match(/^\/dashboard\/api\/mesh\/models\/(disable|enable)$/);
+  if (meshModelMatch && method === 'POST') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const body = JSON.parse(String(init?.body ?? '{}')) as { endpoint_id: string; resource_id: string; model: string };
+    const disabled = meshModelMatch[1] === 'disable';
+    const same = (entry: MeshDisabledModel) => entry.endpoint_id === body.endpoint_id
+      && entry.resource_id === body.resource_id && entry.model.toLowerCase() === body.model.toLowerCase();
+    if (disabled && !MESH_DISABLED_MODELS.some(same)) {
+      MESH_DISABLED_MODELS = [{ ...body, disabled_at_ms: Date.now() }, ...MESH_DISABLED_MODELS];
+    }
+    if (!disabled) {
+      MESH_DISABLED_MODELS = MESH_DISABLED_MODELS.filter((entry) => !same(entry));
+    }
+    return json({ updated: true, endpoint_id: body.endpoint_id, resource_id: body.resource_id, model: body.model, disabled });
   }
 
   // -- Reads --

@@ -1,13 +1,14 @@
-import { useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMemo, useState, type FormEvent, type ReactNode } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { getConnection, queryKeys } from '../../api/connection';
-import type { ProviderHealth } from '../../api/types';
+import type { MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, ProviderHealth } from '../../api/types';
 import { EMPTY_FILTERS } from '../../components/FlowTable/filterTypes';
 import { useFlowRows } from '../../components/FlowTable/useFlowRows';
 import { fmtCost, fmtElapsed, fmtTokens } from '../../components/FlowTable/format';
 import { buildProviderLatency, fmtProviderLatencyMs } from '../../components/viz/providerLatency';
 import { Panel } from '../../components/ui/Panel';
-import { useDashboard } from '../../store/hooks';
+import { Button } from '../../components/ui/Button';
+import { useAuth, useDashboard } from '../../store/hooks';
 import { useTopologyQuery } from '../../store/useTopologyQuery';
 import { cn } from '../../lib/cn';
 import {
@@ -20,11 +21,15 @@ import {
 
 const authPoliciesKey = ['auth', 'policies', 'providers-view'] as const;
 const DASH = '—';
+const INPUT = 'rounded-md border border-line bg-bg px-2 py-1.5 font-mono text-xs text-text outline-none focus:border-accent';
 
 export function ProvidersView() {
   const [status, setStatus] = useState<'all' | ProviderHealth['status']>('all');
   const [query, setQuery] = useState('');
+  const [createdToken, setCreatedToken] = useState<{ label: string | null; token: string } | null>(null);
   const { client } = getConnection();
+  const queryClient = useQueryClient();
+  const mutationsEnabled = useAuth((s) => s.mutationsEnabled);
   const nodes = useDashboard((s) => s.topologyNodes);
   const edges = useDashboard((s) => s.topologyEdges);
   const { rows: flows } = useFlowRows(EMPTY_FILTERS);
@@ -32,8 +37,27 @@ export function ProvidersView() {
 
   const topologyQuery = useQuery({ queryKey: queryKeys.topology, queryFn: () => client.topology() });
   const providersQuery = useQuery({ queryKey: queryKeys.providers, queryFn: () => client.providers() });
+  const meshQuery = useQuery({ queryKey: queryKeys.mesh, queryFn: () => client.mesh(), retry: false });
   const providerMetricsQuery = useQuery({ queryKey: queryKeys.providerMetrics, queryFn: () => client.providerMetrics() });
   const policiesQuery = useQuery({ queryKey: authPoliciesKey, queryFn: () => client.authPolicies() });
+  const invalidateMesh = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.mesh });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.providers });
+  };
+  const createJoinKey = useMutation({
+    mutationFn: (body: { label?: string; max_uses?: number; expires_in_secs?: number }) => client.createMeshJoinKey(body),
+    onSuccess: (created) => {
+      setCreatedToken({ label: created.join_key.label ?? null, token: created.token });
+      invalidateMesh();
+    },
+  });
+  const revokeJoinKey = useMutation({ mutationFn: (id: string) => client.revokeMeshJoinKey(id), onSuccess: invalidateMesh });
+  const setNodeEnabled = useMutation({ mutationFn: ({ endpointId, enabled }: { endpointId: string; enabled: boolean }) => client.setMeshNodeEnabled(endpointId, enabled), onSuccess: invalidateMesh });
+  const setModelDisabled = useMutation({
+    mutationFn: ({ endpointId, resourceId, model, disabled }: { endpointId: string; resourceId: string; model: string; disabled: boolean }) =>
+      client.setMeshModelDisabled({ endpoint_id: endpointId, resource_id: resourceId, model }, disabled),
+    onSuccess: invalidateMesh,
+  });
 
   const inventory = useMemo(() => buildProviderInventory({
     providers: providersQuery.data?.providers ?? [],
@@ -117,11 +141,230 @@ export function ProvidersView() {
       <SummaryStrip summary={inventory.summary} />
 
       <div className="mt-3 space-y-3">
+        <MeshAdminPanel
+          mesh={meshQuery.data ?? null}
+          rows={inventory.rows}
+          loading={meshQuery.isLoading}
+          error={meshQuery.error ? String(meshQuery.error) : null}
+          mutationsEnabled={mutationsEnabled}
+          createdToken={createdToken}
+          busy={createJoinKey.isPending || revokeJoinKey.isPending || setNodeEnabled.isPending || setModelDisabled.isPending}
+          mutationError={String(createJoinKey.error ?? revokeJoinKey.error ?? setNodeEnabled.error ?? setModelDisabled.error ?? '') || null}
+          onCreate={(body) => createJoinKey.mutate(body)}
+          onDismissToken={() => setCreatedToken(null)}
+          onRevoke={(id) => revokeJoinKey.mutate(id)}
+          onSetNode={(endpointId, enabled) => setNodeEnabled.mutate({ endpointId, enabled })}
+          onSetModel={(endpointId, resourceId, model, disabled) => setModelDisabled.mutate({ endpointId, resourceId, model, disabled })}
+        />
         <ProviderTable rows={filteredRows} total={inventory.rows.length} />
         <ModelsPanel models={inventory.unionCatalogModels} />
       </div>
     </div>
   );
+}
+
+function MeshAdminPanel({
+  mesh,
+  rows,
+  loading,
+  error,
+  mutationsEnabled,
+  createdToken,
+  busy,
+  mutationError,
+  onCreate,
+  onDismissToken,
+  onRevoke,
+  onSetNode,
+  onSetModel,
+}: {
+  mesh: MeshAdminState | null;
+  rows: ProviderInventoryRow[];
+  loading: boolean;
+  error: string | null;
+  mutationsEnabled: boolean;
+  createdToken: { label: string | null; token: string } | null;
+  busy: boolean;
+  mutationError: string | null;
+  onCreate: (body: { label?: string; max_uses?: number; expires_in_secs?: number }) => void;
+  onDismissToken: () => void;
+  onRevoke: (id: string) => void;
+  onSetNode: (endpointId: string, enabled: boolean) => void;
+  onSetModel: (endpointId: string, resourceId: string, model: string, disabled: boolean) => void;
+}) {
+  const [label, setLabel] = useState('');
+  const [maxUses, setMaxUses] = useState('1');
+  const [expiresHours, setExpiresHours] = useState('24');
+  const disabledModels = new Set((mesh?.disabled_models ?? []).map(disabledModelKey));
+  const meshEndpointIds = new Set((mesh?.nodes ?? []).map((node) => node.endpoint_id));
+  const meshRows = rows
+    .map((row) => ({ row, endpointId: endpointFromProvider(row.id) }))
+    .filter(({ row, endpointId }) => endpointId && meshEndpointIds.has(endpointId) && row.resourceId);
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    onCreate({
+      label: label.trim() || undefined,
+      max_uses: numberField(maxUses),
+      expires_in_secs: numberField(expiresHours) == null ? undefined : numberField(expiresHours)! * 3600,
+    });
+  };
+  const unavailable = error && error.includes('404');
+
+  return (
+    <Panel className="p-4" data-testid="mesh-admin" data-available={mesh ? 'true' : 'false'}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">Mesh enrollment</h2>
+          <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+            Provision provider tokens, revoke future enrollment, disable nodes, or suppress one advertised model.
+          </p>
+        </div>
+        {!mutationsEnabled && (
+          <span className="rounded-sm bg-status-cooling/15 px-2 py-1 text-[10px] uppercase tracking-wide text-status-cooling" data-testid="mesh-mutations-disabled">
+            mutations disabled
+          </span>
+        )}
+      </div>
+
+      {loading && <p className="mt-3 text-xs text-text-muted">Loading mesh state...</p>}
+      {unavailable && <p className="mt-3 text-xs text-text-muted" data-quality="unavailable">Mesh controller is not enabled on this gateway.</p>}
+      {error && !unavailable && <p className="mt-3 text-xs text-status-down">Could not load mesh admin state: {error}</p>}
+
+      {createdToken && (
+        <div className="mt-3 rounded border border-status-healthy/40 bg-status-healthy/10 p-3" data-testid="mesh-created-token">
+          <div className="text-[10px] uppercase tracking-[0.14em] text-status-healthy">new enrollment token{createdToken.label ? ` · ${createdToken.label}` : ''} · shown once</div>
+          <code className="mt-1 block select-all break-all font-mono text-xs text-text">{createdToken.token}</code>
+          <button type="button" className="mt-1 text-[10px] text-text-muted hover:text-text" onClick={onDismissToken}>dismiss</button>
+        </div>
+      )}
+
+      {mesh && (
+        <>
+          <form className="mt-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_7rem_7rem_auto]" onSubmit={submit}>
+            <input aria-label="Enrollment label" value={label} onChange={(event) => setLabel(event.target.value)} placeholder="label" className={INPUT} />
+            <input aria-label="Max uses" value={maxUses} onChange={(event) => setMaxUses(event.target.value)} inputMode="numeric" className={INPUT} />
+            <input aria-label="Expires hours" value={expiresHours} onChange={(event) => setExpiresHours(event.target.value)} inputMode="numeric" className={INPUT} />
+            <Button type="submit" disabled={!mutationsEnabled || busy} className="text-xs">Create token</Button>
+          </form>
+          {mutationError && <p className="mt-2 text-xs text-status-down">{mutationError}</p>}
+          <div className="mt-3 grid gap-3 xl:grid-cols-3">
+            <JoinKeyList keys={mesh.join_keys} busy={busy} mutationsEnabled={mutationsEnabled} onRevoke={onRevoke} />
+            <NodeList nodes={mesh.nodes} busy={busy} mutationsEnabled={mutationsEnabled} onSetNode={onSetNode} />
+            <ModelOverrideList rows={meshRows} disabledModels={disabledModels} busy={busy} mutationsEnabled={mutationsEnabled} onSetModel={onSetModel} />
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function JoinKeyList({ keys, busy, mutationsEnabled, onRevoke }: { keys: MeshJoinKey[]; busy: boolean; mutationsEnabled: boolean; onRevoke: (id: string) => void }) {
+  return (
+    <MeshList title="tokens" count={keys.length}>
+      {keys.map((key) => (
+        <div key={key.id} className="border-b border-line/70 py-2 last:border-0">
+          <div className="flex items-center justify-between gap-2">
+            <span className="truncate font-mono text-[10px]" title={key.id}>{key.label || key.id}</span>
+            <Button type="button" variant="danger" disabled={!mutationsEnabled || busy || !key.enabled} onClick={() => onRevoke(key.id)} className="px-2 py-1 text-[10px]">Revoke</Button>
+          </div>
+          <div className="mt-1 text-[10px] text-text-muted">
+            {key.enabled ? 'enabled' : 'revoked'} · uses {key.use_count}/{key.max_uses ?? DASH} · expires {key.expires_at_ms ? fmtWhen(key.expires_at_ms) : DASH}
+          </div>
+        </div>
+      ))}
+      {keys.length === 0 && <EmptyMeshLine>No enrollment tokens.</EmptyMeshLine>}
+    </MeshList>
+  );
+}
+
+function NodeList({ nodes, busy, mutationsEnabled, onSetNode }: { nodes: MeshNode[]; busy: boolean; mutationsEnabled: boolean; onSetNode: (endpointId: string, enabled: boolean) => void }) {
+  return (
+    <MeshList title="nodes" count={nodes.length}>
+      {nodes.map((node) => (
+        <div key={node.endpoint_id} className="border-b border-line/70 py-2 last:border-0">
+          <div className="flex items-center justify-between gap-2">
+            <span className="truncate font-mono text-[10px]" title={node.endpoint_id}>{node.label || node.endpoint_id}</span>
+            <Button type="button" variant={node.enabled ? 'danger' : 'default'} disabled={!mutationsEnabled || busy} onClick={() => onSetNode(node.endpoint_id, !node.enabled)} className="px-2 py-1 text-[10px]">
+              {node.enabled ? 'Disable' : 'Enable'}
+            </Button>
+          </div>
+          <div className="mt-1 text-[10px] text-text-muted">
+            {node.enabled ? 'enabled' : 'disabled'} · last seen {node.last_seen_at_ms ? fmtElapsed(Date.now() - node.last_seen_at_ms) + ' ago' : DASH}
+          </div>
+        </div>
+      ))}
+      {nodes.length === 0 && <EmptyMeshLine>No enrolled nodes.</EmptyMeshLine>}
+    </MeshList>
+  );
+}
+
+function ModelOverrideList({
+  rows,
+  disabledModels,
+  busy,
+  mutationsEnabled,
+  onSetModel,
+}: {
+  rows: Array<{ row: ProviderInventoryRow; endpointId: string | null }>;
+  disabledModels: Set<string>;
+  busy: boolean;
+  mutationsEnabled: boolean;
+  onSetModel: (endpointId: string, resourceId: string, model: string, disabled: boolean) => void;
+}) {
+  const entries = rows.flatMap(({ row, endpointId }) => row.advertisedModels.map((model) => ({ row, endpointId, model }))).filter((entry): entry is { row: ProviderInventoryRow; endpointId: string; model: string } => Boolean(entry.endpointId && entry.row.resourceId));
+  return (
+    <MeshList title="model overrides" count={disabledModels.size}>
+      {entries.slice(0, 12).map(({ row, endpointId, model }) => {
+        const resourceId = row.resourceId ?? '';
+        const disabled = disabledModels.has(disabledModelKey({ endpoint_id: endpointId, resource_id: resourceId, model }));
+        return (
+          <div key={`${endpointId}/${resourceId}/${model}`} className="border-b border-line/70 py-2 last:border-0">
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate font-mono text-[10px]" title={`${endpointId}/${resourceId}/${model}`}>{model}</span>
+              <Button type="button" variant={disabled ? 'default' : 'danger'} disabled={!mutationsEnabled || busy} onClick={() => onSetModel(endpointId, resourceId, model, !disabled)} className="px-2 py-1 text-[10px]">
+                {disabled ? 'Enable' : 'Disable'}
+              </Button>
+            </div>
+            <div className="mt-1 truncate text-[10px] text-text-muted">{endpointId} · {resourceId} · {disabled ? 'disabled' : 'routable'}</div>
+          </div>
+        );
+      })}
+      {entries.length === 0 && <EmptyMeshLine>No mesh models advertised.</EmptyMeshLine>}
+    </MeshList>
+  );
+}
+
+function MeshList({ title, count, children }: { title: string; count: number; children: ReactNode }) {
+  return (
+    <div className="min-w-0 rounded border border-line/70 bg-bg px-3 py-2">
+      <div className="flex items-center justify-between border-b border-line/70 pb-1">
+        <h3 className="text-[10px] uppercase tracking-[0.14em] text-text-muted">{title}</h3>
+        <span className="font-mono text-[10px] text-text-muted">{count}</span>
+      </div>
+      <div>{children}</div>
+    </div>
+  );
+}
+
+function EmptyMeshLine({ children }: { children: ReactNode }) {
+  return <p className="py-4 text-center text-xs italic text-text-muted" data-quality="unavailable">{children}</p>;
+}
+
+function endpointFromProvider(providerId: string): string | null {
+  return providerId.startsWith('mesh:') ? providerId.slice('mesh:'.length) : providerId || null;
+}
+
+function disabledModelKey(value: Pick<MeshDisabledModel, 'endpoint_id' | 'resource_id' | 'model'>): string {
+  return `${value.endpoint_id}\n${value.resource_id}\n${value.model.toLowerCase()}`;
+}
+
+function numberField(value: string): number | undefined {
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+}
+
+function fmtWhen(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 16).replace('T', ' ');
 }
 
 function SummaryStrip({ summary }: { summary: ProviderInventorySummary }) {

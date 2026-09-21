@@ -24,6 +24,7 @@ pub(crate) struct MeshRegistry {
 #[derive(Debug, Default)]
 struct RegistryState {
     workers: HashMap<EndpointId, Arc<WorkerSession>>,
+    disabled_models: HashSet<(EndpointId, String, String)>,
     rr: u64,
 }
 
@@ -131,6 +132,56 @@ impl MeshRegistry {
         }
     }
 
+    pub(crate) fn remove_endpoint(&self, endpoint_id: EndpointId, reason: &'static [u8]) -> bool {
+        let removed = self
+            .inner
+            .lock()
+            .expect("mesh registry lock poisoned")
+            .workers
+            .remove(&endpoint_id);
+        if let Some(session) = removed {
+            if let Some(connection) = &session.connection {
+                connection.close(403u32.into(), reason);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn replace_disabled_models(
+        &self,
+        disabled: impl IntoIterator<Item = (EndpointId, String, String)>,
+    ) {
+        let mut state = self.inner.lock().expect("mesh registry lock poisoned");
+        state.disabled_models = disabled
+            .into_iter()
+            .map(|(endpoint_id, resource_id, model)| {
+                (endpoint_id, resource_id, model.to_ascii_lowercase())
+            })
+            .collect();
+    }
+
+    pub(crate) fn set_model_disabled(
+        &self,
+        endpoint_id: EndpointId,
+        resource_id: &str,
+        model: &str,
+        disabled: bool,
+    ) {
+        let mut state = self.inner.lock().expect("mesh registry lock poisoned");
+        let key = (
+            endpoint_id,
+            resource_id.to_string(),
+            model.to_ascii_lowercase(),
+        );
+        if disabled {
+            state.disabled_models.insert(key);
+        } else {
+            state.disabled_models.remove(&key);
+        }
+    }
+
     pub(crate) fn reserve(&self, model: &str) -> Option<MeshReservation> {
         self.reserve_excluding(model, &HashSet::new())
     }
@@ -207,6 +258,27 @@ impl MeshRegistry {
             .any(|candidate| allows(candidate.endpoint_id, &candidate.resource_id))
     }
 
+    pub(crate) fn has_resource_model(
+        &self,
+        endpoint_id: EndpointId,
+        resource_id: &str,
+        model: &str,
+    ) -> bool {
+        let Some(session) = self.current_session_any_generation(endpoint_id) else {
+            return false;
+        };
+        let resources = session
+            .resources
+            .lock()
+            .expect("mesh worker resources lock poisoned");
+        resources.get(resource_id).is_some_and(|resource| {
+            resource
+                .models
+                .iter()
+                .any(|advertised| advertised.id.eq_ignore_ascii_case(model))
+        })
+    }
+
     pub(crate) fn model_catalog(&self) -> Vec<ModelAdvertisement> {
         let now = Instant::now();
         let sessions: Vec<_> = self
@@ -217,6 +289,7 @@ impl MeshRegistry {
             .values()
             .cloned()
             .collect();
+        let disabled = self.disabled_models_snapshot();
         let mut by_id: HashMap<String, Option<i64>> = HashMap::new();
         for session in sessions {
             if session.is_stale(now, self.heartbeat_timeout) {
@@ -231,6 +304,13 @@ impl MeshRegistry {
                     continue;
                 }
                 for model in &resource.models {
+                    if disabled.contains(&(
+                        session.endpoint_id,
+                        resource.resource_id.clone(),
+                        model.id.to_ascii_lowercase(),
+                    )) {
+                        continue;
+                    }
                     by_id.entry(model.id.clone()).or_insert(model.context_limit);
                 }
             }
@@ -256,6 +336,7 @@ impl MeshRegistry {
             .values()
             .cloned()
             .collect();
+        let disabled = self.disabled_models_snapshot();
         let mut entries = Vec::new();
         for session in sessions {
             let stale = session.is_stale(now, self.heartbeat_timeout);
@@ -275,6 +356,13 @@ impl MeshRegistry {
                     models: resource
                         .models
                         .iter()
+                        .filter(|model| {
+                            !disabled.contains(&(
+                                session.endpoint_id,
+                                resource.resource_id.clone(),
+                                model.id.to_ascii_lowercase(),
+                            ))
+                        })
                         .map(|model| crate::upstream::UpstreamModelEntry {
                             id: model.id.clone(),
                             context_limit: model.context_limit,
@@ -286,6 +374,13 @@ impl MeshRegistry {
                     accepting_requests: !stale
                         && resource.healthy
                         && resource.accepting_requests
+                        && resource.models.iter().any(|model| {
+                            !disabled.contains(&(
+                                session.endpoint_id,
+                                resource.resource_id.clone(),
+                                model.id.to_ascii_lowercase(),
+                            ))
+                        })
                         && capacity.active < capacity.limit,
                     healthy: !stale && resource.healthy,
                 });
@@ -326,6 +421,7 @@ impl MeshRegistry {
             .values()
             .cloned()
             .collect();
+        let disabled = self.disabled_models_snapshot();
         let mut out = Vec::new();
         for session in sessions {
             if session.is_stale(now, self.heartbeat_timeout) {
@@ -337,6 +433,13 @@ impl MeshRegistry {
                 .expect("mesh worker resources lock poisoned");
             for resource in resources.values() {
                 if !resource.healthy || !resource.accepting_requests {
+                    continue;
+                }
+                if disabled.contains(&(
+                    session.endpoint_id,
+                    resource.resource_id.clone(),
+                    model.to_ascii_lowercase(),
+                )) {
                     continue;
                 }
                 if !resource
@@ -377,6 +480,26 @@ impl MeshRegistry {
             .get(&endpoint_id)
             .filter(|session| session.generation == generation)
             .cloned()
+    }
+
+    fn current_session_any_generation(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Option<Arc<WorkerSession>> {
+        self.inner
+            .lock()
+            .expect("mesh registry lock poisoned")
+            .workers
+            .get(&endpoint_id)
+            .cloned()
+    }
+
+    fn disabled_models_snapshot(&self) -> HashSet<(EndpointId, String, String)> {
+        self.inner
+            .lock()
+            .expect("mesh registry lock poisoned")
+            .disabled_models
+            .clone()
     }
 }
 
@@ -578,6 +701,59 @@ mod tests {
         assert_eq!(provider.active_requests, Some(1));
         assert!(provider.accepting_requests);
         drop(reservation);
+    }
+
+    #[test]
+    fn disabled_model_is_removed_from_routing_catalog_and_inventory() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            WorkerAdvertisement {
+                protocol_version: PROTOCOL_VERSION,
+                node_name: None,
+                agent_version: "test".into(),
+                resources: vec![ResourceAdvertisement {
+                    resource_id: "gpu".into(),
+                    models: vec![
+                        ModelAdvertisement {
+                            id: "qwen".into(),
+                            context_limit: None,
+                        },
+                        ModelAdvertisement {
+                            id: "llama".into(),
+                            context_limit: None,
+                        },
+                    ],
+                    availability: AvailabilitySchedule::default(),
+                    effective_capacity: 1,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                }],
+            },
+        );
+
+        registry.set_model_disabled(endpoint, "gpu", "QWEN", true);
+
+        assert!(registry.reserve("qwen").is_none());
+        assert!(registry.reserve("llama").is_some());
+        assert_eq!(
+            registry
+                .model_catalog()
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            vec!["llama"]
+        );
+        assert_eq!(
+            registry.provider_inventory()[0]
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["llama"]
+        );
     }
 
     #[test]

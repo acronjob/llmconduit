@@ -1537,7 +1537,7 @@ fn apply_paging(rows: Vec<FlowRow>, page: Option<usize>, limit: Option<usize>) -
 /// carries the locked-down CSP/nosniff/no-referrer/X-Frame-Options set, exactly
 /// like the auth-layer responses. A serialization failure (should be unreachable —
 /// the DTOs are plain data) degrades to a 500 with the same headers.
-fn json_no_store<T: Serialize>(status: StatusCode, body: &T) -> Response {
+pub(crate) fn json_no_store<T: Serialize>(status: StatusCode, body: &T) -> Response {
     let response = match serde_json::to_vec(body) {
         Ok(bytes) => (
             status,

@@ -218,6 +218,9 @@ pub struct Gateway {
     /// Durable store handle for admin/history reads only. Inference writes use
     /// `persistence_queue` above; request execution never awaits this trait object.
     persistence_store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
+    /// Optional mesh controller admin handle. Present only when the controller is
+    /// enabled; dashboard handlers use it for enrollment/node/model lifecycle.
+    mesh_admin: Option<Arc<crate::mesh::controller::MeshAdmin>>,
     /// D6 AbortHub: the live-cancellation registry keyed by `api_call_id`, so the
     /// dashboard kill route can cancel a stuck server-side stream. Gated identically to
     /// the FlowStore (enabled iff `flow_store.is_enabled()`), because the D3 L1 guard —
@@ -809,6 +812,7 @@ impl Gateway {
             client_auth_required: false,
             users_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persistence_store: None,
+            mesh_admin: None,
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
@@ -1078,6 +1082,18 @@ impl Gateway {
     ) -> Self {
         self.persistence_store = Some(store);
         self
+    }
+
+    pub(crate) fn with_mesh_admin(
+        mut self,
+        mesh_admin: Option<Arc<crate::mesh::controller::MeshAdmin>>,
+    ) -> Self {
+        self.mesh_admin = mesh_admin;
+        self
+    }
+
+    pub(crate) fn mesh_admin(&self) -> Option<Arc<crate::mesh::controller::MeshAdmin>> {
+        self.mesh_admin.clone()
     }
 
     pub fn persistence_store(

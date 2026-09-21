@@ -1057,6 +1057,76 @@ export interface ProvidersResponse {
   providers: ProviderInventoryEntry[];
 }
 
+export interface MeshJoinKey {
+  id: string;
+  label?: string;
+  enabled: boolean;
+  created_at_ms: number;
+  expires_at_ms?: number;
+  max_uses?: number;
+  use_count: number;
+}
+
+export interface MeshNode {
+  endpoint_id: string;
+  label?: string;
+  enabled: boolean;
+  joined_at_ms: number;
+  join_key_id?: string;
+  last_seen_at_ms?: number;
+}
+
+export interface MeshDisabledModel {
+  endpoint_id: string;
+  resource_id: string;
+  model: string;
+  disabled_at_ms: number;
+}
+
+export interface MeshAdminState {
+  join_keys: MeshJoinKey[];
+  nodes: MeshNode[];
+  disabled_models: MeshDisabledModel[];
+}
+
+export interface CreateMeshJoinKeyRequest {
+  label?: string;
+  max_uses?: number;
+  expires_in_secs?: number;
+}
+
+export interface CreateMeshJoinKeyResponse {
+  join_key: MeshJoinKey;
+  token: string;
+}
+
+export interface RevokeMeshJoinKeyResponse {
+  updated: boolean;
+  disabled_endpoint_ids: string[];
+  evicted_endpoint_ids: string[];
+}
+
+export interface SetMeshNodeResponse {
+  updated: boolean;
+  endpoint_id: string;
+  enabled: boolean;
+  evicted: boolean;
+}
+
+export interface MeshModelOverrideRequest {
+  endpoint_id: string;
+  resource_id: string;
+  model: string;
+}
+
+export interface SetMeshModelResponse {
+  updated: boolean;
+  endpoint_id: string;
+  resource_id: string;
+  model: string;
+  disabled: boolean;
+}
+
 export type ProviderMetricsSource = 'vllm' | 'sglang';
 
 export interface ProviderCacheMetrics {
@@ -1534,6 +1604,40 @@ function isProviderCacheMetrics(v: unknown): v is ProviderCacheMetrics {
 export const isProvidersResponse = (v: unknown): v is ProvidersResponse => isArrayEnvelope(v, 'providers', isProviderInventoryEntry);
 export const isProviderMetricsResponse = (v: unknown): v is ProviderMetricsResponse =>
   isObj(v) && isUint(v.generated_at_ms) && Array.isArray(v.providers) && v.providers.every(isProviderCacheMetrics);
+
+function isMeshJoinKey(v: unknown): v is MeshJoinKey {
+  return isObj(v) && isStr(v.id) && isOptStr(v.label) && typeof v.enabled === 'boolean'
+    && isUint(v.created_at_ms) && isOptUint(v.expires_at_ms) && isOptUint(v.max_uses)
+    && isUint(v.use_count);
+}
+
+function isMeshNode(v: unknown): v is MeshNode {
+  return isObj(v) && isStr(v.endpoint_id) && isOptStr(v.label) && typeof v.enabled === 'boolean'
+    && isUint(v.joined_at_ms) && isOptStr(v.join_key_id) && isOptUint(v.last_seen_at_ms);
+}
+
+function isMeshDisabledModel(v: unknown): v is MeshDisabledModel {
+  return isObj(v) && isStr(v.endpoint_id) && isStr(v.resource_id) && isStr(v.model) && isUint(v.disabled_at_ms);
+}
+
+export const isMeshAdminState = (v: unknown): v is MeshAdminState =>
+  isObj(v)
+  && Array.isArray(v.join_keys) && v.join_keys.every(isMeshJoinKey)
+  && Array.isArray(v.nodes) && v.nodes.every(isMeshNode)
+  && Array.isArray(v.disabled_models) && v.disabled_models.every(isMeshDisabledModel);
+
+export const isCreateMeshJoinKeyResponse = (v: unknown): v is CreateMeshJoinKeyResponse =>
+  isObj(v) && isMeshJoinKey(v.join_key) && isStr(v.token);
+
+export const isRevokeMeshJoinKeyResponse = (v: unknown): v is RevokeMeshJoinKeyResponse =>
+  isObj(v) && typeof v.updated === 'boolean' && isStringArray(v.disabled_endpoint_ids) && isStringArray(v.evicted_endpoint_ids);
+
+export const isSetMeshNodeResponse = (v: unknown): v is SetMeshNodeResponse =>
+  isObj(v) && typeof v.updated === 'boolean' && isStr(v.endpoint_id) && typeof v.enabled === 'boolean' && typeof v.evicted === 'boolean';
+
+export const isSetMeshModelResponse = (v: unknown): v is SetMeshModelResponse =>
+  isObj(v) && typeof v.updated === 'boolean' && isStr(v.endpoint_id) && isStr(v.resource_id)
+  && isStr(v.model) && typeof v.disabled === 'boolean';
 
 // ---------------------------------------------------------------------------
 // Runtime validation (the WS pipe must NOT trust the wire — findings 4/5/6).

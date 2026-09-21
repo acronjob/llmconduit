@@ -22,6 +22,7 @@ use crate::dashboard_auth::dashboard_login;
 use crate::dashboard_auth::dashboard_logout;
 use crate::dashboard_auth::delegated_login_response;
 use crate::dashboard_auth::require_session;
+use crate::dashboard_mesh;
 use crate::dashboard_ui::dashboard_asset;
 use crate::dashboard_ui::dashboard_index;
 use crate::dashboard_ws::dashboard_ws;
@@ -218,6 +219,31 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/providers", get(dashboard_providers))
+        .route("/dashboard/api/mesh", get(dashboard_mesh::mesh_state))
+        .route(
+            "/dashboard/api/mesh/join-keys",
+            post(dashboard_mesh::create_join_key),
+        )
+        .route(
+            "/dashboard/api/mesh/join-keys/{id}/revoke",
+            post(dashboard_mesh::revoke_join_key),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/disable",
+            post(dashboard_mesh::disable_node),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/enable",
+            post(dashboard_mesh::enable_node),
+        )
+        .route(
+            "/dashboard/api/mesh/models/disable",
+            post(dashboard_mesh::disable_model),
+        )
+        .route(
+            "/dashboard/api/mesh/models/enable",
+            post(dashboard_mesh::enable_model),
+        )
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
         .route("/dashboard/api/history/requests", get(history_requests))
         .route(

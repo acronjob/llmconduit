@@ -965,8 +965,12 @@ async fn run_mesh_command(
                     }
                 }
                 JoinKeyCommands::Revoke { key_id } => {
-                    if store.revoke_join_key(&key_id).await? {
-                        println!("revoked {key_id}");
+                    let revoked = store.revoke_join_key(&key_id).await?;
+                    if revoked.updated {
+                        println!(
+                            "revoked {key_id}; disabled {} enrolled node(s)",
+                            revoked.disabled_endpoint_ids.len()
+                        );
                     } else {
                         println!("join key not found or already disabled: {key_id}");
                     }

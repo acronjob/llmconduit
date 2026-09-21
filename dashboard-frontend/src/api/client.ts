@@ -37,12 +37,19 @@ import type {
   KillResponse,
   LoginRequest,
   MeResponse,
+  CreateMeshJoinKeyRequest,
+  CreateMeshJoinKeyResponse,
+  MeshAdminState,
+  MeshModelOverrideRequest,
   MetricsResponse,
   ProviderMetricsResponse,
   ProvidersResponse,
+  RevokeMeshJoinKeyResponse,
   SessionDetailResponse,
   SessionUser,
   SessionsResponse,
+  SetMeshModelResponse,
+  SetMeshNodeResponse,
   SnapshotResponse,
   ThroughputResponse,
   TopologyResponse,
@@ -59,9 +66,14 @@ import {
   isAuthSummary,
   isAuthUsageResponse,
   isAuthUsersResponse,
+  isCreateMeshJoinKeyResponse,
+  isMeshAdminState,
   isCreatedAuthApiKey,
   isProviderMetricsResponse,
   isProvidersResponse,
+  isRevokeMeshJoinKeyResponse,
+  isSetMeshModelResponse,
+  isSetMeshNodeResponse,
 } from './types';
 
 export type FetchImpl = typeof fetch;
@@ -264,6 +276,40 @@ export class DashboardClient {
 
   providerMetrics(): Promise<ProviderMetricsResponse> {
     return this.request('/provider-metrics', undefined, isProviderMetricsResponse);
+  }
+
+  mesh(): Promise<MeshAdminState> {
+    return this.request('/mesh', undefined, isMeshAdminState);
+  }
+
+  createMeshJoinKey(body: CreateMeshJoinKeyRequest): Promise<CreateMeshJoinKeyResponse> {
+    return this.mutate('/mesh/join-keys', 'POST', body).then((value) => {
+      if (!isCreateMeshJoinKeyResponse(value)) throw new Error('/mesh/join-keys returned an invalid response');
+      return value;
+    });
+  }
+
+  revokeMeshJoinKey(id: string): Promise<RevokeMeshJoinKeyResponse> {
+    return this.mutate(`/mesh/join-keys/${encodeURIComponent(id)}/revoke`, 'POST').then((value) => {
+      if (!isRevokeMeshJoinKeyResponse(value)) throw new Error('/mesh/join-keys/:id/revoke returned an invalid response');
+      return value;
+    });
+  }
+
+  setMeshNodeEnabled(endpointId: string, enabled: boolean): Promise<SetMeshNodeResponse> {
+    const action = enabled ? 'enable' : 'disable';
+    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/${action}`, 'POST').then((value) => {
+      if (!isSetMeshNodeResponse(value)) throw new Error(`/mesh/nodes/:endpoint_id/${action} returned an invalid response`);
+      return value;
+    });
+  }
+
+  setMeshModelDisabled(body: MeshModelOverrideRequest, disabled: boolean): Promise<SetMeshModelResponse> {
+    const action = disabled ? 'disable' : 'enable';
+    return this.mutate(`/mesh/models/${action}`, 'POST', body).then((value) => {
+      if (!isSetMeshModelResponse(value)) throw new Error(`/mesh/models/${action} returned an invalid response`);
+      return value;
+    });
   }
 
   /** Bare array — no cursor (D13: static-ish catalog read). */

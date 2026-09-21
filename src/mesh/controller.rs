@@ -10,7 +10,7 @@ use crate::mesh::protocol::{
     validate_resource_advertisement, validate_worker_advertisement, write_control,
 };
 use crate::mesh::registry::MeshRegistry;
-use crate::mesh::store::{JoinKeyDecision, MeshStore};
+use crate::mesh::store::{DisabledMeshModelRecord, JoinKeyDecision, MeshStore, StoreError};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayMode};
 use std::collections::BTreeMap;
@@ -27,7 +27,67 @@ const INITIAL_CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 type MeshModelAllowlist = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
-pub(crate) fn spawn_controller(config: &MeshControllerConfig) -> AppResult<Arc<MeshRegistry>> {
+#[derive(Debug, Clone)]
+pub(crate) struct MeshAdmin {
+    store: MeshStore,
+    registry: Arc<MeshRegistry>,
+    initialized: Arc<tokio::sync::OnceCell<()>>,
+}
+
+impl MeshAdmin {
+    pub(crate) fn store(&self) -> &MeshStore {
+        &self.store
+    }
+
+    pub(crate) fn registry(&self) -> Arc<MeshRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    pub(crate) async fn initialize(&self) -> Result<(), StoreError> {
+        self.initialized
+            .get_or_try_init(|| async {
+                self.store.initialize().await?;
+                self.reload_disabled_models().await
+            })
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn reload_disabled_models(&self) -> Result<(), StoreError> {
+        let disabled = self.store.list_disabled_models().await?;
+        self.apply_disabled_models(disabled);
+        Ok(())
+    }
+
+    pub(crate) fn disable_live_node(&self, endpoint_id: iroh::EndpointId) -> bool {
+        self.registry
+            .remove_endpoint(endpoint_id, b"mesh node was disabled")
+    }
+
+    pub(crate) fn apply_model_disabled(
+        &self,
+        endpoint_id: iroh::EndpointId,
+        resource_id: &str,
+        model: &str,
+        disabled: bool,
+    ) {
+        self.registry
+            .set_model_disabled(endpoint_id, resource_id, model, disabled);
+    }
+
+    fn apply_disabled_models(&self, records: Vec<DisabledMeshModelRecord>) {
+        self.registry
+            .replace_disabled_models(records.into_iter().filter_map(|record| {
+                record
+                    .endpoint_id
+                    .parse::<iroh::EndpointId>()
+                    .ok()
+                    .map(|endpoint_id| (endpoint_id, record.resource_id, record.model))
+            }));
+    }
+}
+
+pub(crate) fn spawn_controller(config: &MeshControllerConfig) -> AppResult<Arc<MeshAdmin>> {
     let registry = Arc::new(MeshRegistry::new(Duration::from_secs(
         config.heartbeat_timeout_secs,
     )));
@@ -35,20 +95,27 @@ pub(crate) fn spawn_controller(config: &MeshControllerConfig) -> AppResult<Arc<M
         .state_path
         .clone()
         .ok_or_else(|| AppError::bad_request("mesh.controller.state_path is required"))?;
+    let store = MeshStore::at_path(&state_path);
+    let admin = Arc::new(MeshAdmin {
+        store: store.clone(),
+        registry: Arc::clone(&registry),
+        initialized: Arc::new(tokio::sync::OnceCell::new()),
+    });
     let config = config.clone();
     let registry_for_task = Arc::clone(&registry);
+    let admin_for_task = Arc::clone(&admin);
     tokio::spawn(async move {
-        if let Err(err) = run_controller(config, state_path, registry_for_task).await {
+        if let Err(err) = run_controller(config, registry_for_task, admin_for_task).await {
             tracing::error!(error = %err, "mesh controller stopped");
         }
     });
-    Ok(registry)
+    Ok(admin)
 }
 
 async fn run_controller(
     config: MeshControllerConfig,
-    state_path: PathBuf,
     registry: Arc<MeshRegistry>,
+    admin: Arc<MeshAdmin>,
 ) -> AppResult<()> {
     let identity_path = config
         .identity_path
@@ -59,10 +126,11 @@ async fn run_controller(
         .map_err(|err| AppError::internal(format!("failed to load mesh identity: {err}")))?;
     let secret = identity.secret_key();
     let endpoint_id = secret.public();
-    let store = MeshStore::open(state_path)
+    admin
+        .initialize()
         .await
         .map_err(|err| AppError::internal(format!("failed to open mesh store: {err}")))?;
-    let authorizer = Arc::new(MeshAuthorizer::new(store));
+    let authorizer = Arc::new(MeshAuthorizer::new(admin.store.clone()));
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .relay_mode(RelayMode::Disabled)
@@ -436,7 +504,9 @@ mod tests {
     use super::*;
     use crate::config::AvailabilitySchedule;
     use crate::mesh::protocol::{ModelAdvertisement, ResourceAdvertisement, WorkerAdvertisement};
+    use crate::mesh::store::MeshStore;
     use iroh::SecretKey;
+    use uuid::Uuid;
 
     fn advertisement() -> WorkerAdvertisement {
         WorkerAdvertisement {
@@ -476,6 +546,10 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn temp_db(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("llmconduit-{name}-{}.sqlite", Uuid::new_v4()))
     }
 
     #[test]
@@ -537,5 +611,53 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "allowed-model");
+    }
+
+    #[tokio::test]
+    async fn mesh_admin_initialize_does_not_reload_over_live_model_overrides() {
+        let path = temp_db("mesh-admin-once");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let registry = Arc::new(MeshRegistry::new(Duration::from_secs(30)));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            WorkerAdvertisement {
+                protocol_version: PROTOCOL_VERSION,
+                node_name: None,
+                agent_version: "test".into(),
+                resources: vec![ResourceAdvertisement {
+                    resource_id: "gpu".into(),
+                    models: vec![ModelAdvertisement {
+                        id: "qwen".into(),
+                        context_limit: None,
+                    }],
+                    availability: AvailabilitySchedule::default(),
+                    effective_capacity: 1,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                }],
+            },
+        );
+        let admin = MeshAdmin {
+            store: store.clone(),
+            registry: Arc::clone(&registry),
+            initialized: Arc::new(tokio::sync::OnceCell::new()),
+        };
+        admin.initialize().await.expect("initial load");
+        store
+            .set_model_disabled(&endpoint.to_string(), "gpu", "qwen", true, 1)
+            .await
+            .expect("persist disable");
+        admin.apply_model_disabled(endpoint, "gpu", "qwen", true);
+        assert!(registry.reserve("qwen").is_none());
+
+        admin
+            .initialize()
+            .await
+            .expect("second initialize is no-op");
+
+        assert!(registry.reserve("qwen").is_none());
+        let _ = std::fs::remove_file(path);
     }
 }

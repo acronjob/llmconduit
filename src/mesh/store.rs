@@ -23,6 +23,7 @@ pub struct CreatedJoinKey {
     pub id: String,
     pub token: String,
     pub label: Option<String>,
+    pub created_at_ms: i64,
     pub expires_at_ms: Option<i64>,
     pub max_uses: Option<i64>,
 }
@@ -48,6 +49,20 @@ pub struct MeshNodeRecord {
     pub last_seen_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokedJoinKey {
+    pub updated: bool,
+    pub disabled_endpoint_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisabledMeshModelRecord {
+    pub endpoint_id: String,
+    pub resource_id: String,
+    pub model: String,
+    pub disabled_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKeyDecision {
     Accepted,
@@ -60,22 +75,34 @@ pub enum JoinKeyDecision {
 }
 
 impl MeshStore {
+    pub fn at_path(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         if let Some(parent) = path.as_ref().parent()
             && !parent.as_os_str().is_empty()
         {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let store = Self {
-            path: path.as_ref().to_path_buf(),
-        };
-        store
-            .with_conn(|conn| {
-                conn.execute_batch(SCHEMA)?;
-                Ok(())
-            })
-            .await?;
+        let store = Self::at_path(path);
+        store.initialize().await?;
         Ok(store)
+    }
+
+    pub async fn initialize(&self) -> Result<(), StoreError> {
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        self.with_conn(|conn| {
+            conn.execute_batch(SCHEMA)?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn create_join_key(
@@ -108,6 +135,7 @@ impl MeshStore {
             id,
             token,
             label: clean_label,
+            created_at_ms,
             expires_at_ms,
             max_uses,
         })
@@ -126,14 +154,36 @@ impl MeshStore {
         .await
     }
 
-    pub async fn revoke_join_key(&self, id: &str) -> Result<bool, StoreError> {
+    pub async fn revoke_join_key(&self, id: &str) -> Result<RevokedJoinKey, StoreError> {
         let id = id.to_string();
         self.with_conn(move |conn| {
-            let changed = conn.execute(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 "UPDATE mesh_join_keys SET enabled = 0 WHERE id = ?1 AND enabled != 0",
                 params![id],
             )?;
-            Ok(changed > 0)
+            let disabled_endpoint_ids = if changed > 0 {
+                let endpoints = {
+                    let mut stmt = tx.prepare(
+                        "SELECT endpoint_id FROM mesh_nodes \
+                         WHERE join_key_id = ?1 AND enabled != 0 ORDER BY endpoint_id ASC",
+                    )?;
+                    let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                tx.execute(
+                    "UPDATE mesh_nodes SET enabled = 0 WHERE join_key_id = ?1 AND enabled != 0",
+                    params![id],
+                )?;
+                endpoints
+            } else {
+                Vec::new()
+            };
+            tx.commit()?;
+            Ok(RevokedJoinKey {
+                updated: changed > 0,
+                disabled_endpoint_ids,
+            })
         })
         .await
     }
@@ -268,6 +318,52 @@ impl MeshStore {
         .await
     }
 
+    pub async fn list_disabled_models(&self) -> Result<Vec<DisabledMeshModelRecord>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT endpoint_id, resource_id, model, disabled_at_ms \
+                 FROM mesh_disabled_models ORDER BY disabled_at_ms DESC, endpoint_id ASC, resource_id ASC, model ASC",
+            )?;
+            let rows = stmt.query_map([], map_disabled_model)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn set_model_disabled(
+        &self,
+        endpoint_id: &str,
+        resource_id: &str,
+        model: &str,
+        disabled: bool,
+        disabled_at_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let endpoint_id = endpoint_id.trim().to_string();
+        let resource_id = resource_id.trim().to_string();
+        let model = model.trim().to_ascii_lowercase();
+        self.with_conn(move |conn| {
+            if disabled {
+                let changed = conn.execute(
+                    "INSERT INTO mesh_disabled_models \
+                     (endpoint_id, resource_id, model, disabled_at_ms) VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(endpoint_id, resource_id, model) DO UPDATE SET \
+                     disabled_at_ms = excluded.disabled_at_ms",
+                    params![endpoint_id, resource_id, model, disabled_at_ms],
+                )?;
+                Ok(changed > 0)
+            } else {
+                let changed = conn.execute(
+                    "DELETE FROM mesh_disabled_models \
+                     WHERE endpoint_id = ?1 AND resource_id = ?2 AND model = ?3",
+                    params![endpoint_id, resource_id, model],
+                )?;
+                Ok(changed > 0)
+            }
+        })
+        .await
+    }
+
     async fn with_conn<F, T>(&self, f: F) -> Result<T, StoreError>
     where
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
@@ -315,6 +411,14 @@ CREATE TABLE IF NOT EXISTS mesh_nodes (
     last_seen_at_ms INTEGER,
     FOREIGN KEY(join_key_id) REFERENCES mesh_join_keys(id)
 );
+
+CREATE TABLE IF NOT EXISTS mesh_disabled_models (
+    endpoint_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    disabled_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(endpoint_id, resource_id, model)
+);
 "#;
 
 pub fn now_ms() -> i64 {
@@ -358,6 +462,15 @@ fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeshNodeRecord> {
         joined_at_ms: row.get(3)?,
         join_key_id: row.get(4)?,
         last_seen_at_ms: row.get(5)?,
+    })
+}
+
+fn map_disabled_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<DisabledMeshModelRecord> {
+    Ok(DisabledMeshModelRecord {
+        endpoint_id: row.get(0)?,
+        resource_id: row.get(1)?,
+        model: row.get(2)?,
+        disabled_at_ms: row.get(3)?,
     })
 }
 
@@ -405,7 +518,13 @@ mod tests {
             .create_join_key(None, None, None)
             .await
             .expect("create key");
-        assert!(store.revoke_join_key(&revoked.id).await.expect("revoke"));
+        assert!(
+            store
+                .revoke_join_key(&revoked.id)
+                .await
+                .expect("revoke")
+                .updated
+        );
         assert_eq!(
             store
                 .validate_join_key_for_endpoint(&revoked.token, "node-a", None, 1)
@@ -498,6 +617,77 @@ mod tests {
         assert_eq!(accepted, 1);
         assert_eq!(store.list_nodes().await.expect("nodes").len(), 1);
         assert_eq!(store.list_join_keys().await.expect("keys")[0].use_count, 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn revoking_join_key_disables_enrolled_nodes_atomically() {
+        let path = temp_db("revoke-disables-nodes");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let created = store
+            .create_join_key(None, None, Some(2))
+            .await
+            .expect("create key");
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&created.token, "node-a", None, 1)
+                .await
+                .expect("enroll a"),
+            JoinKeyDecision::Accepted
+        );
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&created.token, "node-b", None, 2)
+                .await
+                .expect("enroll b"),
+            JoinKeyDecision::Accepted
+        );
+
+        let revoked = store.revoke_join_key(&created.id).await.expect("revoke");
+
+        assert!(revoked.updated);
+        assert_eq!(revoked.disabled_endpoint_ids, vec!["node-a", "node-b"]);
+        assert!(!store.is_node_authorized("node-a").await.expect("auth a"));
+        assert!(!store.is_node_authorized("node-b").await.expect("auth b"));
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&created.token, "node-c", None, 3)
+                .await
+                .expect("validate revoked"),
+            JoinKeyDecision::Disabled
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn disabled_models_round_trip() {
+        let path = temp_db("disabled-models");
+        let store = MeshStore::open(&path).await.expect("open store");
+
+        assert!(
+            store
+                .set_model_disabled("endpoint", "gpu", "QWEN", true, 123)
+                .await
+                .expect("disable")
+        );
+        assert_eq!(
+            store.list_disabled_models().await.expect("list"),
+            vec![DisabledMeshModelRecord {
+                endpoint_id: "endpoint".to_string(),
+                resource_id: "gpu".to_string(),
+                model: "qwen".to_string(),
+                disabled_at_ms: 123,
+            }]
+        );
+        assert!(
+            store
+                .set_model_disabled("endpoint", "gpu", "qWeN", false, 124)
+                .await
+                .expect("enable")
+        );
+        assert!(store.list_disabled_models().await.expect("list").is_empty());
 
         let _ = std::fs::remove_file(path);
     }
