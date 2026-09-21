@@ -197,6 +197,10 @@ pub struct Gateway {
     native_vision_cache: crate::vision_probe::NativeVisionCache,
     /// Session tree + lineage index (see `crate::sessions`).
     session_linker: Arc<crate::sessions::SessionLinker>,
+    /// Live active-session hub for the dashboard (see `crate::session_hub`).
+    /// `SessionHub::disabled()` when `--with-debug-ui` is off — every op a
+    /// no-op, mirroring the FlowStore/monitor gating.
+    session_hub: crate::session_hub::SessionHub,
     /// YAML-configured keys + the configured `require` flag, kept so the live
     /// registry can be rebuilt as YAML ∪ SQL (see `crate::accounts`).
     yaml_key_specs: Vec<crate::client_auth::VirtualKeySpec>,
@@ -780,6 +784,7 @@ impl Gateway {
             harness_detector: Arc::new(crate::harness::HarnessDetector::builtin()),
             native_vision_cache: crate::vision_probe::NativeVisionCache::default(),
             session_linker: Arc::new(crate::sessions::SessionLinker::new(true)),
+            session_hub: crate::session_hub::SessionHub::disabled(),
             yaml_key_specs: Vec::new(),
             client_auth_required: false,
             users_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -990,6 +995,19 @@ impl Gateway {
 
     pub fn session_linker(&self) -> &Arc<crate::sessions::SessionLinker> {
         &self.session_linker
+    }
+
+    /// Attach the enabled [`SessionHub`](crate::session_hub::SessionHub) (built
+    /// in the `--with-debug-ui` DI branch). Mirrors `with_metrics`.
+    pub fn with_session_hub(mut self, hub: crate::session_hub::SessionHub) -> Self {
+        self.session_hub = hub;
+        self
+    }
+
+    /// Access the live-session hub. `is_enabled()` is `false` when the debug
+    /// UI is off, in which case every hub op is a no-op.
+    pub fn session_hub(&self) -> &crate::session_hub::SessionHub {
+        &self.session_hub
     }
 
     pub fn with_key_registry_source(
@@ -1453,6 +1471,7 @@ impl Gateway {
                     Arc::clone(&serving_token),
                     capture,
                 )
+                .with_session_hub_when_enabled(&self.session_hub)
             });
         let persistence_phases = persistence_guard
             .as_ref()

@@ -18,6 +18,7 @@ import type {
   DebugWsMessage,
   FlowDetail,
   FlowSummary,
+  ActiveSessionsResponse,
   FlowsResponse,
   HistoryMetricsResponse,
   HistoryRequest,
@@ -27,6 +28,7 @@ import type {
   ProviderHealth,
   ProviderLatency,
   SessionDetailResponse,
+  SessionRequestStub,
   SessionRow,
   SessionUser,
   SessionsResponse,
@@ -529,6 +531,9 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   }
 
   // -- Durable history (sessions view + chain diff) --
+  if (path === '/dashboard/api/sessions/active') {
+    return json(MOCK_ACTIVE_SESSIONS());
+  }
   if (path === '/dashboard/api/history/sessions') {
     const roots = qs.get('roots') !== 'false';
     const sessions = roots ? MOCK_SESSIONS.filter((s) => s.parent_id === null) : MOCK_SESSIONS;
@@ -580,9 +585,10 @@ function mockSession(over: Partial<SessionRow> & Pick<SessionRow, 'id' | 'harnes
     kind: 'declared',
     harness_version: null,
     external_id: null,
+    user_id: 'user_dev',
     session_kind: null,
     client_label: 'key-9f3a1c0b2d4e',
-    virtual_key_id: 'virtual-key-1',
+    virtual_key_id: 'key_dev_ci',
     depth: 0,
     root_request_id: null,
     spawned_by_request_id: null,
@@ -593,6 +599,55 @@ function mockSession(over: Partial<SessionRow> & Pick<SessionRow, 'id' | 'harnes
   };
 }
 
+
+/** The live hub cut: root + agent sessions active, the codex one aged out (mirrors
+ *  the 15-minute window — its last activity is 40+ seconds old but still inside;
+ *  kept to exercise window counting). Window counts derive from the stub ring. */
+function MOCK_ACTIVE_SESSIONS(): ActiveSessionsResponse {
+  const now = Date.now();
+  // Rebase the module-load-frozen fixture times to NOW so the board never ages
+  // out mid-session (the seeds are minutes-old offsets, not wall-clock facts).
+  const rebase = (ms: number) => now - (SEED_NOW - ms);
+  const stubsFor = (session: SessionRow): SessionRequestStub[] =>
+    MOCK_HISTORY_REQUESTS
+      .filter((r) => r.session_id === session.id)
+      .map((r) => ({
+        api_call_id: r.id,
+        client_model: r.client_model,
+        created_at_ms: rebase(r.created_at_ms),
+        status: r.status,
+        input_tokens: r.input_tokens,
+        output_tokens: r.output_tokens,
+        cached_tokens: r.cached_tokens,
+        reasoning_tokens: null,
+        error: r.error,
+        terminal_reason: null,
+      }))
+      .sort((a, b) => b.created_at_ms - a.created_at_ms);
+  const windows = (stubs: SessionRequestStub[]) => ({
+    requests_1m: stubs.filter((s) => s.created_at_ms >= now - 60_000).length,
+    requests_5m: stubs.filter((s) => s.created_at_ms >= now - 300_000).length,
+    requests_10m: stubs.filter((s) => s.created_at_ms >= now - 600_000).length,
+    requests_15m: stubs.filter((s) => s.created_at_ms >= now - 900_000).length,
+  });
+  const rows = ['sess_root', 'sess_agent', 'sess_codex']
+    .map((id) => MOCK_SESSIONS.find((s) => s.id === id))
+    .filter((s): s is SessionRow => !!s)
+    .map((session) => {
+      const stubs = stubsFor(session);
+      const aggregate = session.user_id
+        ? {
+            session_id: session.id,
+            input_tokens: stubs.reduce((sum, s) => sum + (s.input_tokens ?? 0), 0) || null,
+            output_tokens: stubs.reduce((sum, s) => sum + (s.output_tokens ?? 0), 0) || null,
+            cached_tokens: stubs.reduce((sum, s) => sum + (s.cached_tokens ?? 0), 0) || null,
+            reasoning_tokens: null,
+          }
+        : null;
+      return { ...session, requests: stubs, ...windows(stubs), aggregate };
+    });
+  return { sessions: rows, seq: 1 };
+}
 export const MOCK_SESSIONS: SessionRow[] = [
   mockSession({ id: 'sess_root', harness: 'claude-code', harness_version: '2.1.205', external_id: '11111111-1111-4111-8111-111111111111', root_request_id: 'api_002', request_count: 2 }),
   mockSession({ id: 'sess_agent', harness: 'claude-code', harness_version: '2.1.205', parent_id: 'sess_root', kind: 'inferred', depth: 1, spawned_by_request_id: 'api_002', root_request_id: 'api_agent_1', request_count: 1, first_seen_ms: SEED_NOW - 30_000, last_seen_ms: SEED_NOW - 29_000 }),
@@ -834,8 +889,7 @@ export class MockWebSocket implements WsLike {
   onmessage: ((ev: { data: unknown }) => void) | null = null;
 
   private timers: ReturnType<typeof setTimeout>[] = [];
-  private seq = { flow: 3, metrics: 1, topology: 1, monitor: 5 };
-
+  private seq = { flow: 3, metrics: 1, topology: 1, monitor: 5, sessions: 0 };
   constructor(_url: string) {
     // Defer so handlers attach before frames flow.
     this.timers.push(setTimeout(() => this.start(), 0));
@@ -853,6 +907,7 @@ export class MockWebSocket implements WsLike {
       buildUsageFrame(++this.seq.flow),
       this.metricsFrame(),
       this.topologyFrame(),
+      this.sessionsFrame(),
       buildMonitorFrame(++this.seq.monitor),
     ];
     for (const frame of live) {
@@ -935,6 +990,16 @@ export class MockWebSocket implements WsLike {
       domain: 'topology',
       seq: ++this.seq.topology,
       batch: [{ type: 'topology_update', nodes, edges: t.edges }],
+    };
+  }
+
+  private sessionsFrame(): DashboardFrame {
+    // Mirrors the Rust sessions-domain push: a tiny touched-ids tick (no body)
+    // that drives the SPA to refetch `/sessions/active`.
+    return {
+      domain: 'sessions',
+      seq: ++this.seq.sessions,
+      batch: [{ type: 'session_update', touched: ['sess_root'] }],
     };
   }
 

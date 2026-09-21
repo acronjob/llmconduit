@@ -30,6 +30,7 @@ pub(crate) mod redaction;
 pub mod replay;
 pub mod request_log;
 pub mod search;
+pub mod session_hub;
 pub mod sessions;
 pub(crate) mod sse_guard;
 /// Crate-internal, test-only peak-allocation probe (the crate's single
@@ -248,6 +249,14 @@ pub fn build_app_with_gateway_control_plane_runtime(
         crate::metrics::MetricsLayer::new()
     } else {
         crate::metrics::MetricsLayer::disabled()
+    };
+    // Live active-session hub (dashboard "sessions now" view): enabled only
+    // when the debug UI is on, mirroring the FlowStore's zero-overhead
+    // `disabled()` split. Fed at the persistence link/terminal seams.
+    let session_hub = if options.with_debug_ui {
+        crate::session_hub::SessionHub::new()
+    } else {
+        crate::session_hub::SessionHub::disabled()
     };
     // F1 (Topic F) durable per-turn capture: opt-in, config-only gate --
     // constructed regardless of `--with-debug-ui` (works even when the debug
@@ -501,6 +510,7 @@ pub fn build_app_with_gateway_control_plane_runtime(
     )
     .with_dashboard_auth(dashboard_auth)
     .with_metrics(metrics)
+    .with_session_hub(session_hub)
     .with_turn_capture(turn_capture)
     .with_operational_models(operational_models, unknown_model_policy);
     if let Some(client_auth) = client_auth {

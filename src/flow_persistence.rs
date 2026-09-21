@@ -193,6 +193,10 @@ pub struct PersistenceTerminalGuard {
     phases: PersistencePhaseClock,
     capture: Arc<PersistenceCapture>,
     finalized: AtomicBool,
+    /// Optional live-session hub (set only when the debug UI is on). Finalize
+    /// mirrors the terminal outcome onto it so the dashboard's active-session
+    /// view updates in real time. A disabled hub is a no-op.
+    session_hub: Option<crate::session_hub::SessionHub>,
 }
 
 impl PersistenceTerminalGuard {
@@ -211,7 +215,23 @@ impl PersistenceTerminalGuard {
             phases: PersistencePhaseClock::new_now(),
             capture,
             finalized: AtomicBool::new(false),
+            session_hub: None,
         }
+    }
+
+    /// Attach the live-session hub (engine-side; only when the debug UI is on).
+    pub fn with_session_hub(mut self, hub: crate::session_hub::SessionHub) -> Self {
+        self.session_hub = Some(hub);
+        self
+    }
+
+    /// Attach the hub ONLY when it is enabled (`--with-debug-ui`); a disabled
+    /// hub stays `None` so finalize skips the emit entirely.
+    pub fn with_session_hub_when_enabled(mut self, hub: &crate::session_hub::SessionHub) -> Self {
+        if hub.is_enabled() {
+            self.session_hub = Some(hub.clone());
+        }
+        self
     }
 
     pub fn phases(&self) -> PersistencePhaseClock {
@@ -289,6 +309,21 @@ impl PersistenceTerminalGuard {
                     error = %error,
                     "failed to serialize terminal persistence metadata"
                 );
+                // The hub's stub must not stay `running` forever: mirror a
+                // bare failed terminal even on this defensive path.
+                if let Some(hub) = &self.session_hub {
+                    hub.record_terminal(crate::session_hub::SessionTerminal {
+                        api_call_id: &self.api_call_id,
+                        status: "failed",
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_tokens: None,
+                        reasoning_tokens: None,
+                        error: Some(error.to_string()),
+                        terminal_reason: None,
+                        completed_at_ms: now_epoch_ms() as u64,
+                    });
+                }
                 return true;
             }
         };
@@ -299,6 +334,22 @@ impl PersistenceTerminalGuard {
         self.capture.finish_upstream_hops();
         // `try_finish` is the only store interaction on this path. Full/closed
         // queues update their own bounded counters and return immediately.
+        // Mirror the terminal outcome onto the live-session hub (no-op when
+        // the debug UI is off or the request never passed the link seam); this
+        // runs BEFORE the queue takes ownership of `finish`.
+        if let Some(hub) = &self.session_hub {
+            hub.record_terminal(crate::session_hub::SessionTerminal {
+                api_call_id: &self.api_call_id,
+                status: &finish.status,
+                input_tokens: finish.input_tokens,
+                output_tokens: finish.output_tokens,
+                cached_tokens: finish.cached_tokens,
+                reasoning_tokens: finish.reasoning_tokens,
+                error: finish.error.clone(),
+                terminal_reason: finish.terminal_reason.clone(),
+                completed_at_ms: u64::try_from(finish.completed_at_ms).unwrap_or(u64::MAX),
+            });
+        }
         let _ = self.queue.try_finish(self.api_call_id.clone(), finish);
         true
     }

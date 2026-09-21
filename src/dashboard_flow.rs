@@ -823,6 +823,13 @@ pub struct FlowSessionFacts {
     /// prefix-cache miss upstream). Absent when lineage was not computed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_bust: Option<bool>,
+    /// Owner of the virtual key that authenticated the request, when known.
+    /// Absent for open-mode requests and keys without an owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// The virtual key's stable database id (never the credential).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_key_id: Option<String>,
 }
 
 impl FlowSessionFacts {
@@ -843,6 +850,24 @@ impl FlowSessionFacts {
                 .map(cap_scalar),
             divergence_kind: link.map(|link| link.lineage.kind.as_str().to_string()),
             cache_bust: link.map(|link| link.lineage.cache_bust),
+            // Key attribution from the PRIMARY linked node's row (the newest
+            // upsert state the linker produced for this request).
+            user_id: link
+                .and_then(|link| {
+                    link.upserts
+                        .iter()
+                        .find(|row| row.id == link.session_id)
+                        .and_then(|row| row.user_id.clone())
+                })
+                .map(cap_scalar),
+            virtual_key_id: link
+                .and_then(|link| {
+                    link.upserts
+                        .iter()
+                        .find(|row| row.id == link.session_id)
+                        .and_then(|row| row.virtual_key_id.clone())
+                })
+                .map(cap_scalar),
         }
     }
 
@@ -853,6 +878,8 @@ impl FlowSessionFacts {
             + opt(&self.session_id)
             + opt(&self.chain_parent_request_id)
             + opt(&self.divergence_kind)
+            + opt(&self.user_id)
+            + opt(&self.virtual_key_id)
     }
 }
 

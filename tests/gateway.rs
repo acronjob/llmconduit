@@ -6759,6 +6759,7 @@ async fn persistent_history_session_routes_list_tree_and_requests() {
         session_kind: None,
         client_label: Some("key-abc".to_string()),
         virtual_key_id: None,
+        user_id: None,
         depth: i64::from(parent.is_some()),
         root_request_id: None,
         spawned_by_request_id: None,

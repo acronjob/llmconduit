@@ -13,6 +13,7 @@ function node(over: Partial<SessionRow> = {}): SessionRow {
     session_kind: null,
     client_label: null,
     virtual_key_id: null,
+    user_id: null,
     depth: 0,
     root_request_id: null,
     spawned_by_request_id: null,

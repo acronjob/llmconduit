@@ -10,6 +10,9 @@
  * scroll container (not virtualized) so it stays put.
  */
 import { useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { getConnection, queryKeys } from '../../api/connection';
+import { useAuth } from '../../store/hooks';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { FlowSummary, ModelPrice } from '../../api/types';
 import { useDashboard, useFlowFilter } from '../../store/hooks';
@@ -37,8 +40,21 @@ const OVERSCAN = 12;
  * identity; a strong key-hash / configured-id carries its source badge. An UNATTRIBUTED flow renders
  * `—` (don't-lie-with-zeros — never a fabricated id). A raw key never reaches here (gap 04 hashes it).
  */
-function ClientCellView({ flow }: { flow: FlowSummary }) {
+function ClientCellView({
+  flow,
+  userName,
+  keyLabel,
+}: {
+  flow: FlowSummary;
+  userName: (id: string | null) => string | null;
+  keyLabel: (id: string | null) => string | null;
+}) {
   const cell = clientCell(flow);
+  // The resolved attribution: a user display name when the flow carries a
+  // `user_id` (admin users query; id-prefix fallback), else the key label or
+  // the already-displayed key-hash/client label. Never a fabricated name.
+  const user = userName(flow.user_id ?? null);
+  const key = keyLabel(flow.virtual_key_id ?? null);
   return (
     <span
       className="flex min-w-0 items-center gap-1"
@@ -51,6 +67,24 @@ function ClientCellView({ flow }: { flow: FlowSummary }) {
       <span className={cn('truncate', cell.weak ? 'italic text-text-muted/70' : 'text-text-muted')}>
         {cell.label}
       </span>
+      {user && (
+        <span
+          className="shrink-0 rounded-sm bg-accent/15 px-1 text-[9px] uppercase tracking-wide text-accent"
+          data-testid="flow-user"
+          title={`user ${flow.user_id}${flow.virtual_key_id ? ` · key ${flow.virtual_key_id}` : ''}`}
+        >
+          {user}
+        </span>
+      )}
+      {key && !user && (
+        <span
+          className="shrink-0 rounded-sm bg-line/40 px-1 text-[9px] uppercase tracking-wide text-text-muted"
+          data-testid="flow-key"
+          title={`virtual key ${flow.virtual_key_id}`}
+        >
+          {key}
+        </span>
+      )}
       {cell.badge && (
         <span
           className={cn(
@@ -116,12 +150,18 @@ export function FlowTable({
   selectedId: string | null;
   onSelect: (apiCallId: string) => void;
 }) {
-  // The filter lives in the SHARED store (D12) so Topology/Sankey clicks can drive it; the
-  // FilterBar below remains the in-table editor (its onChange writes the same store).
+  const { client } = getConnection();
   const filters = useFlowFilter((s) => s.filters);
   const setFilters = flowFilterStore.getState().setFilters;
   const { rows, total, models, upstreams, clients, harnesses } = useFlowRows(filters);
-  const priceTable = useDashboard((s) => s.priceTable);
+  // Gap 04+: resolve the flow's `user_id`/`virtual_key_id` to display names via
+  // the users/keys queries (admin-gated; falls back to id prefixes / the
+  // key-hash label) so the CLIENT column answers "which user, which key".
+  const isAdmin = useAuth((s) => s.user?.is_admin ?? s.authMode !== 'users');
+  const users = useQuery({ queryKey: queryKeys.users, queryFn: () => client.listUsers(), enabled: isAdmin, retry: false });
+  const keys = useQuery({ queryKey: queryKeys.keys('all'), queryFn: () => client.listKeys(isAdmin ? 'all' : undefined), retry: false });
+  const userByName = (id: string | null) => (id == null ? null : users.data?.users.find((u) => u.id === id)?.username ?? `${id.slice(0, 8)}…`);
+  const keyByLabel = (id: string | null) => (id == null ? null : keys.data?.keys.find((k) => k.id === id)?.label ?? null);
   // Gap 09: the per-model context-window capacities (gap-06 nullable `context_limit`), for the
   // aggregate context-pressure stat. A `null`/absent window is UNKNOWN ⇒ that flow is excluded from
   // the pressure figures (never a fabricated 0%/100%).
@@ -130,6 +170,7 @@ export function FlowTable({
   // cut `at_ms` (the snapshot instant) rather than wall-clock `Date.now()`, which would tick the
   // frozen view forward. `seekAtMs` is null while LIVE → rows fall back to `Date.now()` per render.
   const seekAtMs = useDashboard((s) => s.seekAtMs);
+  const priceTable = useDashboard((s) => s.priceTable);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
@@ -177,6 +218,8 @@ export function FlowTable({
                   nowMs={seekAtMs ?? Date.now()}
                   selected={flow.api_call_id === selectedId}
                   onSelect={onSelect}
+                  userName={userByName}
+                  keyLabel={keyByLabel}
                 />
               </div>
             );
@@ -233,6 +276,8 @@ function FlowRow({
   nowMs,
   selected,
   onSelect,
+  userName,
+  keyLabel,
 }: {
   flow: FlowSummary;
   priceTable: Record<string, ModelPrice>;
@@ -240,6 +285,8 @@ function FlowRow({
   nowMs: number;
   selected: boolean;
   onSelect: (id: string) => void;
+  userName: (id: string | null) => string | null;
+  keyLabel: (id: string | null) => string | null;
 }) {
   const klass = statusClass(flow.status, flow.terminal_reason);
   const isError = klass === 'client-error' || klass === 'server-error';
@@ -281,7 +328,7 @@ function FlowRow({
           </span>
         )}
       </span>
-      <ClientCellView flow={flow} />
+      <ClientCellView flow={flow} userName={userName} keyLabel={keyLabel} />
       <HarnessCellView flow={flow} />
       <span className="truncate font-mono">{flow.uri || '—'}</span>
       <span className="flex min-w-0 items-center gap-1.5">
@@ -292,7 +339,7 @@ function FlowRow({
             data-testid="failover-tag"
             title="failover / re-routed"
           >
-            FO
+            failover
           </span>
         )}
       </span>

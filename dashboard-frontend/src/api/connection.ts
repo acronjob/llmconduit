@@ -27,6 +27,7 @@ export const queryKeys = {
   catalog: ['catalog'] as const,
   // Durable history (sessions view + the inspector's chain diff).
   sessions: ['history', 'sessions'] as const,
+  activeSessions: ['history', 'sessions', 'active'] as const,
   session: (id: string) => ['history', 'sessions', id] as const,
   requestBody: (id: string, hop: string) => ['history', 'requests', id, 'body', hop] as const,
   throughput: ['history', 'throughput'] as const,
@@ -150,6 +151,10 @@ function invalidateForDomain(queryClient: QueryClient, domain: Domain): void {
       return;
     case 'monitor':
       // Monitor deltas feed the live store directly; no REST query mirrors them.
+      return;
+    case 'sessions':
+      // The hub tick is a push notification: refetch the active-session board.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.activeSessions });
       return;
   }
 }

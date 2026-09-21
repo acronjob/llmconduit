@@ -253,6 +253,17 @@ pub struct ThroughputBucket {
     pub decode_count: i64,
 }
 
+/// Lifetime token totals over one session node's requests. Each class sums
+/// only the rows that REPORTED it; `None` ⇒ no row reported the class.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct SessionAggregate {
+    pub session_id: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct MetricSample {
     pub backend: String,
@@ -440,6 +451,10 @@ pub trait PersistenceStore: PersistenceWriter {
         session_id: &str,
         limit: usize,
     ) -> StoreResult<Vec<RequestSummary>>;
+    /// Lifetime token totals of one session node's requests: the sums over the
+    /// rows that REPORTED each class (`Option` ⇒ no row reported it — a
+    /// distinct "unavailable", never a fabricated zero).
+    async fn session_aggregate(&self, session_id: &str) -> StoreResult<Option<SessionAggregate>>;
     /// The latest request of a node's chain with its inbound items.
     async fn chain_head(&self, session_id: &str)
     -> StoreResult<Option<crate::sessions::ChainHead>>;
@@ -1011,8 +1026,8 @@ where
 }
 
 const SESSION_COLUMNS: &str = "SELECT id, parent_id, kind, harness, harness_version, external_id, \
-    session_kind, client_label, virtual_key_id, depth, root_request_id, spawned_by_request_id, \
-    first_seen_ms, last_seen_ms, request_count FROM sessions";
+    session_kind, client_label, virtual_key_id, user_id, depth, root_request_id, \
+    spawned_by_request_id, first_seen_ms, last_seen_ms, request_count FROM sessions";
 
 fn decode_session<R>(row: &R) -> StoreResult<crate::sessions::SessionRow>
 where
@@ -1032,12 +1047,13 @@ where
         session_kind: row.try_get(6).map_err(store_error)?,
         client_label: row.try_get(7).map_err(store_error)?,
         virtual_key_id: row.try_get(8).map_err(store_error)?,
-        depth: row.try_get(9).map_err(store_error)?,
-        root_request_id: row.try_get(10).map_err(store_error)?,
-        spawned_by_request_id: row.try_get(11).map_err(store_error)?,
-        first_seen_ms: row.try_get(12).map_err(store_error)?,
-        last_seen_ms: row.try_get(13).map_err(store_error)?,
-        request_count: row.try_get(14).map_err(store_error)?,
+        user_id: row.try_get(9).map_err(store_error)?,
+        depth: row.try_get(10).map_err(store_error)?,
+        root_request_id: row.try_get(11).map_err(store_error)?,
+        spawned_by_request_id: row.try_get(12).map_err(store_error)?,
+        first_seen_ms: row.try_get(13).map_err(store_error)?,
+        last_seen_ms: row.try_get(14).map_err(store_error)?,
+        request_count: row.try_get(15).map_err(store_error)?,
     })
 }
 
@@ -1760,7 +1776,7 @@ impl PersistenceWriter for SqlStore {
         let greatest = if pg { "GREATEST" } else { "MAX" };
         let sql = format!(
             "INSERT INTO sessions (id, parent_id, kind, harness, harness_version, external_id, \
-             session_kind, client_label, virtual_key_id, depth, root_request_id, \
+             session_kind, client_label, virtual_key_id, user_id, depth, root_request_id, \
              spawned_by_request_id, first_seen_ms, last_seen_ms, request_count) VALUES ({}) \
              ON CONFLICT (id) DO UPDATE SET \
              parent_id = COALESCE(excluded.parent_id, sessions.parent_id), \
@@ -1768,13 +1784,14 @@ impl PersistenceWriter for SqlStore {
              session_kind = COALESCE(excluded.session_kind, sessions.session_kind), \
              client_label = COALESCE(sessions.client_label, excluded.client_label), \
              virtual_key_id = COALESCE(sessions.virtual_key_id, excluded.virtual_key_id), \
+             user_id = COALESCE(sessions.user_id, excluded.user_id), \
              depth = excluded.depth, \
              root_request_id = COALESCE(sessions.root_request_id, excluded.root_request_id), \
              spawned_by_request_id = COALESCE(sessions.spawned_by_request_id, \
                  excluded.spawned_by_request_id), \
              last_seen_ms = {greatest}(sessions.last_seen_ms, excluded.last_seen_ms), \
              request_count = {greatest}(sessions.request_count, excluded.request_count)",
-            placeholders(pg, 15)
+            placeholders(pg, 16)
         );
         execute!(
             self,
@@ -1788,6 +1805,7 @@ impl PersistenceWriter for SqlStore {
             row.session_kind,
             row.client_label,
             row.virtual_key_id,
+            row.user_id,
             row.depth,
             row.root_request_id,
             row.spawned_by_request_id,
@@ -2221,6 +2239,60 @@ impl PersistenceStore for SqlStore {
         let rows: Vec<crate::sessions::SessionRow> =
             fetch_all_decoded!(self, &sql, [id], decode_session);
         Ok(rows.into_iter().next())
+    }
+
+    async fn session_aggregate(&self, session_id: &str) -> StoreResult<Option<SessionAggregate>> {
+        let sql = "SELECT session_id, \
+             CAST(COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN cached_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(cached_tokens), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(CASE WHEN reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT), \
+             CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) \
+             FROM requests WHERE session_id = ?1";
+        let rows: Vec<(String, i64, i64, i64, i64, i64, i64, i64, i64)> = match &self.pool {
+            SqlPool::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, i64, i64, i64)>(sql)
+                    .bind(session_id)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(store_error)?
+            }
+            SqlPool::Postgres(pool) => sqlx::query_as::<
+                _,
+                (String, i64, i64, i64, i64, i64, i64, i64, i64),
+            >(sql.replace("?1", "$1").as_str())
+            .bind(session_id)
+            .fetch_all(pool)
+            .await
+            .map_err(store_error)?,
+        };
+        // An aggregate with zero reporting rows in every class is a session
+        // whose requests never reported usage — keep the row (all `None`) so
+        // the caller renders "unavailable", not "missing".
+        Ok(rows.into_iter().next().map(
+            |(
+                session_id,
+                in_n,
+                in_sum,
+                out_n,
+                out_sum,
+                cached_n,
+                cached_sum,
+                reasoning_n,
+                reasoning_sum,
+            )| {
+                SessionAggregate {
+                    session_id: session_id.clone(),
+                    input_tokens: (in_n > 0).then_some(in_sum),
+                    output_tokens: (out_n > 0).then_some(out_sum),
+                    cached_tokens: (cached_n > 0).then_some(cached_sum),
+                    reasoning_tokens: (reasoning_n > 0).then_some(reasoning_sum),
+                }
+            },
+        ))
     }
 
     async fn find_session(
@@ -3131,7 +3203,10 @@ mod tests {
             .collect(),
             SqlPool::Postgres(_) => unreachable!(),
         };
-        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(
+            migration_versions,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
         let request_indexes: Vec<String> = match &store.pool {
             SqlPool::Sqlite(pool) => sqlx::query(
                 "SELECT name FROM sqlite_master WHERE type = 'index' \
@@ -3215,6 +3290,7 @@ mod tests {
             session_kind: None,
             client_label: Some("key-abc".to_string()),
             virtual_key_id: None,
+            user_id: None,
             depth: i64::from(parent.is_some()),
             root_request_id: None,
             spawned_by_request_id: None,
@@ -3254,6 +3330,21 @@ mod tests {
         assert_eq!(root.request_count, 3);
         assert_eq!(root.last_seen_ms, 200);
         assert_eq!(root.root_request_id.as_deref(), Some("r-first"));
+        // The owner column round-trips and the first writer wins on conflict.
+        assert_eq!(root.user_id.as_deref(), None);
+        let mut owned = session("root", None, Some("s-1"), 210);
+        owned.user_id = Some("user-7".to_string());
+        store.upsert_session(owned).await.unwrap();
+        assert_eq!(
+            store
+                .get_session("root")
+                .await
+                .unwrap()
+                .unwrap()
+                .user_id
+                .as_deref(),
+            Some("user-7")
+        );
 
         assert_eq!(
             store
@@ -3316,8 +3407,21 @@ mod tests {
         second.divergence_kind = Some("append".to_string());
         second.cache_bust = Some(false);
         second.item_count = Some(2);
+        first.user_id = Some("user-7".to_string());
         store.begin_request(first).await.unwrap();
         store.begin_request(second).await.unwrap();
+        // Terminal usage of the second request feeds the session aggregate.
+        let mut done = finish();
+        done.input_tokens = Some(100);
+        done.output_tokens = Some(40);
+        done.cached_tokens = Some(60);
+        done.reasoning_tokens = None; // unreported class stays `None`, never 0
+        store.finish_request("req-2", done).await.unwrap();
+        let aggregate = store.session_aggregate("root").await.unwrap().unwrap();
+        assert_eq!(aggregate.input_tokens, Some(100));
+        assert_eq!(aggregate.output_tokens, Some(40));
+        assert_eq!(aggregate.cached_tokens, Some(60));
+        assert_eq!(aggregate.reasoning_tokens, None);
         store
             .store_body(BodyWrite {
                 event: skeleton_event("req-2", 1, 200),

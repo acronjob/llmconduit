@@ -9,6 +9,7 @@
  */
 import type {
   ActivityResponse,
+  ActiveSessionsResponse,
   ApiKeyRecord,
   CatalogEntry,
   CreatedKeyResponse,
@@ -220,6 +221,11 @@ export class DashboardClient {
   /** `GET /history/sessions` — recent session-tree nodes (roots only unless `roots: false`). */
   historySessions(query: { since_ms?: number; limit?: number; roots?: boolean } = {}): Promise<SessionsResponse> {
     return this.request<SessionsResponse>(`/history/sessions${buildQuery(query)}`);
+  }
+
+  /** `GET /sessions/active` — the live hub's active-session cut (last 15 minutes). */
+  activeSessions(): Promise<ActiveSessionsResponse> {
+    return this.request<ActiveSessionsResponse>('/sessions/active');
   }
 
   /** `GET /history/sessions/:id` — one node with its ancestors, children and newest requests. */

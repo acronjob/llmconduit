@@ -103,7 +103,7 @@ export class DashboardSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Per-domain dedup cursors. */
-  private lastSeq: LastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
+  private lastSeq: LastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0, sessions: 0 };
   /** Whether the initial snapshot has been applied (gates live frames). */
   private snapshotApplied = false;
 
@@ -221,7 +221,7 @@ export class DashboardSocket {
     this.pendingSnapshot = null;
     this.liveBaseline = null;
     this.reconnectAttempts = 0;
-    this.lastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
+    this.lastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0, sessions: 0 };
   }
 
   /** Confirmed auth failure: mark error + bounce to login (no reconnect). */
@@ -438,6 +438,9 @@ export class DashboardSocket {
       metrics: snap.cursors.metrics_seq,
       topology: snap.cursors.topology_seq,
       monitor: snap.cursors.monitor_seq,
+      // The snapshot carries no sessions body; baseline 0 accepts the first
+      // live session_update unconditionally (mirroring the monitor cursor).
+      sessions: 0,
     };
     this.snapshotApplied = true;
 
@@ -525,6 +528,10 @@ export class DashboardSocket {
       case 'topology_update':
         store.setTopology(payload.nodes, payload.edges);
         return;
+      case 'session_update':
+        // Push notification only: the connection layer invalidates the
+        // active-sessions query on a sessions-domain frame; no store payload.
+        return;
       default:
         // Compile-time exhaustiveness: a new arm without a case is a TS error here.
         assertNever(payload);
@@ -545,6 +552,11 @@ function domainToCursorKey(domain: Domain): 'flow_seq' | 'metrics_seq' | 'topolo
     case 'topology':
       return 'topology_seq';
     case 'monitor':
+      return 'monitor_seq';
+    case 'sessions':
+      // The sessions domain is not part of the frozen snapshot cursors quad;
+      // its dedup cursor lives only in `lastSeq` (baseline 0). This function
+      // feeds `getCursors()` display only, so reusing the monitor key is safe.
       return 'monitor_seq';
     default:
       return assertNever(domain);

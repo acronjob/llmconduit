@@ -198,6 +198,10 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
     // the `no_store` map.
     let api_routes = Router::new()
         .route("/dashboard/api/flows", get(dashboard_flows))
+        .route(
+            "/dashboard/api/sessions/active",
+            get(crate::dashboard_api::dashboard_sessions_active),
+        )
         .route("/dashboard/api/flows/{id}", get(dashboard_flow_detail))
         .route("/dashboard/api/flows/{id}/kill", post(dashboard_flow_kill))
         .route("/dashboard/api/metrics", get(dashboard_metrics))
@@ -850,14 +854,19 @@ async fn log_api_call(
                         .iter()
                         .map(crate::sessions::ItemFingerprint::from)
                         .collect::<Vec<_>>();
-                    Some(gateway.session_linker().link(crate::sessions::LinkInput {
-                        api_call_id: &api_call_id,
-                        identity,
-                        client_label: attribution.label.as_deref(),
-                        virtual_key_id,
-                        items: &items,
-                        now_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
-                    }))
+                    Some(
+                        gateway.session_linker().link(crate::sessions::LinkInput {
+                            api_call_id: &api_call_id,
+                            identity,
+                            client_label: attribution.label.as_deref(),
+                            virtual_key_id,
+                            user_id: client_identity
+                                .as_ref()
+                                .and_then(|identity| identity.owner_id.as_deref()),
+                            items: &items,
+                            now_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
+                        }),
+                    )
                 }
                 _ => None,
             },
@@ -867,6 +876,24 @@ async fn log_api_call(
             for row in &link.upserts {
                 let _ = queue.try_session(row.clone());
             }
+            // Feed the live active-session hub (no-op when the debug UI is
+            // off). The stub mirrors what the durable begin row will carry.
+            gateway.session_hub().record_begin(
+                &link.upserts,
+                &link.session_id,
+                crate::session_hub::SessionRequestStub {
+                    api_call_id: api_call_id.clone(),
+                    client_model: requested_model.as_deref().unwrap_or_default().to_owned(),
+                    created_at_ms: u64::try_from(now_ms).unwrap_or(u64::MAX),
+                    status: "running".to_string(),
+                    input_tokens: None,
+                    output_tokens: None,
+                    cached_tokens: None,
+                    reasoning_tokens: None,
+                    error: None,
+                    terminal_reason: None,
+                },
+            );
         }
         session_facts = crate::dashboard_flow::FlowSessionFacts::from_parts(
             persistence_inbound

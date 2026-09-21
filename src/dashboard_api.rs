@@ -1506,6 +1506,91 @@ fn json_no_store<T: Serialize>(status: StatusCode, body: &T) -> Response {
     crate::dashboard_auth::no_store(response)
 }
 
+// ---------------------------------------------------------------------------
+// Active sessions (live hub)
+// ---------------------------------------------------------------------------
+
+/// `GET /dashboard/api/sessions/active` — the dashboard's primary live view:
+/// every session with activity in the last 15 minutes (the [`SessionHub`] cut),
+/// each with its 1/5/10/15-minute request windows, the newest request stubs,
+/// and — when durable history is configured — the session's LIFETIME token
+/// totals joined from the store. Attribution (`user_id`, `virtual_key_id`,
+/// `client_label`) rides the hub's `SessionRow` verbatim.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ActiveSessionsBody {
+    /// Newest activity first.
+    sessions: Vec<ActiveSessionBody>,
+    /// The sessions-domain WS cursor at the cut (monotonic; a live
+    /// `session_update` frame with `seq <= this` dedups client-side).
+    seq: u64,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ActiveSessionBody {
+    #[serde(flatten)]
+    session: crate::session_hub::ActiveSession,
+    /// Lifetime totals over the node's durable requests; `None` per class
+    /// when no row reported it. Absent (null) when history is disabled.
+    aggregate: Option<crate::control_plane_store::SessionAggregate>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/sessions/active",
+    tag = "dashboard",
+    operation_id = "dashboard_sessions_active",
+    responses(
+        (status = 200, description = "The active-session cut (last 15 minutes), newest first.", body = ActiveSessionsBody),
+        (status = 401, description = "No valid dashboard session (plain text `unauthorized`).", body = String, content_type = "text/plain"),
+    )
+)]
+pub async fn dashboard_sessions_active(State(gateway): State<Arc<Gateway>>) -> Response {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let cut = gateway
+        .session_hub()
+        .active_sessions(u64::try_from(now_ms).unwrap_or(u64::MAX));
+    let seq = gateway.session_hub().last_seq();
+    // Join the durable lifetime aggregates when history is configured. The
+    // per-session queries are bounded (one per ACTIVE session, and the hub
+    // caps actives); a store error degrades that session's aggregate to
+    // `None` rather than failing the whole read (don't-lie-with-zeros: absent
+    // renders `—`, not a fabricated 0).
+    let store = gateway.persistence_store();
+    let mut sessions = Vec::with_capacity(cut.len());
+    for entry in cut {
+        let aggregate = match &store {
+            Some(store) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    store.session_aggregate(&entry.row.id),
+                )
+                .await
+                {
+                    Ok(Ok(aggregate)) => aggregate,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            session_id = %entry.row.id,
+                            error = %error,
+                            "active-sessions aggregate join failed"
+                        );
+                        None
+                    }
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
+        sessions.push(ActiveSessionBody {
+            session: entry,
+            aggregate,
+        });
+    }
+    json_no_store(StatusCode::OK, &ActiveSessionsBody { sessions, seq })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1836,6 +1921,8 @@ mod tests {
             chain_parent_request_id: Some("api_prev".to_string()),
             divergence_kind: Some("tools_changed".to_string()),
             cache_bust: Some(true),
+            user_id: Some("user-7".to_string()),
+            virtual_key_id: Some("vk-1".to_string()),
         };
         // AGENTS.md: every new wire field proves it survives a round trip.
         let encoded = serde_json::to_string(&facts).unwrap();

@@ -566,6 +566,16 @@ export interface TopologyUpdatePayload {
 }
 
 /**
+ * Sessions-domain push tick: the live-session hub announces which session ids
+ * changed. Carries NO body — the SPA refetches `/dashboard/api/sessions/active`
+ * (the same push-invalidates-REST pattern a metrics frame uses for topology).
+ */
+export interface SessionUpdatePayload {
+  type: 'session_update';
+  touched: string[];
+}
+
+/**
  * The full `DashboardPayload` union. Every arm carries a `type` discriminant; an
  * exhaustive switch over `type` is enforced at compile time via `assertNever`.
  */
@@ -574,14 +584,15 @@ export type DashboardPayload =
   | UsagePayload
   | MetricTickPayload
   | FlowStatusPayload
-  | TopologyUpdatePayload;
+  | TopologyUpdatePayload
+  | SessionUpdatePayload;
 
 // ---------------------------------------------------------------------------
 // DashboardFrame — the batched WS envelope (D7). ONE frame per `DebugUpdate`
 // for the Monitor domain (seq = DebugUpdate.sequence). Per-domain whole-frame dedup.
 // ---------------------------------------------------------------------------
 
-export type Domain = 'flow' | 'metrics' | 'topology' | 'monitor';
+export type Domain = 'flow' | 'metrics' | 'topology' | 'monitor' | 'sessions';
 
 export interface DashboardFrame {
   domain: Domain;
@@ -599,7 +610,9 @@ export const DOMAIN_PAYLOADS: Record<Domain, ReadonlySet<DashboardPayload['type'
   metrics: new Set(['metric_tick']),
   topology: new Set(['topology_update']),
   monitor: new Set(['monitor']),
+  sessions: new Set(['session_update']),
 };
+
 
 /** The first WS message after connect: a full snapshot the live frames build upon. */
 export interface SnapshotFrame {
@@ -690,6 +703,10 @@ export interface FlowSummary extends PhaseTimings {
   divergence_kind?: DivergenceKind | null;
   /** Sessions — true when the divergence falls inside the predecessor's items (prefix-cache miss). */
   cache_bust?: boolean | null;
+  /** Sessions — owner of the authenticating virtual key; absent for open-mode keys. */
+  user_id?: string | null;
+  /** Sessions — the authenticating virtual key's stable database id (never the credential). */
+  virtual_key_id?: string | null;
 }
 
 /** Body-free frozen summary in a snapshot — identical shape to `FlowSummary` (D1). */
@@ -704,7 +721,6 @@ export type SnapshotFlowSummary = FlowSummary;
 export interface SessionRow {
   id: string;
   parent_id: string | null;
-  /** `declared` (the harness put the id on the wire) or `inferred` (opened by the gateway). */
   kind: 'declared' | 'inferred' | string;
   harness: string;
   harness_version: string | null;
@@ -713,6 +729,8 @@ export interface SessionRow {
   session_kind: string | null;
   client_label: string | null;
   virtual_key_id: string | null;
+  /** Owner of the key that opened the node; null for open-mode/legacy rows. */
+  user_id: string | null;
   depth: number;
   root_request_id: string | null;
   spawned_by_request_id: string | null;
@@ -766,6 +784,52 @@ export interface SessionDetailResponse {
   /** Oldest first. */
   requests: HistoryRequest[];
   requests_truncated: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Active sessions (live hub, `GET /dashboard/api/sessions/active`).
+// ---------------------------------------------------------------------------
+
+/** One request stub on a live session's ring (body-free scalar facts). */
+export interface SessionRequestStub {
+  api_call_id: string;
+  client_model: string;
+  created_at_ms: number;
+  /** `running` | `completed` | `failed`. */
+  status: string;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  error?: string | null;
+  terminal_reason?: string | null;
+}
+
+/** A live session: the tree node plus its trailing-window request counts. */
+export interface ActiveSession extends SessionRow {
+  /** Newest-first request stubs within the activity window. */
+  requests: SessionRequestStub[];
+  requests_1m: number;
+  requests_5m: number;
+  requests_10m: number;
+  requests_15m: number;
+}
+
+/** Lifetime token totals over a session's durable requests. */
+export interface SessionAggregate {
+  session_id: string;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
+  reasoning_tokens?: number | null;
+}
+
+/** `GET /dashboard/api/sessions/active` */
+export interface ActiveSessionsResponse {
+  /** Newest activity first. */
+  sessions: Array<ActiveSession & { aggregate: SessionAggregate | null }>;
+  /** The sessions-domain WS cursor at the cut. */
+  seq: number;
 }
 
 /** Which request-side hop of a durable request to reassemble. */
@@ -1129,7 +1193,7 @@ function isNullableUint(v: unknown): v is number | null {
   return v === null || isUint(v);
 }
 
-const DOMAINS: readonly Domain[] = ['flow', 'metrics', 'topology', 'monitor'];
+const DOMAINS: readonly Domain[] = ['flow', 'metrics', 'topology', 'monitor', 'sessions'];
 export function isDomain(v: unknown): v is Domain {
   return isOneOf(v, DOMAINS);
 }
@@ -1409,6 +1473,8 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       );
     case 'topology_update':
       return Array.isArray(v.nodes) && Array.isArray(v.edges) && v.nodes.every(isProviderHealth) && v.edges.every(isTopologyEdge);
+    case 'session_update':
+      return Array.isArray(v.touched) && v.touched.every(isStr);
     default:
       return false;
   }
@@ -1456,7 +1522,9 @@ function isFlowSummary(v: unknown): v is FlowSummary {
     // divergence kind must not paint a row as a cache bust; `cache_bust` is a bool when present.
     isOptStr(v.harness) && isOptStr(v.harness_version) && isOptStr(v.session_id) &&
     isOptStr(v.chain_parent_request_id) && isOptDivergenceKind(v.divergence_kind) &&
-    (v.cache_bust === undefined || v.cache_bust === null || typeof v.cache_bust === 'boolean')
+    (v.cache_bust === undefined || v.cache_bust === null || typeof v.cache_bust === 'boolean') &&
+    // Key attribution (flattened FlowSessionFacts): opaque ids when present.
+    isOptStr(v.user_id) && isOptStr(v.virtual_key_id)
   );
 }
 

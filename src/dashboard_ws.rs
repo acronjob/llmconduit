@@ -117,6 +117,7 @@ pub enum Domain {
     Metrics,
     Topology,
     Monitor,
+    Sessions,
 }
 
 /// The batched WS envelope: ONE frame per source update (e.g. one `DebugUpdate`),
@@ -337,6 +338,12 @@ pub enum DashboardPayload {
         nodes: Vec<TopologyNode>,
         edges: Vec<TopologyEdge>,
     },
+    /// Sessions-domain tick: the ids of sessions whose row or request ring
+    /// changed. Carries NO body — the SPA treats it as a push notification to
+    /// refetch `/dashboard/api/sessions/active` (mirroring how a metrics frame
+    /// invalidates the topology query), so the authoritative cut stays a single
+    /// REST read and the frame stays tiny.
+    SessionUpdate { touched: Vec<String> },
 }
 
 /// The flat metric-tile shape carried by a `metric_tick` payload — mirrors the
@@ -1033,7 +1040,7 @@ fn snapshot_message(
     tag = "ui",
     operation_id = "dashboard_ws",
     responses(
-        (status = 101, description = "WebSocket upgrade accepted; JSON text frames, server → client only (inbound text/binary is ignored; a peer Close/EOF tears the socket down). The FIRST message is always the snapshot `{\"type\":\"snapshot\", cursors: {flow_seq, metrics_seq, topology_seq, monitor_seq}, flows: [SnapshotFlowSummary…], metrics: MetricsSnapshot|null, topology: TopologySnapshot|null}` (the SPA buffers everything until it lands). Every later message is a batched `DashboardFrame` `{domain, seq, batch: [payload…]}` with `domain` ∈ `flow` | `metrics` | `topology` | `monitor` and a per-domain monotonic `seq` (the client drops a whole frame when `seq <= last_seq[domain]`). Each payload is `type`-tagged: `monitor` {message: DebugWsMessage} (one per retained/live monitor message; the transcript is replayed first), `usage` {api_call_id, response_id?, prompt, completion, total, cached?, reasoning?}, `flow_status` {api_call_id, response_id?, status, model_requested?, model_served?, upstream_target?, usage, started_ms, elapsed_ms?, phase timestamps, attempts?, first_upstream_byte_ms?, session facts}, `metric_tick` (the `/dashboard/api/metrics` tile, emitted periodically when it changes), `topology_update` {nodes, edges} (polled every 2 s, emitted when the version advances). At the session cookie's `exp` the server sends Close code 4401 `session expired`; a dev-open listener never expires."),
+        (status = 101, description = "WebSocket upgrade accepted; JSON text frames, server → client only (inbound text/binary is ignored; a peer Close/EOF tears the socket down). The FIRST message is always the snapshot `{\"type\":\"snapshot\", cursors: {flow_seq, metrics_seq, topology_seq, monitor_seq}, flows: [SnapshotFlowSummary…], metrics: MetricsSnapshot|null, topology: TopologySnapshot|null}` (the SPA buffers everything until it lands). Every later message is a batched `DashboardFrame` `{domain, seq, batch: [payload…]}` with `domain` ∈ `flow` | `metrics` | `topology` | `monitor` | `sessions` and a per-domain monotonic `seq` (the client drops a whole frame when `seq <= last_seq[domain]`). Each payload is `type`-tagged: `monitor` {message: DebugWsMessage} (one per retained/live monitor message; the transcript is replayed first), `usage` {api_call_id, response_id?, prompt, completion, total, cached?, reasoning?}, `flow_status` {api_call_id, response_id?, status, model_requested?, model_served?, upstream_target?, usage, started_ms, elapsed_ms?, phase timestamps, attempts?, first_upstream_byte_ms?, session facts}, `metric_tick` (the `/dashboard/api/metrics` tile, emitted periodically when it changes), `topology_update` {nodes, edges} (polled every 2 s, emitted when the version advances), `session_update` {touched: [session ids]} (the live-session hub's push tick; the SPA refetches `/dashboard/api/sessions/active`). At the session cookie's `exp` the server sends Close code 4401 `session expired`; a dev-open listener never expires."),
         (status = 400, description = "Not a WebSocket upgrade: the `WebSocketUpgrade` extractor rejects a plain GET (missing `Connection: upgrade` / `Upgrade: websocket` / `Sec-WebSocket-Key`, or `Sec-WebSocket-Version` not `13`) BEFORE the handler runs, so this precedes the auth check. Plain text reason from axum.", content_type = "text/plain", body = String),
         (status = 401, description = "The upgrade request failed the WS auth: no valid signed `llmconduit_session` cookie, or an `Origin` header not on the allow-list (the configured public origin, else same-origin as `Host` on loopback/insecure dev-open listeners). The bearer-token fallback is NOT honored here. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
         (status = 426, description = "The connection cannot be upgraded (e.g. HTTP/1.0); axum's `WebSocketUpgrade` rejection.", content_type = "text/plain", body = String),
@@ -1073,6 +1080,9 @@ pub async fn dashboard_ws(
 async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
     let flow_store = gateway.flow_store().clone();
     let mut monitor_rx = gateway.subscribe_monitor();
+    // Sessions-domain push: the hub broadcast (a disabled hub's channel never
+    // sends, so the select arm is inert in production).
+    let mut sessions_rx = gateway.session_hub().subscribe();
     let snapshot = gateway.debug_snapshot();
 
     // Split the socket so the loop can READ inbound alongside writing (D7b R2 finding
@@ -1232,6 +1242,38 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => return,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            received = sessions_rx.recv() => {
+                match received {
+                    Ok(update) => {
+                        // One tiny sessions-domain frame per hub event, stamped
+                        // with the hub's own per-domain seq (client-side dedup
+                        // is per-domain, so this needs no coordination with the
+                        // other domains).
+                        let frame = DashboardFrame {
+                            domain: Domain::Sessions,
+                            seq: update.seq,
+                            batch: vec![DashboardPayload::SessionUpdate {
+                                touched: update.touched,
+                            }],
+                        };
+                        match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
+                            SendOutcome::Completed => {}
+                            SendOutcome::Expired => {
+                                send_auth_close(&mut sink).await;
+                                return;
+                            }
+                            SendOutcome::Failed => return,
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // The hub broadcasts at request pace; a lagged receiver
+                        // simply misses ticks. The next accepted frame carries a
+                        // higher seq and the REST refetch heals the cut, so
+                        // resume rather than tearing down the socket.
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -1472,6 +1514,30 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    /// The sessions-domain `session_update` payload serializes as
+    /// `{type:"session_update", touched:[...]}` under `domain:"sessions"` —
+    /// the shape the SPA's `isDashboardPayload`/`DOMAIN_PAYLOADS` guard must
+    /// accept (adding the domain without the frontend guard would have every
+    /// frame rejected).
+    #[test]
+    fn session_update_frame_serializes_sessions_domain() {
+        let frame = DashboardFrame {
+            domain: Domain::Sessions,
+            seq: 3,
+            batch: vec![DashboardPayload::SessionUpdate {
+                touched: vec!["sess-1".to_string(), "sess-2".to_string()],
+            }],
+        };
+        let value = serde_json::to_value(&frame).expect("serialize");
+        assert_eq!(value["domain"], "sessions");
+        assert_eq!(value["seq"], 3);
+        assert_eq!(value["batch"][0]["type"], "session_update");
+        assert_eq!(
+            value["batch"][0]["touched"],
+            serde_json::json!(["sess-1", "sess-2"])
+        );
     }
 
     // -- the batched-envelope no-drop invariant (the key fix) --------------

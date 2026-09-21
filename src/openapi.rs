@@ -157,6 +157,7 @@ impl utoipa::Modify for SecuritySchemes {
         crate::persistent_history_api::history_metrics,
         crate::persistent_history_api::history_activity,
         crate::dashboard_api::dashboard_flows,
+        crate::dashboard_api::dashboard_sessions_active,
         crate::dashboard_api::dashboard_flow_detail,
         crate::dashboard_api::dashboard_metrics,
         crate::dashboard_api::dashboard_topology,

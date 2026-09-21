@@ -210,6 +210,10 @@ pub struct SessionRow {
     pub session_kind: Option<String>,
     pub client_label: Option<String>,
     pub virtual_key_id: Option<String>,
+    /// Owner of the key that opened the node; `None` for open-mode requests,
+    /// legacy rows, and keys without an owner (migration 0012).
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub depth: i64,
     pub root_request_id: Option<String>,
     pub spawned_by_request_id: Option<String>,
@@ -229,12 +233,13 @@ pub struct SessionLink {
     /// Nodes created or touched; persist them (upsert) in order.
     pub upserts: Vec<SessionRow>,
 }
-
 pub struct LinkInput<'a> {
     pub api_call_id: &'a str,
     pub identity: &'a HarnessIdentity,
     pub client_label: Option<&'a str>,
     pub virtual_key_id: Option<&'a str>,
+    /// Owner of the authenticating virtual key, when known.
+    pub user_id: Option<&'a str>,
     pub items: &'a [ItemFingerprint],
     pub now_ms: i64,
 }
@@ -624,6 +629,7 @@ impl Index {
             session_kind: identity.session_kind.clone(),
             client_label: input.client_label.map(str::to_string),
             virtual_key_id: input.virtual_key_id.map(str::to_string),
+            user_id: input.user_id.map(str::to_string),
             depth,
             root_request_id: None,
             spawned_by_request_id: None,
@@ -663,6 +669,7 @@ impl Index {
             session_kind: None,
             client_label: input.client_label.map(str::to_string),
             virtual_key_id: input.virtual_key_id.map(str::to_string),
+            user_id: input.user_id.map(str::to_string),
             depth: 0,
             root_request_id: None,
             spawned_by_request_id: None,
@@ -699,6 +706,7 @@ impl Index {
             session_kind: identity.session_kind.clone(),
             client_label: input.client_label.map(str::to_string),
             virtual_key_id: input.virtual_key_id.map(str::to_string),
+            user_id: input.user_id.map(str::to_string),
             depth,
             root_request_id: None,
             spawned_by_request_id: spawned_by,
@@ -784,6 +792,7 @@ mod tests {
             identity,
             client_label: Some("key-abc"),
             virtual_key_id: Some("vk-1"),
+            user_id: None,
             items,
             now_ms: now,
         })
@@ -1178,6 +1187,7 @@ mod tests {
             session_kind: None,
             client_label: None,
             virtual_key_id: None,
+            user_id: None,
             depth: 0,
             root_request_id: Some("old-1".to_string()),
             spawned_by_request_id: None,
