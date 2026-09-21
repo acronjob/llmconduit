@@ -850,6 +850,15 @@ may be selected with `LLMCONDUIT_DASHBOARD_CLIENT_HEADER` for dashboard
 attribution; values from credential-bearing header names are retained only as a
 one-way short hash, never verbatim.
 
+The Providers view can also control a local [lil-fleet](https://github.com/local-inference-lab/lil-fleet)
+instance. Set `LLMCONDUIT_FLEET_URL` to its loopback origin and provide either
+`LLMCONDUIT_FLEET_TOKEN_FILE` (preferred, so the bearer token can remain in a
+mode-`0600` file) or `LLMCONDUIT_FLEET_TOKEN`. This integration intentionally
+rejects non-loopback URLs; remote/federated Fleet control is a separate trust
+boundary. Inventory reads require a dashboard administrator, while load/unload
+also require the global mutation gate and CSRF token. Fleet credentials remain
+server-side and are never returned to the browser.
+
 ## Endpoints
 
 | Endpoint | Description |
@@ -875,6 +884,8 @@ one-way short hash, never verbatim.
 | `GET /dashboard/api/history/usage` | Authenticated durable usage rollups (SQL storage) |
 | `GET /dashboard/api/history/metrics` | Authenticated durable minute-level provider health/counter history (SQL storage) |
 | `POST /dashboard/api/flows/:id/kill` | Abort a live flow when dashboard mutations are enabled; requires a session and CSRF token |
+| `GET /dashboard/api/fleet` | Administrator-only local Fleet model/deployment inventory when configured |
+| `POST /dashboard/api/fleet/models/:id/load`, `/unload` | Administrator-only, mutation- and CSRF-gated local Fleet GPU lifecycle controls |
 | `GET /dashboard/api/me`, `/users`, `/keys` (+ `POST`/`PATCH`/`DELETE`) | Authenticated accounts API: the current user, user administration, API keys |
 | `POST /dashboard/login`, `POST /dashboard/logout` | Dashboard session (username/password or access token; cookie + CSRF token) |
 | `GET /dashboard/ws`, `GET /debug/ws` | Authenticated WebSocket feeds behind the dashboard and debug UI |
@@ -913,6 +924,9 @@ LLMCONDUIT_ALLOW_INSECURE_DASHBOARD
 LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS
 LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE
 LLMCONDUIT_DASHBOARD_CLIENT_HEADER
+LLMCONDUIT_FLEET_URL
+LLMCONDUIT_FLEET_TOKEN_FILE
+LLMCONDUIT_FLEET_TOKEN
 BRAVE_SEARCH_API_KEY
 OPENAI_API_KEY
 OPENROUTER_API_KEY

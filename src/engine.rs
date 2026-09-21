@@ -185,6 +185,9 @@ pub struct Gateway {
     /// aggregate operator-configured scrape results and is never used for
     /// per-request/key accounting.
     provider_metrics: crate::provider_metrics::ProviderMetricsRegistry,
+    /// Optional local Fleet control-plane client for dashboard GPU switching.
+    /// Built from env-only URL/token settings and never persisted in Config.
+    fleet: Option<Arc<crate::dashboard_fleet::FleetClient>>,
     /// F1 (Topic F) durable per-turn capture handle (see `turn_capture.rs`).
     /// `TurnCapture::disabled()` when `turn_capture_dir` is unset -- every op
     /// a no-op (no thread, no alloc, no fs). Unlike the FlowStore/metrics/
@@ -798,6 +801,7 @@ impl Gateway {
             // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
             metrics: crate::metrics::MetricsLayer::disabled(),
             provider_metrics: crate::provider_metrics::ProviderMetricsRegistry::default(),
+            fleet: None,
             // F1: disabled by default (zero overhead); the DI root attaches an
             // enabled sink via `with_turn_capture` when `turn_capture_dir` is
             // configured -- independent of `--with-debug-ui`.
@@ -962,6 +966,15 @@ impl Gateway {
 
     pub fn provider_metrics(&self) -> crate::provider_metrics::ProviderMetricsRegistry {
         self.provider_metrics.clone()
+    }
+
+    pub fn with_fleet(mut self, fleet: Option<Arc<crate::dashboard_fleet::FleetClient>>) -> Self {
+        self.fleet = fleet;
+        self
+    }
+
+    pub fn fleet(&self) -> Option<Arc<crate::dashboard_fleet::FleetClient>> {
+        self.fleet.clone()
     }
 
     /// Attach the F1 [`TurnCapture`](crate::turn_capture::TurnCapture) sink (built in

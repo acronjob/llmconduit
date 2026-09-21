@@ -1057,6 +1057,50 @@ export interface ProvidersResponse {
   providers: ProviderInventoryEntry[];
 }
 
+export interface FleetModel {
+  id: string;
+  description?: string;
+  image: string;
+}
+
+export interface FleetDeploymentStatus {
+  model_id: string;
+  phase: string;
+  desired_state: string;
+  container_status?: string;
+  health?: string;
+  exit_code?: number;
+  oom_killed?: boolean;
+  assigned_gpus: number[];
+  last_error?: string;
+  last_checked?: string;
+}
+
+export interface FleetModelEntry {
+  model: FleetModel;
+  status: FleetDeploymentStatus;
+}
+
+export interface FleetModelsResponse {
+  models: FleetModelEntry[];
+}
+
+export interface FleetOperation {
+  id: string;
+  kind: string;
+  model_id: string;
+  state: string;
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface FleetOperationResponse {
+  changed: boolean;
+  operation?: FleetOperation;
+}
+
 export interface MeshJoinKey {
   id: string;
   label?: string;
@@ -1604,6 +1648,33 @@ function isProviderCacheMetrics(v: unknown): v is ProviderCacheMetrics {
 export const isProvidersResponse = (v: unknown): v is ProvidersResponse => isArrayEnvelope(v, 'providers', isProviderInventoryEntry);
 export const isProviderMetricsResponse = (v: unknown): v is ProviderMetricsResponse =>
   isObj(v) && isUint(v.generated_at_ms) && Array.isArray(v.providers) && v.providers.every(isProviderCacheMetrics);
+
+function isFleetModel(v: unknown): v is FleetModel {
+  return isObj(v) && isStr(v.id) && isOptStr(v.description) && isStr(v.image);
+}
+
+function isFleetDeploymentStatus(v: unknown): v is FleetDeploymentStatus {
+  return isObj(v) && isStr(v.model_id) && isStr(v.phase) && isStr(v.desired_state)
+    && isOptStr(v.container_status) && isOptStr(v.health) && isOptNum(v.exit_code)
+    && (v.oom_killed === undefined || typeof v.oom_killed === 'boolean')
+    && Array.isArray(v.assigned_gpus) && v.assigned_gpus.every(isUint)
+    && isOptStr(v.last_error) && isOptStr(v.last_checked);
+}
+
+function isFleetModelEntry(v: unknown): v is FleetModelEntry {
+  return isObj(v) && isFleetModel(v.model) && isFleetDeploymentStatus(v.status);
+}
+
+function isFleetOperation(v: unknown): v is FleetOperation {
+  return isObj(v) && isStr(v.id) && isStr(v.kind) && isStr(v.model_id) && isStr(v.state)
+    && isOptStr(v.error) && isStr(v.created_at) && isOptStr(v.started_at) && isOptStr(v.finished_at);
+}
+
+export const isFleetModelsResponse = (v: unknown): v is FleetModelsResponse =>
+  isArrayEnvelope(v, 'models', isFleetModelEntry);
+
+export const isFleetOperationResponse = (v: unknown): v is FleetOperationResponse =>
+  isObj(v) && typeof v.changed === 'boolean' && (v.operation === undefined || isFleetOperation(v.operation));
 
 function isMeshJoinKey(v: unknown): v is MeshJoinKey {
   return isObj(v) && isStr(v.id) && isOptStr(v.label) && typeof v.enabled === 'boolean'

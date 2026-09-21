@@ -29,6 +29,8 @@ import type {
   CreateAuthUserRequest,
   CreatedAuthApiKey,
   CreatedKeyResponse,
+  FleetModelsResponse,
+  FleetOperationResponse,
   FlowDetail,
   FlowsQuery,
   FlowsResponse,
@@ -67,6 +69,8 @@ import {
   isAuthUsageResponse,
   isAuthUsersResponse,
   isCreateMeshJoinKeyResponse,
+  isFleetModelsResponse,
+  isFleetOperationResponse,
   isMeshAdminState,
   isCreatedAuthApiKey,
   isProviderMetricsResponse,
@@ -276,6 +280,24 @@ export class DashboardClient {
 
   providerMetrics(): Promise<ProviderMetricsResponse> {
     return this.request('/provider-metrics', undefined, isProviderMetricsResponse);
+  }
+
+  fleet(): Promise<FleetModelsResponse> {
+    return this.request('/fleet', undefined, isFleetModelsResponse);
+  }
+
+  loadFleetModel(id: string): Promise<FleetOperationResponse> {
+    return this.mutate(`/fleet/models/${encodeURIComponent(id)}/load`, 'POST').then((value) => {
+      if (!isFleetOperationResponse(value)) throw new Error('/fleet/models/:id/load returned an invalid response');
+      return value;
+    });
+  }
+
+  unloadFleetModel(id: string): Promise<FleetOperationResponse> {
+    return this.mutate(`/fleet/models/${encodeURIComponent(id)}/unload`, 'POST').then((value) => {
+      if (!isFleetOperationResponse(value)) throw new Error('/fleet/models/:id/unload returned an invalid response');
+      return value;
+    });
   }
 
   mesh(): Promise<MeshAdminState> {

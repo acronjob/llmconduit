@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { cleanup, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { renderWithQuery, resetWorld } from '../../components/testHarness';
 import { ProvidersView } from './ProvidersView';
 
@@ -22,5 +22,19 @@ describe('ProvidersView', () => {
     expect(table).toHaveTextContent('hit%');
     expect(table).toHaveTextContent('kv');
     expect(screen.getByTestId('providers-catalog')).toHaveTextContent('Exact provider-scoped model advertisements');
+  });
+
+  it('renders Fleet state and sends CSRF-gated load/unload actions', async () => {
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('fleet-panel');
+    await waitFor(() => expect(within(panel).getAllByTestId('fleet-model-card').length).toBeGreaterThan(0));
+    expect(panel).toHaveTextContent('qwen3-8b-flash');
+    expect(panel).toHaveTextContent('GPU 0');
+
+    const idleCard = within(panel).getByText('qwen3-32b').closest('[data-testid="fleet-model-card"]') as HTMLElement;
+    fireEvent.click(within(idleCard).getByRole('button', { name: 'Load' }));
+
+    await waitFor(() => expect(idleCard).toHaveTextContent('loading'));
   });
 });

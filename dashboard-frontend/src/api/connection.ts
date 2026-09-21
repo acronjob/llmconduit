@@ -25,6 +25,7 @@ export const queryKeys = {
   metrics: ['metrics'] as const,
   topology: ['topology'] as const,
   providers: ['providers'] as const,
+  fleet: ['fleet'] as const,
   mesh: ['mesh'] as const,
   providerMetrics: ['provider-metrics'] as const,
   catalog: ['catalog'] as const,

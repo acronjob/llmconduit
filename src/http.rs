@@ -219,6 +219,18 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/providers", get(dashboard_providers))
+        .route(
+            "/dashboard/api/fleet",
+            get(crate::dashboard_fleet::fleet_models),
+        )
+        .route(
+            "/dashboard/api/fleet/models/{id}/load",
+            post(crate::dashboard_fleet::fleet_load_model),
+        )
+        .route(
+            "/dashboard/api/fleet/models/{id}/unload",
+            post(crate::dashboard_fleet::fleet_unload_model),
+        )
         .route("/dashboard/api/mesh", get(dashboard_mesh::mesh_state))
         .route(
             "/dashboard/api/mesh/join-keys",

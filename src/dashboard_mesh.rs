@@ -513,7 +513,7 @@ async fn set_model_disabled(
     }
 }
 
-async fn authorize_mesh_mutation(
+pub(crate) async fn authorize_mesh_mutation(
     auth: &DashboardAuth,
     session: &AuthSession,
     headers: &HeaderMap,
@@ -527,7 +527,7 @@ async fn authorize_mesh_mutation(
     None
 }
 
-fn authorize_mesh_admin_read(
+pub(crate) fn authorize_mesh_admin_read(
     auth: &DashboardAuth,
     session: &AuthSession,
     headers: &HeaderMap,

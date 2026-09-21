@@ -25,6 +25,8 @@ import type {
   CatalogEntry,
   DashboardFrame,
   DebugWsMessage,
+  FleetModelEntry,
+  FleetOperationResponse,
   FlowDetail,
   FlowSummary,
   ActiveSessionsResponse,
@@ -104,6 +106,31 @@ let MESH_NODES: MeshNode[] = [
 
 let MESH_DISABLED_MODELS: MeshDisabledModel[] = [
   { endpoint_id: 'vllm-b', resource_id: 'gpu-b', model: 'gpt-4o', disabled_at_ms: Date.now() - 60_000 },
+];
+
+let FLEET_MODELS: FleetModelEntry[] = [
+  {
+    model: { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', image: 'qwen3:8b-flash' },
+    status: {
+      model_id: 'qwen3-8b-flash',
+      phase: 'ready',
+      desired_state: 'loaded',
+      container_status: 'running',
+      health: 'healthy',
+      assigned_gpus: [0],
+      last_checked: new Date(Date.now() - 2_000).toISOString(),
+    },
+  },
+  {
+    model: { id: 'qwen3-32b', description: 'larger local model', image: 'qwen3:32b' },
+    status: {
+      model_id: 'qwen3-32b',
+      phase: 'unloaded',
+      desired_state: 'unloaded',
+      assigned_gpus: [],
+      last_checked: new Date(Date.now() - 30_000).toISOString(),
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -802,6 +829,39 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   if (path === '/dashboard/api/topology') return json(buildTopology());
   if (path === '/dashboard/api/providers') return json({ providers: PROVIDERS });
   if (path === '/dashboard/api/provider-metrics') return json({ generated_at_ms: Date.now(), providers: PROVIDER_METRICS });
+  if (path === '/dashboard/api/fleet' && method === 'GET') return json({ models: FLEET_MODELS });
+  const fleetAction = path.match(/^\/dashboard\/api\/fleet\/models\/([^/]+)\/(load|unload)$/);
+  if (fleetAction && method === 'POST') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(fleetAction[1] ?? '');
+    const load = fleetAction[2] === 'load';
+    const found = FLEET_MODELS.find((entry) => entry.model.id === id);
+    if (!found) return json({ error: 'unknown Fleet model' }, 404);
+    const now = new Date().toISOString();
+    FLEET_MODELS = FLEET_MODELS.map((entry) => entry.model.id === id ? {
+      ...entry,
+      status: {
+        ...entry.status,
+        phase: load ? 'loading' : 'stopping',
+        desired_state: load ? 'loaded' : 'unloaded',
+        assigned_gpus: load ? entry.status.assigned_gpus.length ? entry.status.assigned_gpus : [0] : [],
+        last_checked: now,
+      },
+    } : entry);
+    const response: FleetOperationResponse = {
+      changed: true,
+      operation: {
+        id: `op_${Date.now()}`,
+        kind: load ? 'activate' : 'unload',
+        model_id: id,
+        state: 'running',
+        created_at: now,
+        started_at: now,
+      },
+    };
+    return json(response);
+  }
   if (path === '/dashboard/api/catalog') return json(CATALOG);
   if (path === '/dashboard/api/snapshot') {
     const atMs = Number(qs.get('at') ?? Date.now());

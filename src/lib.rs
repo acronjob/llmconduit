@@ -11,6 +11,7 @@ pub mod control_plane_store;
 pub mod dashboard_access;
 pub mod dashboard_api;
 pub mod dashboard_auth;
+pub mod dashboard_fleet;
 pub mod dashboard_flow;
 pub mod dashboard_mesh;
 pub mod dashboard_ui;
@@ -552,6 +553,17 @@ pub fn build_app_with_gateway_control_plane_runtime(
     // cache is constructed once and shared so the strip seam (in
     // `stream_responses`) and the executor (`run_image_analysis`) see the same
     // store. Construction is unconditional and cheap; gating happens per-turn.
+    let fleet = if options.with_debug_ui {
+        match crate::dashboard_fleet::FleetClient::from_env(http_client.clone()) {
+            Ok(fleet) => fleet.map(Arc::new),
+            Err(err) => {
+                tracing::warn!("Fleet dashboard integration disabled: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let vision: Arc<dyn crate::vision::VisionClient> =
         Arc::new(ReqwestVisionClient::new(http_client, &config));
     let image_cache = Arc::new(ImageCache::from_config(&config));
@@ -605,6 +617,7 @@ pub fn build_app_with_gateway_control_plane_runtime(
     .with_session_hub(session_hub)
     .with_provider_metrics(provider_metrics.clone())
     .with_turn_capture(turn_capture)
+    .with_fleet(fleet)
     .with_mesh_admin(mesh_admin)
     .with_operational_models(operational_models, unknown_model_policy);
     if let Some(client_auth) = client_auth {

@@ -1,7 +1,7 @@
 import { useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { getConnection, queryKeys } from '../../api/connection';
-import type { MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, ProviderHealth } from '../../api/types';
+import type { FleetModelEntry, FleetModelsResponse, MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, ProviderHealth } from '../../api/types';
 import { EMPTY_FILTERS } from '../../components/FlowTable/filterTypes';
 import { useFlowRows } from '../../components/FlowTable/useFlowRows';
 import { fmtCost, fmtElapsed, fmtTokens } from '../../components/FlowTable/format';
@@ -38,6 +38,7 @@ export function ProvidersView() {
   const topologyQuery = useQuery({ queryKey: queryKeys.topology, queryFn: () => client.topology() });
   const providersQuery = useQuery({ queryKey: queryKeys.providers, queryFn: () => client.providers() });
   const meshQuery = useQuery({ queryKey: queryKeys.mesh, queryFn: () => client.mesh(), retry: false });
+  const fleetQuery = useQuery({ queryKey: queryKeys.fleet, queryFn: () => client.fleet(), retry: false });
   const providerMetricsQuery = useQuery({ queryKey: queryKeys.providerMetrics, queryFn: () => client.providerMetrics() });
   const policiesQuery = useQuery({ queryKey: authPoliciesKey, queryFn: () => client.authPolicies() });
   const invalidateMesh = () => {
@@ -58,6 +59,13 @@ export function ProvidersView() {
       client.setMeshModelDisabled({ endpoint_id: endpointId, resource_id: resourceId, model }, disabled),
     onSuccess: invalidateMesh,
   });
+  const invalidateFleet = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.fleet });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.providers });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.topology });
+  };
+  const loadFleetModel = useMutation({ mutationFn: (id: string) => client.loadFleetModel(id), onSuccess: invalidateFleet });
+  const unloadFleetModel = useMutation({ mutationFn: (id: string) => client.unloadFleetModel(id), onSuccess: invalidateFleet });
 
   const inventory = useMemo(() => buildProviderInventory({
     providers: providersQuery.data?.providers ?? [],
@@ -156,11 +164,145 @@ export function ProvidersView() {
           onSetNode={(endpointId, enabled) => setNodeEnabled.mutate({ endpointId, enabled })}
           onSetModel={(endpointId, resourceId, model, disabled) => setModelDisabled.mutate({ endpointId, resourceId, model, disabled })}
         />
+        <FleetPanel
+          fleet={fleetQuery.data ?? null}
+          loading={fleetQuery.isLoading}
+          error={fleetQuery.error ? String(fleetQuery.error) : null}
+          mutationsEnabled={mutationsEnabled}
+          busy={loadFleetModel.isPending || unloadFleetModel.isPending}
+          mutationError={String(loadFleetModel.error ?? unloadFleetModel.error ?? '') || null}
+          onLoad={(id) => loadFleetModel.mutate(id)}
+          onUnload={(id) => unloadFleetModel.mutate(id)}
+        />
         <ProviderTable rows={filteredRows} total={inventory.rows.length} />
         <ModelsPanel models={inventory.unionCatalogModels} />
       </div>
     </div>
   );
+}
+
+function FleetPanel({
+  fleet,
+  loading,
+  error,
+  mutationsEnabled,
+  busy,
+  mutationError,
+  onLoad,
+  onUnload,
+}: {
+  fleet: FleetModelsResponse | null;
+  loading: boolean;
+  error: string | null;
+  mutationsEnabled: boolean;
+  busy: boolean;
+  mutationError: string | null;
+  onLoad: (id: string) => void;
+  onUnload: (id: string) => void;
+}) {
+  const unavailable = error && error.includes('404');
+  const active = fleet?.models.filter((entry) => isFleetActive(entry)).length ?? 0;
+  return (
+    <Panel className="p-4" data-testid="fleet-panel" data-available={fleet ? 'true' : 'false'}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">Fleet GPU switching</h2>
+          <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+            Local Fleet models · loaded {active}/{fleet?.models.length ?? 0} · actions use the dashboard mutation gate
+          </p>
+        </div>
+        {!mutationsEnabled && (
+          <span className="rounded-sm bg-status-cooling/15 px-2 py-1 text-[10px] uppercase tracking-wide text-status-cooling" data-testid="fleet-mutations-disabled">
+            mutations disabled
+          </span>
+        )}
+      </div>
+
+      {loading && <p className="mt-3 text-xs text-text-muted">Loading Fleet state...</p>}
+      {unavailable && <p className="mt-3 text-xs text-text-muted" data-quality="unavailable">Local Fleet is not configured on this gateway.</p>}
+      {error && !unavailable && <p className="mt-3 text-xs text-status-down">Could not load Fleet state: {error}</p>}
+      {mutationError && <p className="mt-2 text-xs text-status-down">{mutationError}</p>}
+
+      {fleet && (
+        <div className="mt-3 grid gap-2 lg:grid-cols-2">
+          {fleet.models.map((entry) => (
+            <FleetModelCard
+              key={entry.model.id}
+              entry={entry}
+              busy={busy}
+              mutationsEnabled={mutationsEnabled}
+              onLoad={onLoad}
+              onUnload={onUnload}
+            />
+          ))}
+          {fleet.models.length === 0 && <EmptyMeshLine>No Fleet models configured.</EmptyMeshLine>}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function FleetModelCard({
+  entry,
+  busy,
+  mutationsEnabled,
+  onLoad,
+  onUnload,
+}: {
+  entry: FleetModelEntry;
+  busy: boolean;
+  mutationsEnabled: boolean;
+  onLoad: (id: string) => void;
+  onUnload: (id: string) => void;
+}) {
+  const active = isFleetActive(entry);
+  const transitioning = ['loading', 'stopping'].includes(entry.status.phase);
+  const gpus = entry.status.assigned_gpus.length ? entry.status.assigned_gpus.map((gpu) => `GPU ${gpu}`).join(', ') : DASH;
+  return (
+    <div className="min-w-0 rounded border border-line/70 bg-bg p-3" data-testid="fleet-model-card">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="truncate font-mono text-xs text-text" title={entry.model.id}>{entry.model.id}</div>
+          <div className="mt-1 truncate text-[10px] text-text-muted" title={entry.model.image}>{entry.model.image}</div>
+        </div>
+        <span className={cn('rounded-sm px-2 py-1 text-[10px] uppercase tracking-wide', fleetPhaseClass(entry.status.phase))}>
+          {entry.status.phase}
+        </span>
+      </div>
+      {entry.model.description && <p className="mt-2 text-[10px] leading-relaxed text-text-muted">{entry.model.description}</p>}
+      <div className="mt-3 grid grid-cols-2 gap-2 text-[10px]">
+        <FleetFact label="desired" value={entry.status.desired_state} />
+        <FleetFact label="gpus" value={gpus} />
+        <FleetFact label="health" value={entry.status.health ?? entry.status.container_status ?? DASH} />
+        <FleetFact label="checked" value={entry.status.last_checked ? fmtFleetTime(entry.status.last_checked) : DASH} />
+      </div>
+      {entry.status.last_error && <p className="mt-2 text-[10px] text-status-down">{entry.status.last_error}</p>}
+      <div className="mt-3 flex justify-end gap-2">
+        <Button type="button" disabled={!mutationsEnabled || busy || active || transitioning} onClick={() => onLoad(entry.model.id)} className="px-2 py-1 text-[10px]">Load</Button>
+        <Button type="button" variant="danger" disabled={!mutationsEnabled || busy || !active || transitioning} onClick={() => onUnload(entry.model.id)} className="px-2 py-1 text-[10px]">Unload</Button>
+      </div>
+    </div>
+  );
+}
+
+function FleetFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded border border-line/60 bg-panel px-2 py-1.5">
+      <div className="uppercase tracking-[0.14em] text-text-muted">{label}</div>
+      <div className="mt-1 truncate font-mono text-text" title={value} data-quality={value === DASH ? 'unavailable' : 'measured'}>{value}</div>
+    </div>
+  );
+}
+
+function isFleetActive(entry: FleetModelEntry): boolean {
+  return entry.status.phase === 'ready' || entry.status.desired_state === 'loaded';
+}
+
+function fleetPhaseClass(phase: string): string {
+  if (phase === 'ready') return 'bg-status-healthy/15 text-status-healthy';
+  if (phase === 'loading' || phase === 'stopping') return 'bg-status-cooling/15 text-status-cooling';
+  if (phase === 'failed' || phase === 'unhealthy') return 'bg-status-down/15 text-status-down';
+  return 'bg-panel text-text-muted';
 }
 
 function MeshAdminPanel({
@@ -365,6 +507,11 @@ function numberField(value: string): number | undefined {
 
 function fmtWhen(ms: number): string {
   return new Date(ms).toISOString().slice(0, 16).replace('T', ' ');
+}
+
+function fmtFleetTime(value: string): string {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? fmtElapsed(Date.now() - parsed) + ' ago' : value;
 }
 
 function SummaryStrip({ summary }: { summary: ProviderInventorySummary }) {
