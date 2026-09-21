@@ -9686,6 +9686,11 @@ mod tests {
         );
         failover.mark_failure(0, &AppError::upstream("provider unavailable"));
         let health_before_denial = failover.provider_health();
+        let cooldown_before_denial = failover
+            .states
+            .lock()
+            .expect("upstream provider cooldown state lock poisoned")[0]
+            .cooling_until;
         let request = super::ProxyCompletionsRequest::new(
             http::HeaderMap::new(),
             axum::body::Bytes::from_static(br#"{"model":"alias","prompt":"hello"}"#),
@@ -9708,9 +9713,14 @@ mod tests {
             "denial does not mutate health"
         );
         assert_eq!(health[0].status, health_before_denial[0].status);
+        let cooldown_after_denial = failover
+            .states
+            .lock()
+            .expect("upstream provider cooldown state lock poisoned")[0]
+            .cooling_until;
         assert_eq!(
-            health[0].cooling_until_ms,
-            health_before_denial[0].cooling_until_ms
+            cooldown_after_denial, cooldown_before_denial,
+            "denial does not mutate the monotonic cooldown deadline"
         );
     }
 }
