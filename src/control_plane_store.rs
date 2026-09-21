@@ -2242,7 +2242,11 @@ impl PersistenceStore for SqlStore {
     }
 
     async fn session_aggregate(&self, session_id: &str) -> StoreResult<Option<SessionAggregate>> {
-        let sql = "SELECT session_id, \
+        // Select the bound id as a constant rather than the filtered column.
+        // PostgreSQL rejects an ungrouped column beside aggregates, while a
+        // constant preserves the useful all-null aggregate row for sessions
+        // whose requests have not reported usage.
+        let sql = "SELECT CAST(?1 AS TEXT), \
              CAST(COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT), \
              CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
              CAST(COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT), \
