@@ -1,0 +1,504 @@
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use rusqlite::TransactionBehavior;
+use rusqlite::params;
+use sha2::Digest;
+use sha2::Sha256;
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+use tokio::task;
+use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub struct MeshStore {
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedJoinKey {
+    pub id: String,
+    pub token: String,
+    pub label: Option<String>,
+    pub expires_at_ms: Option<i64>,
+    pub max_uses: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinKeyRecord {
+    pub id: String,
+    pub label: Option<String>,
+    pub enabled: bool,
+    pub created_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
+    pub max_uses: Option<i64>,
+    pub use_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshNodeRecord {
+    pub endpoint_id: String,
+    pub label: Option<String>,
+    pub enabled: bool,
+    pub joined_at_ms: i64,
+    pub join_key_id: Option<String>,
+    pub last_seen_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKeyDecision {
+    Accepted,
+    AlreadyEnrolled,
+    NodeRevoked,
+    NotFound,
+    Disabled,
+    Expired,
+    Exhausted,
+}
+
+impl MeshStore {
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        if let Some(parent) = path.as_ref().parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let store = Self {
+            path: path.as_ref().to_path_buf(),
+        };
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(SCHEMA)?;
+                Ok(())
+            })
+            .await?;
+        Ok(store)
+    }
+
+    pub async fn create_join_key(
+        &self,
+        label: Option<String>,
+        expires_at_ms: Option<i64>,
+        max_uses: Option<i64>,
+    ) -> Result<CreatedJoinKey, StoreError> {
+        let token = generate_join_token();
+        let token_hash = hash_join_token(&token);
+        let id = format!("jk_{}", Uuid::new_v4().simple());
+        let created_at_ms = now_ms();
+        let clean_label = label.and_then(nonempty);
+        self.with_conn({
+            let id = id.clone();
+            let label = clean_label.clone();
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO mesh_join_keys \
+                     (id, label, token_hash, enabled, created_at_ms, expires_at_ms, max_uses, use_count) \
+                     VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, 0)",
+                    params![id, label, token_hash.as_slice(), created_at_ms, expires_at_ms, max_uses],
+                )?;
+                Ok(())
+            }
+        })
+        .await?;
+
+        Ok(CreatedJoinKey {
+            id,
+            token,
+            label: clean_label,
+            expires_at_ms,
+            max_uses,
+        })
+    }
+
+    pub async fn list_join_keys(&self) -> Result<Vec<JoinKeyRecord>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, label, enabled, created_at_ms, expires_at_ms, max_uses, use_count \
+                 FROM mesh_join_keys ORDER BY created_at_ms DESC, id DESC",
+            )?;
+            let rows = stmt.query_map([], map_join_key)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn revoke_join_key(&self, id: &str) -> Result<bool, StoreError> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let changed = conn.execute(
+                "UPDATE mesh_join_keys SET enabled = 0 WHERE id = ?1 AND enabled != 0",
+                params![id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn validate_join_key_for_endpoint(
+        &self,
+        token: &str,
+        endpoint_id: &str,
+        node_label: Option<String>,
+        now_ms: i64,
+    ) -> Result<JoinKeyDecision, StoreError> {
+        let token_hash = hash_join_token(token);
+        let endpoint_id = endpoint_id.to_string();
+        let node_label = node_label.and_then(nonempty);
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = tx
+                .query_row(
+                    "SELECT enabled FROM mesh_nodes WHERE endpoint_id = ?1",
+                    params![endpoint_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            match existing {
+                Some(1) => return Ok(JoinKeyDecision::AlreadyEnrolled),
+                Some(_) => return Ok(JoinKeyDecision::NodeRevoked),
+                None => {}
+            }
+            let record = tx
+                .query_row(
+                    "SELECT id, label, enabled, created_at_ms, expires_at_ms, max_uses, use_count \
+                     FROM mesh_join_keys WHERE token_hash = ?1",
+                    params![token_hash.as_slice()],
+                    map_join_key,
+                )
+                .optional()?;
+            let Some(record) = record else {
+                return Ok(JoinKeyDecision::NotFound);
+            };
+            if !record.enabled {
+                return Ok(JoinKeyDecision::Disabled);
+            }
+            if record
+                .expires_at_ms
+                .is_some_and(|expires| expires <= now_ms)
+            {
+                return Ok(JoinKeyDecision::Expired);
+            }
+            if record
+                .max_uses
+                .is_some_and(|max_uses| record.use_count >= max_uses)
+            {
+                return Ok(JoinKeyDecision::Exhausted);
+            }
+
+            tx.execute(
+                "UPDATE mesh_join_keys SET use_count = use_count + 1 WHERE id = ?1",
+                params![record.id],
+            )?;
+            tx.execute(
+                "INSERT INTO mesh_nodes \
+                 (endpoint_id, label, enabled, joined_at_ms, join_key_id, last_seen_at_ms) \
+                 VALUES (?1, ?2, 1, ?3, ?4, ?3) \
+                 ON CONFLICT(endpoint_id) DO UPDATE SET \
+                 label = COALESCE(excluded.label, mesh_nodes.label), enabled = 1, \
+                 join_key_id = excluded.join_key_id, last_seen_at_ms = excluded.last_seen_at_ms",
+                params![endpoint_id, node_label, now_ms, record.id],
+            )?;
+            tx.commit()?;
+            Ok(JoinKeyDecision::Accepted)
+        })
+        .await
+    }
+
+    pub async fn list_nodes(&self) -> Result<Vec<MeshNodeRecord>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT endpoint_id, label, enabled, joined_at_ms, join_key_id, last_seen_at_ms \
+                 FROM mesh_nodes ORDER BY joined_at_ms DESC, endpoint_id ASC",
+            )?;
+            let rows = stmt.query_map([], map_node)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn set_node_enabled(
+        &self,
+        endpoint_id: &str,
+        enabled: bool,
+    ) -> Result<bool, StoreError> {
+        let endpoint_id = endpoint_id.to_string();
+        self.with_conn(move |conn| {
+            let changed = conn.execute(
+                "UPDATE mesh_nodes SET enabled = ?2 WHERE endpoint_id = ?1",
+                params![endpoint_id, enabled as i64],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn is_node_authorized(&self, endpoint_id: &str) -> Result<bool, StoreError> {
+        let endpoint_id = endpoint_id.to_string();
+        self.with_conn(move |conn| {
+            let enabled = conn
+                .query_row(
+                    "SELECT enabled FROM mesh_nodes WHERE endpoint_id = ?1",
+                    params![endpoint_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            Ok(enabled == Some(1))
+        })
+        .await
+    }
+
+    pub async fn touch_node_seen(
+        &self,
+        endpoint_id: &str,
+        seen_at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let endpoint_id = endpoint_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE mesh_nodes SET last_seen_at_ms = ?2 WHERE endpoint_id = ?1",
+                params![endpoint_id, seen_at_ms],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn with_conn<F, T>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let path = self.path.clone();
+        task::spawn_blocking(move || {
+            let mut conn = Connection::open(path)?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            f(&mut conn)
+        })
+        .await
+        .map_err(StoreError::Join)?
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("blocking task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS mesh_join_keys (
+    id TEXT PRIMARY KEY,
+    label TEXT,
+    token_hash BLOB NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER,
+    max_uses INTEGER,
+    use_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS mesh_nodes (
+    endpoint_id TEXT PRIMARY KEY,
+    label TEXT,
+    enabled INTEGER NOT NULL,
+    joined_at_ms INTEGER NOT NULL,
+    join_key_id TEXT,
+    last_seen_at_ms INTEGER,
+    FOREIGN KEY(join_key_id) REFERENCES mesh_join_keys(id)
+);
+"#;
+
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+pub fn hash_join_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn generate_join_token() -> String {
+    let bytes = iroh::SecretKey::generate().to_bytes();
+    format!("llmc_join_{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn nonempty(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn map_join_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<JoinKeyRecord> {
+    Ok(JoinKeyRecord {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        enabled: row.get::<_, i64>(2)? != 0,
+        created_at_ms: row.get(3)?,
+        expires_at_ms: row.get(4)?,
+        max_uses: row.get(5)?,
+        use_count: row.get(6)?,
+    })
+}
+
+fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeshNodeRecord> {
+    Ok(MeshNodeRecord {
+        endpoint_id: row.get(0)?,
+        label: row.get(1)?,
+        enabled: row.get::<_, i64>(2)? != 0,
+        joined_at_ms: row.get(3)?,
+        join_key_id: row.get(4)?,
+        last_seen_at_ms: row.get(5)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("llmconduit-{name}-{}.sqlite", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn join_key_plaintext_is_returned_once_and_hash_is_stored() {
+        let path = temp_db("join-key");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let created = store
+            .create_join_key(Some("community".to_string()), None, Some(1))
+            .await
+            .expect("create key");
+
+        assert!(created.token.starts_with("llmc_join_"));
+        assert_eq!(store.list_join_keys().await.expect("list")[0].use_count, 0);
+        let decision = store
+            .validate_join_key_for_endpoint(&created.token, "node-a", Some("node".to_string()), 1)
+            .await
+            .expect("validate");
+        assert_eq!(decision, JoinKeyDecision::Accepted);
+        assert!(store.is_node_authorized("node-a").await.expect("auth"));
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&created.token, "node-b", None, 2)
+                .await
+                .expect("validate exhausted"),
+            JoinKeyDecision::Exhausted
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn revoked_and_expired_join_keys_are_rejected() {
+        let path = temp_db("revoked-expired");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let revoked = store
+            .create_join_key(None, None, None)
+            .await
+            .expect("create key");
+        assert!(store.revoke_join_key(&revoked.id).await.expect("revoke"));
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&revoked.token, "node-a", None, 1)
+                .await
+                .expect("validate revoked"),
+            JoinKeyDecision::Disabled
+        );
+
+        let expired = store
+            .create_join_key(None, Some(10), None)
+            .await
+            .expect("create expired");
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&expired.token, "node-b", None, 10)
+                .await
+                .expect("validate expired"),
+            JoinKeyDecision::Expired
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn enrolled_identity_does_not_consume_again_and_revocation_is_sticky() {
+        let path = temp_db("node-reenroll");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let created = store
+            .create_join_key(None, None, Some(2))
+            .await
+            .expect("create key");
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&created.token, "node-a", None, 1)
+                .await
+                .expect("first enrollment"),
+            JoinKeyDecision::Accepted
+        );
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&created.token, "node-a", None, 2)
+                .await
+                .expect("repeat enrollment"),
+            JoinKeyDecision::AlreadyEnrolled
+        );
+        assert_eq!(store.list_join_keys().await.expect("list")[0].use_count, 1);
+        assert!(
+            store
+                .set_node_enabled("node-a", false)
+                .await
+                .expect("revoke")
+        );
+        assert_eq!(
+            store
+                .validate_join_key_for_endpoint(&created.token, "node-a", None, 3)
+                .await
+                .expect("revoked enrollment"),
+            JoinKeyDecision::NodeRevoked
+        );
+        assert_eq!(store.list_join_keys().await.expect("list")[0].use_count, 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn concurrent_one_use_key_is_consumed_once() {
+        let path = temp_db("concurrent");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let created = store
+            .create_join_key(None, None, Some(1))
+            .await
+            .expect("create key");
+        let attempts = (0..16).map(|index| {
+            let store = store.clone();
+            let token = created.token.clone();
+            tokio::spawn(async move {
+                store
+                    .validate_join_key_for_endpoint(&token, &format!("node-{index}"), None, 1)
+                    .await
+                    .expect("validate")
+            })
+        });
+        let accepted = futures::future::join_all(attempts)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|decision| *decision == JoinKeyDecision::Accepted)
+            .count();
+
+        assert_eq!(accepted, 1);
+        assert_eq!(store.list_nodes().await.expect("nodes").len(), 1);
+        assert_eq!(store.list_join_keys().await.expect("keys")[0].use_count, 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+}

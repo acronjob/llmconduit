@@ -10,6 +10,8 @@ import { SessionsView } from './sessions/SessionsView';
 import { ThroughputView } from './throughput/ThroughputView';
 import { ActivityView } from './activity/ActivityView';
 import { AccountView } from './account/AccountView';
+import { ProvidersView } from './providers/ProvidersView';
+import { AccessView } from './access/AccessView';
 
 export const VIEW_BY_ROUTE: Record<RouteName, ComponentType> = {
   flows: FlowsView,
@@ -21,4 +23,6 @@ export const VIEW_BY_ROUTE: Record<RouteName, ComponentType> = {
   sankey: SankeyView,
   theater: TheaterView,
   overview: OverviewView,
+  providers: ProvidersView,
+  access: AccessView,
 };

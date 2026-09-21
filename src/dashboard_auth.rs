@@ -464,6 +464,14 @@ impl DashboardAuth {
         (self.sign_session(exp, Some(user)), exp)
     }
 
+    /// Mint a signed cookie referencing a durable delegated session. The policy
+    /// state stays server-side; only the opaque session id and expiry are signed.
+    pub fn issue_delegated_session(&self, session_id: &str, exp: u64) -> String {
+        let payload = format!("{exp}:delegated:{session_id}");
+        let mac = self.mac(payload.as_bytes());
+        format!("{}.{payload}", URL_SAFE_NO_PAD.encode(mac))
+    }
+
     /// Sign a `{exp}:{nonce}[:{base64url(user json)}]` payload, returning the
     /// full cookie value `base64url(mac).{payload}`.
     fn sign_session(&self, exp: u64, user: Option<&crate::accounts::SessionUser>) -> String {
@@ -486,6 +494,37 @@ impl DashboardAuth {
         &self,
         cookie_value: &str,
     ) -> Option<(u64, Option<crate::accounts::SessionUser>)> {
+        let payload = self.verify_signed_payload(cookie_value)?;
+        let mut parts = payload.splitn(3, ':');
+        let exp: u64 = parts.next()?.parse().ok()?;
+        let nonce = parts.next()?;
+        if nonce == "delegated" || exp <= now_unix() {
+            return None;
+        }
+        let user = parts
+            .next()
+            .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        Some((exp, user))
+    }
+
+    /// Resolve a signed delegated cookie to its server-side session id + expiry.
+    pub fn delegated_session(&self, headers: &HeaderMap) -> Option<(String, u64)> {
+        let value = cookie_value(headers, SESSION_COOKIE)?;
+        let payload = self.verify_signed_payload(&value)?;
+        let mut parts = payload.split(':');
+        let exp: u64 = parts.next()?.parse().ok()?;
+        if parts.next()? != "delegated" || exp <= now_unix() {
+            return None;
+        }
+        let session_id = parts.next()?.to_string();
+        if session_id.is_empty() || parts.next().is_some() {
+            return None;
+        }
+        Some((session_id, exp))
+    }
+
+    fn verify_signed_payload<'a>(&self, cookie_value: &'a str) -> Option<&'a str> {
         let (mac_b64, payload) = cookie_value.split_once('.')?;
         let presented_mac = URL_SAFE_NO_PAD.decode(mac_b64).ok()?;
         let expected_mac = self.mac(payload.as_bytes());
@@ -494,19 +533,7 @@ impl DashboardAuth {
         if !bool::from(presented_mac.ct_eq_padded(&expected_mac)) {
             return None;
         }
-        let mut parts = payload.splitn(3, ':');
-        let exp: u64 = parts.next()?.parse().ok()?;
-        let _nonce = parts.next()?;
-        if exp <= now_unix() {
-            return None;
-        }
-        // The MAC already authenticated the payload; a decode failure here can
-        // only come from a session minted by an incompatible build.
-        let user = parts
-            .next()
-            .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        Some((exp, user))
+        Some(payload)
     }
 
     fn mac(&self, message: &[u8]) -> Vec<u8> {
@@ -588,7 +615,7 @@ impl DashboardAuth {
     /// - If NO `PUBLIC_ORIGIN` is configured, the request's `Origin` must match
     ///   its `Host`. This fallback is enabled on loopback and in explicitly
     ///   insecure tokenless mode, preserving a same-origin CSWSH boundary.
-    fn origin_allowed(&self, headers: &HeaderMap) -> bool {
+    pub(crate) fn origin_allowed(&self, headers: &HeaderMap) -> bool {
         let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
             return true;
         };
@@ -1022,6 +1049,32 @@ pub async fn dashboard_logout(Extension(auth): Extension<Arc<DashboardAuth>>) ->
     response
 }
 
+/// Build the successful key-login response without exposing session or CSRF
+/// material in the body. Both values are carried only by hardened cookies.
+pub(crate) fn delegated_login_response(
+    auth: &DashboardAuth,
+    session_id: &str,
+    csrf: &str,
+    exp: u64,
+) -> Response {
+    let secure = auth.secure_cookies();
+    let session_value = auth.issue_delegated_session(session_id, exp);
+    let max_age = exp.saturating_sub(now_unix());
+    let mut response = no_store(
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"authenticated": true})),
+        )
+            .into_response(),
+    );
+    append_set_cookie(
+        response.headers_mut(),
+        &session_cookie_with_max_age(&session_value, secure, max_age),
+    );
+    append_set_cookie(response.headers_mut(), &csrf_cookie(csrf, secure));
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Auth middleware + extractor for the protected HTTP routes
 // ---------------------------------------------------------------------------
@@ -1113,9 +1166,12 @@ where
 /// SAME cookie authorizes `/dashboard` AND `/debug`), `Max-Age=86400`, and
 /// `Secure` only when a public https origin is configured.
 fn session_cookie(value: &str, secure: bool) -> String {
-    let mut cookie = format!(
-        "{SESSION_COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
-    );
+    session_cookie_with_max_age(value, secure, SESSION_TTL_SECS)
+}
+
+fn session_cookie_with_max_age(value: &str, secure: bool, max_age: u64) -> String {
+    let mut cookie =
+        format!("{SESSION_COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -1861,6 +1917,20 @@ mod tests {
             auth.authenticate(&headers).unwrap().user.unwrap().username,
             "koen"
         );
+    }
+
+    #[test]
+    fn delegated_cookie_is_typed_and_never_accepted_as_bootstrap() {
+        let auth = build(public_bind(), &env_with_token());
+        let exp = now_unix() + 300;
+        let cookie = auth.issue_delegated_session("dsh_example", exp);
+        assert!(auth.verify_session(&cookie).is_none());
+        let headers = headers_with(&[("cookie", &format!("{SESSION_COOKIE}={cookie}"))]);
+        assert_eq!(
+            auth.delegated_session(&headers),
+            Some(("dsh_example".to_string(), exp))
+        );
+        assert!(auth.authenticate(&headers).is_none());
     }
 
     #[test]

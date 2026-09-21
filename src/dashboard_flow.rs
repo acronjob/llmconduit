@@ -603,6 +603,10 @@ pub struct TerminalMetricsInputs {
     pub endpoint: String,
     pub upstream: Option<String>,
     pub usage: Option<FlowUsage>,
+    /// Measured first-upstream-byte → first-content duration.
+    pub prefill_ms: Option<u128>,
+    /// Measured first-content → clean-stream-end duration.
+    pub decode_ms: Option<u128>,
     /// Gap 03 — the per-attempt trace, read off the shared `ServingToken` at finalize
     /// alongside `usage`. Carried on the evict-safe terminal payload (NOT only the
     /// FlowStore record) so spec 12 can aggregate per-provider metrics without
@@ -1635,16 +1639,17 @@ impl DashboardFlowStore {
     /// cheap on the streaming hot path. This is a NEW phase-only mutation, so it bumps
     /// the record's `record_seq` exactly like the other mutators (the flow frame the
     /// dashboard later sends carries the freshly-stamped TTFT).
-    pub fn stamp_first_content_delta(&self, id: &str) {
-        if !self.enabled {
-            return;
-        }
+    pub fn stamp_first_content_delta(&self, id: &str) -> u128 {
         let now = now_ms();
+        if !self.enabled {
+            return now;
+        }
         let mut state = self.lock();
         state.prune_expired(now);
         state.update(id, |record| {
             record.phases.stamp_first_content_delta(now);
         });
+        now
     }
 
     /// Gap 02 — stamp the **stream end** phase: the engine reached the terminal
@@ -1654,16 +1659,17 @@ impl DashboardFlowStore {
     /// cannot re-stamp. `id` may be the `api_call_id` OR the `response_id`. No-op when
     /// disabled or unknown. Phase-only mutation (no body); bumps `record_seq` like the
     /// other mutators.
-    pub fn stamp_stream_end(&self, id: &str) {
-        if !self.enabled {
-            return;
-        }
+    pub fn stamp_stream_end(&self, id: &str) -> u128 {
         let now = now_ms();
+        if !self.enabled {
+            return now;
+        }
         let mut state = self.lock();
         state.prune_expired(now);
         state.update(id, |record| {
             record.phases.stamp_stream_end(now);
         });
+        now
     }
 
     /// Mint the D3 **L0 middleware guard** for a freshly `open`ed flow (the
@@ -2087,6 +2093,7 @@ impl TelemetryGuard {
             // `store.finalize`/`record_attempts` below, so the payload is independent of
             // whether the record still exists.
             let (attempts, first_upstream_byte_ms) = self.serving.attempts_snapshot();
+            let (first_content_delta_ms, stream_end_ms) = self.serving.phase_snapshot();
             *self
                 .terminal_metrics
                 .lock()
@@ -2096,6 +2103,12 @@ impl TelemetryGuard {
                     endpoint: self.endpoint.clone(),
                     upstream: serving.clone(),
                     usage,
+                    prefill_ms: first_upstream_byte_ms
+                        .zip(first_content_delta_ms)
+                        .map(|(start, end)| end.saturating_sub(start)),
+                    decode_ms: first_content_delta_ms
+                        .zip(stream_end_ms)
+                        .map(|(start, end)| end.saturating_sub(start)),
                     attempts: attempts.clone(),
                 });
             self.store

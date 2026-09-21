@@ -8,3 +8,5 @@
 
 # Local orchestration state.
 .ralph/
+.token
+.api-key

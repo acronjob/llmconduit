@@ -11,13 +11,16 @@ use crate::dashboard_api::dashboard_catalog;
 use crate::dashboard_api::dashboard_flow_detail;
 use crate::dashboard_api::dashboard_flows;
 use crate::dashboard_api::dashboard_metrics;
+use crate::dashboard_api::dashboard_providers;
 use crate::dashboard_api::dashboard_snapshot;
 use crate::dashboard_api::dashboard_topology;
+use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationDenied;
 use crate::dashboard_auth::MutationPolicy;
 use crate::dashboard_auth::dashboard_login;
 use crate::dashboard_auth::dashboard_logout;
+use crate::dashboard_auth::delegated_login_response;
 use crate::dashboard_auth::require_session;
 use crate::dashboard_ui::dashboard_asset;
 use crate::dashboard_ui::dashboard_index;
@@ -71,6 +74,7 @@ use axum::routing::get;
 use axum::routing::on;
 use axum::routing::post;
 use futures::SinkExt;
+use futures::Stream;
 use futures::StreamExt;
 use http_body::Frame;
 use http_body::SizeHint;
@@ -118,7 +122,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
     // 10 MiB) so oversized inbound bodies are the operator's choice, not a
     // silent framework default.
     let max_request_body_bytes = gateway.config().max_request_body_bytes;
-    let router = Router::new()
+    let inference_routes = Router::new()
         .route("/v1/responses", post(post_responses).get(get_responses))
         .route("/v1/messages", post(post_messages))
         .route("/v1/messages/count_tokens", post(post_count_tokens))
@@ -127,6 +131,12 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/completions", post(post_completions))
         .route("/v1/models", get(get_models))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            require_inference_auth,
+        ));
+    let router = Router::new()
+        .merge(inference_routes)
         .route("/health", get(get_health))
         .route("/openapi.json", get(get_openapi))
         .route("/", {
@@ -143,7 +153,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         options.with_debug_ui && options.register_protected_routes,
         gateway.dashboard_auth(),
     ) {
-        (true, Some(auth)) => router.merge(protected_routes(auth)),
+        (true, Some(auth)) => router.merge(protected_routes(Arc::clone(&gateway), auth)),
         _ => router,
     };
 
@@ -185,7 +195,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
 /// The shared `Arc<DashboardAuth>` is attached as a request `Extension` scoped to
 /// this sub-router so the middleware/handlers/extractors can read it
 /// (`/debug/ws` reads it via `gateway.dashboard_auth()` instead).
-fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
+fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
     // D13 `/dashboard/api/*` REST surface. `no-store` + the dashboard security
     // headers are applied as ROUTE-LEVEL response middleware on the WHOLE api router
     // (D13 R1 MED), so EVERY response carries them — including an axum EXTRACTOR
@@ -207,6 +217,7 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/api/metrics", get(dashboard_metrics))
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
+        .route("/dashboard/api/providers", get(dashboard_providers))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
         .route("/dashboard/api/history/requests", get(history_requests))
         .route(
@@ -253,7 +264,18 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
             "/dashboard/api/keys/{id}",
             axum::routing::delete(crate::accounts_api::delete_key),
         )
+        .merge(crate::provider_metrics::dashboard_routes::<Arc<Gateway>>(
+            gateway.provider_metrics(),
+        ))
         .route_layer(middleware::map_response(dashboard_api_no_store));
+
+    let access_routes =
+        crate::dashboard_access::routes::<Arc<Gateway>>(gateway.authz_arc().access_backend())
+            .route_layer(middleware::map_response(dashboard_api_no_store))
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&gateway),
+                require_management_access,
+            ));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
     // headers in-handler (they serve HTML, not the JSON `no-store` set), so they are
@@ -266,9 +288,17 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
     // dashboard read AND the kill mutation is 401'd for an unauthenticated caller
     // BEFORE any handler work (the kill's CSRF/mutation gate runs only for an
     // authenticated request).
-    let session_gated = api_routes
-        .merge(debug_routes)
-        .route_layer(middleware::from_fn(require_session));
+    let api_gated = api_routes.route_layer(middleware::from_fn_with_state(
+        Arc::clone(&gateway),
+        require_dashboard_session,
+    ));
+    let debug_gated = debug_routes.route_layer(middleware::from_fn(require_session));
+    let dashboard_shell = Router::new()
+        .route("/dashboard", get(dashboard_index))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            resolve_optional_dashboard_session,
+        ));
 
     // Routes that read the auth context but manage their own access decision,
     // plus the self-gated WS and the public hashed assets.
@@ -279,17 +309,411 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
     // + `Origin` allow-list + cookie-`exp` close, via D7a's `authenticate_ws`), so
     // it OWNS its rejection and the WS `Origin` check stays authoritative.
     let open = Router::new()
-        .route("/dashboard", get(dashboard_index))
         .route("/dashboard/login", post(dashboard_login))
         .route("/dashboard/logout", post(dashboard_logout))
+        .route("/dashboard/auth/key-login", post(dashboard_key_login))
+        .route("/dashboard/auth/logout", post(dashboard_auth_logout))
         .route("/debug/ws", get(debug_ws))
         .route("/dashboard/ws", get(dashboard_ws))
         .route("/dashboard/assets/{*path}", get(dashboard_asset));
 
-    session_gated
+    api_gated
+        .merge(debug_gated)
+        .merge(access_routes)
+        .merge(dashboard_shell)
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).
         .layer(Extension(auth))
+}
+
+async fn require_dashboard_session(
+    State(gateway): State<Arc<Gateway>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(auth) = request.extensions().get::<Arc<DashboardAuth>>().cloned() else {
+        return management_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    if let Some(session) = auth.authenticate(request.headers()) {
+        request.extensions_mut().insert(session);
+        return next.run(request).await;
+    }
+    if let Some((session_id, exp)) = auth.delegated_session(request.headers()) {
+        match gateway
+            .authz()
+            .authenticate_delegated_session(&session_id)
+            .await
+        {
+            Ok(Some(actor)) => {
+                request
+                    .extensions_mut()
+                    .insert(AuthSession { exp, user: None });
+                request.extensions_mut().insert(actor);
+                return next.run(request).await;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return management_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authorization unavailable",
+                );
+            }
+        }
+    }
+    management_error(StatusCode::UNAUTHORIZED, "unauthorized")
+}
+
+async fn resolve_optional_dashboard_session(
+    State(gateway): State<Arc<Gateway>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(auth) = request.extensions().get::<Arc<DashboardAuth>>().cloned() else {
+        return next.run(request).await;
+    };
+    let session = if let Some(session) = auth.authenticate(request.headers()) {
+        Some(session)
+    } else if let Some((session_id, exp)) = auth.delegated_session(request.headers()) {
+        match gateway
+            .authz()
+            .authenticate_delegated_session(&session_id)
+            .await
+        {
+            Ok(Some(actor)) => {
+                request.extensions_mut().insert(actor);
+                Some(AuthSession { exp, user: None })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(session) = session {
+        request.extensions_mut().insert(session);
+    }
+    next.run(request).await
+}
+
+#[derive(Deserialize)]
+struct DashboardKeyLogin {
+    api_key: String,
+}
+
+async fn dashboard_key_login(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    headers: HeaderMap,
+    Json(body): Json<DashboardKeyLogin>,
+) -> Response {
+    if !auth.origin_allowed(&headers) {
+        return management_error(StatusCode::FORBIDDEN, "cross-origin login denied");
+    }
+    let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", body.api_key)) else {
+        return management_error(StatusCode::UNAUTHORIZED, "invalid API key");
+    };
+    let mut key_headers = HeaderMap::new();
+    key_headers.insert(header::AUTHORIZATION, value);
+    let context = match gateway.authz().authenticate(&key_headers) {
+        Ok(Some(context)) => context,
+        Ok(None) | Err(crate::authz::AuthFailure::Missing | crate::authz::AuthFailure::Invalid) => {
+            return management_error(StatusCode::UNAUTHORIZED, "invalid API key");
+        }
+        Err(crate::authz::AuthFailure::Forbidden) => {
+            return management_error(StatusCode::FORBIDDEN, "management permission denied");
+        }
+        Err(crate::authz::AuthFailure::Unavailable) => {
+            return management_error(StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable");
+        }
+    };
+    let csrf = auth.issue_csrf_token();
+    let digest = Sha256::digest(csrf.as_bytes());
+    let exp =
+        chrono::Utc::now().timestamp().max(0) as u64 + crate::dashboard_auth::SESSION_TTL_SECS;
+    let actor = match gateway
+        .authz()
+        .create_delegated_session(
+            &context,
+            digest.as_slice(),
+            i64::try_from(exp).unwrap_or(i64::MAX),
+        )
+        .await
+    {
+        Ok(actor) => actor,
+        Err(crate::authz::AuthError::Forbidden) => {
+            return management_error(StatusCode::FORBIDDEN, "management permission denied");
+        }
+        Err(_) => {
+            return management_error(StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable");
+        }
+    };
+    let crate::dashboard_access::ManagementActor::Delegated { session_id, .. } = actor else {
+        return management_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
+    };
+    delegated_login_response(&auth, &session_id, &csrf, exp)
+}
+
+async fn dashboard_auth_logout(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some((session_id, _)) = auth.delegated_session(&headers) {
+        if !auth.origin_allowed(&headers) {
+            return management_error(StatusCode::FORBIDDEN, "cross-origin logout denied");
+        }
+        if let Err(denied) = auth.authorize_mutation(&headers) {
+            return management_error(denied.status(), denied.message());
+        }
+        let Some(csrf) = headers
+            .get(crate::dashboard_auth::CSRF_HEADER)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return management_error(StatusCode::FORBIDDEN, "missing or invalid CSRF token");
+        };
+        let digest = Sha256::digest(csrf.as_bytes());
+        match gateway
+            .authz()
+            .verify_delegated_csrf_digest(&session_id, digest.as_slice())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return management_error(StatusCode::FORBIDDEN, "missing or invalid CSRF token");
+            }
+            Err(_) => {
+                return management_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authorization unavailable",
+                );
+            }
+        }
+        if gateway
+            .authz()
+            .revoke_delegated_session(&session_id)
+            .await
+            .is_err()
+        {
+            return management_error(StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable");
+        }
+    }
+    dashboard_logout(Extension(auth)).await
+}
+
+async fn require_management_access(
+    State(gateway): State<Arc<Gateway>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(dashboard_auth) = request.extensions().get::<Arc<DashboardAuth>>().cloned() else {
+        return management_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+
+    let (actor, cookie_or_dashboard_token) =
+        if dashboard_auth.authenticate(request.headers()).is_some() {
+            (crate::dashboard_access::ManagementActor::Bootstrap, true)
+        } else if let Some((session_id, _)) = dashboard_auth.delegated_session(request.headers()) {
+            match gateway
+                .authz()
+                .authenticate_delegated_session(&session_id)
+                .await
+            {
+                Ok(Some(actor)) => (actor, true),
+                Ok(None) => return management_error(StatusCode::UNAUTHORIZED, "unauthorized"),
+                Err(_) => {
+                    return management_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authorization unavailable",
+                    );
+                }
+            }
+        } else {
+            match gateway.authz().authenticate(request.headers()) {
+                Ok(Some(context)) => (context.management_actor(), false),
+                Ok(None)
+                | Err(crate::authz::AuthFailure::Missing)
+                | Err(crate::authz::AuthFailure::Invalid) => {
+                    return management_error(StatusCode::UNAUTHORIZED, "unauthorized");
+                }
+                Err(crate::authz::AuthFailure::Forbidden) => {
+                    return management_error(StatusCode::FORBIDDEN, "management permission denied");
+                }
+                Err(crate::authz::AuthFailure::Unavailable) => {
+                    return management_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authorization unavailable",
+                    );
+                }
+            }
+        };
+
+    if request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD {
+        if cookie_or_dashboard_token {
+            if let Err(denied) = dashboard_auth.authorize_mutation(request.headers()) {
+                return management_error(denied.status(), denied.message());
+            }
+            if let crate::dashboard_access::ManagementActor::Delegated { session_id, .. } = &actor {
+                let Some(csrf) = request
+                    .headers()
+                    .get(crate::dashboard_auth::CSRF_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                else {
+                    return management_error(
+                        StatusCode::FORBIDDEN,
+                        "missing or invalid CSRF token",
+                    );
+                };
+                let digest = Sha256::digest(csrf.as_bytes());
+                match gateway
+                    .authz()
+                    .verify_delegated_csrf_digest(session_id, digest.as_slice())
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return management_error(
+                            StatusCode::FORBIDDEN,
+                            "missing or invalid CSRF token",
+                        );
+                    }
+                    Err(_) => {
+                        return management_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "authorization unavailable",
+                        );
+                    }
+                }
+            }
+        } else if !dashboard_auth.mutations_enabled() {
+            return management_error(StatusCode::FORBIDDEN, "dashboard mutations are disabled");
+        } else if request.headers().contains_key(header::ORIGIN)
+            && !dashboard_auth.origin_allowed(request.headers())
+        {
+            return management_error(
+                StatusCode::FORBIDDEN,
+                "cross-origin management request denied",
+            );
+        }
+    }
+
+    request.extensions_mut().insert(actor);
+    next.run(request).await
+}
+
+fn management_error(status: StatusCode, message: &'static str) -> Response {
+    crate::dashboard_auth::no_store(
+        (status, Json(serde_json::json!({ "error": message }))).into_response(),
+    )
+}
+
+async fn require_inference_auth(
+    State(gateway): State<Arc<Gateway>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if !gateway.authz().is_enabled() {
+        return next.run(request).await;
+    }
+    let endpoint = auth_endpoint(request.uri().path());
+    let context = match gateway.authz().authenticate(request.headers()) {
+        Ok(Some(context)) => context,
+        Ok(None) => return next.run(request).await,
+        Err(failure) => return auth_failure_response(request.uri().path(), failure),
+    };
+    if !context.allows_endpoint(endpoint) {
+        return auth_failure_response(request.uri().path(), crate::authz::AuthFailure::Forbidden);
+    }
+    request.extensions_mut().insert(context);
+    next.run(request).await
+}
+
+fn auth_endpoint(path: &str) -> &'static str {
+    match path {
+        "/v1/responses" => "responses",
+        "/v1/chat/completions" => "chat",
+        "/v1/messages" => "messages",
+        "/v1/messages/count_tokens" => "count_tokens",
+        "/v1/completions" => "completions",
+        "/v1/models" => "models",
+        _ => "unknown",
+    }
+}
+
+fn auth_failure_response(path: &str, failure: crate::authz::AuthFailure) -> Response {
+    let (status, message) = match failure {
+        crate::authz::AuthFailure::Missing => (StatusCode::UNAUTHORIZED, "missing API key"),
+        crate::authz::AuthFailure::Invalid => (StatusCode::UNAUTHORIZED, "invalid API key"),
+        crate::authz::AuthFailure::Forbidden => (
+            StatusCode::FORBIDDEN,
+            "the API key is not authorized for this request",
+        ),
+        crate::authz::AuthFailure::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authorization service unavailable",
+        ),
+    };
+    let mut response = if path.starts_with("/v1/messages") {
+        (
+            status,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": if status == StatusCode::UNAUTHORIZED { "authentication_error" } else { "permission_error" },
+                    "message": message
+                }
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            status,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": if status == StatusCode::UNAUTHORIZED { "invalid_request_error" } else { "permission_denied" },
+                    "code": if status == StatusCode::UNAUTHORIZED { "invalid_api_key" } else { "permission_denied" }
+                }
+            })),
+        )
+            .into_response()
+    };
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"llmconduit\""),
+        );
+    }
+    response
+}
+
+fn authorize_inference(
+    context: Option<&crate::authz::AuthContext>,
+    endpoint: crate::upstream::InferenceEndpoint,
+    requested_model: &str,
+) -> AppResult<crate::upstream::AuthorizationScope> {
+    context.map_or_else(
+        || Ok(crate::upstream::AuthorizationScope::unrestricted()),
+        |context| {
+            context
+                .authorization_scope(endpoint, requested_model)
+                .map_err(|_| {
+                    AppError::forbidden("the API key is not authorized for the requested model")
+                })
+        },
+    )
+}
+
+async fn acquire_inference_session(
+    gateway: &Gateway,
+    context: Option<&crate::authz::AuthContext>,
+) -> AppResult<Option<crate::authz::SessionLease>> {
+    match context {
+        Some(context) => gateway
+            .authz()
+            .acquire_session(context)
+            .await
+            .map_err(|err| AppError::forbidden(err.to_string())),
+        None => Ok(None),
+    }
 }
 
 /// Route-level response middleware (D13 R1 MED): stamp `no-store` + the dashboard
@@ -490,7 +914,13 @@ fn unknown_model_error(anthropic_surface: bool) -> Response {
 /// length. So for these endpoints we suppress ALL body-derived fields (digest,
 /// length, summary, AND payload), logging only non-body metadata.
 fn is_dashboard_auth_path(path: &str) -> bool {
-    matches!(path, "/dashboard/login" | "/dashboard/logout")
+    matches!(
+        path,
+        "/dashboard/login"
+            | "/dashboard/logout"
+            | "/dashboard/auth/key-login"
+            | "/dashboard/auth/logout"
+    )
 }
 
 /// Body-derived tracing fields for the inbound-request log line. `None` for a
@@ -2037,22 +2467,34 @@ fn json_type(value: &Value) -> &'static str {
 )]
 async fn post_responses(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let served = gateway.resolve_request_model(&request.model).await.0;
+    let authorization = authorize_inference(
+        auth.as_ref().map(|value| &value.0),
+        crate::upstream::InferenceEndpoint::Responses,
+        &requested,
+    )?;
+    let auth = auth.map(|value| value.0);
+    let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let wants_stream = request.stream;
     let stream = gateway
-        .stream_responses_with_capture(
+        .clone()
+        .stream_responses_with_capture_authorized_context(
             request,
             api_call_id.map(|extension| extension.0.0),
             persistence.map(|extension| extension.0),
+            authorization,
+            crate::upstream::InferenceEndpoint::Responses,
+            auth,
         )
         .await?;
     let response = if wants_stream {
-        stream_responses_response(stream)
+        stream_responses_response(stream, lease)
     } else {
         collect_responses_response(stream).await?
     };
@@ -2095,11 +2537,14 @@ async fn post_responses(
 )]
 async fn get_responses(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     match upgrade {
         Ok(upgrade) => upgrade
-            .on_upgrade(move |socket| responses_ws_serve(socket, gateway))
+            .on_upgrade(move |socket| {
+                responses_ws_serve(socket, gateway, auth.map(|value| value.0))
+            })
             .into_response(),
         Err(_) => {
             // Plain GET without an `Upgrade: websocket` header. 426 tells the
@@ -2119,7 +2564,11 @@ async fn get_responses(
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
 /// The Responses-WS socket loop. See [`get_responses`] for the protocol rationale.
-async fn responses_ws_serve(socket: WebSocket, gateway: Arc<Gateway>) {
+async fn responses_ws_serve(
+    socket: WebSocket,
+    gateway: Arc<Gateway>,
+    auth: Option<crate::authz::AuthContext>,
+) {
     // `split` so the inbound `recv` and outbound `send` can be raced in the same
     // `select!` without a double-`&mut` borrow conflict (the dashboard/debug WS
     // loops use the same pattern).
@@ -2167,9 +2616,44 @@ async fn responses_ws_serve(socket: WebSocket, gateway: Arc<Gateway>) {
     };
     request.stream = true;
 
+    let requested = request.model.clone();
+    let authorization = match authorize_inference(
+        auth.as_ref(),
+        crate::upstream::InferenceEndpoint::Responses,
+        &requested,
+    ) {
+        Ok(authorization) => authorization,
+        Err(_) => {
+            let _ = send_responses_ws_error(
+                &mut sink,
+                "permission_denied",
+                "the API key is not authorized for the requested model",
+            )
+            .await;
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
+    let _lease = match acquire_inference_session(&gateway, auth.as_ref()).await {
+        Ok(lease) => lease,
+        Err(err) => {
+            let _ = send_responses_ws_error(&mut sink, "permission_denied", &err.to_string()).await;
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
     // 3. Run the turn through the SAME engine path as the HTTP POST.
     let event_stream = match gateway
-        .stream_responses_with_api_call_id(request, None)
+        .clone()
+        .stream_responses_authorized_with_context(
+            request,
+            None,
+            authorization,
+            crate::upstream::InferenceEndpoint::Responses,
+            auth,
+        )
         .await
     {
         Ok(s) => s,
@@ -2273,6 +2757,7 @@ async fn send_responses_ws_error(
 )]
 async fn post_messages(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
     Json(request): Json<AnthropicRequest>,
@@ -2283,6 +2768,7 @@ async fn post_messages(
         request,
         api_call_id,
         persistence.map(|extension| extension.0),
+        auth.map(|value| value.0),
     )
     .await
     {
@@ -2305,7 +2791,11 @@ async fn post_messages(
     ),
     security(("bearer" = []), ("api_key" = []))
 )]
-async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
+async fn post_count_tokens(
+    State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
+    body: Bytes,
+) -> Response {
     let request: AnthropicRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
@@ -2314,7 +2804,7 @@ async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> 
             )));
         }
     };
-    match handle_count_tokens(gateway, request).await {
+    match handle_count_tokens(gateway, request, auth.map(|value| value.0)).await {
         Ok(response) => response,
         Err(err) => anthropic_error_response(err),
     }
@@ -2323,6 +2813,7 @@ async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> 
 async fn handle_count_tokens(
     gateway: Arc<Gateway>,
     request: AnthropicRequest,
+    auth: Option<crate::authz::AuthContext>,
 ) -> AppResult<Response> {
     use crate::engine::TokenizeCapability;
 
@@ -2333,6 +2824,11 @@ async fn handle_count_tokens(
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
+    let authorization = authorize_inference(
+        auth.as_ref(),
+        crate::upstream::InferenceEndpoint::CountTokens,
+        &original_model,
+    )?;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let roles = gateway.roles_for_request(&original_model, &resolved_model);
     let lowered = responses_to_chat::lower_request_with_image_agent_and_roles(
@@ -2370,7 +2866,13 @@ async fn handle_count_tokens(
         None,
         None,
     )
-    .with_thinking_override(thinking_override);
+    .with_thinking_override(thinking_override)
+    .with_authorization(
+        authorization,
+        crate::upstream::InferenceEndpoint::CountTokens,
+    );
+
+    let _lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
 
     match gateway.upstream_client().count_tokens(&backend).await {
         Ok(Some(count)) => {
@@ -2412,12 +2914,20 @@ async fn handle_count_tokens(
 )]
 async fn post_chat_completions(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
+    let authorization = authorize_inference(
+        auth.as_ref().map(|value| &value.0),
+        crate::upstream::InferenceEndpoint::ChatCompletions,
+        &requested,
+    )?;
+    let auth = auth.map(|value| value.0);
+    let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let wants_stream = request.stream;
     let include_usage = request
         .stream_options
@@ -2425,15 +2935,19 @@ async fn post_chat_completions(
         .is_some_and(|options| options.include_usage);
     let responses_request = chat_completions::convert_request(request)?;
     let stream = gateway
-        .stream_responses_with_capture(
+        .clone()
+        .stream_responses_with_capture_authorized_context(
             responses_request,
             api_call_id.map(|extension| extension.0.0),
             persistence.map(|extension| extension.0),
+            authorization,
+            crate::upstream::InferenceEndpoint::ChatCompletions,
+            auth,
         )
         .await?;
 
     let response = if wants_stream {
-        stream_chat_completions_response(model.clone(), include_usage, stream)
+        stream_chat_completions_response(model.clone(), include_usage, stream, lease)
     } else {
         collect_chat_completions_response(model.clone(), stream).await?
     };
@@ -2457,14 +2971,56 @@ async fn post_chat_completions(
 )]
 async fn post_completions(
     State(gateway): State<Arc<Gateway>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
+    let request_metadata = auth
+        .as_ref()
+        .map(|_| {
+            let value = serde_json::from_slice::<Value>(&body)
+                .map_err(|_| AppError::bad_request("request body must be valid JSON"))?;
+            let model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| AppError::bad_request("request body must include a model"))?;
+            let streaming = value
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Ok::<_, AppError>((model, streaming))
+        })
+        .transpose()?;
+    let authorization =
+        if let (Some(context), Some((model, _))) = (auth.as_ref(), request_metadata.as_ref()) {
+            authorize_inference(
+                Some(&context.0),
+                crate::upstream::InferenceEndpoint::Completions,
+                model,
+            )?
+        } else {
+            crate::upstream::AuthorizationScope::unrestricted()
+        };
+    let auth = auth.map(|value| value.0);
+    let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let response = gateway
         .upstream_client()
-        .proxy_completions(headers, body)
+        .proxy_completions(
+            crate::upstream::ProxyCompletionsRequest::new(headers, body)
+                .with_authorization(authorization),
+        )
         .await?;
-    Ok(proxy_upstream_response(response))
+    let accounting = request_metadata.map(|(model, streaming)| {
+        RawCompletionAccounting::new(
+            Arc::clone(&gateway),
+            auth,
+            model,
+            streaming,
+            response.status().is_success(),
+        )
+    });
+    Ok(proxy_upstream_response(response, lease, accounting))
 }
 
 async fn handle_post_messages(
@@ -2472,9 +3028,16 @@ async fn handle_post_messages(
     request: AnthropicRequest,
     api_call_id: Option<String>,
     persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+    auth: Option<crate::authz::AuthContext>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
+    let authorization = authorize_inference(
+        auth.as_ref(),
+        crate::upstream::InferenceEndpoint::Messages,
+        &requested,
+    )?;
+    let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let wants_stream = request.stream;
     let suppress_reasoning = !matches!(
         request.thinking.as_ref(),
@@ -2482,11 +3045,19 @@ async fn handle_post_messages(
     );
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let stream = gateway
-        .stream_responses_with_capture(responses_request, api_call_id, persistence)
+        .clone()
+        .stream_responses_with_capture_authorized_context(
+            responses_request,
+            api_call_id,
+            persistence,
+            authorization,
+            crate::upstream::InferenceEndpoint::Messages,
+            auth,
+        )
         .await?;
 
     let response = if wants_stream {
-        stream_anthropic_response(model.clone(), suppress_reasoning, stream)?
+        stream_anthropic_response(model.clone(), suppress_reasoning, stream, lease)?
     } else {
         collect_anthropic_response(model.clone(), suppress_reasoning, stream).await?
     };
@@ -2692,9 +3263,11 @@ fn stream_chat_completions_response(
     model: String,
     include_usage: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
+    lease: Option<crate::authz::SessionLease>,
 ) -> Response {
     let (tx, rx) = mpsc::channel(128);
     tokio::spawn(async move {
+        let _lease = lease;
         let mut converter = ChatCompletionStreamConverter::new(model, include_usage);
         let mut stream = std::pin::pin!(stream);
         'streaming: while let Some(event) = stream.next().await {
@@ -2732,9 +3305,11 @@ fn stream_anthropic_response(
     model: String,
     suppress_reasoning: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
+    lease: Option<crate::authz::SessionLease>,
 ) -> AppResult<Response> {
     let (tx, rx) = mpsc::channel(128);
     tokio::spawn(async move {
+        let _lease = lease;
         let mut converter =
             AnthropicStreamConverter::with_reasoning_suppression(model, suppress_reasoning);
         let mut stream = std::pin::pin!(stream);
@@ -2783,16 +3358,262 @@ fn stream_anthropic_response(
     Ok(response)
 }
 
-fn proxy_upstream_response(response: reqwest::Response) -> Response {
+fn proxy_upstream_response(
+    response: reqwest::Response,
+    lease: Option<crate::authz::SessionLease>,
+    accounting: Option<RawCompletionAccounting>,
+) -> Response {
     let status = response.status();
     let upstream_headers = response.headers().clone();
     let mut builder = Response::builder().status(status);
     if let Some(headers) = builder.headers_mut() {
         copy_proxy_response_headers(&upstream_headers, headers);
     }
+    let mut upstream = Box::pin(response.bytes_stream());
+    let mut accounting = accounting;
+    let stream = futures::stream::poll_fn(move |cx| {
+        let _keep_lease_alive = &lease;
+        match upstream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                if let Some(accounting) = accounting.as_mut() {
+                    accounting.push(&bytes);
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(accounting) = accounting.as_mut() {
+                    accounting.finish("failed");
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                if let Some(accounting) = accounting.as_mut() {
+                    accounting.finish(if accounting.upstream_success {
+                        "completed"
+                    } else {
+                        "failed"
+                    });
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    });
     builder
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::from_stream(stream))
         .expect("valid upstream proxy response")
+}
+
+const COMPLETIONS_USAGE_PARSE_LIMIT_BYTES: usize = 256 * 1024;
+
+struct RawCompletionAccounting {
+    gateway: Arc<Gateway>,
+    context: Option<crate::authz::AuthContext>,
+    requested_model: String,
+    parser: RawCompletionUsageParser,
+    upstream_success: bool,
+}
+
+impl RawCompletionAccounting {
+    fn new(
+        gateway: Arc<Gateway>,
+        context: Option<crate::authz::AuthContext>,
+        requested_model: String,
+        streaming: bool,
+        upstream_success: bool,
+    ) -> Self {
+        Self {
+            gateway,
+            context,
+            requested_model,
+            parser: RawCompletionUsageParser::new(streaming),
+            upstream_success,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.parser.push(bytes);
+    }
+
+    fn finish(&mut self, status: &'static str) {
+        let Some(context) = self.context.take() else {
+            return;
+        };
+        let (served_model, usage) = self.parser.finish();
+        self.gateway.record_authenticated_usage_values(
+            Some(context),
+            None,
+            crate::upstream::InferenceEndpoint::Completions,
+            self.requested_model.clone(),
+            status,
+            served_model,
+            None,
+            None,
+            usage,
+        );
+    }
+}
+
+impl Drop for RawCompletionAccounting {
+    fn drop(&mut self) {
+        self.finish("cancelled");
+    }
+}
+
+enum RawCompletionUsageParser {
+    Json {
+        body: Vec<u8>,
+        overflowed: bool,
+    },
+    Sse {
+        pending: Vec<u8>,
+        overflowed_line: bool,
+        served_model: Option<String>,
+        usage: Option<crate::dashboard_flow::FlowUsage>,
+    },
+}
+
+impl RawCompletionUsageParser {
+    fn new(streaming: bool) -> Self {
+        if streaming {
+            Self::Sse {
+                pending: Vec::new(),
+                overflowed_line: false,
+                served_model: None,
+                usage: None,
+            }
+        } else {
+            Self::Json {
+                body: Vec::new(),
+                overflowed: false,
+            }
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Json { body, overflowed } => {
+                if *overflowed {
+                    return;
+                }
+                let remaining = COMPLETIONS_USAGE_PARSE_LIMIT_BYTES.saturating_sub(body.len());
+                if bytes.len() > remaining {
+                    body.clear();
+                    *overflowed = true;
+                } else {
+                    body.extend_from_slice(bytes);
+                }
+            }
+            Self::Sse {
+                pending,
+                overflowed_line,
+                served_model,
+                usage,
+            } => {
+                for &byte in bytes {
+                    if byte == b'\n' {
+                        if !*overflowed_line {
+                            parse_completion_sse_line(pending, served_model, usage);
+                        }
+                        pending.clear();
+                        *overflowed_line = false;
+                    } else if !*overflowed_line {
+                        if pending.len() == COMPLETIONS_USAGE_PARSE_LIMIT_BYTES {
+                            pending.clear();
+                            *overflowed_line = true;
+                        } else {
+                            pending.push(byte);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) -> (Option<String>, Option<crate::dashboard_flow::FlowUsage>) {
+        match self {
+            Self::Json { body, overflowed } => {
+                if *overflowed {
+                    return (None, None);
+                }
+                serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .map(|value| completion_usage_from_value(&value))
+                    .unwrap_or_default()
+            }
+            Self::Sse {
+                pending,
+                overflowed_line,
+                served_model,
+                usage,
+            } => {
+                if !*overflowed_line && !pending.is_empty() {
+                    parse_completion_sse_line(pending, served_model, usage);
+                }
+                (served_model.take(), usage.take())
+            }
+        }
+    }
+}
+
+fn parse_completion_sse_line(
+    line: &[u8],
+    served_model: &mut Option<String>,
+    usage: &mut Option<crate::dashboard_flow::FlowUsage>,
+) {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let Some(data) = line.strip_prefix(b"data:") else {
+        return;
+    };
+    let data = data.strip_prefix(b" ").unwrap_or(data);
+    if data == b"[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(data) else {
+        return;
+    };
+    let (model, parsed_usage) = completion_usage_from_value(&value);
+    if model.is_some() {
+        *served_model = model;
+    }
+    if parsed_usage.is_some() {
+        *usage = parsed_usage;
+    }
+}
+
+fn completion_usage_from_value(
+    value: &Value,
+) -> (Option<String>, Option<crate::dashboard_flow::FlowUsage>) {
+    let served_model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let usage = value.get("usage").and_then(|usage| {
+        let prompt = usage.get("prompt_tokens")?.as_i64()?;
+        let completion = usage.get("completion_tokens")?.as_i64()?;
+        let total = usage.get("total_tokens")?.as_i64()?;
+        if prompt < 0 || completion < 0 || total < 0 {
+            return None;
+        }
+        let cached = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0);
+        let reasoning = usage
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0);
+        Some(crate::dashboard_flow::FlowUsage {
+            prompt,
+            completion,
+            total,
+            cached,
+            reasoning,
+        })
+    });
+    (served_model, usage)
 }
 
 fn copy_proxy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
@@ -2833,8 +3654,12 @@ fn responses_wire_event_data(event: &crate::engine::SseEvent) -> String {
     data.to_string()
 }
 
-fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) -> Response {
-    let mapped = stream.map(|event| {
+fn stream_responses_response(
+    stream: ReceiverStream<crate::engine::SseEvent>,
+    lease: Option<crate::authz::SessionLease>,
+) -> Response {
+    let mapped = stream.map(move |event| {
+        let _keep_lease_alive = &lease;
         let data = responses_wire_event_data(&event);
         Ok::<_, Infallible>(
             axum::response::sse::Event::default()
@@ -2977,29 +3802,35 @@ async fn get_models(
     Query(query): Query<ModelsListQuery>,
     State(gateway): State<Arc<Gateway>>,
     identity: Option<Extension<ClientIdentity>>,
+    auth: Option<Extension<crate::authz::AuthContext>>,
 ) -> AppResult<Response> {
     let anthropic_models = is_anthropic_models_request(&headers);
     let response = gateway.upstream_client().list_models().await?;
-    let (status, body, mut etag) = collect_models_response(response).await?;
-    let body = if let Some(Extension(identity)) = identity {
+    let (status, mut body, etag) = collect_models_response(response).await?;
+    let identity_filtered = if let Some(Extension(identity)) = identity.as_ref() {
         if identity.allowed_models().is_empty() {
-            body
+            false
         } else {
-            // The upstream ETag describes the unfiltered catalog, not this
-            // key-specific view, so it cannot be shared across auth scopes.
-            etag = None;
-            filter_models_for_identity(body, &identity)
+            filter_models_body_for_identity(&mut body, identity);
+            true
         }
     } else {
-        body
+        false
     };
+    if let Some(context) = auth.as_ref() {
+        filter_models_body(&mut body, &context.0);
+    }
     let body = if anthropic_models {
         transform_models_response_for_anthropic(body, &query, gateway.config())?
     } else {
         body
     };
     let mut headers = HeaderMap::new();
-    if !anthropic_models && let Some(etag) = etag {
+    if auth.is_none()
+        && !identity_filtered
+        && !anthropic_models
+        && let Some(etag) = etag
+    {
         headers.insert(
             http::header::ETAG,
             HeaderValue::from_str(&etag)
@@ -3009,7 +3840,7 @@ async fn get_models(
     Ok((status, headers, Json(body)).into_response())
 }
 
-fn filter_models_for_identity(mut body: Value, identity: &ClientIdentity) -> Value {
+fn filter_models_body_for_identity(body: &mut Value, identity: &ClientIdentity) {
     fn retain_allowed(entries: &mut Vec<Value>, identity: &ClientIdentity) {
         entries.retain(|entry| {
             entry
@@ -3019,7 +3850,7 @@ fn filter_models_for_identity(mut body: Value, identity: &ClientIdentity) -> Val
         });
     }
 
-    match &mut body {
+    match body {
         Value::Array(entries) => retain_allowed(entries, identity),
         Value::Object(map) => {
             if let Some(entries) = map.get_mut("data").and_then(Value::as_array_mut) {
@@ -3031,7 +3862,34 @@ fn filter_models_for_identity(mut body: Value, identity: &ClientIdentity) -> Val
         }
         _ => {}
     }
-    body
+}
+
+fn filter_models_body(body: &mut Value, context: &crate::authz::AuthContext) {
+    let models = match body {
+        Value::Array(models) => Some(models),
+        Value::Object(map) => {
+            let key = if map.contains_key("data") {
+                "data"
+            } else {
+                "models"
+            };
+            map.get_mut(key).and_then(Value::as_array_mut)
+        }
+        _ => None,
+    };
+    if let Some(models) = models {
+        models.retain(|model| {
+            model
+                .as_str()
+                .or_else(|| {
+                    model
+                        .get("id")
+                        .or_else(|| model.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .is_some_and(|id| context.allows_model("models", id))
+        });
+    }
 }
 
 fn is_anthropic_models_request(headers: &HeaderMap) -> bool {
@@ -3475,6 +4333,8 @@ mod tests {
         );
         // Logout is symmetric (bodyless, but the same path class).
         assert!(body_log_fields("/dashboard/logout", &Bytes::new()).is_none());
+        assert!(body_log_fields("/dashboard/auth/key-login", &body).is_none());
+        assert!(body_log_fields("/dashboard/auth/logout", &Bytes::new()).is_none());
 
         // A normal inference path still logs the length + digest + summary, and
         // that digest is over the body (never resembles the bare-token digest).
@@ -3647,5 +4507,52 @@ mod tests {
         );
         // Unknown encoding ⇒ Err (caller returns 415, not a silent 400 JSON parse).
         assert!(super::decode_content_encoding(&body, "snappy").is_err());
+    }
+
+    #[test]
+    fn raw_completions_nonstream_usage_preserves_optional_breakdowns() {
+        let mut parser = super::RawCompletionUsageParser::new(false);
+        parser.push(
+            br#"{"model":"served-v1","usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#,
+        );
+        let (model, usage) = parser.finish();
+        assert_eq!(model.as_deref(), Some("served-v1"));
+        assert_eq!(
+            usage,
+            Some(crate::dashboard_flow::FlowUsage {
+                prompt: 12,
+                completion: 5,
+                total: 17,
+                cached: Some(3),
+                reasoning: Some(2),
+            })
+        );
+    }
+
+    #[test]
+    fn raw_completions_stream_usage_survives_arbitrary_chunking() {
+        let wire = b"data: {\"model\":\"served-v2\",\"choices\":[{\"text\":\"ok\"}]}\r\n\r\ndata: {\"model\":\"served-v2\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\ndata: [DONE]\n\n";
+        for split in 0..=wire.len() {
+            let mut parser = super::RawCompletionUsageParser::new(true);
+            parser.push(&wire[..split]);
+            parser.push(&wire[split..]);
+            let (model, usage) = parser.finish();
+            assert_eq!(model.as_deref(), Some("served-v2"), "split={split}");
+            assert_eq!(usage.unwrap().total, 10, "split={split}");
+        }
+    }
+
+    #[test]
+    fn raw_completions_bounded_parser_reports_oversize_as_unavailable() {
+        let mut nonstream = super::RawCompletionUsageParser::new(false);
+        nonstream.push(&vec![b'x'; super::COMPLETIONS_USAGE_PARSE_LIMIT_BYTES + 1]);
+        assert_eq!(nonstream.finish(), (None, None));
+
+        let mut streaming = super::RawCompletionUsageParser::new(true);
+        streaming.push(&vec![b'x'; super::COMPLETIONS_USAGE_PARSE_LIMIT_BYTES + 1]);
+        streaming.push(b"\ndata: {\"model\":\"recovered\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n");
+        let (model, usage) = streaming.finish();
+        assert_eq!(model.as_deref(), Some("recovered"));
+        assert_eq!(usage.unwrap().total, 2);
     }
 }

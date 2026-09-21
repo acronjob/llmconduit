@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 async-stream = "0.3"
-chrono = { version = "0.4", features = ["clock"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "macros", "ws"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -14,6 +15,7 @@ dirs = "6"
 eventsource-stream = "0.2"
 futures = "0.3"
 hex = "0.4"
+iroh = { version = "1.2", default-features = false, features = ["tls-ring"] }
 # Dashboard session-cookie auth (D7): HMAC-SHA256 signing (`hmac` + the existing
 # `sha2`), constant-time comparison of tokens/MACs (`subtle`), and base64url
 # cookie encoding (`base64`). Secrets are read from the environment in the auth
@@ -39,6 +41,7 @@ http-body = "1"
 include_dir = "0.7"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -51,7 +54,7 @@ toml = { version = "1", default-features = false, features = ["parse", "serde", 
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "migrate", "macros"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 # D6 AbortHub: `CancellationToken` for server-side flow kill. Race-free `cancelled()`
 # future (no lost-wakeup, unlike a hand-rolled `Notify`) composed alongside every

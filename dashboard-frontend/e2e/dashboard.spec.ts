@@ -10,6 +10,33 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on login shell').toEqual([]);
   });
 
+  test('navigation and status controls reflow at half-screen width', async ({ page, consoleErrors }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    await login(page);
+    await page.waitForTimeout(800);
+
+    const dimensions = await page.evaluate(() => {
+      const nav = document.querySelector('nav');
+      const stats = document.querySelector('[data-testid="stats-strip"]');
+      return {
+        viewport: innerWidth,
+        document: document.documentElement.scrollWidth,
+        navClient: nav?.clientWidth ?? 0,
+        navScroll: nav?.scrollWidth ?? 0,
+        statsClient: stats?.clientWidth ?? 0,
+        statsScroll: stats?.scrollWidth ?? 0,
+      };
+    });
+
+    expect(dimensions.document).toBeLessThanOrEqual(dimensions.viewport);
+    expect(dimensions.navScroll).toBeLessThanOrEqual(dimensions.navClient);
+    expect(dimensions.statsScroll).toBeLessThanOrEqual(dimensions.statsClient);
+    await expect(page.getByRole('navigation').getByRole('button', { name: 'Access', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Logout', exact: true })).toBeVisible();
+    await expect(page.getByTestId('window-selector')).toBeVisible();
+    expect(consoleErrors, 'console errors at half-screen width').toEqual([]);
+  });
+
   // Gap 01: the stats strip must be HONEST under live (mock-streamed) traffic — real
   // numeric values, not the all-`0.0` the live WS tile used to ship. The mock streams a
   // snapshot + a metric_tick (active_streams/tokens_per_sec/cost_per_min all > 0), so the
@@ -22,7 +49,7 @@ test.describe('Argus dashboard', () => {
 
     // tok/s + $/min + active are the fields the OLD WS tile hard-coded to 0 — they must
     // now carry real values (the mock seeds them > 0), proving live flows reach the strip.
-    for (const key of ['active_streams', 'tokens_per_sec', 'cost_per_min', 'reqs_per_sec']) {
+    for (const key of ['active_streams', 'prefill_tokens_per_sec', 'decode_tokens_per_sec', 'cost_per_min', 'reqs_per_sec']) {
       const value = page.getByTestId(`chip-${key}`).getByTestId('chip-value');
       await expect(value).toBeVisible();
       const text = (await value.textContent())?.trim() ?? '';
@@ -38,7 +65,8 @@ test.describe('Argus dashboard', () => {
     expect(await quality('reqs_per_sec')).toBe('measured');
     expect(await quality('active_streams')).toBe('measured');
     expect(await quality('p50')).toBe('derived');
-    expect(await quality('tokens_per_sec')).toBe('derived');
+    expect(await quality('prefill_tokens_per_sec')).toBe('derived');
+    expect(await quality('decode_tokens_per_sec')).toBe('derived');
     expect(await quality('cost_per_min')).toBe('estimated');
 
     expect(consoleErrors, 'console errors on the stats strip').toEqual([]);

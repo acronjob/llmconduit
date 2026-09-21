@@ -81,7 +81,7 @@
       </div>
       <div id="token-fields" hidden>
         <label for="token">Access token</label>
-        <input id="token" name="token" type="password" autocomplete="off" spellcheck="false">
+        <input id="token" name="token" type="password" autocomplete="current-password" spellcheck="false">
       </div>
       <button id="submit" type="submit">Sign in</button>
       <button id="toggle" type="button" class="link">Use an access token instead</button>
@@ -117,10 +117,11 @@
       errorEl.textContent = "";
       submitBtn.disabled = true;
       try {
+        const delegated = tokenMode && tokenInput.value.startsWith("llmc_");
         const body = tokenMode
-          ? { token: tokenInput.value }
+          ? (delegated ? { api_key: tokenInput.value } : { token: tokenInput.value })
           : { username: userInput.value, password: passInput.value };
-        const response = await fetch("/dashboard/login", {
+        const response = await fetch(delegated ? "/dashboard/auth/key-login" : "/dashboard/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),

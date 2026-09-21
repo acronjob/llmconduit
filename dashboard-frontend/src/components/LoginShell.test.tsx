@@ -32,6 +32,19 @@ describe('LoginShell', () => {
     await waitFor(() => expect(authStore.getState().authenticated).toBe(true));
   });
 
+  it('uses delegated key login for an llmc_ management key', async () => {
+    const login = vi.fn();
+    const keyLogin = vi.fn().mockResolvedValue(undefined);
+    const client = { login, keyLogin } as unknown as DashboardClient;
+    render(<LoginShell client={client} />);
+
+    fireEvent.change(screen.getByLabelText('Dashboard token'), { target: { value: 'llmc_delegate' } });
+    fireEvent.click(screen.getByRole('button', { name: /sign in/i }));
+
+    await waitFor(() => expect(keyLogin).toHaveBeenCalledWith('llmc_delegate'));
+    expect(login).not.toHaveBeenCalled();
+  });
+
   it('shows an error and stays unauthenticated when login rejects', async () => {
     const login = vi.fn().mockRejectedValue(new Error('bad'));
     const client = { login } as unknown as DashboardClient;

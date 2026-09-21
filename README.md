@@ -42,6 +42,53 @@ upstream_base_url: "http://127.0.0.1:8000/v1"
 upstream_model: "Qwen3.5"
 ```
 
+### Inference API keys
+
+Inference authentication is opt-in and defaults to the legacy-compatible
+`disabled` mode. To enable fail-closed API-key enforcement, configure a
+dedicated SQLite store and supply the verifier pepper through the environment:
+
+```yaml
+auth:
+  mode: enforce
+  store_path: "/var/lib/llmconduit/auth.sqlite3"
+```
+
+```bash
+export LLMCONDUIT_AUTH_PEPPER='a-long-random-environment-only-secret'
+# Required only on the first startup of an empty auth store.
+export LLMCONDUIT_AUTH_BOOTSTRAP_KEY='llmc_<at-least-27-more-random-characters>'
+```
+
+The bootstrap key receives wildcard inference access. Subsequent keys are
+created from the dashboard **Access** view and are displayed exactly once;
+only an HMAC-SHA256 verifier and short non-secret prefix are stored. Clients may
+send either `Authorization: Bearer llmc_...`, a raw `Authorization` value, or
+`x-api-key`. Missing/invalid credentials receive `401`; valid keys without an
+endpoint/model grant receive `403`. Authenticated `/v1/models` responses are
+filtered to the caller's grants and upstream ETags are stripped.
+
+Key creation and revocation use the existing dashboard session and mutation
+gate, so start with `--with-debug-ui` and set
+`LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`; browser writes also require the
+dashboard CSRF token. The pepper and bootstrap key are never persisted in the
+YAML config or returned by read APIs.
+
+To import current OpenRouter endpoint pricing into the authorization store,
+set the management credential in the environment and name each model to sync:
+
+```bash
+export OPENROUTER_API_KEY='your-openrouter-management-key'
+llmconduit pricing sync openrouter \
+  --model openai/gpt-4.1 \
+  --model anthropic/claude-sonnet-4
+```
+
+The command uses the same bounded importer and SQLite snapshots as the
+dashboard pricing action. Operator-configured price overrides retain
+precedence; unavailable token/cache price components remain unavailable rather
+than being reported as zero.
+
 Multi-upstream model routing:
 
 ```yaml
@@ -836,6 +883,7 @@ LLMCONDUIT_PERSISTENCE_QUEUE_CAPACITY
 LLMCONDUIT_PERSISTENCE_RETENTION_DAYS
 LLMCONDUIT_REQUIRE_AUTH
 LLMCONDUIT_CONVERSATION_ID_HEADER
+LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS
 LLMCONDUIT_DASHBOARD_TOKEN
 LLMCONDUIT_DASHBOARD_SESSION_KEY
 LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN
@@ -845,9 +893,31 @@ LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE
 LLMCONDUIT_DASHBOARD_CLIENT_HEADER
 BRAVE_SEARCH_API_KEY
 OPENAI_API_KEY
+OPENROUTER_API_KEY
 ```
 
 `OPENAI_API_KEY` is used as a fallback upstream API key.
+
+Provider cache metrics are optional, dashboard-only aggregate observability.
+Targets are accepted only from operator configuration, never from dashboard
+request parameters, and each URL must point exactly at an HTTP(S) `/metrics`
+path. They may be attached to the primary or any configured/fallback upstream:
+
+```yaml
+upstreams:
+  - name: local-vllm
+    upstream_base_url: http://127.0.0.1:8000/v1
+    metrics_url: http://127.0.0.1:8000/metrics
+    metrics_source: vllm
+```
+
+```bash
+export LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=30
+```
+
+Scrapes run only with `--with-debug-ui`; failures retain the last good sample
+and never affect inference. These provider-level counters are not attributed to
+individual API keys or requests.
 
 ## Request Logs
 

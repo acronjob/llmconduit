@@ -20,7 +20,7 @@ use llmconduit::error::AppError;
 use llmconduit::monitor::MonitorHub;
 use llmconduit::replay::ReplayStore;
 use llmconduit::upstream::{
-    BackendChatRequest, UpstreamClient, UpstreamModelEntry, UpstreamStream,
+    BackendChatRequest, UpstreamClient, UpstreamModelEntry, UpstreamModelsResponse, UpstreamStream,
 };
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -549,7 +549,7 @@ impl UpstreamClient for ServingUpstream {
         ])))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, AppError> {
+    async fn list_models(&self) -> Result<UpstreamModelsResponse, AppError> {
         Err(AppError::internal("unused"))
     }
 

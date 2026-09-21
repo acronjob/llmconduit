@@ -76,6 +76,56 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     expect(unavailable?.context_limit ?? null).toBeNull();
     expect(unavailable?.context_limit).not.toBe(0);
   });
+
+  it('providers() and providerMetrics() return exact provider inventory and cache samples', async () => {
+    const client = new DashboardClient({ fetchImpl: mockFetch });
+    const providers = await client.providers();
+    expect(providers.providers.find((provider) => provider.provider_id === 'vllm-a')?.models.map((model) => model.id)).toContain('llama-3.1-70b');
+    expect(providers.providers.find((provider) => provider.provider_id === 'vllm-a')?.availability?.timezone).toBe('America/Chicago');
+
+    const metrics = await client.providerMetrics();
+    const vllm = metrics.providers.find((provider) => provider.provider === 'vllm-a');
+    expect(vllm?.source).toBe('vllm');
+    expect(vllm?.cache_hit_rate).toBeGreaterThan(0);
+  });
+});
+
+describe('DashboardClient — access management runtime validation', () => {
+  it('validates management responses and sends CSRF for mutations', async () => {
+    const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
+    const summary = await client.authSummary();
+    expect(summary.policy_epoch).toBeGreaterThan(0);
+    const users = await client.authUsers();
+    const created = await client.createAuthApiKey({ principal_id: users.users[0]!.id, name: 'test' });
+    expect(created.raw_key).toMatch(/^llmc_/);
+    const revoked = await client.revokeAuthApiKey(created.id);
+    expect(revoked.api_keys.find((key) => key.id === created.id)?.enabled).toBe(false);
+  });
+
+  it('rejects an invalid management response before it reaches the UI', async () => {
+    const fetchInvalid: typeof fetch = async () => new Response(JSON.stringify({ users: [{ id: 7 }] }), { status: 200 });
+    const client = new DashboardClient({ fetchImpl: fetchInvalid });
+    await expect(client.authUsers()).rejects.toThrow(/invalid response/);
+  });
+
+  it('accepts the backend audit outcome used for successful management events', async () => {
+    const fetchAudit: typeof fetch = async () => new Response(JSON.stringify({
+      events: [{
+        id: '1',
+        timestamp: '2026-09-20T12:06:19+00:00',
+        actor: 'bootstrap',
+        action: 'bootstrap.created',
+        target: 'key_bootstrap',
+        outcome: 'ok',
+        metadata: {},
+      }],
+    }), { status: 200 });
+    const client = new DashboardClient({ fetchImpl: fetchAudit });
+
+    await expect(client.authAudit()).resolves.toMatchObject({
+      events: [{ outcome: 'ok' }],
+    });
+  });
 });
 
 describe('readCsrfCookie', () => {

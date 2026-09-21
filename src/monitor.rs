@@ -1066,6 +1066,7 @@ impl MonitorState {
             .find(|record| record.request.response_id == response_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_timeline_event(
         &mut self,
         response_id: &str,

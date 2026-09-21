@@ -161,6 +161,10 @@ pub struct Gateway {
     /// case the auth-gated routes are simply not registered. NEVER built from
     /// the persisted `Config` (secrets are read from the environment).
     dashboard_auth: Option<Arc<crate::dashboard_auth::DashboardAuth>>,
+    /// Inference API-key authorization. Disabled by default for tests and
+    /// legacy configurations; the DI root attaches the validated enforce-mode
+    /// service before the router is built.
+    authz: Arc<crate::authz::AuthzService>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
     /// D4 published topology health: the latest versioned
     /// `Arc<ProviderHealthSnapshot>`, swapped by the publication task (1 s tick +
@@ -177,6 +181,10 @@ pub struct Gateway {
     /// (NOT the middleware); the 5 s snapshot task reads it under the fixed
     /// FlowStore→Metrics lock order.
     metrics: crate::metrics::MetricsLayer,
+    /// Optional provider-level cache observability. This registry contains only
+    /// aggregate operator-configured scrape results and is never used for
+    /// per-request/key accounting.
+    provider_metrics: crate::provider_metrics::ProviderMetricsRegistry,
     /// F1 (Topic F) durable per-turn capture handle (see `turn_capture.rs`).
     /// `TurnCapture::disabled()` when `turn_capture_dir` is unset -- every op
     /// a no-op (no thread, no alloc, no fs). Unlike the FlowStore/metrics/
@@ -244,6 +252,16 @@ pub struct Gateway {
 pub struct SseEvent {
     pub event: String,
     pub data: Value,
+}
+
+fn inference_endpoint_name(endpoint: crate::upstream::InferenceEndpoint) -> &'static str {
+    match endpoint {
+        crate::upstream::InferenceEndpoint::Responses => "responses",
+        crate::upstream::InferenceEndpoint::ChatCompletions => "chat",
+        crate::upstream::InferenceEndpoint::Messages => "messages",
+        crate::upstream::InferenceEndpoint::CountTokens => "count_tokens",
+        crate::upstream::InferenceEndpoint::Completions => "completions",
+    }
 }
 
 #[derive(Clone)]
@@ -770,11 +788,13 @@ impl Gateway {
             flow_store,
             abort_hub,
             dashboard_auth: None,
+            authz: Arc::new(crate::authz::AuthzService::default()),
             upstream_model_catalog: Arc::new(Mutex::new(None)),
             provider_health: ProviderHealthPublisher::default(),
             // D5: disabled by default (zero overhead); the DI root attaches an
             // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
             metrics: crate::metrics::MetricsLayer::disabled(),
+            provider_metrics: crate::provider_metrics::ProviderMetricsRegistry::default(),
             // F1: disabled by default (zero overhead); the DI root attaches an
             // enabled sink via `with_turn_capture` when `turn_capture_dir` is
             // configured -- independent of `--with-debug-ui`.
@@ -926,6 +946,18 @@ impl Gateway {
     /// off, in which case every metrics op is a no-op (zero lock, zero work).
     pub fn metrics(&self) -> &crate::metrics::MetricsLayer {
         &self.metrics
+    }
+
+    pub fn with_provider_metrics(
+        mut self,
+        provider_metrics: crate::provider_metrics::ProviderMetricsRegistry,
+    ) -> Self {
+        self.provider_metrics = provider_metrics;
+        self
+    }
+
+    pub fn provider_metrics(&self) -> crate::provider_metrics::ProviderMetricsRegistry {
+        self.provider_metrics.clone()
     }
 
     /// Attach the F1 [`TurnCapture`](crate::turn_capture::TurnCapture) sink (built in
@@ -1091,19 +1123,89 @@ impl Gateway {
         // SAME `{status, model, endpoint, upstream}` bucket — so a concurrent 5 s
         // snapshot can never split the count and the tokens across two different 1 s
         // slots.
-        self.metrics.record_terminal(
+        self.metrics.record_terminal_with_phases(
             status,
             inputs.model_served.as_deref(),
             &inputs.endpoint,
             inputs.upstream.as_deref(),
             elapsed_ms,
             inputs.usage,
+            inputs.prefill_ms,
+            inputs.decode_ms,
             // Gap 12: the evict-safe per-attempt trace (spec 03) feeds the per-provider
             // latency/error rings off the SAME terminal payload as `usage` — NOT a
             // re-read of the evictable FlowStore record, so a failed primary on a flow
             // whose record was pruned/evicted before finalize is still counted.
             &inputs.attempts,
         );
+    }
+
+    /// Schedule durable per-key terminal accounting off the async runtime.
+    /// `auth_request_id` is the idempotency key, so a defensive duplicate
+    /// finalize attempt cannot double-charge the request.
+    fn record_authenticated_usage(
+        &self,
+        context: Option<crate::authz::AuthContext>,
+        api_call_id: Option<String>,
+        endpoint: crate::upstream::InferenceEndpoint,
+        requested_model: String,
+        status: &'static str,
+        serving: &crate::upstream::ServingToken,
+    ) {
+        let (route, provider) = serving.snapshot();
+        let (served_model, usage) = serving.metrics_snapshot();
+        self.record_authenticated_usage_values(
+            context,
+            api_call_id,
+            endpoint,
+            requested_model,
+            status,
+            served_model,
+            provider,
+            route,
+            usage,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_authenticated_usage_values(
+        &self,
+        context: Option<crate::authz::AuthContext>,
+        api_call_id: Option<String>,
+        endpoint: crate::upstream::InferenceEndpoint,
+        requested_model: String,
+        status: &'static str,
+        served_model: Option<String>,
+        provider: Option<String>,
+        route: Option<String>,
+        usage: Option<crate::dashboard_flow::FlowUsage>,
+    ) {
+        let Some(context) = context else {
+            return;
+        };
+        let charge = usage.and_then(|usage| {
+            let price = served_model
+                .as_deref()
+                .and_then(|model| self.price_for(model))?;
+            let rates = crate::usage_accounting::UsageRates::from_model_price(price)?;
+            crate::usage_accounting::charge_for_usage(usage, rates)
+        });
+        let event = crate::usage_accounting::UsageEvent {
+            auth_request_id: context.auth_request_id.clone(),
+            api_call_id,
+            key_id: context.key_id.clone(),
+            principal_id: context.principal_id.clone(),
+            endpoint: inference_endpoint_name(endpoint).to_string(),
+            requested_model: Some(requested_model),
+            served_model,
+            provider,
+            route,
+            status: status.to_string(),
+            usage,
+            charge,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        context.record_usage(event);
     }
 
     /// Attach the D7 dashboard auth context (built from the environment in the
@@ -1123,6 +1225,19 @@ impl Gateway {
     /// refused registration.
     pub fn dashboard_auth(&self) -> Option<Arc<crate::dashboard_auth::DashboardAuth>> {
         self.dashboard_auth.clone()
+    }
+
+    pub fn with_authz(mut self, authz: crate::authz::AuthzService) -> Self {
+        self.authz = Arc::new(authz);
+        self
+    }
+
+    pub fn authz(&self) -> &crate::authz::AuthzService {
+        &self.authz
+    }
+
+    pub fn authz_arc(&self) -> Arc<crate::authz::AuthzService> {
+        Arc::clone(&self.authz)
     }
 
     /// Access the dashboard FlowStore (D1). `is_enabled()` is `false` when the
@@ -1161,14 +1276,20 @@ impl Gateway {
     /// A thin pass-through to [`Config::price_for`] so the dashboard REST handlers
     /// + the flow-cost roll-up resolve prices without reaching into `config()`.
     pub fn price_for(&self, model: &str) -> Option<crate::config::ModelPrice> {
-        self.config.price_for(model)
+        self.config
+            .price_for(model)
+            .or_else(|| self.authz.effective_price(model))
     }
 
     /// D13: the whole per-model price table (`/dashboard/api/topology` returns it,
     /// the Sankey colors edges from it). A borrow of the `Config`-owned map; empty
     /// when none is configured (contract-valid — an empty `price_table` validates).
-    pub fn price_table(&self) -> &std::collections::HashMap<String, crate::config::ModelPrice> {
-        &self.config.price_table
+    pub fn price_table(&self) -> std::collections::HashMap<String, crate::config::ModelPrice> {
+        let mut prices = self.authz.effective_price_table();
+        // Persisted/YAML operator configuration is the final authority. Imported
+        // averages and dashboard-written values only fill otherwise-unpriced models.
+        prices.extend(self.config.price_table.clone());
+        prices
     }
 
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {
@@ -1448,6 +1569,70 @@ impl Gateway {
         api_call_id: Option<String>,
         persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_capture_authorized_context(
+            request,
+            api_call_id,
+            persistence_capture,
+            crate::upstream::AuthorizationScope::unrestricted(),
+            crate::upstream::InferenceEndpoint::Responses,
+            None,
+        )
+        .await
+    }
+
+    /// Stream a canonical request while retaining the ingress authorization
+    /// scope through every tool-loop turn and backend rebuild. HTTP ingress uses
+    /// this entry point after authentication; internal and legacy callers keep
+    /// the unrestricted wrapper above.
+    pub async fn stream_responses_authorized(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_capture_authorized_context(
+            request,
+            api_call_id,
+            None,
+            authorization,
+            endpoint,
+            None,
+        )
+        .await
+    }
+
+    /// Authenticated HTTP ingress additionally supplies the identity used for
+    /// exactly-once terminal usage accounting. Keeping the context separate
+    /// from the candidate predicate ensures the raw credential is never retained.
+    pub async fn stream_responses_authorized_with_context(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+        auth_context: Option<crate::authz::AuthContext>,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_capture_authorized_context(
+            request,
+            api_call_id,
+            None,
+            authorization,
+            endpoint,
+            auth_context,
+        )
+        .await
+    }
+
+    pub(crate) async fn stream_responses_with_capture_authorized_context(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+        auth_context: Option<crate::authz::AuthContext>,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
         // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
         // telemetry guard built BELOW and every per-turn `BackendChatRequest` in
         // `run_turn` share the SAME `Arc` — the failover/routing layers tag
@@ -1600,6 +1785,14 @@ impl Gateway {
             if let Some(guard) = &capture_guard {
                 guard.finalize("failed", Some(&error_detail));
             }
+            self.record_authenticated_usage(
+                auth_context.clone(),
+                api_call_id.clone(),
+                endpoint,
+                model_requested.clone(),
+                "failed",
+                &serving_token,
+            );
             err
         };
 
@@ -1698,8 +1891,11 @@ impl Gateway {
             && let Some(api_call_id) = api_call_id.as_deref()
         {
             let normalized = crate::dashboard_flow::capture_body_from_value(&request);
-            self.flow_store()
-                .set_normalized(api_call_id, Some(model_requested), Some(normalized));
+            self.flow_store().set_normalized(
+                api_call_id,
+                Some(model_requested.clone()),
+                Some(normalized),
+            );
         }
         // Lower the canonical request to the upstream chat payload BEFORE
         // budgeting. The `?` surfaces any lowering/validation error (invalid
@@ -1827,6 +2023,10 @@ impl Gateway {
             .unwrap_or(0);
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
+        let accounting_context = auth_context.clone();
+        let accounting_api_call_id = api_call_id.clone();
+        let accounting_requested_model = model_requested.clone();
+        let accounting_serving_token = Arc::clone(&serving_token);
         tokio::spawn(async move {
             let result = gateway
                 .run_turn(
@@ -1856,6 +2056,8 @@ impl Gateway {
                     // Bounded four-hop state shared with the concrete upstream
                     // leaves. It is independent of disk turn capture.
                     persistence_capture,
+                    authorization,
+                    endpoint,
                     tx.clone(),
                     // D6: the flow's kill token, composed with every `tx.closed()`
                     // client-hangup check inside `run_turn` + its helpers.
@@ -1889,6 +2091,20 @@ impl Gateway {
                 ),
                 Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
             };
+            let accounting_status = match status {
+                crate::dashboard_flow::FlowStatus::Completed => "completed",
+                crate::dashboard_flow::FlowStatus::Cancelled => "cancelled",
+                crate::dashboard_flow::FlowStatus::Failed => "failed",
+                crate::dashboard_flow::FlowStatus::Open => "failed",
+            };
+            gateway.record_authenticated_usage(
+                accounting_context,
+                accounting_api_call_id,
+                endpoint,
+                accounting_requested_model,
+                accounting_status,
+                &accounting_serving_token,
+            );
             if let Some(guard) = &telemetry_guard {
                 guard.finalize(status, Some(reason.clone()));
                 // D5: record the terminal into the metrics rings (sources served
@@ -1935,6 +2151,15 @@ impl Gateway {
                         );
                     }
                 }
+            }
+            // Publish the successful terminal status only AFTER the authoritative
+            // FlowStore record has finalized. Dashboard WS enrichment resolves this
+            // monitor event back to the record; emitting inside `run_turn` raced the
+            // finalize above and could permanently publish a stale `open` status.
+            if status == crate::dashboard_flow::FlowStatus::Completed {
+                gateway
+                    .monitor
+                    .emit(response_id.clone(), MonitorEventKind::Completed);
             }
             // F1c: report the SAME engine terminal to the capture guard (status +
             // reason come from the engine seam ONLY, never the served tee). Idempotent
@@ -2209,6 +2434,11 @@ impl Gateway {
         // FlowStore so persistence-only production records true client TTFT.
         persistence_phases: Option<crate::flow_persistence::PersistencePhaseClock>,
         persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+        // Request-local authorization is immutable and reused for every turn in
+        // the server-tool loop. Provider/route selection still occurs downstream,
+        // where candidates are checked before dispatch or capacity mutation.
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
         tx: mpsc::Sender<SseEvent>,
         // D6: the flow's cancellation token (registered in the AbortHub by the L1 guard
         // under `api_call_id`). COMPOSED with — never a replacement for — every existing
@@ -2662,6 +2892,7 @@ impl Gateway {
                 Some(response_id.clone()),
                 Some(Arc::clone(&serving_token)),
             )
+            .with_authorization(authorization.clone(), endpoint)
             .with_thinking_override(request.thinking)
             // F1d: attach the turn-capture handle (see above) so the leaf's
             // `upstream_request` write can reach this turn's artifact.
@@ -2809,7 +3040,8 @@ impl Gateway {
                     // production hot path — no `api_call_id` threaded AND the monitor
                     // disabled — keeping `MonitorHub::disabled()` truly zero-overhead.
                     // Borrow `usage` here; it is MOVED into `turn_usage` below.
-                    if api_call_id.is_some() || self.monitor.is_enabled() {
+                    if api_call_id.is_some() || self.monitor.is_enabled() || self.authz.is_enabled()
+                    {
                         // `total` is the flow's running cumulative (turn_base + this
                         // cumulative chunk), NOT an increment — so a multi-chunk turn
                         // does not double-count and a midstream cancel keeps this LAST
@@ -2822,6 +3054,11 @@ impl Gateway {
                             // final usage into the metrics layer even if the FlowStore
                             // record is pruned/evicted before finalize. Same dashboard-only
                             // path as `record_usage`, so the disabled path stays zero-cost.
+                            serving_token.set_usage(total);
+                        } else if self.authz.is_enabled() {
+                            // Auth accounting is independent of the debug UI. Keep
+                            // the cumulative total on the shared terminal token even
+                            // when no FlowStore/api_call_id exists.
                             serving_token.set_usage(total);
                         }
                         // D3: emit the usage event to the monitor hub. The `/debug/ws`
@@ -2896,7 +3133,9 @@ impl Gateway {
                             // on an `api_call_id` so the production hot path (no dashboard)
                             // skips even the disabled-store early-return's call overhead.
                             if let Some(api_call_id) = &api_call_id {
-                                self.flow_store().stamp_first_content_delta(api_call_id);
+                                let stamped =
+                                    self.flow_store().stamp_first_content_delta(api_call_id);
+                                serving_token.stamp_first_content_delta(stamped);
                             }
                             if let Some(phases) = &persistence_phases {
                                 phases.stamp_first_content_delta();
@@ -3372,12 +3611,12 @@ impl Gateway {
         // hot path skips the call. The `?`s above mean we only reach here on a clean
         // emit, which is exactly the semantics we want.
         if let Some(api_call_id) = &api_call_id {
-            self.flow_store().stamp_stream_end(api_call_id);
+            let stamped = self.flow_store().stamp_stream_end(api_call_id);
+            serving_token.stamp_stream_end(stamped);
         }
         if let Some(phases) = &persistence_phases {
             phases.stamp_stream_end();
         }
-        self.monitor.emit(response_id, MonitorEventKind::Completed);
         // F1c (finding #3): carry the terminal shape to the seam so the capture
         // artifact records `incomplete` for a max-token truncation. `is_incomplete`
         // was already derived above from the upstream `finish_reason` (the same bit
@@ -3517,7 +3756,7 @@ impl Gateway {
     async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {
         let mut cache = self.upstream_model_catalog.lock().await;
         if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < UPSTREAM_MODEL_CATALOG_TTL_SECS
+            && cached.fetched_at.elapsed() < self.upstream.model_catalog_cache_ttl()
         {
             return Ok(cached.catalog.clone());
         }

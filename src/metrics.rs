@@ -141,6 +141,18 @@ pub struct BucketCounts {
     pub completion_tokens: i64,
     pub cached_tokens: i64,
     pub reasoning_tokens: i64,
+    /// Prompt tokens from flows with a measured prefill phase.
+    pub prefill_tokens: i64,
+    /// Summed measured first-byte → first-content time for `prefill_tokens`.
+    pub prefill_ms: u128,
+    /// Completion tokens from flows with a measured decode phase.
+    pub decode_tokens: i64,
+    /// Summed measured first-content → stream-end time for `decode_tokens`.
+    pub decode_ms: u128,
+    /// Flows contributing a non-zero measured prefill duration.
+    pub prefill_samples: u64,
+    /// Flows contributing a non-zero measured decode duration.
+    pub decode_samples: u64,
     /// Count of the TERMINAL flows in this bucket that actually carried token usage
     /// (gap 01 review round 1, finding 3): token throughput is only MEASURABLE for a
     /// flow whose final usage was reported. A finalized flow with no `usage` (an
@@ -547,6 +559,13 @@ impl WindowRing {
                 entry.reasoning_tokens = entry
                     .reasoning_tokens
                     .saturating_add(counts.reasoning_tokens);
+                entry.prefill_tokens = entry.prefill_tokens.saturating_add(counts.prefill_tokens);
+                entry.prefill_ms = entry.prefill_ms.saturating_add(counts.prefill_ms);
+                entry.decode_tokens = entry.decode_tokens.saturating_add(counts.decode_tokens);
+                entry.decode_ms = entry.decode_ms.saturating_add(counts.decode_ms);
+                entry.prefill_samples =
+                    entry.prefill_samples.saturating_add(counts.prefill_samples);
+                entry.decode_samples = entry.decode_samples.saturating_add(counts.decode_samples);
                 entry.usage_samples = entry.usage_samples.saturating_add(counts.usage_samples);
                 entry.unreported_cached_samples = entry
                     .unreported_cached_samples
@@ -604,6 +623,60 @@ impl WindowReport {
         self.buckets
             .values()
             .map(|counts| counts.usage_samples)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Aggregate effective prefill speed across flows with measured prompt usage and
+    /// a non-zero first-byte → first-content phase.
+    pub fn prefill_tokens_per_sec(&self) -> f64 {
+        let tokens = self
+            .buckets
+            .values()
+            .map(|counts| counts.prefill_tokens)
+            .fold(0i64, i64::saturating_add);
+        let ms = self
+            .buckets
+            .values()
+            .map(|counts| counts.prefill_ms)
+            .fold(0u128, u128::saturating_add);
+        if ms == 0 {
+            0.0
+        } else {
+            tokens as f64 * 1000.0 / ms as f64
+        }
+    }
+
+    /// Aggregate decode speed across flows with measured completion usage and a
+    /// non-zero first-content → stream-end phase.
+    pub fn decode_tokens_per_sec(&self) -> f64 {
+        let tokens = self
+            .buckets
+            .values()
+            .map(|counts| counts.decode_tokens)
+            .fold(0i64, i64::saturating_add);
+        let ms = self
+            .buckets
+            .values()
+            .map(|counts| counts.decode_ms)
+            .fold(0u128, u128::saturating_add);
+        if ms == 0 {
+            0.0
+        } else {
+            tokens as f64 * 1000.0 / ms as f64
+        }
+    }
+
+    pub fn prefill_sample_count(&self) -> u64 {
+        self.buckets
+            .values()
+            .map(|counts| counts.prefill_samples)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    pub fn decode_sample_count(&self) -> u64 {
+        self.buckets
+            .values()
+            .map(|counts| counts.decode_samples)
             .fold(0u64, u64::saturating_add)
     }
 
@@ -1015,12 +1088,15 @@ impl MetricsState {
     /// each computing its own `now_epoch_s()` under its own lock — could do across a
     /// second boundary). Both join the same `{status, model, endpoint, upstream}`
     /// bucket key, so a completed flow's count + tokens are always co-located.
+    #[allow(clippy::too_many_arguments)]
     fn record_terminal(
         &mut self,
         epoch_s: u64,
         key: &BucketKey,
         elapsed_ms: f64,
         usage: Option<FlowUsage>,
+        prefill_ms: Option<u128>,
+        decode_ms: Option<u128>,
         attempts: &[Attempt],
     ) {
         for ring in [&mut self.ring_1m, &mut self.ring_5m, &mut self.ring_1h] {
@@ -1055,6 +1131,16 @@ impl MetricsState {
                 if usage.cached.is_none() {
                     entry.unreported_cached_samples =
                         entry.unreported_cached_samples.saturating_add(1);
+                }
+                if let Some(prefill_ms) = prefill_ms.filter(|duration| *duration > 0) {
+                    entry.prefill_tokens = entry.prefill_tokens.saturating_add(usage.prompt);
+                    entry.prefill_ms = entry.prefill_ms.saturating_add(prefill_ms);
+                    entry.prefill_samples = entry.prefill_samples.saturating_add(1);
+                }
+                if let Some(decode_ms) = decode_ms.filter(|duration| *duration > 0) {
+                    entry.decode_tokens = entry.decode_tokens.saturating_add(usage.completion);
+                    entry.decode_ms = entry.decode_ms.saturating_add(decode_ms);
+                    entry.decode_samples = entry.decode_samples.saturating_add(1);
                 }
             }
             slot.histogram.record(elapsed_ms);
@@ -1257,6 +1343,35 @@ impl MetricsLayer {
         usage: Option<FlowUsage>,
         attempts: &[Attempt],
     ) {
+        self.record_terminal_with_phases(
+            status,
+            served_model,
+            endpoint,
+            upstream,
+            elapsed_ms,
+            usage,
+            None,
+            None,
+            attempts,
+        );
+    }
+
+    /// Record a terminal response with measured prefill and decode durations.
+    /// The phase durations are optional because older/non-streaming capture paths may
+    /// not observe both phase boundaries; missing measurements never become fake zeroes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_terminal_with_phases(
+        &self,
+        status: FlowStatus,
+        served_model: Option<&str>,
+        endpoint: &str,
+        upstream: Option<&str>,
+        elapsed_ms: u128,
+        usage: Option<FlowUsage>,
+        prefill_ms: Option<u128>,
+        decode_ms: Option<u128>,
+        attempts: &[Attempt],
+    ) {
         if !self.enabled {
             return;
         }
@@ -1267,8 +1382,15 @@ impl MetricsLayer {
             upstream: label_or_unknown(upstream),
         };
         let epoch_s = now_epoch_s();
-        self.lock()
-            .record_terminal(epoch_s, &key, elapsed_ms as f64, usage, attempts);
+        self.lock().record_terminal(
+            epoch_s,
+            &key,
+            elapsed_ms as f64,
+            usage,
+            prefill_ms,
+            decode_ms,
+            attempts,
+        );
     }
 
     /// The current metrics domain sequence (the per-domain cursor). `0` when
@@ -1817,6 +1939,39 @@ mod tests {
     }
 
     #[test]
+    fn phase_token_rates_use_measured_durations_and_independent_sample_counts() {
+        let metrics = MetricsLayer::new();
+        for (prompt, completion, prefill_ms, decode_ms) in [
+            (1000, 100, Some(100), Some(1000)),
+            (500, 50, Some(50), None),
+        ] {
+            metrics.record_terminal_with_phases(
+                FlowStatus::Completed,
+                Some("m"),
+                "/v1/responses",
+                Some("p"),
+                1200,
+                Some(FlowUsage {
+                    prompt,
+                    completion,
+                    total: prompt + completion,
+                    cached: None,
+                    reasoning: None,
+                }),
+                prefill_ms,
+                decode_ms,
+                &[],
+            );
+        }
+
+        let report = metrics.view().window_1m;
+        assert_eq!(report.prefill_sample_count(), 2);
+        assert_eq!(report.decode_sample_count(), 1);
+        assert!((report.prefill_tokens_per_sec() - 10_000.0).abs() < 1e-9);
+        assert!((report.decode_tokens_per_sec() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn record_terminal_without_usage_records_count_only() {
         // A terminal with no usage (e.g. a pre-spawn failure) records the count + the
         // latency but no tokens — still one atomic seq bump.
@@ -2161,6 +2316,8 @@ mod tests {
                     },
                     10.0,
                     None,
+                    None,
+                    None,
                     &[failed_attempt(
                         &format!("rot-{index}"),
                         10,
@@ -2207,7 +2364,7 @@ mod tests {
         // (a) a terminal with NO attempts → no per-provider entries.
         let without = {
             let mut state = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
-            state.record_terminal(epoch, &key, 40.0, None, &[]);
+            state.record_terminal(epoch, &key, 40.0, None, None, None, &[]);
             state.view(epoch).approx_bytes()
         };
         // (b) the SAME terminal but WITH several distinct-provider attempts → populated
@@ -2219,7 +2376,7 @@ mod tests {
                 failed_attempt("provider-beta", 70, AttemptErrorClass::Timeout),
                 served_attempt("provider-gamma", 40),
             ];
-            state.record_terminal(epoch, &key, 40.0, None, &attempts);
+            state.record_terminal(epoch, &key, 40.0, None, None, None, &attempts);
             state.view(epoch).approx_bytes()
         };
 
@@ -2279,6 +2436,8 @@ mod tests {
                     upstream: "provider-a".to_string(),
                 },
                 40.0,
+                None,
+                None,
                 None,
                 &[served_attempt("provider-a", 40)],
             );

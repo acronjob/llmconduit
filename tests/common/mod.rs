@@ -162,7 +162,7 @@ impl UpstreamClient for MockUpstream {
         Ok(Box::pin(stream::iter(chunks)))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, AppError> {
+    async fn list_models(&self) -> Result<llmconduit::upstream::UpstreamModelsResponse, AppError> {
         Err(AppError::internal("unused in this test"))
     }
 
@@ -484,6 +484,7 @@ pub const TEST_IMAGE_DATA_URL: &str =
 
 pub fn test_config() -> Config {
     Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
         upstream_api_key: None,
@@ -517,6 +518,8 @@ pub fn test_config() -> Config {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
+        mesh: llmconduit::config::MeshConfig::default(),
     }
 }
 

@@ -1,12 +1,14 @@
 pub mod accounts;
 pub mod accounts_api;
 pub mod adapters;
+pub mod authz;
 pub mod cli;
 pub mod client_auth;
 pub mod config;
 pub mod content_store;
 pub mod control_plane;
 pub mod control_plane_store;
+pub mod dashboard_access;
 pub mod dashboard_api;
 pub mod dashboard_auth;
 pub mod dashboard_flow;
@@ -19,11 +21,14 @@ pub mod flow_persistence;
 pub mod harness;
 pub mod http;
 pub mod log_rotation;
+pub mod mesh;
 pub mod metrics;
 pub mod models;
 pub mod monitor;
 pub mod openapi;
+pub mod openrouter_pricing;
 pub mod persistent_history_api;
+pub mod provider_metrics;
 pub(crate) mod proxy_headers;
 pub mod raw;
 pub(crate) mod redaction;
@@ -43,6 +48,7 @@ pub mod tool_repair;
 pub mod turn_capture;
 pub mod upstream;
 pub mod upstream_metrics;
+pub mod usage_accounting;
 pub mod vision;
 pub mod vision_probe;
 
@@ -69,6 +75,7 @@ use crate::config::Config;
 use crate::engine::Gateway;
 use crate::http::RouterOptions;
 use crate::http::build_router;
+use crate::mesh::MeshUpstreamClient;
 use crate::monitor::MonitorHub;
 use crate::raw::RawOutput;
 use crate::replay::ReplayStore;
@@ -84,6 +91,46 @@ use crate::vision::ImageCache;
 use crate::vision::ReqwestVisionClient;
 use std::sync::Arc;
 use std::time::Duration;
+
+const PROVIDER_METRICS_INTERVAL_ENV: &str = "LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS";
+const DEFAULT_PROVIDER_METRICS_INTERVAL_SECS: u64 = 30;
+
+fn provider_metrics_interval_from_env() -> Duration {
+    let seconds = std::env::var(PROVIDER_METRICS_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROVIDER_METRICS_INTERVAL_SECS)
+        .clamp(5, 3_600);
+    Duration::from_secs(seconds)
+}
+
+fn spawn_provider_metrics_refresh(
+    registry: crate::provider_metrics::ProviderMetricsRegistry,
+    targets: Vec<crate::provider_metrics::ProviderMetricsTarget>,
+    interval: Duration,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let scraper = crate::provider_metrics::ProviderMetricsScraper::default();
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let report = registry.refresh(&scraper, &targets).await;
+            if report.failed > 0 || report.skipped > 0 {
+                tracing::warn!(
+                    attempted = report.attempted,
+                    updated = report.updated,
+                    failed = report.failed,
+                    skipped = report.skipped,
+                    "provider metrics refresh completed with unavailable targets"
+                );
+            }
+        }
+    });
+}
 
 pub fn build_app(config: Config) -> axum::Router {
     build_app_with_gateway(config).0
@@ -258,6 +305,12 @@ pub fn build_app_with_gateway_control_plane_runtime(
     } else {
         crate::session_hub::SessionHub::disabled()
     };
+    let provider_metrics = crate::provider_metrics::ProviderMetricsRegistry::default();
+    let provider_metrics_targets = if options.with_debug_ui {
+        config.provider_metrics_targets.clone()
+    } else {
+        Vec::new()
+    };
     // F1 (Topic F) durable per-turn capture: opt-in, config-only gate --
     // constructed regardless of `--with-debug-ui` (works even when the debug
     // UI/dashboard is off). `disabled()` is a zero-op sink (no thread, no
@@ -266,12 +319,22 @@ pub fn build_app_with_gateway_control_plane_runtime(
         Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),
         None => crate::turn_capture::TurnCapture::disabled(),
     };
+    let mesh_registry = if config.mesh.controller.enabled {
+        Some(
+            crate::mesh::controller::spawn_controller(&config.mesh.controller)
+                .expect("validated mesh controller configuration"),
+        )
+    } else {
+        None
+    };
+    let mesh_enabled = mesh_registry.is_some();
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
     // client so route-name/glob matching applies.
     let routing_mode = !config.upstreams.is_empty()
         || !config.model_routes.is_empty()
-        || !operational_routes.is_empty();
+        || !operational_routes.is_empty()
+        || mesh_enabled;
     // Per-backend-model finalization policies (effort map, `template_family`
     // override, `upstream_chat_kwargs`), shared (cheap clone) across all leaf
     // clients so each resolves against the FINAL provider model (T1). Built once
@@ -300,47 +363,61 @@ pub fn build_app_with_gateway_control_plane_runtime(
             .with_flow_store(flow_store.clone())
         };
     let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
-        let mut providers: Vec<RoutingUpstreamProvider> = config
-            .upstreams
-            .iter()
-            .map(|provider| {
-                let primary_client = make_upstream_client(
-                    provider.upstream_base_url.clone(),
-                    provider.upstream_api_key.clone(),
-                    provider.upstream_request_log_path.clone(),
-                );
-                let fallback_providers = provider
-                    .fallback_upstreams
-                    .iter()
-                    .map(|fallback| {
-                        FailoverUpstreamProvider::new(
-                            fallback.name.clone(),
-                            make_upstream_client(
-                                fallback.upstream_base_url.clone(),
-                                fallback.upstream_api_key.clone(),
-                                fallback.upstream_request_log_path.clone(),
-                            ),
-                            fallback.upstream_model.clone(),
-                            fallback.exposed_model.clone(),
-                            fallback.upstream_chat_kwargs.clone(),
-                        )
-                    })
-                    .collect();
-                RoutingUpstreamProvider::new(
-                    provider.name.clone(),
-                    primary_client,
-                    provider.upstream_model.clone(),
-                    provider.upstream_chat_kwargs.clone(),
-                    fallback_providers,
-                    Duration::from_secs(config.upstream_failure_cooldown_secs),
-                )
-            })
-            .collect();
+        let mut providers = Vec::new();
+        if let Some(registry) = mesh_registry {
+            providers.push(RoutingUpstreamProvider::new(
+                "mesh",
+                MeshUpstreamClient::new(
+                    registry,
+                    finalization_policies.clone(),
+                    flatten_content,
+                    max_sse_frame_bytes,
+                    flow_store.clone(),
+                ),
+                None,
+                serde_json::Map::new(),
+                Vec::new(),
+                Duration::from_secs(config.upstream_failure_cooldown_secs),
+            ));
+        }
+        providers.extend(config.upstreams.iter().map(|provider| {
+            let primary_client = make_upstream_client(
+                provider.upstream_base_url.clone(),
+                provider.upstream_api_key.clone(),
+                provider.upstream_request_log_path.clone(),
+            );
+            let fallback_providers = provider
+                .fallback_upstreams
+                .iter()
+                .map(|fallback| {
+                    FailoverUpstreamProvider::new(
+                        fallback.name.clone(),
+                        make_upstream_client(
+                            fallback.upstream_base_url.clone(),
+                            fallback.upstream_api_key.clone(),
+                            fallback.upstream_request_log_path.clone(),
+                        ),
+                        fallback.upstream_model.clone(),
+                        fallback.exposed_model.clone(),
+                        fallback.upstream_chat_kwargs.clone(),
+                    )
+                })
+                .collect();
+            RoutingUpstreamProvider::new(
+                provider.name.clone(),
+                primary_client,
+                provider.upstream_model.clone(),
+                provider.upstream_chat_kwargs.clone(),
+                fallback_providers,
+                Duration::from_secs(config.upstream_failure_cooldown_secs),
+            )
+        }));
         // Operational/ad-hoc routes still need the ordinary top-level provider
         // as their passthrough/default catalog when no explicit `upstreams` are
         // configured. Otherwise merely adding one alias makes every unknown
         // model unroutable despite `unknown_model_policy: passthrough`.
         if config.upstreams.is_empty()
+            && !mesh_enabled
             && (!operational_routes.is_empty() || !config.model_routes.is_empty())
         {
             let primary_client = make_upstream_client(
@@ -484,6 +561,19 @@ pub fn build_app_with_gateway_control_plane_runtime(
     // a non-loopback bind without a token + validated https origin REFUSES to
     // register the protected routes (logged), unless `ALLOW_INSECURE=1`.
     let bind_addr = config.bind_addr;
+    let authz = crate::authz::AuthzService::from_config(&config.auth)
+        .unwrap_or_else(|err| panic!("inference auth startup validation failed: {err}"));
+    match config.auth.mode {
+        crate::config::AuthMode::Disabled => {
+            tracing::info!("inference authentication disabled");
+        }
+        crate::config::AuthMode::Enforce => {
+            tracing::info!(
+                store_path = %config.auth.store_path.display(),
+                "inference authentication enabled"
+            );
+        }
+    }
     let (dashboard_auth, register_protected_routes) = if options.with_debug_ui {
         build_dashboard_auth(bind_addr)
     } else {
@@ -509,8 +599,10 @@ pub fn build_app_with_gateway_control_plane_runtime(
         flow_store,
     )
     .with_dashboard_auth(dashboard_auth)
+    .with_authz(authz)
     .with_metrics(metrics)
     .with_session_hub(session_hub)
+    .with_provider_metrics(provider_metrics.clone())
     .with_turn_capture(turn_capture)
     .with_operational_models(operational_models, unknown_model_policy);
     if let Some(client_auth) = client_auth {
@@ -525,7 +617,6 @@ pub fn build_app_with_gateway_control_plane_runtime(
         .with_session_linker(runtime.session_linker)
         .with_key_registry_source(runtime.yaml_key_specs, runtime.client_auth_required);
     gateway.set_users_configured(runtime.users_configured);
-    {}
     if let Some(store) = runtime.persistence_store {
         gateway = gateway.with_persistence_store(store);
     }
@@ -546,6 +637,11 @@ pub fn build_app_with_gateway_control_plane_runtime(
             snapshot_flow_store,
             gateway.provider_health_publisher(),
             snapshot_monitor,
+        );
+        spawn_provider_metrics_refresh(
+            provider_metrics,
+            provider_metrics_targets,
+            provider_metrics_interval_from_env(),
         );
     }
     let router_options = RouterOptions {

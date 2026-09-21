@@ -435,6 +435,8 @@ export interface MetricWindow {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /**
    * Count of TERMINAL (finalized) flows in this window — the data-quality signal for
@@ -452,6 +454,10 @@ export interface MetricWindow {
    * is unmeasurable → it renders `—`, NEVER a fabricated `0`. A finite `u64`.
    */
   usage_samples: number;
+  /** Flows with prompt usage and a measured non-zero prefill phase. */
+  prefill_samples: number;
+  /** Flows with completion usage and a measured non-zero decode phase. */
+  decode_samples: number;
   /**
    * Count of usage-bearing terminal flows whose served model has a configured price
    * (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no PRICED
@@ -477,11 +483,15 @@ export interface MetricTickPayload {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
   samples: number;
   /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
   usage_samples: number;
+  prefill_samples: number;
+  decode_samples: number;
   /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
   priced_samples: number;
   /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
@@ -520,6 +530,7 @@ export interface FlowStatusPayload extends PhaseTimings {
   upstream_target?: string | null;
   usage: Usage | null;
   started_ms: number;
+  finished_ms?: number | null;
   elapsed_ms?: number | null;
   /** Gap 03 — the per-attempt failover trace (optional; present once the backend projects it). */
   attempts?: Attempt[];
@@ -939,11 +950,15 @@ export interface MetricsResponse {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
   samples: number;
   /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
   usage_samples: number;
+  prefill_samples: number;
+  decode_samples: number;
   /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
   priced_samples: number;
   /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
@@ -997,6 +1012,67 @@ export interface TopologyResponse {
 export interface CatalogEntry {
   id: string;
   context_limit?: number | null;
+}
+
+export interface ProviderInventoryModel {
+  id: string;
+  context_limit?: number | null;
+}
+
+export interface AvailabilitySchedule {
+  timezone: string;
+  default_capacity: number;
+  weekly: AvailabilityWeeklyWindow[];
+  exceptions: AvailabilityException[];
+}
+
+export interface AvailabilityWeeklyWindow {
+  days: string[];
+  start_local: string;
+  end_local: string;
+  capacity: number;
+}
+
+export interface AvailabilityException {
+  start: string;
+  end: string;
+  capacity: number;
+}
+
+export interface ProviderInventoryEntry {
+  provider_id: string;
+  provider_name: string;
+  resource_id: string | null;
+  route: string | null;
+  base_url: string;
+  models: ProviderInventoryModel[];
+  availability: AvailabilitySchedule | null;
+  capacity_limit: number | null;
+  active_requests: number | null;
+  accepting_requests: boolean;
+  healthy: boolean;
+}
+
+export interface ProvidersResponse {
+  providers: ProviderInventoryEntry[];
+}
+
+export type ProviderMetricsSource = 'vllm' | 'sglang';
+
+export interface ProviderCacheMetrics {
+  provider: string;
+  source: ProviderMetricsSource;
+  fetched_at_ms: number;
+  cache_hits: number | null;
+  cache_queries: number | null;
+  cache_hit_rate: number | null;
+  kv_cache_usage: number | null;
+  data_quality: 'derived';
+}
+
+export interface ProviderMetricsResponse {
+  generated_at_ms: number;
+  providers: ProviderCacheMetrics[];
 }
 
 /** `GET /dashboard/api/snapshot?at=<unix_ms>` */
@@ -1151,6 +1227,315 @@ export interface DashboardBootstrap {
 }
 
 // ---------------------------------------------------------------------------
+// Access management shapes (RBAC dashboard)
+// ---------------------------------------------------------------------------
+
+export type ManagementPermission =
+  | 'auth.keys.read'
+  | 'auth.keys.create'
+  | 'auth.keys.revoke'
+  | 'auth.keys.rotate'
+  | 'auth.principals.read'
+  | 'auth.principals.write'
+  | 'auth.groups.read'
+  | 'auth.groups.write'
+  | 'auth.roles.read'
+  | 'auth.roles.write'
+  | 'auth.policies.read'
+  | 'auth.policies.write'
+  | 'auth.usage.read'
+  | 'auth.audit.read'
+  | 'auth.pricing.read'
+  | 'auth.pricing.sync'
+  | 'auth.pricing.write'
+  | 'auth.sessions.read'
+  | 'auth.sessions.terminate';
+
+export interface AuthSummary {
+  policy_epoch: number;
+  actor: {
+    kind: 'bootstrap' | 'delegated';
+    principal_id: string | null;
+    display_name: string;
+    permissions: ManagementPermission[];
+  };
+  counts: {
+    users: number;
+    groups: number;
+    roles: number;
+    policies: number;
+    api_keys: number;
+    active_sessions: number;
+  };
+}
+
+export interface AuthUser {
+  id: string;
+  kind: 'user' | 'service_account';
+  display_name: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface AuthGroup {
+  id: string;
+  name: string;
+  enabled: boolean;
+  member_count: number;
+}
+
+export interface AuthRole {
+  id: string;
+  name: string;
+  enabled: boolean;
+  permissions: ManagementPermission[];
+}
+
+export interface AuthPolicy {
+  id: string;
+  name: string;
+  effect: 'allow' | 'deny';
+  enabled: boolean;
+  subjects: string[];
+  endpoints: string[];
+  models: string[];
+  requested_models: string[];
+  served_models: string[];
+  providers: string[];
+  routes: string[];
+  time_windows: AuthPolicyTimeWindow[];
+  max_concurrent_sessions: number | null;
+  max_daily_session_starts: number | null;
+  management_permissions: ManagementPermission[];
+}
+
+export interface AuthPolicyTimeWindow {
+  weekday_mask: number;
+  start_minute: number;
+  end_minute: number;
+  absolute_start_ms: number | null;
+  absolute_end_ms: number | null;
+}
+
+export interface AuthApiKey {
+  id: string;
+  principal_id: string;
+  name: string;
+  prefix: string;
+  enabled: boolean;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+}
+
+/** Returned only by create/rotate. `raw_key` must never be persisted or fetched later. */
+export interface CreatedAuthApiKey extends AuthApiKey {
+  raw_key: string;
+}
+
+export interface AuthSession {
+  id: string;
+  kind: 'inference' | 'dashboard';
+  principal_id: string;
+  key_id: string;
+  endpoint: string | null;
+  requested_model: string | null;
+  started_at: string;
+  expires_at: string | null;
+}
+
+export interface AuthUsageRow {
+  dimension: string;
+  value: string;
+  requests: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cached_tokens: number | null;
+  reasoning_tokens: number | null;
+  cost: number | null;
+  cost_confidence: CostConfidence;
+}
+
+export interface AuthAuditEvent {
+  id: string;
+  timestamp: string;
+  actor: string;
+  action: string;
+  target: string;
+  outcome: 'ok' | 'denied' | 'error';
+  metadata: Record<string, unknown>;
+}
+
+export interface AuthPricingRow {
+  model: string;
+  provider: string;
+  source: string;
+  fetched_at: string;
+  input_per_1k: string;
+  output_per_1k: string;
+  confidence: CostConfidence;
+}
+
+export interface AuthUsersResponse { users: AuthUser[] }
+export interface AuthGroupsResponse { groups: AuthGroup[] }
+export interface AuthRolesResponse { roles: AuthRole[] }
+export interface AuthPoliciesResponse { policies: AuthPolicy[] }
+export interface AuthApiKeysResponse { api_keys: AuthApiKey[] }
+export interface AuthSessionsResponse { sessions: AuthSession[] }
+export interface AuthUsageResponse { usage: AuthUsageRow[] }
+export interface AuthAuditResponse { events: AuthAuditEvent[] }
+export interface AuthPricingResponse { pricing: AuthPricingRow[] }
+
+export interface KeyLoginRequest { api_key: string }
+export interface CreateAuthUserRequest {
+  display_name: string;
+  kind: AuthUser['kind'];
+}
+export interface CreateAuthGroupRequest {
+  name: string;
+  members: string[];
+}
+export interface CreateAuthRoleRequest {
+  name: string;
+  permissions: ManagementPermission[];
+}
+export interface CreateAuthApiKeyRequest {
+  principal_id: string;
+  name: string;
+  expires_at?: string | null;
+}
+export interface CreateAuthPolicyRequest {
+  name: string;
+  effect: AuthPolicy['effect'];
+  subjects: string[];
+  endpoints: string[];
+  models: string[];
+  requested_models: string[];
+  served_models: string[];
+  providers: string[];
+  routes: string[];
+  time_windows: AuthPolicyTimeWindow[];
+  max_concurrent_sessions: number | null;
+  max_daily_session_starts: number | null;
+  management_permissions: ManagementPermission[];
+}
+
+export function isAuthSummary(v: unknown): v is AuthSummary {
+  if (!isObj(v) || !isUint(v.policy_epoch) || !isObj(v.actor) || !isObj(v.counts)) return false;
+  const actor = v.actor;
+  const counts = v.counts;
+  return isOneOf(actor.kind, ['bootstrap', 'delegated'] as const)
+    && isNullableStr(actor.principal_id)
+    && isStr(actor.display_name)
+    && isStringArray(actor.permissions)
+    && ['users', 'groups', 'roles', 'policies', 'api_keys', 'active_sessions'].every((k) => isUint(counts[k]));
+}
+
+function isAuthUser(v: unknown): v is AuthUser {
+  return isObj(v) && isStr(v.id) && isOneOf(v.kind, ['user', 'service_account'] as const)
+    && isStr(v.display_name) && typeof v.enabled === 'boolean' && isStr(v.created_at);
+}
+function isAuthGroup(v: unknown): v is AuthGroup {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && typeof v.enabled === 'boolean' && isUint(v.member_count);
+}
+function isAuthRole(v: unknown): v is AuthRole {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && typeof v.enabled === 'boolean' && isStringArray(v.permissions);
+}
+function isAuthPolicy(v: unknown): v is AuthPolicy {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && isOneOf(v.effect, ['allow', 'deny'] as const)
+    && typeof v.enabled === 'boolean' && isStringArray(v.subjects) && isStringArray(v.endpoints)
+    && isStringArray(v.models) && isStringArray(v.requested_models) && isStringArray(v.served_models)
+    && isStringArray(v.providers) && isStringArray(v.routes)
+    && Array.isArray(v.time_windows) && v.time_windows.every((window) => isObj(window)
+      && isUint(window.weekday_mask) && isUint(window.start_minute) && isUint(window.end_minute)
+      && (window.absolute_start_ms === null || typeof window.absolute_start_ms === 'number')
+      && (window.absolute_end_ms === null || typeof window.absolute_end_ms === 'number'))
+    && (v.max_concurrent_sessions === null || isUint(v.max_concurrent_sessions))
+    && (v.max_daily_session_starts === null || isUint(v.max_daily_session_starts))
+    && isStringArray(v.management_permissions);
+}
+function isAuthApiKey(v: unknown): v is AuthApiKey {
+  return isObj(v) && isStr(v.id) && isStr(v.principal_id) && isStr(v.name) && isStr(v.prefix)
+    && typeof v.enabled === 'boolean' && isStr(v.created_at) && isNullableStr(v.expires_at)
+    && isNullableStr(v.last_used_at);
+}
+function isAuthSession(v: unknown): v is AuthSession {
+  return isObj(v) && isStr(v.id) && isOneOf(v.kind, ['inference', 'dashboard'] as const)
+    && isStr(v.principal_id) && isStr(v.key_id) && isNullableStr(v.endpoint)
+    && isNullableStr(v.requested_model) && isStr(v.started_at) && isNullableStr(v.expires_at);
+}
+function isAuthUsageRow(v: unknown): v is AuthUsageRow {
+  return isObj(v) && isStr(v.dimension) && isStr(v.value) && isUint(v.requests)
+    && isNullableUint(v.prompt_tokens) && isNullableUint(v.completion_tokens)
+    && isNullableUint(v.cached_tokens) && isNullableUint(v.reasoning_tokens)
+    && (v.cost === null || isNum(v.cost)) && isOneOf(v.cost_confidence, COST_CONFIDENCES);
+}
+function isAuthAuditEvent(v: unknown): v is AuthAuditEvent {
+  return isObj(v) && isStr(v.id) && isStr(v.timestamp) && isStr(v.actor) && isStr(v.action)
+    && isStr(v.target) && isOneOf(v.outcome, ['ok', 'denied', 'error'] as const) && isObj(v.metadata);
+}
+function isAuthPricingRow(v: unknown): v is AuthPricingRow {
+  return isObj(v) && isStr(v.model) && isStr(v.provider) && isStr(v.source) && isStr(v.fetched_at)
+    && isStr(v.input_per_1k) && isStr(v.output_per_1k) && isOneOf(v.confidence, COST_CONFIDENCES);
+}
+
+function isArrayEnvelope(v: unknown, key: string, guard: (item: unknown) => boolean): boolean {
+  return isObj(v) && Array.isArray(v[key]) && v[key].every(guard);
+}
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every(isStr);
+}
+
+export const isAuthUsersResponse = (v: unknown): v is AuthUsersResponse => isArrayEnvelope(v, 'users', isAuthUser);
+export const isAuthGroupsResponse = (v: unknown): v is AuthGroupsResponse => isArrayEnvelope(v, 'groups', isAuthGroup);
+export const isAuthRolesResponse = (v: unknown): v is AuthRolesResponse => isArrayEnvelope(v, 'roles', isAuthRole);
+export const isAuthPoliciesResponse = (v: unknown): v is AuthPoliciesResponse => isArrayEnvelope(v, 'policies', isAuthPolicy);
+export const isAuthApiKeysResponse = (v: unknown): v is AuthApiKeysResponse => isArrayEnvelope(v, 'api_keys', isAuthApiKey);
+export const isAuthSessionsResponse = (v: unknown): v is AuthSessionsResponse => isArrayEnvelope(v, 'sessions', isAuthSession);
+export const isAuthUsageResponse = (v: unknown): v is AuthUsageResponse => isArrayEnvelope(v, 'usage', isAuthUsageRow);
+export const isAuthAuditResponse = (v: unknown): v is AuthAuditResponse => isArrayEnvelope(v, 'events', isAuthAuditEvent);
+export const isAuthPricingResponse = (v: unknown): v is AuthPricingResponse => isArrayEnvelope(v, 'pricing', isAuthPricingRow);
+export function isCreatedAuthApiKey(v: unknown): v is CreatedAuthApiKey {
+  if (!isObj(v) || !isAuthApiKey(v)) return false;
+  const rawKey = (v as unknown as Record<string, unknown>).raw_key;
+  return isStr(rawKey) && rawKey.startsWith('llmc_');
+}
+
+function isAvailabilitySchedule(v: unknown): v is AvailabilitySchedule {
+  return isObj(v) && isStr(v.timezone) && isUint(v.default_capacity)
+    && Array.isArray(v.weekly) && v.weekly.every((window) => isObj(window)
+      && isStringArray(window.days) && isStr(window.start_local) && isStr(window.end_local)
+      && isUint(window.capacity))
+    && Array.isArray(v.exceptions) && v.exceptions.every((exception) => isObj(exception)
+      && isStr(exception.start) && isStr(exception.end) && isUint(exception.capacity));
+}
+
+function isProviderInventoryModel(v: unknown): v is ProviderInventoryModel {
+  return isObj(v) && isStr(v.id) && isOptUint(v.context_limit);
+}
+
+function isProviderInventoryEntry(v: unknown): v is ProviderInventoryEntry {
+  return isObj(v) && isStr(v.provider_id) && isStr(v.provider_name)
+    && isNullableStr(v.resource_id) && isNullableStr(v.route) && isStr(v.base_url)
+    && Array.isArray(v.models) && v.models.every(isProviderInventoryModel)
+    && (v.availability === null || isAvailabilitySchedule(v.availability))
+    && isNullableUint(v.capacity_limit) && isNullableUint(v.active_requests)
+    && typeof v.accepting_requests === 'boolean'
+    && typeof v.healthy === 'boolean';
+}
+
+function isProviderCacheMetrics(v: unknown): v is ProviderCacheMetrics {
+  return isObj(v) && isStr(v.provider) && isOneOf(v.source, ['vllm', 'sglang'] as const)
+    && isUint(v.fetched_at_ms) && isOptNum(v.cache_hits) && isOptNum(v.cache_queries)
+    && isOptNum(v.cache_hit_rate) && isOptNum(v.kv_cache_usage)
+    && v.data_quality === 'derived';
+}
+
+export const isProvidersResponse = (v: unknown): v is ProvidersResponse => isArrayEnvelope(v, 'providers', isProviderInventoryEntry);
+export const isProviderMetricsResponse = (v: unknown): v is ProviderMetricsResponse =>
+  isObj(v) && isUint(v.generated_at_ms) && Array.isArray(v.providers) && v.providers.every(isProviderCacheMetrics);
+
+// ---------------------------------------------------------------------------
 // Runtime validation (the WS pipe must NOT trust the wire — findings 4/5/6).
 // A frame is validated WHOLLY (envelope + every payload arm, exact enums, unsigned-int
 // seq, domain↔payload compatibility) BEFORE the socket touches any cursor or store.
@@ -1263,11 +1648,13 @@ function isOptUsage(v: unknown): boolean {
 function isMetricWindow(v: unknown): v is MetricWindow {
   return (
     isObj(v) && isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+    isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
     // The three per-metric measurability denominators are non-negative integer counts
     // (gap 01): `samples` (latency/error), `usage_samples` (tok/s), `priced_samples`
     // ($/min). All REQUIRED — the Rust tile always emits them.
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+    isUint(v.decode_samples) && isUint(v.priced_samples) &&
     // Gap 07: the aggregate cost-confidence tag is REQUIRED on every window.
     isCostConfidence(v.cost_confidence)
   );
@@ -1458,8 +1845,10 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
     case 'metric_tick':
       return (
         isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-        isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+        isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+        isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
+        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+        isUint(v.decode_samples) && isUint(v.priced_samples) &&
         isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
       );
     case 'flow_status':
@@ -1467,7 +1856,7 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
         isStr(v.api_call_id) && isOptStr(v.response_id) &&
         isOneOf(v.status, FLOW_STATUSES) &&
         isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
-        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.elapsed_ms) &&
+        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.finished_ms) && isOptUint(v.elapsed_ms) &&
         // Gap 02/03: optional spine fields on the live flow update — validated when present.
         isOptPhaseTimings(v) && isOptAttempts(v.attempts) && isOptUint(v.first_upstream_byte_ms)
       );
@@ -1542,8 +1931,10 @@ function isMetricsResponse(v: unknown): v is MetricsResponse {
   return (
     isObj(v) && isUint(v.metrics_seq) &&
     isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+    isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+    isUint(v.decode_samples) && isUint(v.priced_samples) &&
     isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
   );
 }

@@ -46,7 +46,7 @@ use crate::metrics::MetricsView;
 use crate::metrics::StatusClass;
 use crate::metrics::WindowReport;
 use crate::monitor::DebugWsMessage;
-use crate::upstream::ProviderHealthSnapshot;
+use crate::upstream::{ProviderHealthSnapshot, ProviderInventoryEntry};
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
@@ -443,6 +443,14 @@ pub struct CatalogEntry {
     pub context_limit: Option<i64>,
 }
 
+/// `GET /dashboard/api/providers` — concrete provider resources and their
+/// advertised model/capacity metadata. Kept separate from topology so graph
+/// snapshots remain small and provider inventory can carry schedules.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvidersBody {
+    pub providers: Vec<ProviderInventoryEntry>,
+}
+
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut. Mirrors
 /// the frozen `SnapshotResponse`: the per-domain `cursors`, the cut instant, the
 /// body-free flow summaries (priced), and the metrics/topology cuts reshaped into
@@ -746,6 +754,8 @@ fn rest_window_tile(
     };
     let reqs_per_sec = total as f64 / window_secs;
     let tokens_per_sec = window_total_tokens(report) as f64 / window_secs;
+    let prefill_tokens_per_sec = report.prefill_tokens_per_sec();
+    let decode_tokens_per_sec = report.decode_tokens_per_sec();
     let cost_per_min = window_total_cost(report, prices) / (window_secs / 60.0);
     // Per-metric measurability denominators (gap 01 review round 1, finding 3): token
     // and cost availability are SEPARATE from latency/error. `usage_samples` counts
@@ -756,6 +766,8 @@ fn rest_window_tile(
     // renders `—`; or `usage_samples > 0` yet `priced_samples == 0` (only unpriced
     // models) → `cost_per_min` renders `—`, distinguishing "unpriced" from `$0.00`.
     let usage_samples = report.usage_sample_count();
+    let prefill_samples = report.prefill_sample_count();
+    let decode_samples = report.decode_sample_count();
     let priced_samples = report.priced_sample_count(|model| price_lookup(prices, model).is_some());
     // Gap 07: the aggregate cost confidence for this window's `cost_per_min` — `estimated`
     // when any priced bucket would silently bill cached at the default `0.0`, so the strip
@@ -772,6 +784,8 @@ fn rest_window_tile(
         p95: finite(percentiles.p95),
         p99: finite(percentiles.p99),
         tokens_per_sec: finite(tokens_per_sec),
+        prefill_tokens_per_sec: finite(prefill_tokens_per_sec),
+        decode_tokens_per_sec: finite(decode_tokens_per_sec),
         cost_per_min: finite(cost_per_min),
         // `total` is the count of TERMINAL flows in the window — the latency/error
         // measured/unavailable signal. `0` here ≠ "zero throughput"; it means NO
@@ -780,6 +794,8 @@ fn rest_window_tile(
         // use the separate denominators above.
         samples: total,
         usage_samples,
+        prefill_samples,
+        decode_samples,
         priced_samples,
         cost_confidence,
     }
@@ -808,9 +824,13 @@ pub fn metrics_body(
         p95: m1.p95,
         p99: m1.p99,
         tokens_per_sec: m1.tokens_per_sec,
+        prefill_tokens_per_sec: m1.prefill_tokens_per_sec,
+        decode_tokens_per_sec: m1.decode_tokens_per_sec,
         cost_per_min: m1.cost_per_min,
         samples: m1.samples,
         usage_samples: m1.usage_samples,
+        prefill_samples: m1.prefill_samples,
+        decode_samples: m1.decode_samples,
         priced_samples: m1.priced_samples,
         cost_confidence: m1.cost_confidence,
         windows: MetricWindows { m1, m5, h1 },
@@ -1249,7 +1269,8 @@ pub async fn dashboard_flow_detail(
 pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response {
     let (view, metrics_seq) = gateway.metrics().view_with_seq();
     let active = active_stream_count(gateway.as_ref());
-    let body = metrics_body(&view, metrics_seq, active, gateway.price_table());
+    let prices = gateway.price_table();
+    let body = metrics_body(&view, metrics_seq, active, &prices);
     json_no_store(StatusCode::OK, &body)
 }
 
@@ -1284,7 +1305,8 @@ pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response 
 pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response {
     let snapshot = gateway.provider_health_publisher().latest();
     let view = gateway.metrics().view();
-    let body = topology_body(&snapshot, gateway.price_table(), &view.window_1m);
+    let prices = gateway.price_table();
+    let body = topology_body(&snapshot, &prices, &view.window_1m);
     json_no_store(StatusCode::OK, &body)
 }
 
@@ -1342,6 +1364,18 @@ pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response 
         Err(_) => Vec::new(),
     };
     json_no_store(StatusCode::OK, &entries)
+}
+
+/// `GET /dashboard/api/providers` — provider-scoped model catalogs, availability
+/// schedules, and current capacity. A failed inventory refresh returns an empty
+/// list so the rest of the dashboard remains usable while an upstream is down.
+pub async fn dashboard_providers(State(gateway): State<Arc<Gateway>>) -> Response {
+    let providers = gateway
+        .upstream_client()
+        .provider_inventory()
+        .await
+        .unwrap_or_default();
+    json_no_store(StatusCode::OK, &ProvidersBody { providers })
 }
 
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut from the D5
@@ -1421,9 +1455,13 @@ pub async fn dashboard_snapshot(
         &cut.metrics,
         cut.cursors.metrics_seq,
         active,
-        prices,
+        &prices,
     ));
-    let topology = Some(topology_body(&cut.topology, prices, &cut.metrics.window_1m));
+    let topology = Some(topology_body(
+        &cut.topology,
+        &prices,
+        &cut.metrics.window_1m,
+    ));
     json_no_store(
         StatusCode::OK,
         &SnapshotResponse {
@@ -1677,13 +1715,15 @@ mod tests {
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
         // One completed flow on a priced model: 1000 prompt + 500 completion tokens.
-        metrics.record_terminal(
+        metrics.record_terminal_with_phases(
             FS::Completed,
             Some("glm-5.1"),
             "/v1/responses",
             Some("vllm-a"),
             1200,
             Some(usage(1000, 500, 0)),
+            Some(100),
+            Some(2000),
             &[],
         );
         let (view, seq) = metrics.view_with_seq();
@@ -1711,6 +1751,16 @@ mod tests {
             (body.tokens_per_sec - 25.0).abs() < 1e-9,
             "tok/s {} == 1500/60",
             body.tokens_per_sec
+        );
+        assert!(
+            (body.prefill_tokens_per_sec - 10_000.0).abs() < 1e-9,
+            "prefill tok/s {} == 1000/0.1s",
+            body.prefill_tokens_per_sec
+        );
+        assert!(
+            (body.decode_tokens_per_sec - 250.0).abs() < 1e-9,
+            "decode tok/s {} == 500/2s",
+            body.decode_tokens_per_sec
         );
         // cost = 1000 prompt @2.0/1k + 500 completion @6.0/1k = 2.0 + 3.0 = 5.0 over
         // 1 minute → cost_per_min ≈ 5.0.
@@ -1766,13 +1816,15 @@ mod tests {
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
         // (a) usage on a PRICED model → counts toward samples + usage + priced.
-        metrics.record_terminal(
+        metrics.record_terminal_with_phases(
             FS::Completed,
             Some("glm-5.1"),
             "/v1/responses",
             Some("vllm-a"),
             900,
             Some(usage(1000, 500, 0)),
+            Some(100),
+            Some(2000),
             &[],
         );
         // (b) NO usage (e.g. an upstream that omitted it) → samples only.
@@ -1831,13 +1883,15 @@ mod tests {
         use crate::dashboard_flow::FlowStatus as FS;
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
-        metrics.record_terminal(
+        metrics.record_terminal_with_phases(
             FS::Completed,
             Some("glm-5.1"),
             "/v1/responses",
             Some("vllm-a"),
             900,
             Some(usage(1000, 500, 0)),
+            Some(100),
+            Some(2000),
             &[],
         );
         let (view, seq) = metrics.view_with_seq();
@@ -1851,9 +1905,19 @@ mod tests {
         // Headline mirrors.
         assert_eq!(value["usage_samples"], serde_json::json!(1));
         assert_eq!(value["priced_samples"], serde_json::json!(1));
+        assert_eq!(value["prefill_tokens_per_sec"], serde_json::json!(10_000.0));
+        assert_eq!(value["decode_tokens_per_sec"], serde_json::json!(250.0));
         // Per-window (m1 fed the terminal; m5/h1 share the same epoch ⇒ same counts).
         for window in ["m1", "m5", "h1"] {
             assert_eq!(value["windows"][window]["samples"], serde_json::json!(1));
+            assert_eq!(
+                value["windows"][window]["prefill_tokens_per_sec"],
+                serde_json::json!(10_000.0)
+            );
+            assert_eq!(
+                value["windows"][window]["decode_tokens_per_sec"],
+                serde_json::json!(250.0)
+            );
             assert_eq!(
                 value["windows"][window]["usage_samples"],
                 serde_json::json!(1)
@@ -2634,6 +2698,42 @@ mod tests {
             catalog_fetched_ms: None,
             catalog_size: None,
         }
+    }
+
+    #[test]
+    fn providers_body_preserves_provider_scoped_models_schedule_and_capacity() {
+        let body = ProvidersBody {
+            providers: vec![crate::upstream::ProviderInventoryEntry {
+                provider_id: "mesh:worker-a".into(),
+                provider_name: "local-vllm".into(),
+                resource_id: Some("gpu-0".into()),
+                route: Some("gpu-0".into()),
+                base_url: "mesh://worker-a/gpu-0".into(),
+                models: vec![crate::upstream::UpstreamModelEntry {
+                    id: "local-model".into(),
+                    context_limit: Some(32_768),
+                }],
+                availability: Some(crate::config::AvailabilitySchedule {
+                    timezone: "America/Chicago".into(),
+                    default_capacity: 2,
+                    weekly: Vec::new(),
+                    exceptions: Vec::new(),
+                }),
+                capacity_limit: Some(2),
+                active_requests: Some(1),
+                accepting_requests: true,
+                healthy: true,
+            }],
+        };
+
+        let value = serde_json::to_value(body).expect("serialize providers body");
+        let provider = &value["providers"][0];
+        assert_eq!(provider["provider_id"], "mesh:worker-a");
+        assert_eq!(provider["models"][0]["id"], "local-model");
+        assert_eq!(provider["models"][0]["context_limit"], 32_768);
+        assert_eq!(provider["availability"]["timezone"], "America/Chicago");
+        assert_eq!(provider["capacity_limit"], 2);
+        assert_eq!(provider["active_requests"], 1);
     }
 
     /// Gap 12 (AGENTS.md changed-wire-field rule): the per-provider latency/error metrics

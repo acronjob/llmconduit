@@ -275,11 +275,19 @@ impl PersistenceTerminalGuard {
         let (route, provider) = self.serving.snapshot();
         let (model_served, usage) = self.serving.metrics_snapshot();
         let (attempts, first_upstream_byte_ms) = self.serving.attempts_snapshot();
+        let phases = self.phases.snapshot();
         let metrics = TerminalMetricsInputs {
             model_served,
             endpoint: String::new(),
             upstream: provider.or(route),
             usage,
+            prefill_ms: first_upstream_byte_ms
+                .zip(phases.first_content_delta_ms)
+                .map(|(start, end)| end.saturating_sub(start)),
+            decode_ms: phases
+                .first_content_delta_ms
+                .zip(phases.stream_end_ms)
+                .map(|(start, end)| end.saturating_sub(start)),
             attempts,
         };
         let response_id = self
@@ -291,7 +299,7 @@ impl PersistenceTerminalGuard {
             response_id: response_id.as_deref(),
             outcome,
             completed_at_ms: now_epoch_ms(),
-            phases: self.phases.snapshot(),
+            phases,
             first_upstream_byte_ms,
             terminal_reason,
             error,
@@ -560,6 +568,15 @@ pub fn finish_from_flow_record(
         endpoint: record.uri.clone(),
         upstream: record.upstream_target.clone(),
         usage: record.usage,
+        prefill_ms: record
+            .first_upstream_byte_ms
+            .zip(record.phases.first_content_delta_ms)
+            .map(|(start, end)| end.saturating_sub(start)),
+        decode_ms: record
+            .phases
+            .first_content_delta_ms
+            .zip(record.phases.stream_end_ms)
+            .map(|(start, end)| end.saturating_sub(start)),
         attempts: record.attempts.clone(),
     };
     finish_from_terminal(TerminalPersistenceInput {
@@ -1407,6 +1424,8 @@ mod tests {
                 cached: Some(3),
                 reasoning: Some(2),
             }),
+            prefill_ms: Some(38),
+            decode_ms: Some(20),
             attempts: vec![
                 attempt("a", "model-a", AttemptStatus::Failed, 1_010),
                 attempt("b", "model-b", AttemptStatus::Served, 1_030),

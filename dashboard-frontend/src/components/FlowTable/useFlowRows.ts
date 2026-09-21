@@ -6,7 +6,8 @@
  *     (connection.ts finding 10). It seeds rows the store has not seen and stays the source of
  *     server-only fields (terminal_reason, cost roll-up) until a live frame supersedes them.
  *
- * The store wins on conflict (it carries the freshest status/usage). `flowOrder` defines the
+ * The store wins on volatile data except that a terminal status always beats an `open` status,
+ * regardless of which transport delivered it first. `flowOrder` defines the
  * live-row identity, but the MERGED union is sorted GLOBALLY by `started_ms` descending so a
  * newer REST-only row can never sort below an older live row (finding 4) — newest-on-top holds
  * regardless of source. Filtering + the distinct model/upstream option lists are derived here so
@@ -73,13 +74,16 @@ function mergeRows(
 
 /**
  * Reconciles a live store row with its REST counterpart. The live frame is the FRESHEST source of
- * the volatile flow STATE (`status`, `usage`), so those always win. But a WS-created row (one the
+ * the volatile flow STATE (`usage` and normally `status`). Status is reconciled monotonically:
+ * terminal beats `open`, so a delayed/stale WS frame cannot resurrect a completed REST row and a
+ * stale REST refetch cannot reopen a terminal WS row. But a WS-created row (one the
  * `flow_status` patch minted before the REST list arrived) carries PLACEHOLDERS for the fields the
  * frame cannot author — `method:'POST'`, `uri:''`, and null `finished/elapsed/cost/terminal_reason`
  * — so it kept showing those placeholders even after the authoritative REST row landed (finding 3).
  *
  * Field policy:
- *  - status / usage / started_ms: LIVE wins (the socket owns the live state + stream start).
+ *  - status: terminal beats `open`; if both agree on terminality, LIVE wins.
+ *  - usage / started_ms: LIVE wins (the socket owns the live state + stream start).
  *  - method / uri: REST-authoritative request line — REST wins when present (it never changes over a
  *    flow's life, so this only replaces a WS placeholder; falls back to live if REST omitted it).
  *  - model_requested / model_served / upstream_target / response_id: LIVE wins when present, else
@@ -104,8 +108,10 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
   // figure and its confidence label always agree: if the live frame supplied the cost, use its tag;
   // else adopt the REST roll-up's tag together with the REST cost.
   const liveAuthoredCost = live.cost != null;
+  const status = live.status === 'open' && rest.status !== 'open' ? rest.status : live.status;
   const merged: FlowSummary = {
     ...live,
+    status,
     // REST-authoritative request line: replace a WS placeholder with the real value.
     method: rest.method || live.method,
     uri: rest.uri || live.uri,
@@ -160,6 +166,7 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
 /** True when every `FlowSummary` field is identical (so the merge can return `live` unchanged). */
 function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
   return (
+    a.status === b.status &&
     a.method === b.method &&
     a.uri === b.uri &&
     (a.response_id ?? null) === (b.response_id ?? null) &&

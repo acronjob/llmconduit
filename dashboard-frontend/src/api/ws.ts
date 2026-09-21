@@ -512,9 +512,13 @@ export class DashboardSocket {
           p95: payload.p95,
           p99: payload.p99,
           tokens_per_sec: payload.tokens_per_sec,
+          prefill_tokens_per_sec: payload.prefill_tokens_per_sec,
+          decode_tokens_per_sec: payload.decode_tokens_per_sec,
           cost_per_min: payload.cost_per_min,
           samples: payload.samples,
           usage_samples: payload.usage_samples,
+          prefill_samples: payload.prefill_samples,
+          decode_samples: payload.decode_samples,
           priced_samples: payload.priced_samples,
           // Gap 07: thread the aggregate cost confidence from the tick to the store.
           cost_confidence: payload.cost_confidence,

@@ -11,7 +11,23 @@ import type {
   ActivityResponse,
   ActiveSessionsResponse,
   ApiKeyRecord,
+  AuthApiKeysResponse,
+  AuthAuditResponse,
+  AuthGroupsResponse,
+  AuthPoliciesResponse,
+  AuthPricingResponse,
+  AuthRolesResponse,
+  AuthSessionsResponse,
+  AuthSummary,
+  AuthUsageResponse,
+  AuthUsersResponse,
   CatalogEntry,
+  CreateAuthApiKeyRequest,
+  CreateAuthGroupRequest,
+  CreateAuthPolicyRequest,
+  CreateAuthRoleRequest,
+  CreateAuthUserRequest,
+  CreatedAuthApiKey,
   CreatedKeyResponse,
   FlowDetail,
   FlowsQuery,
@@ -22,6 +38,8 @@ import type {
   LoginRequest,
   MeResponse,
   MetricsResponse,
+  ProviderMetricsResponse,
+  ProvidersResponse,
   SessionDetailResponse,
   SessionUser,
   SessionsResponse,
@@ -29,6 +47,21 @@ import type {
   ThroughputResponse,
   TopologyResponse,
   UserRecord,
+} from './types';
+import {
+  isAuthApiKeysResponse,
+  isAuthAuditResponse,
+  isAuthGroupsResponse,
+  isAuthPoliciesResponse,
+  isAuthPricingResponse,
+  isAuthRolesResponse,
+  isAuthSessionsResponse,
+  isAuthSummary,
+  isAuthUsageResponse,
+  isAuthUsersResponse,
+  isCreatedAuthApiKey,
+  isProviderMetricsResponse,
+  isProvidersResponse,
 } from './types';
 
 export type FetchImpl = typeof fetch;
@@ -66,7 +99,7 @@ export class DashboardClient {
     this.onUnauthorized = opts.onUnauthorized;
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async request<T>(path: string, init?: RequestInit, guard?: (value: unknown) => value is T): Promise<T> {
     const res = await this.fetchImpl(`${this.basePath}${path}`, {
       credentials: 'include',
       ...init,
@@ -81,7 +114,9 @@ export class DashboardClient {
     }
     // 204/empty bodies decode to `undefined as T` at the call sites that allow it.
     const text = await res.text();
-    return (text ? JSON.parse(text) : undefined) as T;
+    const value: unknown = text ? JSON.parse(text) : undefined;
+    if (guard && !guard(value)) throw new Error(`${path} returned an invalid response`);
+    return value as T;
   }
 
   // -- Auth -----------------------------------------------------------------
@@ -166,9 +201,25 @@ export class DashboardClient {
     return this.request<HistoryMetricsResponse>(`/history/metrics${buildQuery(query)}`);
   }
 
-  /** `POST /dashboard/logout` — clears the session cookie. */
+  /** Delegated management login backed by an API key. */
+  async keyLogin(apiKey: string): Promise<void> {
+    const res = await this.fetchImpl('/dashboard/auth/key-login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: apiKey }),
+    });
+    if (!res.ok) throw new Error(`key login failed: ${res.status}`);
+  }
+
+  /** `POST /dashboard/auth/logout` — revokes delegated sessions and clears cookies. */
   async logout(): Promise<void> {
-    await this.fetchImpl('/dashboard/logout', { method: 'POST', credentials: 'include' });
+    const csrf = this.getCsrfToken();
+    await this.fetchImpl('/dashboard/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+      headers: csrf ? { 'X-CSRF-Token': csrf } : undefined,
+    });
   }
 
   /**
@@ -207,6 +258,14 @@ export class DashboardClient {
     return this.request<TopologyResponse>('/topology');
   }
 
+  providers(): Promise<ProvidersResponse> {
+    return this.request('/providers', undefined, isProvidersResponse);
+  }
+
+  providerMetrics(): Promise<ProviderMetricsResponse> {
+    return this.request('/provider-metrics', undefined, isProviderMetricsResponse);
+  }
+
   /** Bare array — no cursor (D13: static-ish catalog read). */
   catalog(): Promise<CatalogEntry[]> {
     return this.request<CatalogEntry[]>('/catalog');
@@ -241,6 +300,79 @@ export class DashboardClient {
     return this.request<unknown>(`/history/requests/${encodeURIComponent(id)}/body?hop=${hop}`);
   }
 
+  // -- Access management ----------------------------------------------------
+
+  authSummary(): Promise<AuthSummary> {
+    return this.request('/auth/summary', undefined, isAuthSummary);
+  }
+  authUsers(): Promise<AuthUsersResponse> {
+    return this.request('/auth/users', undefined, isAuthUsersResponse);
+  }
+  authGroups(): Promise<AuthGroupsResponse> {
+    return this.request('/auth/groups', undefined, isAuthGroupsResponse);
+  }
+  authRoles(): Promise<AuthRolesResponse> {
+    return this.request('/auth/roles', undefined, isAuthRolesResponse);
+  }
+  authPolicies(): Promise<AuthPoliciesResponse> {
+    return this.request('/auth/policies', undefined, isAuthPoliciesResponse);
+  }
+  authApiKeys(): Promise<AuthApiKeysResponse> {
+    return this.request('/auth/api-keys', undefined, isAuthApiKeysResponse);
+  }
+  authSessions(): Promise<AuthSessionsResponse> {
+    return this.request('/auth/sessions', undefined, isAuthSessionsResponse);
+  }
+  authUsage(): Promise<AuthUsageResponse> {
+    return this.request('/auth/usage', undefined, isAuthUsageResponse);
+  }
+  authAudit(): Promise<AuthAuditResponse> {
+    return this.request('/auth/audit', undefined, isAuthAuditResponse);
+  }
+  authPricing(): Promise<AuthPricingResponse> {
+    return this.request('/auth/pricing', undefined, isAuthPricingResponse);
+  }
+
+  createAuthUser(body: CreateAuthUserRequest): Promise<AuthUsersResponse> {
+    return this.authMutation('/auth/users', body, isAuthUsersResponse);
+  }
+  createAuthGroup(body: CreateAuthGroupRequest): Promise<AuthGroupsResponse> {
+    return this.authMutation('/auth/groups', body, isAuthGroupsResponse);
+  }
+  createAuthRole(body: CreateAuthRoleRequest): Promise<AuthRolesResponse> {
+    return this.authMutation('/auth/roles', body, isAuthRolesResponse);
+  }
+  createAuthApiKey(body: CreateAuthApiKeyRequest): Promise<CreatedAuthApiKey> {
+    return this.authMutation('/auth/api-keys', body, isCreatedAuthApiKey);
+  }
+  createAuthPolicy(body: CreateAuthPolicyRequest): Promise<AuthPoliciesResponse> {
+    return this.authMutation('/auth/policies', body, isAuthPoliciesResponse);
+  }
+  revokeAuthApiKey(id: string): Promise<AuthApiKeysResponse> {
+    return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/revoke`, undefined, isAuthApiKeysResponse);
+  }
+  rotateAuthApiKey(id: string): Promise<CreatedAuthApiKey> {
+    return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/rotate`, undefined, isCreatedAuthApiKey);
+  }
+  revokeAuthSession(id: string): Promise<AuthSessionsResponse> {
+    return this.authMutation(`/auth/sessions/${encodeURIComponent(id)}/revoke`, undefined, isAuthSessionsResponse);
+  }
+
+  private authMutation<T>(
+    path: string,
+    body: unknown,
+    guard: (value: unknown) => value is T,
+  ): Promise<T> {
+    const csrf = this.getCsrfToken();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+    return this.request(path, {
+      method: 'POST',
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }, guard);
+  }
+
   // -- Mutation (CSRF-gated) ------------------------------------------------
 
   /** `POST /flows/:id/kill` — attaches `X-CSRF-Token` (D7). */
@@ -253,6 +385,7 @@ export class DashboardClient {
       headers,
     });
   }
+
 }
 
 /** Serializes a query object into a `?a=b&c=d` string, dropping undefined/null values. */

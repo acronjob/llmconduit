@@ -1,3 +1,5 @@
+use chrono::DateTime;
+use chrono::FixedOffset;
 use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
@@ -549,6 +551,45 @@ pub enum UnsupportedImagePolicy {
     Reject,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    #[default]
+    Disabled,
+    Enforce,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthConfig {
+    pub mode: AuthMode,
+    pub store_path: PathBuf,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::Disabled,
+            store_path: PathBuf::from("llmconduit-auth.sqlite3"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersistedAuthConfig {
+    pub mode: AuthMode,
+    pub store_path: String,
+}
+
+impl Default for PersistedAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::Disabled,
+            store_path: "llmconduit-auth.sqlite3".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -564,6 +605,7 @@ pub struct Config {
     /// capture sink entirely (zero-op: no thread, no alloc, no fs).
     pub turn_capture_dir: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    pub provider_metrics_targets: Vec<crate::provider_metrics::ProviderMetricsTarget>,
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
@@ -634,6 +676,163 @@ pub struct Config {
     /// default — an absent model simply has no price (cost stays `None`/0), which
     /// is contract-valid (the frontend only requires finite rates when present).
     pub price_table: HashMap<String, ModelPrice>,
+    /// Inference authorization configuration. The key-verification pepper and
+    /// optional bootstrap key remain environment-only and are never retained in
+    /// this `Debug + Clone` structure.
+    pub auth: AuthConfig,
+    pub mesh: MeshConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MeshConfig {
+    pub controller: MeshControllerConfig,
+    pub worker: MeshWorkerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshControllerConfig {
+    pub enabled: bool,
+    pub bind_addr: SocketAddr,
+    pub identity_path: Option<PathBuf>,
+    pub state_path: Option<PathBuf>,
+    pub heartbeat_timeout_secs: u64,
+    pub model_allowlist: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+}
+
+impl Default for MeshControllerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "0.0.0.0:4433"
+                .parse()
+                .expect("default mesh controller bind address is valid"),
+            identity_path: None,
+            state_path: None,
+            heartbeat_timeout_secs: 30,
+            model_allowlist: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshWorkerConfig {
+    pub controller_addr: Option<String>,
+    pub controller_endpoint_id: Option<String>,
+    pub identity_path: Option<PathBuf>,
+    pub heartbeat_interval_secs: u64,
+    pub resources: Vec<MeshWorkerResourceConfig>,
+}
+
+impl Default for MeshWorkerConfig {
+    fn default() -> Self {
+        Self {
+            controller_addr: None,
+            controller_endpoint_id: None,
+            identity_path: None,
+            heartbeat_interval_secs: 10,
+            resources: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshWorkerResourceConfig {
+    pub id: String,
+    pub target: SocketAddr,
+    pub models: Vec<String>,
+    pub model_refresh_secs: u64,
+    pub availability: AvailabilitySchedule,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AvailabilitySchedule {
+    pub timezone: String,
+    pub default_capacity: u32,
+    pub weekly: Vec<WeeklyCapacityWindow>,
+    pub exceptions: Vec<CapacityException>,
+}
+
+impl Default for AvailabilitySchedule {
+    fn default() -> Self {
+        Self {
+            timezone: "UTC".to_string(),
+            default_capacity: 0,
+            weekly: Vec::new(),
+            exceptions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeeklyCapacityWindow {
+    pub days: Vec<MeshWeekday>,
+    pub start_local: LocalTime,
+    pub end_local: LocalTime,
+    pub capacity: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapacityException {
+    pub start: DateTime<FixedOffset>,
+    pub end: DateTime<FixedOffset>,
+    pub capacity: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshWeekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+impl MeshWeekday {
+    fn index(self) -> usize {
+        match self {
+            Self::Mon => 0,
+            Self::Tue => 1,
+            Self::Wed => 2,
+            Self::Thu => 3,
+            Self::Fri => 4,
+            Self::Sat => 5,
+            Self::Sun => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalTime {
+    hour: u8,
+    minute: u8,
+}
+
+impl LocalTime {
+    fn minutes_since_midnight(self) -> u16 {
+        u16::from(self.hour) * 60 + u16::from(self.minute)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalTime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_local_time(&value).map_err(DeError::custom)
+    }
+}
+
+impl Serialize for LocalTime {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("{:02}:{:02}", self.hour, self.minute))
+    }
 }
 
 /// One model's billing rates (T13/D13), per 1k tokens. Field names mirror the
@@ -1154,6 +1353,10 @@ pub struct PersistedFallbackUpstream {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_source: Option<crate::provider_metrics::MetricsSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1169,6 +1372,10 @@ pub struct PersistedUpstream {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_source: Option<crate::provider_metrics::MetricsSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
 }
@@ -1183,6 +1390,10 @@ pub struct PersistedConfig {
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_source: Option<crate::provider_metrics::MetricsSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1270,6 +1481,151 @@ pub struct PersistedConfig {
     /// `upstream_chat_kwargs` env-JSON pattern). Empty by default.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub price_table: HashMap<String, ModelPrice>,
+    #[serde(default, skip_serializing_if = "is_default_auth_config")]
+    pub auth: PersistedAuthConfig,
+    #[serde(default, skip_serializing_if = "PersistedMeshConfig::is_default")]
+    pub mesh: PersistedMeshConfig,
+}
+
+fn is_default_auth_config(config: &PersistedAuthConfig) -> bool {
+    config == &PersistedAuthConfig::default()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PersistedMeshConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedMeshControllerConfig::is_default"
+    )]
+    pub controller: PersistedMeshControllerConfig,
+    #[serde(default, skip_serializing_if = "PersistedMeshWorkerConfig::is_default")]
+    pub worker: PersistedMeshWorkerConfig,
+}
+
+impl PersistedMeshConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedMeshControllerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mesh_controller_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<String>,
+    #[serde(default = "default_mesh_heartbeat_timeout_secs")]
+    pub heartbeat_timeout_secs: u64,
+    /// Controller-side routing approval map:
+    /// endpoint_id -> resource_id -> allowed model ids. An empty map is
+    /// fail-closed: enrolled workers remain connected but cannot receive work.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_allowlist: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+}
+
+impl Default for PersistedMeshControllerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_mesh_controller_bind_addr(),
+            identity_path: None,
+            state_path: None,
+            heartbeat_timeout_secs: default_mesh_heartbeat_timeout_secs(),
+            model_allowlist: BTreeMap::new(),
+        }
+    }
+}
+
+impl PersistedMeshControllerConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedMeshWorkerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_path: Option<String>,
+    #[serde(default = "default_mesh_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<PersistedMeshWorkerResourceConfig>,
+}
+
+impl Default for PersistedMeshWorkerConfig {
+    fn default() -> Self {
+        Self {
+            controller_addr: None,
+            controller_endpoint_id: None,
+            identity_path: None,
+            heartbeat_interval_secs: default_mesh_heartbeat_interval_secs(),
+            resources: Vec::new(),
+        }
+    }
+}
+
+impl PersistedMeshWorkerConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedMeshWorkerResourceConfig {
+    pub id: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default = "default_mesh_model_refresh_secs")]
+    pub model_refresh_secs: u64,
+    #[serde(default)]
+    pub availability: PersistedAvailabilitySchedule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedAvailabilitySchedule {
+    #[serde(default = "default_mesh_timezone")]
+    pub timezone: String,
+    #[serde(default)]
+    pub default_capacity: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weekly: Vec<PersistedWeeklyCapacityWindow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions: Vec<PersistedCapacityException>,
+}
+
+impl Default for PersistedAvailabilitySchedule {
+    fn default() -> Self {
+        Self {
+            timezone: default_mesh_timezone(),
+            default_capacity: 0,
+            weekly: Vec::new(),
+            exceptions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedWeeklyCapacityWindow {
+    pub days: Vec<MeshWeekday>,
+    pub start: LocalTime,
+    pub end: LocalTime,
+    pub capacity: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedCapacityException {
+    pub start: DateTime<FixedOffset>,
+    pub end: DateTime<FixedOffset>,
+    pub capacity: u32,
 }
 
 fn default_bind_addr() -> String {
@@ -1278,6 +1634,26 @@ fn default_bind_addr() -> String {
 
 fn default_upstream_base_url() -> String {
     "http://127.0.0.1:8000/v1".to_string()
+}
+
+fn default_mesh_controller_bind_addr() -> String {
+    "0.0.0.0:4433".to_string()
+}
+
+fn default_mesh_heartbeat_timeout_secs() -> u64 {
+    30
+}
+
+fn default_mesh_heartbeat_interval_secs() -> u64 {
+    10
+}
+
+fn default_mesh_model_refresh_secs() -> u64 {
+    60
+}
+
+fn default_mesh_timezone() -> String {
+    "UTC".to_string()
 }
 
 fn default_brave_base_url() -> String {
@@ -1359,6 +1735,8 @@ impl Default for PersistedConfig {
             upstream_base_url: default_upstream_base_url(),
             upstream_api_key: None,
             upstream_model: None,
+            metrics_url: None,
+            metrics_source: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
@@ -1389,6 +1767,8 @@ impl Default for PersistedConfig {
             image_cache_ttl_secs: default_image_cache_ttl_secs(),
             unsupported_image_policy: default_unsupported_image_policy(),
             price_table: HashMap::new(),
+            auth: PersistedAuthConfig::default(),
+            mesh: PersistedMeshConfig::default(),
         }
     }
 }
@@ -1535,9 +1915,59 @@ impl Config {
             .enumerate()
             .map(parse_upstream)
             .collect::<Result<Vec<_>, String>>()?;
+        let mut provider_metrics_targets = Vec::new();
+        if let Some(target) = parse_provider_metrics_target(
+            "primary",
+            config.metrics_url.as_deref(),
+            config.metrics_source,
+            "root",
+        )? {
+            provider_metrics_targets.push(target);
+        }
+        for (index, (persisted, resolved)) in config
+            .fallback_upstreams
+            .iter()
+            .zip(&fallback_upstreams)
+            .enumerate()
+        {
+            if let Some(target) = parse_provider_metrics_target(
+                &resolved.name,
+                persisted.metrics_url.as_deref(),
+                persisted.metrics_source,
+                &format!("fallback_upstreams[{index}]"),
+            )? {
+                provider_metrics_targets.push(target);
+            }
+        }
+        for (index, (persisted, resolved)) in config.upstreams.iter().zip(&upstreams).enumerate() {
+            if let Some(target) = parse_provider_metrics_target(
+                &resolved.name,
+                persisted.metrics_url.as_deref(),
+                persisted.metrics_source,
+                &format!("upstreams[{index}]"),
+            )? {
+                provider_metrics_targets.push(target);
+            }
+            for (fallback_index, (persisted_fallback, resolved_fallback)) in persisted
+                .fallback_upstreams
+                .iter()
+                .zip(&resolved.fallback_upstreams)
+                .enumerate()
+            {
+                if let Some(target) = parse_provider_metrics_target(
+                    &resolved_fallback.name,
+                    persisted_fallback.metrics_url.as_deref(),
+                    persisted_fallback.metrics_source,
+                    &format!("upstreams[{index}].fallback_upstreams[{fallback_index}]"),
+                )? {
+                    provider_metrics_targets.push(target);
+                }
+            }
+        }
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
         let model_routes = resolve_model_routes(&config.model_routes)?;
+        let mesh = parse_mesh_config(&config.mesh)?;
         let vision_url = match trim_nonempty(config.vision_url.as_deref()) {
             Some(url) => {
                 Some(Url::parse(&url).map_err(|err| format!("invalid vision_url: {err}"))?)
@@ -1575,6 +2005,7 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
+            provider_metrics_targets,
             upstreams,
             fallback_upstreams,
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
@@ -1617,6 +2048,11 @@ impl Config {
                 retain_finite_prices(&mut table);
                 table
             },
+            auth: AuthConfig {
+                mode: config.auth.mode,
+                store_path: PathBuf::from(config.auth.store_path.trim()),
+            },
+            mesh,
         })
     }
 
@@ -1941,6 +2377,373 @@ pub(crate) fn is_glob_pattern(value: &str) -> bool {
     value.contains(['*', '?', '['])
 }
 
+const MAX_MESH_CONFIGURED_CAPACITY: u32 = 65_535;
+const MAX_MESH_RESOURCE_ID_BYTES: usize = 128;
+const MAX_MESH_RESOURCE_MODELS: usize = 1024;
+const MAX_MESH_MODEL_ID_BYTES: usize = 512;
+
+fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String> {
+    let controller_bind_addr = config
+        .controller
+        .bind_addr
+        .parse()
+        .map_err(|err| format!("invalid mesh.controller.bind_addr: {err}"))?;
+    let controller_identity_path =
+        trim_nonempty(config.controller.identity_path.as_deref()).map(PathBuf::from);
+    let controller_state_path =
+        trim_nonempty(config.controller.state_path.as_deref()).map(PathBuf::from);
+    if config.controller.enabled {
+        if controller_identity_path.is_none() {
+            return Err(
+                "mesh.controller.identity_path is required when controller is enabled".to_string(),
+            );
+        }
+        if controller_state_path.is_none() {
+            return Err(
+                "mesh.controller.state_path is required when controller is enabled".to_string(),
+            );
+        }
+        if config.controller.heartbeat_timeout_secs == 0 {
+            return Err(
+                "mesh.controller.heartbeat_timeout_secs must be greater than zero".to_string(),
+            );
+        }
+    }
+    validate_mesh_model_allowlist(&config.controller.model_allowlist)?;
+
+    let worker_configured = config.worker.controller_addr.is_some()
+        || config.worker.controller_endpoint_id.is_some()
+        || config.worker.identity_path.is_some()
+        || !config.worker.resources.is_empty()
+        || config.worker.heartbeat_interval_secs != default_mesh_heartbeat_interval_secs();
+    let worker_controller_addr = trim_nonempty(config.worker.controller_addr.as_deref());
+    let worker_controller_endpoint_id =
+        trim_nonempty(config.worker.controller_endpoint_id.as_deref());
+    let worker_identity_path =
+        trim_nonempty(config.worker.identity_path.as_deref()).map(PathBuf::from);
+    if worker_configured {
+        if worker_controller_addr.is_none() {
+            return Err("mesh.worker.controller_addr is required for worker mode".to_string());
+        }
+        if worker_controller_endpoint_id.is_none() {
+            return Err(
+                "mesh.worker.controller_endpoint_id is required for worker mode".to_string(),
+            );
+        }
+        if worker_identity_path.is_none() {
+            return Err("mesh.worker.identity_path is required for worker mode".to_string());
+        }
+        if config.worker.resources.is_empty() {
+            return Err(
+                "mesh.worker.resources must contain at least one resource for worker mode"
+                    .to_string(),
+            );
+        }
+        if config.worker.heartbeat_interval_secs == 0 {
+            return Err(
+                "mesh.worker.heartbeat_interval_secs must be greater than zero".to_string(),
+            );
+        }
+    }
+
+    let resources = config
+        .worker
+        .resources
+        .iter()
+        .enumerate()
+        .map(parse_mesh_worker_resource)
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(MeshConfig {
+        controller: MeshControllerConfig {
+            enabled: config.controller.enabled,
+            bind_addr: controller_bind_addr,
+            identity_path: controller_identity_path,
+            state_path: controller_state_path,
+            heartbeat_timeout_secs: config.controller.heartbeat_timeout_secs,
+            model_allowlist: config.controller.model_allowlist.clone(),
+        },
+        worker: MeshWorkerConfig {
+            controller_addr: worker_controller_addr,
+            controller_endpoint_id: worker_controller_endpoint_id,
+            identity_path: worker_identity_path,
+            heartbeat_interval_secs: config.worker.heartbeat_interval_secs,
+            resources,
+        },
+    })
+}
+
+fn validate_mesh_model_allowlist(
+    allowlist: &BTreeMap<String, BTreeMap<String, Vec<String>>>,
+) -> Result<(), String> {
+    for (endpoint_id, resources) in allowlist {
+        if endpoint_id.trim().is_empty() {
+            return Err(
+                "mesh.controller.model_allowlist endpoint id must not be blank".to_string(),
+            );
+        }
+        if endpoint_id.chars().any(char::is_control) {
+            return Err(
+                "mesh.controller.model_allowlist endpoint id must not contain control characters"
+                    .to_string(),
+            );
+        }
+        if resources.is_empty() {
+            return Err(format!(
+                "mesh.controller.model_allowlist[{endpoint_id}] must approve at least one resource"
+            ));
+        }
+        for (resource_id, models) in resources {
+            if resource_id.trim().is_empty() {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}] resource id must not be blank"
+                ));
+            }
+            if resource_id.len() > MAX_MESH_RESOURCE_ID_BYTES {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} must be at most {MAX_MESH_RESOURCE_ID_BYTES} bytes"
+                ));
+            }
+            if resource_id.chars().any(char::is_control) {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}] resource id must not contain control characters"
+                ));
+            }
+            if models.is_empty() {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} must approve at least one model"
+                ));
+            }
+            if models.len() > MAX_MESH_RESOURCE_MODELS {
+                return Err(format!(
+                    "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} must contain at most {MAX_MESH_RESOURCE_MODELS} models"
+                ));
+            }
+            for model in models {
+                if model.trim().is_empty() {
+                    return Err(format!(
+                        "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} must not contain blank model ids"
+                    ));
+                }
+                if model.len() > MAX_MESH_MODEL_ID_BYTES || model.chars().any(char::is_control) {
+                    return Err(format!(
+                        "mesh.controller.model_allowlist[{endpoint_id}].{resource_id} contains an invalid model id"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_mesh_worker_resource(
+    (index, resource): (usize, &PersistedMeshWorkerResourceConfig),
+) -> Result<MeshWorkerResourceConfig, String> {
+    let id = resource.id.trim();
+    if id.is_empty() {
+        return Err(format!(
+            "mesh.worker.resources[{index}].id must not be blank"
+        ));
+    }
+    if id.len() > MAX_MESH_RESOURCE_ID_BYTES {
+        return Err(format!(
+            "mesh.worker.resources[{index}].id must be at most {MAX_MESH_RESOURCE_ID_BYTES} bytes"
+        ));
+    }
+    if resource.model_refresh_secs == 0 {
+        return Err(format!(
+            "mesh.worker.resources[{index}].model_refresh_secs must be greater than zero"
+        ));
+    }
+    if resource.models.len() > MAX_MESH_RESOURCE_MODELS {
+        return Err(format!(
+            "mesh.worker.resources[{index}].models must contain at most {MAX_MESH_RESOURCE_MODELS} entries"
+        ));
+    }
+    let models = resource
+        .models
+        .iter()
+        .enumerate()
+        .map(|(model_index, model)| {
+            let model = model.trim();
+            if model.is_empty() {
+                return Err(format!(
+                    "mesh.worker.resources[{index}].models[{model_index}] must not be blank"
+                ));
+            }
+            if model.len() > MAX_MESH_MODEL_ID_BYTES || model.chars().any(char::is_control) {
+                return Err(format!(
+                    "mesh.worker.resources[{index}].models[{model_index}] is invalid"
+                ));
+            }
+            Ok(model.to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let target = resource
+        .target
+        .trim()
+        .parse()
+        .map_err(|err| format!("invalid mesh.worker.resources[{index}].target: {err}"))?;
+    let availability = parse_availability_schedule(
+        &resource.availability,
+        &format!("mesh.worker.resources[{index}].availability"),
+    )?;
+    Ok(MeshWorkerResourceConfig {
+        id: id.to_string(),
+        target,
+        models,
+        model_refresh_secs: resource.model_refresh_secs,
+        availability,
+    })
+}
+
+fn parse_availability_schedule(
+    schedule: &PersistedAvailabilitySchedule,
+    path: &str,
+) -> Result<AvailabilitySchedule, String> {
+    let timezone = trim_nonempty(Some(&schedule.timezone))
+        .ok_or_else(|| format!("{path}.timezone must not be blank"))?;
+    timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|err| format!("{path}.timezone is not a valid IANA timezone: {err}"))?;
+    validate_mesh_capacity(
+        schedule.default_capacity,
+        &format!("{path}.default_capacity"),
+    )?;
+
+    let weekly = schedule
+        .weekly
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            if window.days.is_empty() {
+                return Err(format!("{path}.weekly[{index}].days must not be empty"));
+            }
+            if window.start == window.end {
+                return Err(format!(
+                    "{path}.weekly[{index}] must not have a zero-length window"
+                ));
+            }
+            validate_mesh_capacity(window.capacity, &format!("{path}.weekly[{index}].capacity"))?;
+            Ok(WeeklyCapacityWindow {
+                days: window.days.clone(),
+                start_local: window.start,
+                end_local: window.end,
+                capacity: window.capacity,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    validate_weekly_capacity_windows(&weekly, path)?;
+
+    let exceptions = schedule
+        .exceptions
+        .iter()
+        .enumerate()
+        .map(|(index, exception)| {
+            if exception.end <= exception.start {
+                return Err(format!(
+                    "{path}.exceptions[{index}].end must be after start"
+                ));
+            }
+            validate_mesh_capacity(
+                exception.capacity,
+                &format!("{path}.exceptions[{index}].capacity"),
+            )?;
+            Ok(CapacityException {
+                start: exception.start,
+                end: exception.end,
+                capacity: exception.capacity,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    validate_capacity_exceptions(&exceptions, path)?;
+
+    Ok(AvailabilitySchedule {
+        timezone,
+        default_capacity: schedule.default_capacity,
+        weekly,
+        exceptions,
+    })
+}
+
+fn validate_mesh_capacity(capacity: u32, path: &str) -> Result<(), String> {
+    if capacity > MAX_MESH_CONFIGURED_CAPACITY {
+        return Err(format!("{path} must be <= {MAX_MESH_CONFIGURED_CAPACITY}"));
+    }
+    Ok(())
+}
+
+fn validate_weekly_capacity_windows(
+    weekly: &[WeeklyCapacityWindow],
+    path: &str,
+) -> Result<(), String> {
+    let mut by_day: [Vec<(u16, u16, usize)>; 7] = Default::default();
+    for (index, window) in weekly.iter().enumerate() {
+        let start = window.start_local.minutes_since_midnight();
+        let end = window.end_local.minutes_since_midnight();
+        for day in &window.days {
+            let day_index = day.index();
+            if end > start {
+                by_day[day_index].push((start, end, index));
+            } else {
+                by_day[day_index].push((start, 24 * 60, index));
+                by_day[(day_index + 1) % 7].push((0, end, index));
+            }
+        }
+    }
+    for windows in &mut by_day {
+        windows.sort_by_key(|(start, end, _)| (*start, *end));
+        for pair in windows.windows(2) {
+            let (_, prev_end, prev_index) = pair[0];
+            let (next_start, _, next_index) = pair[1];
+            if prev_end > next_start {
+                return Err(format!(
+                    "{path}.weekly[{prev_index}] overlaps mesh availability window weekly[{next_index}]"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_capacity_exceptions(
+    exceptions: &[CapacityException],
+    path: &str,
+) -> Result<(), String> {
+    let mut ranges = exceptions
+        .iter()
+        .enumerate()
+        .map(|(index, exception)| (exception.start, exception.end, index))
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|(start, end, _)| (*start, *end));
+    for pair in ranges.windows(2) {
+        let (_, prev_end, prev_index) = pair[0];
+        let (next_start, _, next_index) = pair[1];
+        if prev_end > next_start {
+            return Err(format!(
+                "{path}.exceptions[{prev_index}] overlaps mesh availability exception exceptions[{next_index}]"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_local_time(value: &str) -> Result<LocalTime, String> {
+    let (hour, minute) = value
+        .split_once(':')
+        .ok_or_else(|| format!("local time {value:?} must use HH:MM"))?;
+    let hour = hour
+        .parse::<u8>()
+        .map_err(|_| format!("local time {value:?} has invalid hour"))?;
+    let minute = minute
+        .parse::<u8>()
+        .map_err(|_| format!("local time {value:?} has invalid minute"))?;
+    if hour > 23 || minute > 59 {
+        return Err(format!("local time {value:?} must be within 00:00..23:59"));
+    }
+    Ok(LocalTime { hour, minute })
+}
+
 /// Translate a glob pattern into an anchored, case-insensitive `Regex`,
 /// approximating Python `fnmatch` semantics: `*` → any run, `?` → one char,
 /// `[...]` → a character class (with `[!...]` negation), and every other
@@ -2260,6 +3063,35 @@ fn parse_upstream(
     })
 }
 
+fn parse_provider_metrics_target(
+    provider: &str,
+    metrics_url: Option<&str>,
+    metrics_source: Option<crate::provider_metrics::MetricsSource>,
+    path: &str,
+) -> Result<Option<crate::provider_metrics::ProviderMetricsTarget>, String> {
+    let metrics_url = trim_nonempty(metrics_url);
+    match (metrics_url, metrics_source) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(format!(
+            "{path}.metrics_source is required with metrics_url"
+        )),
+        (None, Some(_)) => Err(format!(
+            "{path}.metrics_url is required with metrics_source"
+        )),
+        (Some(raw_url), Some(source)) => {
+            let url =
+                Url::parse(&raw_url).map_err(|err| format!("invalid {path}.metrics_url: {err}"))?;
+            crate::provider_metrics::ProviderMetricsTarget::from_operator_config(
+                provider.to_string(),
+                url,
+                source,
+            )
+            .map(Some)
+            .map_err(|err| format!("invalid {path}.metrics_url: {err}"))
+        }
+    }
+}
+
 fn parse_fallback_upstream(
     provider: &PersistedFallbackUpstream,
     index: usize,
@@ -2573,6 +3405,7 @@ mod tests {
     use super::OrderedModelRoutes;
     use super::PersistedConfig;
     use super::PersistedFallbackUpstream;
+    use super::PersistedMeshConfig;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
     use super::RolesConfig;
@@ -2821,6 +3654,9 @@ model_profiles:
     #[test]
     fn from_persisted_invalid_base_url() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_base_url: "not a url".to_string(),
             ..PersistedConfig::default()
         };
@@ -2830,6 +3666,9 @@ model_profiles:
     #[test]
     fn whitespace_api_key_trimmed() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_api_key: Some("  secret  ".to_string()),
             ..PersistedConfig::default()
         };
@@ -2837,6 +3676,9 @@ model_profiles:
         assert_eq!(result.upstream_api_key, Some("secret".to_string()));
 
         let config2 = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_api_key: Some("   ".to_string()),
             ..PersistedConfig::default()
         };
@@ -2851,6 +3693,9 @@ model_profiles:
     #[test]
     fn turn_capture_dir_trims_blank_to_none() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             turn_capture_dir: Some("  /tmp/llmconduit-turns  ".to_string()),
             ..PersistedConfig::default()
         };
@@ -2861,6 +3706,9 @@ model_profiles:
         );
 
         let blank = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             turn_capture_dir: Some("   ".to_string()),
             ..PersistedConfig::default()
         };
@@ -2925,8 +3773,14 @@ model_profiles:
     #[test]
     fn from_persisted_parses_fallback_upstreams() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             fallback_upstreams: vec![
                 PersistedFallbackUpstream {
+                    metrics_url: None,
+                    metrics_source: None,
+
                     name: Some(" backup ".to_string()),
                     upstream_base_url: "  http://127.0.0.1:8001/v1  ".to_string(),
                     upstream_api_key: Some(" backup-secret ".to_string()),
@@ -2942,6 +3796,9 @@ model_profiles:
                     upstream_request_log_path: Some(" /tmp/llmconduit-fallback.jsonl ".to_string()),
                 },
                 PersistedFallbackUpstream {
+                    metrics_url: None,
+                    metrics_source: None,
+
                     name: Some("   ".to_string()),
                     upstream_base_url: "http://127.0.0.1:8002/v1".to_string(),
                     upstream_api_key: Some("   ".to_string()),
@@ -2998,7 +3855,13 @@ model_profiles:
     #[test]
     fn from_persisted_parses_explicit_upstreams_with_nested_fallbacks() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstreams: vec![PersistedUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 name: Some(" local ".to_string()),
                 upstream_base_url: " http://127.0.0.1:8000/v1 ".to_string(),
                 upstream_api_key: Some(" local-secret ".to_string()),
@@ -3009,6 +3872,9 @@ model_profiles:
                 )]),
                 upstream_request_log_path: Some(" /tmp/llmconduit-local.jsonl ".to_string()),
                 fallback_upstreams: vec![PersistedFallbackUpstream {
+                    metrics_url: None,
+                    metrics_source: None,
+
                     name: Some(" backup ".to_string()),
                     upstream_base_url: " https://openrouter.ai/api/v1 ".to_string(),
                     upstream_api_key: Some(" backup-secret ".to_string()),
@@ -3058,7 +3924,13 @@ model_profiles:
     #[test]
     fn from_persisted_rejects_invalid_fallback_upstream_url() {
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "not a url".to_string(),
                 ..PersistedFallbackUpstream::default()
             }],
@@ -3105,6 +3977,9 @@ model_profiles:
             std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
         }
         let mut config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_api_key: None,
             ..Default::default()
         };
@@ -3165,6 +4040,9 @@ model_profiles:
             std::env::set_var("LLMCONDUIT_TURN_CAPTURE_DIR", "   ");
         }
         let mut config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             turn_capture_dir: Some("/tmp/llmconduit-existing".to_string()),
             ..PersistedConfig::default()
         };
@@ -3253,6 +4131,9 @@ model_profiles:
             std::env::set_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY", "bogus");
         }
         let mut config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             unsupported_image_policy: UnsupportedImagePolicy::Reject,
             ..PersistedConfig::default()
         };
@@ -3289,6 +4170,9 @@ model_profiles:
             uuid::Uuid::new_v4().simple()
         ));
         let config = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: Some("upstream-secret".to_string()),
@@ -3357,6 +4241,8 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: PersistedMeshConfig::default(),
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
@@ -3367,6 +4253,9 @@ model_profiles:
     #[test]
     fn resolves_profile_specific_upstream_chat_kwargs() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -3428,6 +4317,8 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3479,6 +4370,9 @@ model_profiles:
         // NOT sniff to any family, so the per-model override (not name sniffing)
         // is what drives injection at the leaf.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             template_family: Some("deepseek".to_string()),
             model_profiles: BTreeMap::from_iter([(
                 "Router-X".to_string(),
@@ -3518,6 +4412,9 @@ model_profiles:
         // Unknown/blank override values normalize to None (fall back to name
         // sniffing) rather than forcing a wrong contract.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             template_family: Some("  Bogus ".to_string()),
             ..PersistedConfig::default()
         })
@@ -3531,6 +4428,9 @@ model_profiles:
 
         // A recognized value is canonicalized to lowercase.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             template_family: Some("KIMI".to_string()),
             ..PersistedConfig::default()
         })
@@ -3553,6 +4453,9 @@ model_profiles:
     #[test]
     fn resolves_model_profiles_case_insensitively() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -3607,6 +4510,8 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3632,6 +4537,9 @@ model_profiles:
     #[test]
     fn resolves_upstream_model_profile_after_global_model_remap() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
@@ -3682,6 +4590,8 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3717,6 +4627,9 @@ model_profiles:
         // model ONLY (at-most-one per-model policy over the global base), so the
         // request-alias profile's kwargs do NOT bleed into the backend request.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
@@ -3787,6 +4700,8 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3827,6 +4742,9 @@ model_profiles:
     #[test]
     fn resolves_exact_model_profile_before_case_insensitive_fallback() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -3892,6 +4810,8 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -3913,6 +4833,9 @@ model_profiles:
     #[test]
     fn resolves_global_system_prompt_prefix_with_profile_prefix() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             system_prompt_prefix: Some("Global prefix.".to_string()),
             model_profiles: BTreeMap::from_iter([(
                 "GLM-5.1".to_string(),
@@ -3945,6 +4868,9 @@ model_profiles:
     #[test]
     fn model_profiles_extend_templates_in_order() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             model_profile_templates: BTreeMap::from_iter([
                 (
                     "reasoning".to_string(),
@@ -4120,6 +5046,9 @@ model_profiles:
     #[test]
     fn model_profiles_reject_unknown_template() {
         let error = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             model_profiles: BTreeMap::from_iter([(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
@@ -4142,6 +5071,9 @@ model_profiles:
     #[test]
     fn model_profiles_reject_template_cycles() {
         let error = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             model_profile_templates: BTreeMap::from_iter([
                 (
                     "a".to_string(),
@@ -4254,6 +5186,9 @@ model_profiles:
     #[test]
     fn passes_prefixed_model_name_unmodified_when_no_profile() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -4288,6 +5223,8 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -4304,6 +5241,9 @@ model_profiles:
     #[test]
     fn resolves_exact_prefix_model_profile_when_present() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
@@ -4349,6 +5289,8 @@ model_profiles:
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: PersistedMeshConfig::default(),
         })
         .expect("config");
 
@@ -4364,8 +5306,14 @@ model_profiles:
         // empty branch in `build_app_with_gateway_and_options`. The top-level
         // primary path and the global fallback paths are the active log paths.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "http://127.0.0.1:8001/v1".to_string(),
                 upstream_request_log_path: Some("/tmp/llmconduit-global/backup.jsonl".to_string()),
                 ..PersistedFallbackUpstream::default()
@@ -4392,10 +5340,16 @@ model_profiles:
         // top-level `upstream_request_log_path` and global `fallback_upstreams`
         // are never written to, so they must NOT be collected for cleanup.
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_request_log_path: Some(
                 "/tmp/llmconduit-inactive-top/primary.jsonl".to_string(),
             ),
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "http://127.0.0.1:9001/v1".to_string(),
                 upstream_request_log_path: Some(
                     "/tmp/llmconduit-inactive-global/backup.jsonl".to_string(),
@@ -4403,11 +5357,17 @@ model_profiles:
                 ..PersistedFallbackUpstream::default()
             }],
             upstreams: vec![PersistedUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
                 upstream_request_log_path: Some(
                     "/tmp/llmconduit-routing/primary.jsonl".to_string(),
                 ),
                 fallback_upstreams: vec![PersistedFallbackUpstream {
+                    metrics_url: None,
+                    metrics_source: None,
+
                     upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
                     upstream_request_log_path: Some(
                         "/tmp/llmconduit-routing-fallback/backup.jsonl".to_string(),
@@ -4447,6 +5407,9 @@ model_profiles:
     #[test]
     fn debug_log_dirs_includes_turn_capture_dir() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             ..PersistedConfig::default()
@@ -4470,8 +5433,14 @@ model_profiles:
     #[test]
     fn debug_log_dirs_includes_turn_capture_dir_in_routing_mode() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             upstreams: vec![PersistedUpstream {
+                metrics_url: None,
+                metrics_source: None,
+
                 upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
                 ..PersistedUpstream::default()
             }],
@@ -4492,6 +5461,9 @@ model_profiles:
     #[test]
     fn debug_log_dirs_dedups_turn_capture_dir_against_request_log_dir() {
         let config = Config::from_persisted(&PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             upstream_request_log_path: Some("/tmp/llmconduit-shared/requests.jsonl".to_string()),
             turn_capture_dir: Some("/tmp/llmconduit-shared".to_string()),
             ..PersistedConfig::default()
@@ -4534,6 +5506,9 @@ model_profiles:
         let mut table = HashMap::new();
         table.insert("GLM-5.1".to_string(), ModelPrice::without_cached(1.0, 2.0));
         let persisted = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             price_table: table,
             ..Default::default()
         };
@@ -4706,6 +5681,47 @@ model_profiles:
         assert!(!ModelPrice::without_cached(1.0, 2.0).cached_price_configured);
     }
 
+    #[test]
+    fn provider_metrics_targets_round_trip_and_validate_at_resolution() {
+        let yaml = r#"
+upstream_base_url: http://127.0.0.1:8000/v1
+metrics_url: http://127.0.0.1:8000/metrics
+metrics_source: vllm
+upstreams:
+  - name: sglang-a
+    upstream_base_url: http://127.0.0.1:30000/v1
+    metrics_url: http://127.0.0.1:30000/metrics
+    metrics_source: sglang
+    fallback_upstreams:
+      - name: backup
+        upstream_base_url: http://127.0.0.1:30001/v1
+        metrics_url: http://127.0.0.1:30001/metrics
+        metrics_source: vllm
+"#;
+        let persisted: PersistedConfig = serde_yaml::from_str(yaml).unwrap();
+        let encoded = serde_yaml::to_string(&persisted).unwrap();
+        let reparsed: PersistedConfig = serde_yaml::from_str(&encoded).unwrap();
+        assert_eq!(persisted, reparsed);
+        let resolved = Config::from_persisted(&persisted).unwrap();
+        assert_eq!(resolved.provider_metrics_targets.len(), 3);
+
+        let mut missing_source = persisted.clone();
+        missing_source.metrics_source = None;
+        assert!(
+            Config::from_persisted(&missing_source)
+                .unwrap_err()
+                .contains("metrics_source is required")
+        );
+
+        let mut wrong_path = persisted;
+        wrong_path.metrics_url = Some("http://127.0.0.1:8000/private".to_string());
+        assert!(
+            Config::from_persisted(&wrong_path)
+                .unwrap_err()
+                .contains("invalid root.metrics_url")
+        );
+    }
+
     /// Gap 07 review round 1, finding 3 — a NO-cache-rate price (`without_cached`,
     /// numeric `cached_per_1k: 0.0`, presence `false`) MUST round-trip as STILL NOT
     /// configured. The serialized form carries BOTH `cached_per_1k: 0.0` AND
@@ -4747,6 +5763,9 @@ model_profiles:
         let mut table = HashMap::new();
         table.insert("no-cache".to_string(), ModelPrice::without_cached(2.0, 6.0));
         let persisted = PersistedConfig {
+            metrics_url: None,
+            metrics_source: None,
+
             price_table: table,
             ..Default::default()
         };
@@ -4770,5 +5789,198 @@ model_profiles:
             "an explicit flag wins even with cached_per_1k omitted"
         );
         assert_eq!(flag_only.cached_per_1k, 0.0);
+    }
+
+    #[test]
+    fn mesh_absent_defaults_without_changing_existing_configs() {
+        let config = Config::from_persisted(&PersistedConfig::default()).expect("config");
+
+        assert!(!config.mesh.controller.enabled);
+        assert_eq!(
+            config.mesh.controller.bind_addr,
+            "0.0.0.0:4433".parse().expect("addr")
+        );
+        assert!(config.mesh.controller.identity_path.is_none());
+        assert!(config.mesh.controller.state_path.is_none());
+        assert!(config.mesh.worker.resources.is_empty());
+
+        let yaml = serde_yaml::to_string(&PersistedConfig::default()).expect("serialize");
+        assert!(
+            !yaml.contains("mesh:"),
+            "default persisted config omits mesh so old configs round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn mesh_worker_schedule_loads_and_round_trips() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "primary"
+        target: "127.0.0.1:8000"
+        models: ["qwen3", "llama-vision"]
+        availability:
+          timezone: "America/Chicago"
+          default_capacity: 0
+          weekly:
+            - days: [mon, tue, wed, thu, fri]
+              start: "00:00"
+              end: "08:00"
+              capacity: 32
+            - days: [mon, tue, wed, thu, fri]
+              start: "18:00"
+              end: "00:00"
+              capacity: 16
+          exceptions:
+            - start: "2026-12-24T00:00:00-06:00"
+              end: "2026-12-26T00:00:00-06:00"
+              capacity: 0
+"#,
+        )
+        .expect("yaml");
+        let yaml = serde_yaml::to_string(&persisted).expect("serialize");
+        let reparsed: PersistedConfig = serde_yaml::from_str(&yaml).expect("reparse");
+        assert_eq!(reparsed.mesh, persisted.mesh);
+
+        let config = Config::from_persisted(&persisted).expect("config");
+        let resource = &config.mesh.worker.resources[0];
+        assert_eq!(resource.id, "primary");
+        assert_eq!(resource.models, ["qwen3", "llama-vision"]);
+        assert_eq!(resource.model_refresh_secs, 60);
+        assert_eq!(resource.availability.timezone, "America/Chicago");
+        assert_eq!(resource.availability.weekly.len(), 2);
+        assert_eq!(resource.availability.exceptions.len(), 1);
+    }
+
+    #[test]
+    fn mesh_worker_models_reject_blank_entries() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "primary"
+        target: "127.0.0.1:8000"
+        models: ["qwen3", " "]
+"#,
+        )
+        .expect("yaml");
+
+        let err = Config::from_persisted(&persisted).expect_err("blank model rejected");
+        assert!(err.contains("models[1] must not be blank"));
+    }
+
+    #[test]
+    fn mesh_controller_enabled_requires_identity_and_state_paths() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  controller:
+    enabled: true
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("missing paths rejected");
+        assert!(err.contains("mesh.controller.identity_path"));
+
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  controller:
+    enabled: true
+    identity_path: "/var/lib/llmconduit/controller.key"
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("missing state rejected");
+        assert!(err.contains("mesh.controller.state_path"));
+    }
+
+    #[test]
+    fn mesh_controller_model_allowlist_loads() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  controller:
+    enabled: true
+    identity_path: "/var/lib/llmconduit/controller.key"
+    state_path: "/var/lib/llmconduit/mesh.sqlite"
+    model_allowlist:
+      endpoint-a:
+        primary: ["approved-model"]
+"#,
+        )
+        .expect("yaml");
+
+        let config = Config::from_persisted(&persisted).expect("config");
+
+        assert_eq!(
+            config.mesh.controller.model_allowlist["endpoint-a"]["primary"],
+            ["approved-model"]
+        );
+    }
+
+    #[test]
+    fn mesh_weekly_overlap_is_rejected_including_cross_midnight_spillover() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "primary"
+        target: "127.0.0.1:8000"
+        availability:
+          timezone: "UTC"
+          weekly:
+            - days: [mon]
+              start: "20:00"
+              end: "02:00"
+              capacity: 8
+            - days: [tue]
+              start: "01:00"
+              end: "03:00"
+              capacity: 4
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("overlap rejected");
+        assert!(err.contains("overlaps mesh availability window"));
+    }
+
+    #[test]
+    fn mesh_zero_length_weekly_window_is_rejected() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "primary"
+        target: "127.0.0.1:8000"
+        availability:
+          timezone: "UTC"
+          weekly:
+            - days: [mon]
+              start: "08:00"
+              end: "08:00"
+              capacity: 4
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("zero-length window rejected");
+        assert!(err.contains("zero-length window"));
     }
 }

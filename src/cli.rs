@@ -6,6 +6,7 @@ use crate::control_plane::ControlPlaneConfig;
 use crate::control_plane::ControlPlaneSection;
 use clap::Parser;
 use clap::Subcommand;
+use clap::ValueEnum;
 use dialoguer::Confirm;
 use dialoguer::Input;
 use dialoguer::Password;
@@ -76,6 +77,108 @@ pub enum Commands {
         /// Maximum number of consecutive pairs to report.
         #[arg(long, default_value_t = 10)]
         pairs: usize,
+    },
+    /// Run a mesh worker sidecar.
+    Worker {
+        /// Path to the worker config file. Defaults to ~/.config/llmconduit/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// DEPRECATED: one-shot enrollment key. Prefer LLMCONDUIT_MESH_JOIN_KEY, --join-key-stdin, or --join-key-file so the token is not exposed in process listings.
+        #[arg(long = "join-key", conflicts_with_all = ["join_key_stdin", "join_key_file"])]
+        join_key: Option<String>,
+        /// Read the one-shot enrollment key from stdin.
+        #[arg(long = "join-key-stdin", default_value_t = false, conflicts_with_all = ["join_key", "join_key_file"])]
+        join_key_stdin: bool,
+        /// Read the one-shot enrollment key from a file.
+        #[arg(long = "join-key-file", conflicts_with_all = ["join_key", "join_key_stdin"])]
+        join_key_file: Option<PathBuf>,
+    },
+    /// Manage mesh controller state.
+    Mesh {
+        /// Path to the controller config file. Defaults to ~/.config/llmconduit/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: MeshCommands,
+    },
+    /// Import model pricing into the authorization store.
+    Pricing {
+        /// Path to the config file. Defaults to ~/.config/llmconduit/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: PricingCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PricingCommands {
+    /// Fetch official endpoint pricing and persist normalized snapshots.
+    Sync {
+        source: PricingSource,
+        /// OpenRouter model id to import, repeatable (for example openai/gpt-4.1).
+        #[arg(long = "model", required = true)]
+        models: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum PricingSource {
+    Openrouter,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MeshCommands {
+    /// Show controller mesh identity and state information.
+    Info,
+    /// Manage enrollment join keys.
+    JoinKey {
+        #[command(subcommand)]
+        command: JoinKeyCommands,
+    },
+    /// Manage enrolled worker nodes.
+    Node {
+        #[command(subcommand)]
+        command: NodeCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JoinKeyCommands {
+    /// Create a join token. The plaintext token is printed exactly once.
+    Create {
+        /// Optional operator-facing label.
+        #[arg(long)]
+        label: Option<String>,
+        /// Maximum number of successful enrollments allowed.
+        #[arg(long = "max-uses")]
+        max_uses: Option<i64>,
+        /// Relative expiry such as 30m, 12h, or 7d.
+        #[arg(long = "expires-in")]
+        expires_in: Option<String>,
+    },
+    /// List join keys without exposing plaintext tokens.
+    List,
+    /// Disable a join key by id.
+    Revoke {
+        /// Join-key id, for example jk_<uuid>.
+        key_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NodeCommands {
+    /// List enrolled worker nodes.
+    List,
+    /// Disable a worker node by endpoint id.
+    Revoke {
+        /// Worker Iroh endpoint id.
+        endpoint_id: String,
+    },
+    /// Re-enable a worker node by endpoint id.
+    Enable {
+        /// Worker Iroh endpoint id.
+        endpoint_id: String,
     },
 }
 
@@ -245,6 +348,9 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
     };
 
     let config = PersistedConfig {
+        metrics_url: None,
+        metrics_source: None,
+
         bind_addr,
         upstream_base_url,
         upstream_api_key,
@@ -282,6 +388,8 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         image_cache_ttl_secs: existing.image_cache_ttl_secs,
         unsupported_image_policy: existing.unsupported_image_policy,
         price_table: existing.price_table.clone(),
+        auth: existing.auth.clone(),
+        mesh: existing.mesh.clone(),
     };
 
     let should_write = Confirm::with_theme(&theme)
@@ -353,5 +461,142 @@ mod tests {
             .expect("migrated key is accepted by fail-closed startup validation");
         assert!(!migrate_config_file(&path).expect("idempotent rewrite"));
         std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn parses_worker_command_with_join_key() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "worker",
+            "--config",
+            "/etc/llmconduit/worker.yaml",
+            "--join-key",
+            "llmc_join_secret",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worker {
+                config: Some(_),
+                join_key: Some(_),
+                join_key_stdin: false,
+                join_key_file: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_worker_command_with_join_key_stdin() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "worker",
+            "--config",
+            "/etc/llmconduit/worker.yaml",
+            "--join-key-stdin",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worker {
+                config: Some(_),
+                join_key: None,
+                join_key_stdin: true,
+                join_key_file: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_worker_command_with_join_key_file() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "worker",
+            "--config",
+            "/etc/llmconduit/worker.yaml",
+            "--join-key-file",
+            "/run/secrets/mesh-join-key",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Worker {
+                config: Some(_),
+                join_key: None,
+                join_key_stdin: false,
+                join_key_file: Some(_),
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_mesh_join_key_create_command() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "mesh",
+            "--config",
+            "/etc/llmconduit/config.yaml",
+            "join-key",
+            "create",
+            "--label",
+            "community",
+            "--max-uses",
+            "20",
+            "--expires-in",
+            "7d",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Mesh {
+                command: MeshCommands::JoinKey {
+                    command: JoinKeyCommands::Create {
+                        label: Some(_),
+                        max_uses: Some(20),
+                        expires_in: Some(_),
+                    }
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_mesh_node_enable_command() {
+        let cli = Cli::parse_from(["llmconduit", "mesh", "node", "enable", "endpoint-id"]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Mesh {
+                command: MeshCommands::Node {
+                    command: NodeCommands::Enable { endpoint_id },
+                },
+                ..
+            }) if endpoint_id == "endpoint-id"
+        ));
+    }
+
+    #[test]
+    fn parses_openrouter_pricing_sync_models() {
+        let cli = Cli::parse_from([
+            "llmconduit",
+            "pricing",
+            "sync",
+            "openrouter",
+            "--model",
+            "openai/gpt-4.1",
+            "--model",
+            "anthropic/claude-sonnet-4",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Pricing {
+                command: PricingCommands::Sync {
+                    source: PricingSource::Openrouter,
+                    models,
+                },
+                ..
+            }) if models == ["openai/gpt-4.1", "anthropic/claude-sonnet-4"]
+        ));
     }
 }

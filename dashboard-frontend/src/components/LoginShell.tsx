@@ -1,8 +1,8 @@
 /**
- * Login shell — rendered when the SPA loads unauthenticated (D7/D9). Username + password by
- * default once accounts exist (`auth_mode: users`), the shared access token otherwise; either
- * form can be switched to. On success the server sets the session cookie and we flip the auth
- * store (and remember the user) so the dashboard mounts. Any 401 elsewhere bounces back here.
+ * Login shell — rendered when the SPA loads unauthenticated (D7/D9). Username + password is
+ * the default once accounts exist (`auth_mode: users`); token mode accepts either the
+ * bootstrap dashboard token or an `llmc_` delegated management key. On success the server
+ * sets the session cookie and the dashboard mounts. Any 401 elsewhere bounces back here.
  */
 import { useState, type FormEvent } from 'react';
 import { Panel } from './ui/Panel';
@@ -10,6 +10,7 @@ import { Button } from './ui/Button';
 import { authStore } from '../store/authStore';
 import { useAuth } from '../store/hooks';
 import type { DashboardClient } from '../api/client';
+import type { SessionUser } from '../api/types';
 
 const INPUT = 'rounded-md border border-line bg-panel-raised px-3 py-2 font-mono text-sm text-text outline-none focus:border-accent';
 
@@ -27,7 +28,13 @@ export function LoginShell({ client }: { client: DashboardClient }) {
     setBusy(true);
     setError(null);
     try {
-      const { user } = await client.login(tokenMode ? { token } : { username, password });
+      let user: SessionUser | null = null;
+      if (tokenMode) {
+        if (token.startsWith('llmc_')) await client.keyLogin(token);
+        else ({ user } = await client.login({ token }));
+      } else {
+        ({ user } = await client.login({ username, password }));
+      }
       // Server set the session cookie; reflect it in the store to mount the dashboard.
       authStore.getState().setUser(user);
       authStore.getState().setAuthenticated(true);
@@ -45,13 +52,13 @@ export function LoginShell({ client }: { client: DashboardClient }) {
       <Panel className="w-full max-w-sm p-6">
         <h1 className="mb-1 text-lg font-semibold text-text">llmconduit</h1>
         <p className="mb-4 text-sm text-text-muted" data-testid="login-subtitle">
-          {tokenMode ? 'Dashboard access token required.' : 'Sign in with your username and password.'}
+          {tokenMode ? 'Dashboard token or management-enabled API key required.' : 'Sign in with your username and password.'}
         </p>
         <form onSubmit={onSubmit} className="flex flex-col gap-3" data-testid="login-form" data-mode={tokenMode ? 'token' : 'users'}>
           {tokenMode ? (
             <label className="flex flex-col gap-1 text-sm">
               <span className="text-text-muted">Token</span>
-              <input type="password" autoFocus value={token} onChange={(e) => setToken(e.target.value)} className={INPUT} placeholder="LLMCONDUIT_DASHBOARD_TOKEN" aria-label="Dashboard token" />
+              <input type="password" autoFocus value={token} onChange={(e) => setToken(e.target.value)} className={INPUT} placeholder="Dashboard token or llmc_…" aria-label="Dashboard token" />
             </label>
           ) : (
             <>

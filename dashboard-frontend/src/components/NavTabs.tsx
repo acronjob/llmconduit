@@ -12,6 +12,8 @@ const LABELS: Record<RouteName, string> = {
   sankey: 'Sankey',
   theater: 'Theater',
   overview: 'Overview',
+  providers: 'Providers',
+  access: 'Access',
 };
 
 /** The Argus eye — the hundred-eyed watchman's iris, the brand mark. Keeps a slow watch. */
@@ -32,9 +34,9 @@ function ArgusEye({ className }: { className?: string }) {
 
 export function NavTabs({ active, onLogout }: { active: RouteName; onLogout: () => void }) {
   return (
-    <nav className="flex items-center gap-6 border-b border-line bg-panel px-5 py-2.5">
+    <nav className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-line bg-panel px-5 py-2.5">
       {/* Masthead: the Argus eye + tracked wordmark; llmconduit rides below as the eyebrow. */}
-      <div className="flex items-center gap-2.5 pr-1">
+      <div className="flex shrink-0 items-center gap-2.5 pr-1">
         <ArgusEye className="argus-eye h-[18px] w-[18px] text-accent" />
         <div className="leading-none">
           <div className="font-ui text-sm font-bold tracking-[0.24em] text-text">ARGUS</div>
@@ -43,7 +45,7 @@ export function NavTabs({ active, onLogout }: { active: RouteName; onLogout: () 
           </div>
         </div>
       </div>
-      <div className="flex items-center gap-1">
+      <div className="order-3 flex w-full flex-wrap items-center gap-1 lg:order-none lg:w-auto">
         {ROUTES.map((r) => (
           <button
             key={r}
@@ -60,7 +62,7 @@ export function NavTabs({ active, onLogout }: { active: RouteName; onLogout: () 
           </button>
         ))}
       </div>
-      <Button variant="ghost" className="ml-auto" onClick={onLogout}>
+      <Button variant="ghost" className="ml-auto shrink-0" onClick={onLogout}>
         Logout
       </Button>
     </nav>

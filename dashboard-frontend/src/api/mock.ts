@@ -13,6 +13,15 @@ import type {
   ActivityBucket,
   ActivityResponse,
   ApiKeyRecord,
+  AuthApiKey,
+  AuthAuditEvent,
+  AuthGroup,
+  AuthPolicy,
+  AuthPricingRow,
+  AuthRole,
+  AuthSession,
+  AuthUsageRow,
+  AuthUser,
   CatalogEntry,
   DashboardFrame,
   DebugWsMessage,
@@ -25,7 +34,9 @@ import type {
   MetricSample,
   MetricsResponse,
   MonitorPayload,
+  ProviderCacheMetrics,
   ProviderHealth,
+  ProviderInventoryEntry,
   ProviderLatency,
   SessionDetailResponse,
   SessionRequestStub,
@@ -43,6 +54,39 @@ import type {
 import type { WsLike } from './ws';
 
 const MOCK_CSRF = 'mock-csrf-token';
+
+let AUTH_USERS: AuthUser[] = [
+  { id: 'usr_ops', kind: 'user', display_name: 'Operations', enabled: true, created_at: '2026-06-01T09:00:00Z' },
+  { id: 'usr_batch', kind: 'service_account', display_name: 'Batch inference', enabled: true, created_at: '2026-06-02T12:00:00Z' },
+];
+let AUTH_GROUPS: AuthGroup[] = [
+  { id: 'grp_prod', name: 'Production', enabled: true, member_count: 2 },
+];
+let AUTH_ROLES: AuthRole[] = [
+  { id: 'role_operator', name: 'Operator', enabled: true, permissions: ['auth.keys.read', 'auth.keys.create', 'auth.usage.read', 'auth.sessions.read'] },
+];
+let AUTH_POLICIES: AuthPolicy[] = [
+  { id: 'pol_prod', name: 'Production models', effect: 'allow', enabled: true, subjects: ['grp_prod'], endpoints: ['responses', 'chat'], models: [], requested_models: ['gpt-*'], served_models: ['gpt-4.1'], providers: ['openai'], routes: ['cloud'], time_windows: [{ weekday_mask: 31, start_minute: 480, end_minute: 1080, absolute_start_ms: null, absolute_end_ms: null }], max_concurrent_sessions: 4, max_daily_session_starts: 100, management_permissions: [] },
+  { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], models: [], requested_models: ['*'], served_models: ['*'], providers: ['vllm-b'], routes: ['local'], time_windows: [], max_concurrent_sessions: null, max_daily_session_starts: null, management_permissions: [] },
+];
+let AUTH_KEYS: AuthApiKey[] = [
+  { id: 'key_ops', principal_id: 'usr_ops', name: 'operator laptop', prefix: 'llmc_7ad2', enabled: true, created_at: '2026-06-03T10:00:00Z', expires_at: null, last_used_at: '2026-06-21T14:19:40Z' },
+];
+let AUTH_SESSIONS: AuthSession[] = [
+  { id: 'sess_admin', kind: 'dashboard', principal_id: 'usr_ops', key_id: 'key_ops', endpoint: null, requested_model: null, started_at: '2026-06-21T14:00:00Z', expires_at: '2026-06-21T22:00:00Z' },
+  { id: 'sess_infer', kind: 'inference', principal_id: 'usr_batch', key_id: 'key_batch', endpoint: 'responses', requested_model: 'gpt-4.1', started_at: '2026-06-21T14:19:57Z', expires_at: null },
+];
+const AUTH_USAGE: AuthUsageRow[] = [
+  { dimension: 'key', value: 'key_ops', requests: 142, prompt_tokens: 82120, completion_tokens: 11940, cached_tokens: 30220, reasoning_tokens: null, cost: 1.8241, cost_confidence: 'confident' },
+  { dimension: 'group', value: 'grp_prod', requests: 18, prompt_tokens: null, completion_tokens: null, cached_tokens: null, reasoning_tokens: null, cost: null, cost_confidence: 'unavailable' },
+];
+const AUTH_AUDIT: AuthAuditEvent[] = [
+  { id: 'audit_001', timestamp: '2026-06-21T14:18:00Z', actor: 'usr_ops', action: 'api_key.create', target: 'key_ops', outcome: 'ok', metadata: { prefix: 'llmc_7ad2' } },
+  { id: 'audit_002', timestamp: '2026-06-21T14:19:00Z', actor: 'key_ops', action: 'inference.authorize', target: 'vllm-b', outcome: 'denied', metadata: { policy: 'pol_deny_local' } },
+];
+const AUTH_PRICING: AuthPricingRow[] = [
+  { model: 'gpt-4.1', provider: 'openai', source: 'operator', fetched_at: '2026-06-20T00:00:00Z', input_per_1k: '0.002', output_per_1k: '0.008', confidence: 'confident' },
+];
 
 // ---------------------------------------------------------------------------
 // Seed data — shapes mirror the REAL Rust DTOs (D1 FlowSummary, D4 ProviderHealth).
@@ -91,6 +135,64 @@ const CATALOG: CatalogEntry[] = [
   // gap 06: a model whose upstream advertises NO window ⇒ `null` (unavailable),
   // distinct from a real `0`. Renderers show `—`, never `0`.
   { id: 'mystery-model', context_limit: null },
+];
+
+const PROVIDERS: ProviderInventoryEntry[] = [
+  {
+    provider_id: 'vllm-a',
+    provider_name: 'vllm-a',
+    resource_id: 'gpu-a',
+    route: null,
+    base_url: 'http://localhost:8001',
+    models: [
+      { id: 'llama-3.1-70b', context_limit: 131072 },
+      { id: 'qwen2.5-coder-32b', context_limit: 32768 },
+    ],
+    availability: {
+      timezone: 'America/Chicago',
+      default_capacity: 0,
+      weekly: [{ days: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'], start_local: '08:00', end_local: '18:00', capacity: 8 }],
+      exceptions: [],
+    },
+    capacity_limit: 8,
+    active_requests: 2,
+    accepting_requests: true,
+    healthy: true,
+  },
+  {
+    provider_id: 'vllm-b',
+    provider_name: 'vllm-b',
+    resource_id: 'gpu-b',
+    route: null,
+    base_url: 'http://localhost:8002',
+    models: [
+      { id: 'gpt-4o', context_limit: 128000 },
+      { id: 'mystery-model', context_limit: null },
+    ],
+    availability: null,
+    capacity_limit: 4,
+    active_requests: 4,
+    accepting_requests: false,
+    healthy: false,
+  },
+  {
+    provider_id: 'openai',
+    provider_name: 'openai-proxy',
+    resource_id: null,
+    route: 'cloud',
+    base_url: 'https://api.openai.com',
+    models: [{ id: 'gpt-4o', context_limit: 128000 }],
+    availability: null,
+    capacity_limit: null,
+    active_requests: null,
+    accepting_requests: false,
+    healthy: false,
+  },
+];
+
+const PROVIDER_METRICS: ProviderCacheMetrics[] = [
+  { provider: 'vllm-a', source: 'vllm', fetched_at_ms: Date.now() - 4000, cache_hits: 820, cache_queries: 1200, cache_hit_rate: 0.683, kv_cache_usage: 0.42, data_quality: 'derived' },
+  { provider: 'vllm-b', source: 'sglang', fetched_at_ms: Date.now() - 9000, cache_hits: null, cache_queries: null, cache_hit_rate: 0.31, kv_cache_usage: 0.91, data_quality: 'derived' },
 ];
 
 /**
@@ -268,11 +370,15 @@ function buildMetrics(): MetricsResponse {
     const samples = Math.round(252 * m);
     return {
       reqs_per_sec: 4.2 * m, active_streams: Math.round(3 * m), error_pct: 1.1,
-      p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142 * m, cost_per_min: 0.21 * m,
+      p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142 * m,
+      prefill_tokens_per_sec: 10_430.25 * m, decode_tokens_per_sec: 78.34 * m,
+      cost_per_min: 0.21 * m,
       samples,
       // The mock's window is fully measured: every finalized flow reported usage on a
       // priced model, so all three denominators equal `samples` (tok/s + $/min measurable).
       usage_samples: samples,
+      prefill_samples: samples,
+      decode_samples: samples,
       priced_samples: samples,
       // Gap 07: the priced llama model has no configured cache rate (and the seed flow on it
       // bills/omits cached) ⇒ the aggregate $/min is an ESTIMATE, labelled as such.
@@ -283,9 +389,14 @@ function buildMetrics(): MetricsResponse {
   return {
     metrics_seq: 1,
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+    prefill_tokens_per_sec: m1.prefill_tokens_per_sec,
+    decode_tokens_per_sec: m1.decode_tokens_per_sec,
+    cost_per_min: 0.21,
     samples: m1.samples,
     usage_samples: m1.usage_samples,
+    prefill_samples: m1.prefill_samples,
+    decode_samples: m1.decode_samples,
     priced_samples: m1.priced_samples,
     cost_confidence: m1.cost_confidence,
     windows: { m1, m5: win(0.9), h1: win(0.7) },
@@ -477,9 +588,93 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     const resp: HistoryMetricsResponse = { samples: seedUpstreamSamples(), since_ms: 0, limit: 5000, truncated: false };
     return json(resp);
   }
-  if (path === '/dashboard/logout' && method === 'POST') {
+  if (path === '/dashboard/auth/key-login' && method === 'POST') {
     return json({ ok: true });
   }
+  if (path === '/dashboard/api/auth/summary' && method === 'GET') {
+    return json({
+      policy_epoch: 7,
+      actor: {
+        kind: 'bootstrap', principal_id: null, display_name: 'Bootstrap administrator',
+        permissions: [],
+      },
+      counts: {
+        users: AUTH_USERS.length, groups: AUTH_GROUPS.length, roles: AUTH_ROLES.length,
+        policies: AUTH_POLICIES.length, api_keys: AUTH_KEYS.length,
+        active_sessions: AUTH_SESSIONS.length,
+      },
+    });
+  }
+  if (path === '/dashboard/api/auth/users') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { display_name?: string; kind?: AuthUser['kind'] };
+      if (!body.display_name || !body.kind) return json({ error: 'invalid user' }, 400);
+      AUTH_USERS = [...AUTH_USERS, {
+        id: `usr_${AUTH_USERS.length + 1}`, display_name: body.display_name,
+        kind: body.kind, enabled: true, created_at: new Date().toISOString(),
+      }];
+    }
+    return json({ users: AUTH_USERS });
+  }
+  if (path === '/dashboard/api/auth/groups') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { name?: string; members?: string[] };
+      if (!body.name || !Array.isArray(body.members)) return json({ error: 'invalid group' }, 400);
+      AUTH_GROUPS = [...AUTH_GROUPS, { id: `grp_${AUTH_GROUPS.length + 1}`, name: body.name, enabled: true, member_count: body.members.length }];
+    }
+    return json({ groups: AUTH_GROUPS });
+  }
+  if (path === '/dashboard/api/auth/roles') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { name?: string; permissions?: AuthRole['permissions'] };
+      if (!body.name || !Array.isArray(body.permissions)) return json({ error: 'invalid role' }, 400);
+      AUTH_ROLES = [...AUTH_ROLES, { id: `role_${AUTH_ROLES.length + 1}`, name: body.name, enabled: true, permissions: body.permissions }];
+    }
+    return json({ roles: AUTH_ROLES });
+  }
+  if (path === '/dashboard/api/auth/policies') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as Omit<AuthPolicy, 'id' | 'enabled'>;
+      if (!body.name || !['allow', 'deny'].includes(body.effect)) return json({ error: 'invalid policy' }, 400);
+      AUTH_POLICIES = [...AUTH_POLICIES, { ...body, id: `pol_${AUTH_POLICIES.length + 1}`, enabled: true }];
+    }
+    return json({ policies: AUTH_POLICIES });
+  }
+  if (path === '/dashboard/api/auth/api-keys') {
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { principal_id?: string; name?: string; expires_at?: string | null };
+      if (!body.principal_id || !body.name) return json({ error: 'invalid key' }, 400);
+      const apiKey: AuthApiKey = { id: `key_${AUTH_KEYS.length + 1}`, principal_id: body.principal_id, name: body.name, prefix: 'llmc_demo', enabled: true, created_at: new Date().toISOString(), expires_at: body.expires_at ?? null, last_used_at: null };
+      AUTH_KEYS = [...AUTH_KEYS, apiKey];
+      return json({ ...apiKey, raw_key: `llmc_mock_${apiKey.id}_copy_once` });
+    }
+    return json({ api_keys: AUTH_KEYS });
+  }
+  const keyAction = path.match(/^\/dashboard\/api\/auth\/api-keys\/([^/]+)\/(revoke|rotate)$/);
+  if (keyAction && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(keyAction[1] ?? '');
+    const found = AUTH_KEYS.find((key) => key.id === id);
+    if (!found) return json({ error: 'unknown key' }, 404);
+    if (keyAction[2] === 'revoke') {
+      AUTH_KEYS = AUTH_KEYS.map((key) => key.id === id ? { ...key, enabled: false } : key);
+      return json({ api_keys: AUTH_KEYS });
+    }
+    const rotated = { ...found, id: `${found.id}_rotated`, prefix: 'llmc_rot8', created_at: new Date().toISOString(), last_used_at: null };
+    AUTH_KEYS = [...AUTH_KEYS.filter((key) => key.id !== id), rotated];
+    return json({ ...rotated, raw_key: `llmc_mock_${rotated.id}_copy_once` });
+  }
+  if (path === '/dashboard/api/auth/sessions') return json({ sessions: AUTH_SESSIONS });
+  const sessionRevoke = path.match(/^\/dashboard\/api\/auth\/sessions\/([^/]+)\/revoke$/);
+  if (sessionRevoke && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(sessionRevoke[1] ?? '');
+    AUTH_SESSIONS = AUTH_SESSIONS.filter((session) => session.id !== id);
+    return json({ sessions: AUTH_SESSIONS });
+  }
+  if (path === '/dashboard/api/auth/usage') return json({ usage: AUTH_USAGE });
+  if (path === '/dashboard/api/auth/audit') return json({ events: AUTH_AUDIT });
+  if (path === '/dashboard/api/auth/pricing') return json({ pricing: AUTH_PRICING });
 
   // -- Kill (CSRF) -- `:id` == api_call_id ONLY (D13 contract). CSRF checked first
   // (security gate), then the id must be a seeded api_call_id else 404 (finding 7).
@@ -516,6 +711,8 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   }
   if (path === '/dashboard/api/metrics') return json(buildMetrics());
   if (path === '/dashboard/api/topology') return json(buildTopology());
+  if (path === '/dashboard/api/providers') return json({ providers: PROVIDERS });
+  if (path === '/dashboard/api/provider-metrics') return json({ generated_at_ms: Date.now(), providers: PROVIDER_METRICS });
   if (path === '/dashboard/api/catalog') return json(CATALOG);
   if (path === '/dashboard/api/snapshot') {
     const atMs = Number(qs.get('at') ?? Date.now());
@@ -969,9 +1166,14 @@ export class MockWebSocket implements WsLike {
       batch: [{
         type: 'metric_tick',
         reqs_per_sec: m.reqs_per_sec, active_streams: m.active_streams, error_pct: m.error_pct,
-        p50: m.p50, p95: m.p95, p99: m.p99, tokens_per_sec: m.tokens_per_sec, cost_per_min: m.cost_per_min,
+        p50: m.p50, p95: m.p95, p99: m.p99, tokens_per_sec: m.tokens_per_sec,
+        prefill_tokens_per_sec: m.prefill_tokens_per_sec,
+        decode_tokens_per_sec: m.decode_tokens_per_sec,
+        cost_per_min: m.cost_per_min,
         samples: m.samples,
         usage_samples: m.usage_samples,
+        prefill_samples: m.prefill_samples,
+        decode_samples: m.decode_samples,
         priced_samples: m.priced_samples,
         cost_confidence: m.cost_confidence,
         windows: m.windows,
