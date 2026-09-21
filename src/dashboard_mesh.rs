@@ -3,6 +3,7 @@ use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationPolicy;
 use crate::engine::Gateway;
+use crate::mesh::protocol::{validate_model_id, validate_resource_id};
 use crate::mesh::store::CreatedJoinKey;
 use crate::mesh::store::DisabledMeshModelRecord;
 use crate::mesh::store::JoinKeyRecord;
@@ -19,6 +20,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
+
+const MAX_JOIN_KEY_LABEL_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MeshAdminState {
@@ -191,6 +194,13 @@ pub async fn create_join_key(
             "max_uses and expires_in_secs must be greater than zero when provided",
         );
     };
+    if body
+        .label
+        .as_deref()
+        .is_some_and(|label| label.len() > MAX_JOIN_KEY_LABEL_BYTES)
+    {
+        return mesh_error(StatusCode::BAD_REQUEST, "label must be at most 128 bytes");
+    }
     if let Err(err) = admin.initialize().await {
         tracing::error!(error = %err, "failed to initialize mesh admin store");
         return mesh_error(StatusCode::INTERNAL_SERVER_ERROR, "mesh state unavailable");
@@ -570,6 +580,8 @@ impl TryFrom<MeshModelOverrideRequest> for ModelOverrideTarget {
         if endpoint_id.is_empty() || resource_id.is_empty() || model.is_empty() {
             return Err("endpoint_id, resource_id, and model are required");
         }
+        validate_resource_id(&resource_id).map_err(|_| "invalid resource_id")?;
+        validate_model_id(&model).map_err(|_| "invalid model")?;
         let endpoint = endpoint_id
             .parse()
             .map_err(|_| "invalid mesh endpoint id")?;
@@ -754,6 +766,29 @@ mod tests {
                 expires_in_secs: Some(-1),
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn model_override_target_rejects_oversized_identifiers() {
+        let endpoint_id = SecretKey::generate().public().to_string();
+        assert_eq!(
+            ModelOverrideTarget::try_from(MeshModelOverrideRequest {
+                endpoint_id: endpoint_id.clone(),
+                resource_id: "r".repeat(crate::mesh::protocol::MAX_RESOURCE_ID_BYTES + 1),
+                model: "qwen".to_string(),
+            })
+            .expect_err("oversized resource id rejected"),
+            "invalid resource_id"
+        );
+        assert_eq!(
+            ModelOverrideTarget::try_from(MeshModelOverrideRequest {
+                endpoint_id,
+                resource_id: "gpu".to_string(),
+                model: "m".repeat(crate::mesh::protocol::MAX_MODEL_ID_BYTES + 1),
+            })
+            .expect_err("oversized model id rejected"),
+            "invalid model"
         );
     }
 

@@ -239,7 +239,7 @@ pub fn validate_resource_id(resource_id: &str) -> Result<(), ProtocolError> {
     reject_control_characters(resource_id, "resource id")
 }
 
-fn validate_model_id(model_id: &str) -> Result<(), ProtocolError> {
+pub(crate) fn validate_model_id(model_id: &str) -> Result<(), ProtocolError> {
     validate_bounded_string(
         model_id,
         MAX_MODEL_ID_BYTES,

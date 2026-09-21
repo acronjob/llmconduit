@@ -322,6 +322,28 @@ restart. Requests record the key's owner in `requests.user_id`, and
 `GET /dashboard/api/history/activity?since_ms=&bucket_secs=` roll usage up
 per user and key.
 
+### Mesh enrollment administration
+
+When mesh controller mode is enabled, dashboard administrators can manage
+provider enrollment from the Providers view. Creating an enrollment key returns
+its token exactly once; only its hash is retained. Keys may be time-limited or
+usage-limited. Revoking a key immediately disables and disconnects every node
+that enrolled with it, as well as preventing future enrollment.
+
+An administrator can also disable or re-enable a single node, or disable an
+exact advertised `(endpoint, resource, model)` tuple without restarting the
+gateway. Model-level disables are an operational routing control, not a security
+quarantine: if a provider is untrusted or may advertise another model alias,
+disable its node or revoke its enrollment key instead. Mesh administration is
+restricted to bootstrap dashboard sessions and administrator user sessions;
+delegated management sessions cannot use these controls. Mutations retain the
+dashboard's existing CSRF and mutation-policy checks.
+
+Mesh enrollment and disabled-model state remains in the mesh controller's
+dedicated SQLite database. `control_plane.storage: postgres` stores dashboard
+accounts, API keys, request history, and metrics; it intentionally does not move
+mesh identity state or Access RBAC state into PostgreSQL.
+
 ### Upstream engine metrics and throughput
 
 With a SQL store, llmconduit scrapes every backend's Prometheus `/metrics`
