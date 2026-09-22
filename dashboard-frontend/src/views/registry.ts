@@ -12,12 +12,14 @@ import { ActivityView } from './activity/ActivityView';
 import { AccountView } from './account/AccountView';
 import { ProvidersView } from './providers/ProvidersView';
 import { AccessView } from './access/AccessView';
+import { ChatView } from './chat/ChatView';
 
 export const VIEW_BY_ROUTE: Record<RouteName, ComponentType> = {
   flows: FlowsView,
   sessions: SessionsView,
   throughput: ThroughputView,
   activity: ActivityView,
+  chat: ChatView,
   account: AccountView,
   topology: TopologyView,
   sankey: SankeyView,

@@ -284,8 +284,27 @@ fn migrate_legacy_root_control_plane(value: YamlValue) -> Result<(YamlValue, boo
                 })
             })
         });
+    let root_auth = root
+        .get(YamlValue::String("auth".to_string()))
+        .and_then(YamlValue::as_mapping);
+    let gateway_auth = root_auth.is_some_and(|auth| {
+        auth.contains_key(YamlValue::String("mode".to_string()))
+            || auth.contains_key(YamlValue::String("store_path".to_string()))
+    });
+    let legacy_auth = root_auth.is_some_and(|auth| {
+        !gateway_auth || {
+            auth.contains_key(YamlValue::String("require".to_string()))
+                || auth.contains_key(YamlValue::String("conversation_id_header".to_string()))
+                || auth.contains_key(YamlValue::String("keys".to_string()))
+        }
+    });
+    if gateway_auth && legacy_auth {
+        return Err(
+            "root `auth` mixes gateway authentication fields with legacy control-plane fields"
+                .to_string(),
+        );
+    }
     let legacy_keys = [
-        "auth",
         "storage",
         "backends",
         "aliases",
@@ -293,7 +312,8 @@ fn migrate_legacy_root_control_plane(value: YamlValue) -> Result<(YamlValue, boo
         "admin_password",
         "admin_username",
     ];
-    let has_legacy_root = has_legacy_profile_chain
+    let has_legacy_root = legacy_auth
+        || has_legacy_profile_chain
         || legacy_keys
             .iter()
             .any(|key| root.contains_key(YamlValue::String((*key).to_string())));
@@ -327,7 +347,7 @@ fn migrate_legacy_root_control_plane(value: YamlValue) -> Result<(YamlValue, boo
     });
     let mut operational = OperationalConfig::from_stored(&legacy_operational.to_string())?;
 
-    let auth_value = take_yaml(&mut root, "auth");
+    let auth_value = legacy_auth.then(|| take_yaml(&mut root, "auth")).flatten();
     let storage_value = take_yaml(&mut root, "storage");
     let mut auth = AuthBootstrap::default();
     if let Some(value) = auth_value {
@@ -1414,6 +1434,81 @@ auth:
             ControlPlaneConfig::from_yaml_str("control_plane: {}\nauth:\n  require: true\n")
                 .unwrap_err();
         assert!(error.contains("mixes legacy root control-plane fields"));
+    }
+
+    #[test]
+    fn gateway_auth_coexists_with_namespaced_control_plane() {
+        let source = r#"
+auth:
+  mode: enforce
+  store_path: /var/lib/llmconduit/auth.sqlite3
+control_plane:
+  auth:
+    require: false
+"#;
+        let document = ControlPlaneConfig::from_yaml_str(source).expect("parse");
+
+        assert_eq!(
+            document.gateway().auth.mode,
+            crate::config::AuthMode::Enforce
+        );
+        assert_eq!(
+            document.gateway().auth.store_path,
+            "/var/lib/llmconduit/auth.sqlite3"
+        );
+        assert!(!document.control_plane().auth.require);
+        assert!(!document.migrated_legacy_root());
+    }
+
+    #[test]
+    fn gateway_auth_without_control_plane_is_not_migrated() {
+        let source = r#"
+auth:
+  mode: enforce
+  store_path: auth.sqlite3
+"#;
+        let document = ControlPlaneConfig::from_yaml_str(source).expect("parse");
+
+        assert_eq!(
+            document.gateway().auth.mode,
+            crate::config::AuthMode::Enforce
+        );
+        assert_eq!(document.gateway().auth.store_path, "auth.sqlite3");
+        assert!(!document.migrated_legacy_root());
+    }
+
+    #[test]
+    fn gateway_auth_survives_migration_of_other_legacy_fields() {
+        let source = r#"
+auth:
+  mode: enforce
+  store_path: auth.sqlite3
+storage:
+  backend: jsonl
+  jsonl_dir: history
+"#;
+        let document = ControlPlaneConfig::from_yaml_str(source).expect("migrate");
+
+        assert_eq!(
+            document.gateway().auth.mode,
+            crate::config::AuthMode::Enforce
+        );
+        assert_eq!(document.gateway().auth.store_path, "auth.sqlite3");
+        assert_eq!(
+            document.control_plane().storage.backend,
+            StorageBackend::Jsonl
+        );
+        assert!(document.migrated_legacy_root());
+    }
+
+    #[test]
+    fn mixed_gateway_and_legacy_root_auth_is_rejected() {
+        let error = ControlPlaneConfig::from_yaml_str(
+            "auth:\n  mode: enforce\n  store_path: auth.sqlite3\n  require: true\n",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("mixes gateway authentication fields"));
     }
 
     #[test]

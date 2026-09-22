@@ -8,12 +8,12 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-pub const ENROLL_ALPN: &[u8] = b"llmconduit-mesh-enroll/1";
-pub const WORKER_ALPN: &[u8] = b"llmconduit-mesh-worker/1";
+pub const ENROLL_ALPN: &[u8] = b"llmconduit-mesh-enroll/2";
+pub const WORKER_ALPN: &[u8] = b"llmconduit-mesh-worker/2";
 
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
-pub const REQUEST_PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 2;
+pub const REQUEST_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_REQUEST_PREFACE_BYTES: usize = 4 * 1024;
 pub const MAX_NODE_NAME_BYTES: usize = 128;
@@ -22,6 +22,10 @@ pub const MAX_RESOURCE_ID_BYTES: usize = 128;
 pub const MAX_MODEL_ID_BYTES: usize = 512;
 pub const MAX_RESOURCES_PER_NODE: usize = 32;
 pub const MAX_MODELS_PER_RESOURCE: usize = 1024;
+pub const MAX_SWITCHABLE_MODELS: usize = 256;
+pub const MAX_SWITCHING_PROVIDER_BYTES: usize = 64;
+pub const MAX_SWITCHING_DESCRIPTION_BYTES: usize = 1024;
+pub const MAX_SWITCHING_STATE_BYTES: usize = 64;
 pub const MAX_CAPACITY_PER_RESOURCE: u32 = 65_535;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +55,22 @@ pub struct WorkerAdvertisement {
     pub node_name: Option<String>,
     pub agent_version: String,
     pub resources: Vec<ResourceAdvertisement>,
+    pub model_switching: Option<ModelSwitchingAdvertisement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSwitchingAdvertisement {
+    pub provider: String,
+    pub models: Vec<SwitchableModelAdvertisement>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchableModelAdvertisement {
+    pub id: String,
+    pub description: Option<String>,
+    pub phase: String,
+    pub desired_state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,6 +116,7 @@ pub enum WorkerToHub {
         models: Vec<ModelAdvertisement>,
         revision: u64,
     },
+    ModelSwitchingUpdate(ModelSwitchingAdvertisement),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +132,30 @@ pub struct RequestOpen {
     pub protocol_version: u16,
     pub request_id: Uuid,
     pub resource_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum StreamOpen {
+    Inference(RequestOpen),
+    SwitchModel(SwitchModelRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchModelRequest {
+    pub protocol_version: u16,
+    pub request_id: Uuid,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchModelResponse {
+    pub request_id: Uuid,
+    pub model_id: String,
+    pub accepted: bool,
+    pub changed: bool,
+    pub error: Option<String>,
+    pub model_switching: Option<ModelSwitchingAdvertisement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +199,59 @@ pub fn validate_worker_advertisement(
     }
     for resource in &advertisement.resources {
         validate_resource_advertisement(resource)?;
+    }
+    if let Some(switching) = &advertisement.model_switching {
+        validate_model_switching(switching)?;
+    }
+    Ok(())
+}
+
+pub fn validate_model_switching(
+    switching: &ModelSwitchingAdvertisement,
+) -> Result<(), ProtocolError> {
+    validate_bounded_string(
+        &switching.provider,
+        MAX_SWITCHING_PROVIDER_BYTES,
+        ProtocolError::BlankSwitchingProvider,
+        |len, max| ProtocolError::SwitchingProviderTooLong { len, max },
+    )?;
+    reject_control_characters(&switching.provider, "switching provider")?;
+    if switching.models.len() > MAX_SWITCHABLE_MODELS {
+        return Err(ProtocolError::TooManyModels {
+            count: switching.models.len(),
+            max: MAX_SWITCHABLE_MODELS,
+        });
+    }
+    for model in &switching.models {
+        validate_model_id(&model.id)?;
+        if let Some(description) = &model.description {
+            if description.len() > MAX_SWITCHING_DESCRIPTION_BYTES {
+                return Err(ProtocolError::SwitchingDescriptionTooLong {
+                    len: description.len(),
+                    max: MAX_SWITCHING_DESCRIPTION_BYTES,
+                });
+            }
+            reject_control_characters(description, "switching model description")?;
+        }
+        for (field, value) in [
+            ("switching model phase", model.phase.as_str()),
+            (
+                "switching model desired state",
+                model.desired_state.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ProtocolError::BlankSwitchingState { field });
+            }
+            if value.len() > MAX_SWITCHING_STATE_BYTES {
+                return Err(ProtocolError::SwitchingStateTooLong {
+                    field,
+                    len: value.len(),
+                    max: MAX_SWITCHING_STATE_BYTES,
+                });
+            }
+            reject_control_characters(value, field)?;
+        }
     }
     Ok(())
 }
@@ -219,6 +317,11 @@ pub fn validate_resource_advertisement(
 pub fn validate_request_open(request: &RequestOpen) -> Result<(), ProtocolError> {
     validate_protocol_version(request.protocol_version)?;
     validate_resource_id(&request.resource_id)
+}
+
+pub fn validate_switch_model_request(request: &SwitchModelRequest) -> Result<(), ProtocolError> {
+    validate_protocol_version(request.protocol_version)?;
+    validate_model_id(&request.model_id)
 }
 
 pub fn validate_protocol_version(version: u16) -> Result<(), ProtocolError> {
@@ -408,6 +511,20 @@ pub enum ProtocolError {
     BlankModelId,
     #[error("model id is {len} bytes, maximum is {max}")]
     ModelIdTooLong { len: usize, max: usize },
+    #[error("switching provider must not be blank")]
+    BlankSwitchingProvider,
+    #[error("switching provider is {len} bytes, maximum is {max}")]
+    SwitchingProviderTooLong { len: usize, max: usize },
+    #[error("switching model description is {len} bytes, maximum is {max}")]
+    SwitchingDescriptionTooLong { len: usize, max: usize },
+    #[error("{field} must not be blank")]
+    BlankSwitchingState { field: &'static str },
+    #[error("{field} is {len} bytes, maximum is {max}")]
+    SwitchingStateTooLong {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
     #[error("{field} must not contain control characters")]
     ControlCharacter { field: &'static str },
     #[error("join key must not be blank")]
@@ -505,6 +622,7 @@ mod tests {
                 healthy: true,
                 revision: 1,
             }],
+            model_switching: None,
         };
         validate_worker_advertisement(&advertisement).unwrap();
         advertisement.resources[0].models = vec![
@@ -521,12 +639,39 @@ mod tests {
     }
 
     #[test]
+    fn model_switching_validation_bounds_all_operator_visible_fields() {
+        let mut switching = ModelSwitchingAdvertisement {
+            provider: "lil-fleet".to_string(),
+            models: vec![SwitchableModelAdvertisement {
+                id: "qwen3-flash".to_string(),
+                description: Some("fast lane".to_string()),
+                phase: "ready".to_string(),
+                desired_state: "loaded".to_string(),
+            }],
+            revision: 1,
+        };
+        validate_model_switching(&switching).unwrap();
+        switching.models[0].description = Some("x".repeat(MAX_SWITCHING_DESCRIPTION_BYTES + 1));
+        assert!(matches!(
+            validate_model_switching(&switching),
+            Err(ProtocolError::SwitchingDescriptionTooLong { .. })
+        ));
+        switching.models[0].description = None;
+        switching.models[0].phase = "ready\nforged".to_string();
+        assert!(matches!(
+            validate_model_switching(&switching),
+            Err(ProtocolError::ControlCharacter { .. })
+        ));
+    }
+
+    #[test]
     fn advertisement_validation_rejects_log_injection_and_oversized_model_ids() {
         let mut advertisement = WorkerAdvertisement {
             protocol_version: PROTOCOL_VERSION,
             node_name: Some("node-a\nforged-log".to_string()),
             agent_version: "test".to_string(),
             resources: Vec::new(),
+            model_switching: None,
         };
         assert!(matches!(
             validate_worker_advertisement(&advertisement),

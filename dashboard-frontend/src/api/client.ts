@@ -22,6 +22,9 @@ import type {
   AuthUsageResponse,
   AuthUsersResponse,
   CatalogEntry,
+  ConfiguredProvider,
+  ConfiguredProvidersResponse,
+  CreateConfiguredProviderRequest,
   CreateAuthApiKeyRequest,
   CreateAuthGroupRequest,
   CreateAuthPolicyRequest,
@@ -52,6 +55,7 @@ import type {
   SessionsResponse,
   SetMeshModelResponse,
   SetMeshNodeResponse,
+  SwitchMeshModelResponse,
   SnapshotResponse,
   ThroughputResponse,
   TopologyResponse,
@@ -69,6 +73,8 @@ import {
   isAuthUsageResponse,
   isAuthUsersResponse,
   isCreateMeshJoinKeyResponse,
+  isConfiguredProviderResponse,
+  isConfiguredProvidersResponse,
   isFleetModelsResponse,
   isFleetOperationResponse,
   isMeshAdminState,
@@ -78,9 +84,42 @@ import {
   isRevokeMeshJoinKeyResponse,
   isSetMeshModelResponse,
   isSetMeshNodeResponse,
+  isSwitchMeshModelResponse,
 } from './types';
 
 export type FetchImpl = typeof fetch;
+
+export interface DashboardChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface DashboardChatRequest {
+  model: string;
+  messages: DashboardChatMessage[];
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+}
+
+export interface DashboardChatDelta {
+  kind: 'content' | 'reasoning';
+  text: string;
+}
+
+export interface DashboardChatUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface DashboardChatResult {
+  model: string | null;
+  requestedModel: string | null;
+  finishReason: string | null;
+  usage: DashboardChatUsage | null;
+}
 
 /** Raised when a fetch returns 401; the shell listens for this to bounce to login. */
 export class UnauthorizedError extends Error {
@@ -278,6 +317,21 @@ export class DashboardClient {
     return this.request('/providers', undefined, isProvidersResponse);
   }
 
+  configuredProviders(): Promise<ConfiguredProvidersResponse> {
+    return this.request('/configured-providers', undefined, isConfiguredProvidersResponse);
+  }
+
+  createConfiguredProvider(body: CreateConfiguredProviderRequest): Promise<ConfiguredProvider> {
+    return this.mutate('/configured-providers', 'POST', body).then((value) => {
+      if (!isConfiguredProviderResponse(value)) throw new Error('/configured-providers returned an invalid response');
+      return value;
+    });
+  }
+
+  deleteConfiguredProvider(id: string): Promise<void> {
+    return this.mutate(`/configured-providers/${encodeURIComponent(id)}`, 'DELETE');
+  }
+
   providerMetrics(): Promise<ProviderMetricsResponse> {
     return this.request('/provider-metrics', undefined, isProviderMetricsResponse);
   }
@@ -334,9 +388,107 @@ export class DashboardClient {
     });
   }
 
+  switchMeshModel(endpointId: string, modelId: string): Promise<SwitchMeshModelResponse> {
+    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/switch`, 'POST').then((value) => {
+      if (!isSwitchMeshModelResponse(value)) throw new Error('/mesh/nodes/:endpoint_id/models/:model_id/switch returned an invalid response');
+      return value;
+    });
+  }
+
   /** Bare array — no cursor (D13: static-ish catalog read). */
   catalog(): Promise<CatalogEntry[]> {
     return this.request<CatalogEntry[]>('/catalog');
+  }
+
+  /** Stream a dashboard-authenticated turn through the real gateway path. */
+  async streamChat(
+    request: DashboardChatRequest,
+    onDelta: (delta: DashboardChatDelta) => void,
+    signal?: AbortSignal,
+  ): Promise<DashboardChatResult> {
+    const csrf = this.getCsrfToken();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+    const response = await this.fetchImpl(`${this.basePath}/chat`, {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      signal,
+      body: JSON.stringify({ ...request, stream: true, stream_options: { include_usage: true } }),
+    });
+    if (response.status === 401) {
+      this.onUnauthorized?.();
+      throw new UnauthorizedError();
+    }
+    if (!response.ok) {
+      const text = await response.text();
+      let detail = text.trim();
+      try {
+        const parsed = JSON.parse(text) as { error?: string | { message?: string } };
+        detail = typeof parsed.error === 'string' ? parsed.error : parsed.error?.message ?? detail;
+      } catch {
+        // Preserve a plain-text upstream/dashboard error.
+      }
+      throw new Error(detail || `chat failed: ${response.status}`);
+    }
+    if (!response.body) throw new Error('chat response did not include a stream');
+
+    const result: DashboardChatResult = {
+      model: response.headers.get('x-llmconduit-model'),
+      requestedModel: response.headers.get('x-llmconduit-requested'),
+      finishReason: null,
+      usage: null,
+    };
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let doneSeen = false;
+
+    const processLine = (rawLine: string) => {
+      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+      if (!line.startsWith('data:')) return;
+      const data = line.slice(5).trimStart();
+      if (data === '[DONE]') {
+        doneSeen = true;
+        return;
+      }
+      if (!data) return;
+      let event: {
+        model?: string;
+        choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>;
+        usage?: DashboardChatUsage | null;
+        error?: { message?: string };
+      };
+      try {
+        event = JSON.parse(data) as typeof event;
+      } catch {
+        throw new Error('chat stream returned malformed JSON');
+      }
+      if (event.error) throw new Error(event.error.message || 'model returned an error');
+      if (event.model) result.model = event.model;
+      if (event.usage) result.usage = event.usage;
+      for (const choice of event.choices ?? []) {
+        if (choice.delta?.reasoning_content) onDelta({ kind: 'reasoning', text: choice.delta.reasoning_content });
+        if (choice.delta?.content) onDelta({ kind: 'content', text: choice.delta.content });
+        if (choice.finish_reason) result.finishReason = choice.finish_reason;
+      }
+    };
+
+    let streamDone = false;
+    while (!streamDone) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      let newline = buffer.indexOf('\n');
+      while (newline >= 0) {
+        processLine(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf('\n');
+      }
+      streamDone = done;
+    }
+    if (buffer.trim()) processLine(buffer);
+    if (!doneSeen) throw new Error('stream ended before the terminal [DONE] marker');
+    return result;
   }
 
   snapshot(atMs: number): Promise<SnapshotResponse> {

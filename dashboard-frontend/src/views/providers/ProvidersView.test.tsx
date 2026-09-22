@@ -37,4 +37,31 @@ describe('ProvidersView', () => {
 
     await waitFor(() => expect(idleCard).toHaveTextContent('loading'));
   });
+
+  it('discovers and removes additional OpenAI-compatible providers', async () => {
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('configured-providers-panel');
+    expect(panel).toHaveTextContent('Local lab');
+    expect(panel).not.toHaveTextContent('secret-value');
+
+    fireEvent.change(within(panel).getByLabelText('Provider name'), { target: { value: 'Remote lab' } });
+    fireEvent.change(within(panel).getByLabelText('Provider URL'), { target: { value: 'https://inference.example/v1' } });
+    fireEvent.change(within(panel).getByLabelText('Provider API key'), { target: { value: 'secret-value' } });
+    fireEvent.click(within(panel).getByRole('button', { name: 'Discover & add' }));
+
+    await waitFor(() => expect(panel).toHaveTextContent('Remote lab'));
+    expect(panel).not.toHaveTextContent('secret-value');
+  });
+
+  it('renders and invokes model switching advertised by a downstream mesh worker', async () => {
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('mesh-admin');
+    await waitFor(() => expect(panel).toHaveTextContent('remote model switching'));
+    const model = within(panel).getByText('qwen3-32b').closest('[data-testid="remote-switch-model"]') as HTMLElement;
+    fireEvent.click(within(model).getByRole('button', { name: 'Switch' }));
+
+    await waitFor(() => expect(model).toHaveTextContent('loading'));
+  });
 });

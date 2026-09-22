@@ -53,6 +53,7 @@ mod tests {
                 healthy: true,
                 revision: 1,
             }],
+            model_switching: None,
         }
     }
 

@@ -1057,6 +1057,25 @@ export interface ProvidersResponse {
   providers: ProviderInventoryEntry[];
 }
 
+/** Dashboard-managed OpenAI-compatible provider. Credentials never cross this wire. */
+export interface ConfiguredProvider {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key_present: boolean;
+  models: ProviderInventoryModel[];
+}
+
+export interface ConfiguredProvidersResponse {
+  providers: ConfiguredProvider[];
+}
+
+export interface CreateConfiguredProviderRequest {
+  name: string;
+  base_url: string;
+  api_key: string;
+}
+
 export interface FleetModel {
   id: string;
   description?: string;
@@ -1118,6 +1137,20 @@ export interface MeshNode {
   joined_at_ms: number;
   join_key_id?: string;
   last_seen_at_ms?: number;
+  model_switching?: MeshModelSwitching;
+}
+
+export interface MeshModelSwitching {
+  provider: string;
+  models: MeshSwitchableModel[];
+  revision: number;
+}
+
+export interface MeshSwitchableModel {
+  id: string;
+  description?: string;
+  phase: string;
+  desired_state: string;
 }
 
 export interface MeshDisabledModel {
@@ -1171,6 +1204,14 @@ export interface SetMeshModelResponse {
   disabled: boolean;
 }
 
+export interface SwitchMeshModelResponse {
+  endpoint_id: string;
+  model_id: string;
+  accepted: boolean;
+  changed: boolean;
+  error?: string;
+}
+
 export type ProviderMetricsSource = 'vllm' | 'sglang';
 
 export interface ProviderCacheMetrics {
@@ -1222,7 +1263,7 @@ export interface SessionUser {
   is_admin: boolean;
 }
 
-export type AuthMode = 'users' | 'token' | 'open';
+export type AuthMode = 'users' | 'token' | 'open' | 'github';
 
 /** `GET /dashboard/api/me` */
 export interface MeResponse {
@@ -1366,6 +1407,7 @@ export type ManagementPermission =
   | 'auth.sessions.terminate';
 
 export interface AuthSummary {
+  enabled: boolean;
   policy_epoch: number;
   actor: {
     kind: 'bootstrap' | 'delegated';
@@ -1535,7 +1577,7 @@ export interface CreateAuthPolicyRequest {
 }
 
 export function isAuthSummary(v: unknown): v is AuthSummary {
-  if (!isObj(v) || !isUint(v.policy_epoch) || !isObj(v.actor) || !isObj(v.counts)) return false;
+  if (!isObj(v) || typeof v.enabled !== 'boolean' || !isUint(v.policy_epoch) || !isObj(v.actor) || !isObj(v.counts)) return false;
   const actor = v.actor;
   const counts = v.counts;
   return isOneOf(actor.kind, ['bootstrap', 'delegated'] as const)
@@ -1646,6 +1688,14 @@ function isProviderCacheMetrics(v: unknown): v is ProviderCacheMetrics {
 }
 
 export const isProvidersResponse = (v: unknown): v is ProvidersResponse => isArrayEnvelope(v, 'providers', isProviderInventoryEntry);
+function isConfiguredProvider(v: unknown): v is ConfiguredProvider {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && isStr(v.base_url)
+    && typeof v.api_key_present === 'boolean'
+    && Array.isArray(v.models) && v.models.every(isProviderInventoryModel);
+}
+export const isConfiguredProvidersResponse = (v: unknown): v is ConfiguredProvidersResponse =>
+  isArrayEnvelope(v, 'providers', isConfiguredProvider);
+export const isConfiguredProviderResponse = isConfiguredProvider;
 export const isProviderMetricsResponse = (v: unknown): v is ProviderMetricsResponse =>
   isObj(v) && isUint(v.generated_at_ms) && Array.isArray(v.providers) && v.providers.every(isProviderCacheMetrics);
 
@@ -1684,7 +1734,14 @@ function isMeshJoinKey(v: unknown): v is MeshJoinKey {
 
 function isMeshNode(v: unknown): v is MeshNode {
   return isObj(v) && isStr(v.endpoint_id) && isOptStr(v.label) && typeof v.enabled === 'boolean'
-    && isUint(v.joined_at_ms) && isOptStr(v.join_key_id) && isOptUint(v.last_seen_at_ms);
+    && isUint(v.joined_at_ms) && isOptStr(v.join_key_id) && isOptUint(v.last_seen_at_ms)
+    && (v.model_switching === undefined || isMeshModelSwitching(v.model_switching));
+}
+
+function isMeshModelSwitching(v: unknown): v is MeshModelSwitching {
+  return isObj(v) && isStr(v.provider) && isUint(v.revision)
+    && Array.isArray(v.models) && v.models.every((model) => isObj(model) && isStr(model.id)
+      && isOptStr(model.description) && isStr(model.phase) && isStr(model.desired_state));
 }
 
 function isMeshDisabledModel(v: unknown): v is MeshDisabledModel {
@@ -1709,6 +1766,10 @@ export const isSetMeshNodeResponse = (v: unknown): v is SetMeshNodeResponse =>
 export const isSetMeshModelResponse = (v: unknown): v is SetMeshModelResponse =>
   isObj(v) && typeof v.updated === 'boolean' && isStr(v.endpoint_id) && isStr(v.resource_id)
   && isStr(v.model) && typeof v.disabled === 'boolean';
+
+export const isSwitchMeshModelResponse = (v: unknown): v is SwitchMeshModelResponse =>
+  isObj(v) && isStr(v.endpoint_id) && isStr(v.model_id) && typeof v.accepted === 'boolean'
+  && typeof v.changed === 'boolean' && isOptStr(v.error);
 
 // ---------------------------------------------------------------------------
 // Runtime validation (the WS pipe must NOT trust the wire — findings 4/5/6).

@@ -3,7 +3,7 @@ use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationPolicy;
 use crate::engine::Gateway;
-use crate::mesh::protocol::{validate_model_id, validate_resource_id};
+use crate::mesh::protocol::{ModelSwitchingAdvertisement, validate_model_id, validate_resource_id};
 use crate::mesh::store::CreatedJoinKey;
 use crate::mesh::store::DisabledMeshModelRecord;
 use crate::mesh::store::JoinKeyRecord;
@@ -55,6 +55,24 @@ pub struct MeshNode {
     pub join_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_switching: Option<MeshModelSwitching>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MeshModelSwitching {
+    pub provider: String,
+    pub models: Vec<MeshSwitchableModel>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MeshSwitchableModel {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub phase: String,
+    pub desired_state: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -109,6 +127,16 @@ pub struct SetMeshModelResponse {
     pub disabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SwitchMeshModelResponse {
+    pub endpoint_id: String,
+    pub model_id: String,
+    pub accepted: bool,
+    pub changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[utoipa::path(
     get,
     path = "/dashboard/api/mesh",
@@ -148,11 +176,26 @@ pub async fn mesh_state(
             return mesh_error(StatusCode::INTERNAL_SERVER_ERROR, "mesh state unavailable");
         }
     };
+    let registry = admin.registry();
+    let nodes = nodes
+        .into_iter()
+        .map(|record| {
+            let switching = record
+                .endpoint_id
+                .parse()
+                .ok()
+                .and_then(|endpoint| registry.model_switching(endpoint))
+                .map(MeshModelSwitching::from);
+            let mut node = MeshNode::from(record);
+            node.model_switching = switching;
+            node
+        })
+        .collect();
     json_no_store(
         StatusCode::OK,
         &MeshAdminState {
             join_keys: join_keys.into_iter().map(MeshJoinKey::from).collect(),
-            nodes: nodes.into_iter().map(MeshNode::from).collect(),
+            nodes,
             disabled_models: disabled_models
                 .into_iter()
                 .map(MeshDisabledModel::from)
@@ -326,6 +369,85 @@ pub async fn enable_node(
     headers: HeaderMap,
 ) -> Response {
     set_node_enabled(gateway, auth, session, headers, endpoint_id, true).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/switch",
+    tag = "dashboard",
+    params(
+        ("endpoint_id" = String, Path, description = "Iroh endpoint id."),
+        ("model_id" = String, Path, description = "Advertised Fleet model id.")
+    ),
+    responses(
+        (status = 200, body = SwitchMeshModelResponse),
+        (status = 202, body = SwitchMeshModelResponse),
+        (status = 400, body = crate::openapi::DashboardError),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 404, body = crate::openapi::DashboardError),
+        (status = 409, body = crate::openapi::DashboardError),
+        (status = 502, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn switch_node_model(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    Extension(session): Extension<AuthSession>,
+    Path((endpoint_id, model_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = authorize_mesh_mutation(auth.as_ref(), &session, &headers).await {
+        return response;
+    }
+    let Some(admin) = gateway.mesh_admin() else {
+        return mesh_error(StatusCode::NOT_FOUND, "mesh controller is disabled");
+    };
+    let endpoint_id = endpoint_id.trim().to_string();
+    let model_id = model_id.trim().to_string();
+    let endpoint = match endpoint_id.parse() {
+        Ok(endpoint) => endpoint,
+        Err(_) => return mesh_error(StatusCode::BAD_REQUEST, "invalid mesh endpoint id"),
+    };
+    if validate_model_id(&model_id).is_err() {
+        return mesh_error(StatusCode::BAD_REQUEST, "invalid model id");
+    }
+    if let Err(err) = admin.initialize().await {
+        tracing::error!(error = %err, "failed to initialize mesh admin store");
+        return mesh_error(StatusCode::INTERNAL_SERVER_ERROR, "mesh state unavailable");
+    }
+    match admin
+        .registry()
+        .switch_model(endpoint, model_id.clone())
+        .await
+    {
+        Ok(result) if result.accepted => json_no_store(
+            if result.changed {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            },
+            &SwitchMeshModelResponse {
+                endpoint_id,
+                model_id,
+                accepted: true,
+                changed: result.changed,
+                error: None,
+            },
+        ),
+        Ok(result) => mesh_error(
+            StatusCode::CONFLICT,
+            result
+                .error
+                .as_deref()
+                .unwrap_or("downstream provider rejected the model switch"),
+        ),
+        Err(err) => {
+            tracing::warn!(error = %err, endpoint_id, model_id, "mesh model switch failed");
+            mesh_error(err.status_code(), &err.client_message)
+        }
+    }
 }
 
 #[utoipa::path(
@@ -639,6 +761,26 @@ impl From<MeshNodeRecord> for MeshNode {
             joined_at_ms: value.joined_at_ms,
             join_key_id: value.join_key_id,
             last_seen_at_ms: value.last_seen_at_ms,
+            model_switching: None,
+        }
+    }
+}
+
+impl From<ModelSwitchingAdvertisement> for MeshModelSwitching {
+    fn from(value: ModelSwitchingAdvertisement) -> Self {
+        Self {
+            provider: value.provider,
+            models: value
+                .models
+                .into_iter()
+                .map(|model| MeshSwitchableModel {
+                    id: model.id,
+                    description: model.description,
+                    phase: model.phase,
+                    desired_state: model.desired_state,
+                })
+                .collect(),
+            revision: value.revision,
         }
     }
 }
@@ -676,6 +818,7 @@ mod tests {
                 public_origin: None,
                 allow_insecure: false,
                 allow_mutations: true,
+                ..Default::default()
             },
         )
         .expect("auth")

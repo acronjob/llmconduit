@@ -23,6 +23,7 @@ import type {
   AuthUsageRow,
   AuthUser,
   CatalogEntry,
+  ConfiguredProvider,
   DashboardFrame,
   DebugWsMessage,
   FleetModelEntry,
@@ -99,8 +100,33 @@ let MESH_JOIN_KEYS: MeshJoinKey[] = [
   { id: 'jk_mock_spare', label: 'new provider', enabled: true, created_at_ms: Date.now() - 120_000, max_uses: 1, use_count: 0 },
 ];
 
+let CONFIGURED_PROVIDERS: ConfiguredProvider[] = [
+  {
+    id: 'managed-local-lab',
+    name: 'Local lab',
+    base_url: 'http://127.0.0.1:8101/v1',
+    api_key_present: true,
+    models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }],
+  },
+];
+
 let MESH_NODES: MeshNode[] = [
-  { endpoint_id: 'vllm-a', label: 'mesh worker a', enabled: true, joined_at_ms: Date.now() - 3_300_000, join_key_id: 'jk_mock_used', last_seen_at_ms: Date.now() - 5_000 },
+  {
+    endpoint_id: 'vllm-a',
+    label: 'mesh worker a',
+    enabled: true,
+    joined_at_ms: Date.now() - 3_300_000,
+    join_key_id: 'jk_mock_used',
+    last_seen_at_ms: Date.now() - 5_000,
+    model_switching: {
+      provider: 'fleet',
+      revision: 1,
+      models: [
+        { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', phase: 'ready', desired_state: 'loaded' },
+        { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded' },
+      ],
+    },
+  },
   { endpoint_id: 'vllm-b', label: 'mesh worker b', enabled: true, joined_at_ms: Date.now() - 2_400_000, join_key_id: 'jk_mock_spare', last_seen_at_ms: Date.now() - 45_000 },
 ];
 
@@ -542,6 +568,27 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   const path = url.replace(/^https?:\/\/[^/]+/, '').split('?')[0] ?? url;
   const qs = new URLSearchParams(url.includes('?') ? url.slice(url.indexOf('?')) : '');
 
+  if (path === '/dashboard/api/chat' && method === 'POST') {
+    if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
+    const body = parseBody(init?.body);
+    const model = typeof body.model === 'string' ? body.model : 'gpt-4o';
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const prompt = messages.at(-1)?.content;
+    const reply = `Mock response from ${model}: ${typeof prompt === 'string' ? prompt : 'ready'}`;
+    const midpoint = Math.max(1, Math.floor(reply.length / 2));
+    const chunk = (delta: { content?: string; reasoning_content?: string }, finishReason: string | null, usage: object | null = null) =>
+      `data: ${JSON.stringify({ id: 'chatcmpl_mock', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta, finish_reason: finishReason }], usage })}\n\n`;
+    const stream = [
+      chunk({ reasoning_content: '**Checking** the request.' }, null),
+      chunk({ content: reply.slice(0, midpoint) }, null),
+      chunk({ content: reply.slice(midpoint) }, null),
+      chunk({}, 'stop'),
+      `data: ${JSON.stringify({ id: 'chatcmpl_mock', object: 'chat.completion.chunk', model, choices: [], usage: { prompt_tokens: 8, completion_tokens: 12, total_tokens: 20 } })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join('');
+    return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'x-llmconduit-model': model } });
+  }
+
   // -- Auth -- a username/password login is accepted for the seeded users (any password
   // of 8+ chars), a token login for any non-empty token; the response carries the user.
   if (path === '/dashboard/login' && method === 'POST') {
@@ -638,6 +685,7 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   }
   if (path === '/dashboard/api/auth/summary' && method === 'GET') {
     return json({
+      enabled: true,
       policy_epoch: 7,
       actor: {
         kind: 'bootstrap', principal_id: null, display_name: 'Bootstrap administrator',
@@ -740,6 +788,32 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     const resp: MeshAdminState = { join_keys: MESH_JOIN_KEYS, nodes: MESH_NODES, disabled_models: MESH_DISABLED_MODELS };
     return json(resp);
   }
+  if (path === '/dashboard/api/configured-providers' && method === 'GET') {
+    return json({ providers: CONFIGURED_PROVIDERS });
+  }
+  if (path === '/dashboard/api/configured-providers' && method === 'POST') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const body = JSON.parse(String(init?.body ?? '{}')) as { name?: string; base_url?: string; api_key?: string };
+    if (!body.name?.trim() || !body.base_url?.trim() || !body.api_key) return json({ error: 'invalid provider' }, 400);
+    const provider: ConfiguredProvider = {
+      id: `managed-${CONFIGURED_PROVIDERS.length + 1}`,
+      name: body.name.trim(),
+      base_url: body.base_url.trim(),
+      api_key_present: true,
+      models: [{ id: 'discovered-model', context_limit: null }],
+    };
+    CONFIGURED_PROVIDERS = [...CONFIGURED_PROVIDERS, provider];
+    return json(provider, 201);
+  }
+  const configuredProviderDelete = path.match(/^\/dashboard\/api\/configured-providers\/([^/]+)$/);
+  if (configuredProviderDelete && method === 'DELETE') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(configuredProviderDelete[1] ?? '');
+    CONFIGURED_PROVIDERS = CONFIGURED_PROVIDERS.filter((provider) => provider.id !== id);
+    return new Response(null, { status: 204 });
+  }
   if (path === '/dashboard/api/mesh/join-keys' && method === 'POST') {
     const csrf = headerValue(init?.headers, 'X-CSRF-Token');
     if (!csrf) return json({ error: 'missing csrf' }, 403);
@@ -789,6 +863,27 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       return { ...node, enabled };
     });
     return updated ? json({ updated, endpoint_id: endpointId, enabled, evicted: !enabled }) : json({ error: 'mesh node not found' }, 404);
+  }
+  const meshSwitchMatch = path.match(/^\/dashboard\/api\/mesh\/nodes\/([^/]+)\/models\/([^/]+)\/switch$/);
+  if (meshSwitchMatch && method === 'POST') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const endpointId = decodeURIComponent(meshSwitchMatch[1] ?? '');
+    const modelId = decodeURIComponent(meshSwitchMatch[2] ?? '');
+    const node = MESH_NODES.find((entry) => entry.endpoint_id === endpointId);
+    if (!node?.model_switching?.models.some((model) => model.id === modelId)) {
+      return json({ error: 'model is not advertised as switchable' }, 400);
+    }
+    node.model_switching = {
+      ...node.model_switching,
+      revision: node.model_switching.revision + 1,
+      models: node.model_switching.models.map((model) => ({
+        ...model,
+        phase: model.id === modelId ? 'loading' : model.phase,
+        desired_state: model.id === modelId ? 'loaded' : model.desired_state,
+      })),
+    };
+    return json({ endpoint_id: endpointId, model_id: modelId, accepted: true, changed: true });
   }
   const meshModelMatch = path.match(/^\/dashboard\/api\/mesh\/models\/(disable|enable)$/);
   if (meshModelMatch && method === 'POST') {
@@ -1086,6 +1181,13 @@ export const MOCK_KEYS: ApiKeyRecord[] = [
 /** Reset the mutable mock account state (tests). */
 export function resetMockAccounts(): void {
   mockSessionUser = null;
+  CONFIGURED_PROVIDERS = [{
+    id: 'managed-local-lab',
+    name: 'Local lab',
+    base_url: 'http://127.0.0.1:8101/v1',
+    api_key_present: true,
+    models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }],
+  }];
   MOCK_USERS.splice(0, MOCK_USERS.length,
     { id: 'user_admin', username: 'admin', is_admin: true, created_at_ms: Date.now() - 86_400_000 * 30, updated_at_ms: Date.now() - 86_400_000 * 30 },
     { id: 'user_dev', username: 'dev', is_admin: false, created_at_ms: Date.now() - 86_400_000 * 3, updated_at_ms: Date.now() - 86_400_000 * 3 },

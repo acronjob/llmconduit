@@ -479,9 +479,11 @@ fn parse_sse_stream(
             ))?;
         }
         if !saw_finish_reason {
-            Err(AppError::upstream(
-                "mesh upstream SSE ended without a terminal finish_reason",
-            ))?;
+            // HTTP framing and [DONE] were both validated above. An omitted
+            // finish reason is unknown metadata, not a truncated response.
+            tracing::warn!(
+                "mesh upstream SSE completed with [DONE] but without a terminal finish_reason"
+            );
         }
         if let Some(capture) = capture.as_ref() {
             capture.mark_upstream_response_streamed();
@@ -686,7 +688,7 @@ mod tests {
     use crate::mesh::protocol::{
         PROTOCOL_VERSION, ResourceAdvertisement, WORKER_ALPN, WorkerAdvertisement,
     };
-    use crate::mesh::worker::{WorkerRuntime, handle_request};
+    use crate::mesh::worker::{WorkerRuntime, handle_stream};
     use iroh::endpoint::presets;
     use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
     use std::net::{Ipv4Addr, SocketAddr};
@@ -795,6 +797,7 @@ mod tests {
                     healthy: true,
                     revision: 1,
                 }],
+                model_switching: None,
             },
         );
         let mesh = MeshUpstreamClient::new(
@@ -1066,7 +1069,7 @@ mod tests {
         let worker_task = tokio::spawn(async move {
             for _ in 0..7 {
                 let (send, recv) = worker_connection.accept_bi().await.unwrap();
-                let _ = handle_request(send, recv, Arc::clone(&runtime)).await;
+                let _ = handle_stream(send, recv, Arc::clone(&runtime)).await;
             }
         });
 
@@ -1090,6 +1093,7 @@ mod tests {
                     healthy: true,
                     revision: 1,
                 }],
+                model_switching: None,
             },
         );
         let client = MeshUpstreamClient::new(
@@ -1171,10 +1175,8 @@ mod tests {
             assert!(error.to_string().contains(expected_error), "{error}");
         }
 
-        for (prompt, expected_error) in [
-            ("missing done", "[DONE]"),
-            ("missing finish", "finish_reason"),
-        ] {
+        for (prompt, expected_error) in [("missing done", Some("[DONE]")), ("missing finish", None)]
+        {
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "model": "mesh-model",
                 "messages": [{"role": "user", "content": prompt}],
@@ -1192,12 +1194,16 @@ mod tests {
                     .as_deref(),
                 Some("partial")
             );
-            let error = stream
-                .next()
-                .await
-                .expect("terminal protocol error")
-                .expect_err("incomplete terminal protocol must fail");
-            assert!(error.to_string().contains(expected_error), "{error}");
+            if let Some(expected_error) = expected_error {
+                let error = stream
+                    .next()
+                    .await
+                    .expect("terminal protocol error")
+                    .expect_err("incomplete terminal protocol must fail");
+                assert!(error.to_string().contains(expected_error), "{error}");
+            } else {
+                assert!(stream.next().await.is_none(), "clean [DONE] must complete");
+            }
         }
 
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({

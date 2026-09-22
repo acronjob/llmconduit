@@ -548,6 +548,64 @@ impl AuthzService {
         }))
     }
 
+    /// Recover the inference identity represented by a live delegated dashboard
+    /// session. Management authorization and inference authorization remain separate:
+    /// callers still run the normal endpoint/model policy check on this context.
+    pub async fn delegated_inference_context(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<AuthContext>, AuthError> {
+        let service = self.clone();
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            service.delegated_inference_context_blocking(&session_id)
+        })
+        .await
+        .map_err(|_| AuthError::PolicyUnavailable)?
+    }
+
+    fn delegated_inference_context_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<AuthContext>, AuthError> {
+        let Some(inner) = &self.inner else {
+            return Ok(None);
+        };
+        let session = inner
+            .store
+            .lock()
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .load_dashboard_session(session_id)
+            .map_err(|_| AuthError::PolicyUnavailable)?;
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        let authority = inner
+            .authority
+            .read()
+            .map_err(|_| AuthError::PolicyUnavailable)?
+            .clone();
+        let identity = PolicyIdentity {
+            request_id: AuthRequestId::new(),
+            key_id: session.key_id,
+            key_prefix: session.key_prefix,
+            principal_id: session.principal_id,
+            policy_epoch: authority.epoch,
+        };
+        let usage_admission = inner
+            .usage_persistence
+            .admit()
+            .map_err(|_| AuthError::PolicyUnavailable)?;
+        Ok(Some(AuthContext {
+            auth_request_id: identity.request_id.as_str().to_string(),
+            key_id: identity.key_id.clone(),
+            principal_id: identity.principal_id.clone(),
+            identity,
+            policy: Arc::clone(&authority.policy),
+            usage_admission: Some(usage_admission),
+        }))
+    }
+
     pub async fn revoke_delegated_session(&self, session_id: &str) -> Result<bool, String> {
         let service = self.clone();
         let session_id = session_id.to_owned();
@@ -1000,10 +1058,23 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let delegated_context = service
+            .delegated_inference_context(&session_id)
+            .await
+            .unwrap()
+            .expect("live delegated session retains its inference identity");
+        assert!(delegated_context.allows_model("chat", "any-model"));
         assert!(service.revoke_delegated_session(&session_id).await.unwrap());
         assert!(
             service
                 .authenticate_delegated_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            service
+                .delegated_inference_context(&session_id)
                 .await
                 .unwrap()
                 .is_none()

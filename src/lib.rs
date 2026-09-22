@@ -23,6 +23,7 @@ pub mod flow_persistence;
 pub mod harness;
 pub mod http;
 pub mod log_rotation;
+pub mod managed_providers;
 pub mod mesh;
 pub mod metrics;
 pub mod models;
@@ -364,7 +365,7 @@ pub fn build_app_with_gateway_control_plane_runtime(
             // off) so the single point that sees the on-wire body can capture it.
             .with_flow_store(flow_store.clone())
         };
-    let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
+    let base_upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
         let mut providers = Vec::new();
         if let Some(admin) = mesh_admin.clone() {
             providers.push(RoutingUpstreamProvider::new(
@@ -548,6 +549,28 @@ pub fn build_app_with_gateway_control_plane_runtime(
             ))
         }
     };
+    let managed_providers = runtime.persistence_store.as_ref().map(|store| {
+        crate::managed_providers::ManagedProviderRegistry::new(
+            Arc::clone(store),
+            crate::managed_providers::ManagedProviderOptions {
+                http_client: http_client.clone(),
+                flatten_content,
+                min_completion_tokens,
+                max_sse_frame_bytes,
+                finalization_policies: finalization_policies.clone(),
+                flow_store: flow_store.clone(),
+            },
+        )
+    });
+    let upstream: Arc<dyn crate::upstream::UpstreamClient> =
+        if let Some(registry) = managed_providers.clone() {
+            Arc::new(crate::managed_providers::ManagedProviderUpstream::new(
+                Arc::clone(&base_upstream),
+                registry,
+            ))
+        } else {
+            base_upstream
+        };
     let search = Arc::new(BraveSearchClient::new(http_client.clone(), config.clone()));
     // G4 image agent: a vision client + a shared per-session image cache. The
     // cache is constructed once and shared so the strip seam (in
@@ -618,6 +641,7 @@ pub fn build_app_with_gateway_control_plane_runtime(
     .with_provider_metrics(provider_metrics.clone())
     .with_turn_capture(turn_capture)
     .with_fleet(fleet)
+    .with_managed_providers(managed_providers)
     .with_mesh_admin(mesh_admin)
     .with_operational_models(operational_models, unknown_model_policy);
     if let Some(client_auth) = client_auth {

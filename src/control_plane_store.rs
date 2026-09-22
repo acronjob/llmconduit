@@ -492,6 +492,17 @@ pub trait PersistenceStore: PersistenceWriter {
         is_admin: bool,
         actor: &str,
     ) -> StoreResult<UserRecord>;
+    /// Create or refresh an externally-authenticated dashboard user with a
+    /// caller-stable id such as `github:<numeric-id>`. These rows deliberately
+    /// carry a non-PHC password sentinel, so password login cannot authenticate
+    /// them through `verify_password`.
+    async fn upsert_external_user(
+        &self,
+        id: &str,
+        username: &str,
+        is_admin: bool,
+        actor: &str,
+    ) -> StoreResult<UserRecord>;
     async fn update_user(
         &self,
         id: &str,
@@ -2670,6 +2681,52 @@ impl PersistenceStore for SqlStore {
         })
     }
 
+    async fn upsert_external_user(
+        &self,
+        id: &str,
+        username: &str,
+        is_admin: bool,
+        actor: &str,
+    ) -> StoreResult<UserRecord> {
+        let now = now_ms();
+        let password_hash = "external-oauth-only";
+        let pg = self.postgres();
+        let sql = if pg {
+            "INSERT INTO users (id, username, password_hash, is_admin, created_at_ms, created_by, \
+             updated_at_ms, updated_by, deleted_at_ms) \
+             VALUES ($1, $2, $3, $4, $5, $6, $5, $6, NULL) \
+             ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, \
+             is_admin = EXCLUDED.is_admin, updated_at_ms = EXCLUDED.updated_at_ms, \
+             updated_by = EXCLUDED.updated_by, deleted_at_ms = NULL"
+                .to_string()
+        } else {
+            "INSERT INTO users (id, username, password_hash, is_admin, created_at_ms, created_by, \
+             updated_at_ms, updated_by, deleted_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?6, NULL) \
+             ON CONFLICT(id) DO UPDATE SET username = excluded.username, \
+             is_admin = excluded.is_admin, updated_at_ms = excluded.updated_at_ms, \
+             updated_by = excluded.updated_by, deleted_at_ms = NULL"
+                .to_string()
+        };
+        execute!(
+            self,
+            &sql,
+            id,
+            username,
+            password_hash,
+            is_admin as i64,
+            now,
+            actor
+        );
+        Ok(UserRecord {
+            id: id.to_string(),
+            username: username.to_string(),
+            is_admin,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
     async fn update_user(
         &self,
         id: &str,
@@ -3622,6 +3679,53 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn external_users_are_upserted_by_stable_id_for_key_ownership() {
+        let store = SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("connect");
+        let first = store
+            .upsert_external_user("github:123", "github:octocat", false, "github-sso")
+            .await
+            .expect("upsert github user");
+        assert_eq!(first.id, "github:123");
+        assert_eq!(first.username, "github:octocat");
+        assert!(!first.is_admin);
+        assert!(
+            store
+                .get_user_auth("github:octocat")
+                .await
+                .unwrap()
+                .is_some_and(|auth| !crate::accounts::verify_password(
+                    &auth.password_hash,
+                    "any-password"
+                )),
+            "external users must not authenticate through password login"
+        );
+
+        store
+            .put_api_key(
+                "github-key",
+                "llmc_github",
+                Some("scoped"),
+                Some(&first.id),
+                &["qwen".to_string()],
+                "test",
+            )
+            .await
+            .expect("key");
+        let second = store
+            .upsert_external_user("github:123", "github:octo-renamed", true, "github-sso")
+            .await
+            .expect("refresh github user");
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.username, "github:octo-renamed");
+        assert!(second.is_admin);
+        let keys = store.list_api_keys_for_user("github:123").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, "github-key");
     }
 
     #[tokio::test]

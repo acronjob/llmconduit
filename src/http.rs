@@ -7,17 +7,22 @@ use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
 use crate::adapters::responses_to_chat;
 use crate::client_auth::ClientAuthOutcome;
 use crate::client_auth::ClientIdentity;
+use crate::dashboard_api::create_configured_provider;
 use crate::dashboard_api::dashboard_catalog;
+use crate::dashboard_api::dashboard_configured_providers;
 use crate::dashboard_api::dashboard_flow_detail;
 use crate::dashboard_api::dashboard_flows;
 use crate::dashboard_api::dashboard_metrics;
 use crate::dashboard_api::dashboard_providers;
 use crate::dashboard_api::dashboard_snapshot;
 use crate::dashboard_api::dashboard_topology;
+use crate::dashboard_api::delete_configured_provider;
 use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationDenied;
 use crate::dashboard_auth::MutationPolicy;
+use crate::dashboard_auth::dashboard_github_callback;
+use crate::dashboard_auth::dashboard_github_start;
 use crate::dashboard_auth::dashboard_login;
 use crate::dashboard_auth::dashboard_logout;
 use crate::dashboard_auth::delegated_login_response;
@@ -71,6 +76,7 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::response::Sse;
 use axum::routing::MethodFilter;
+use axum::routing::delete;
 use axum::routing::get;
 use axum::routing::on;
 use axum::routing::post;
@@ -218,7 +224,16 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         .route("/dashboard/api/metrics", get(dashboard_metrics))
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
+        .route("/dashboard/api/chat", post(dashboard_chat_completions))
         .route("/dashboard/api/providers", get(dashboard_providers))
+        .route(
+            "/dashboard/api/configured-providers",
+            get(dashboard_configured_providers).post(create_configured_provider),
+        )
+        .route(
+            "/dashboard/api/configured-providers/{id}",
+            delete(delete_configured_provider),
+        )
         .route(
             "/dashboard/api/fleet",
             get(crate::dashboard_fleet::fleet_models),
@@ -247,6 +262,10 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         .route(
             "/dashboard/api/mesh/nodes/{endpoint_id}/enable",
             post(dashboard_mesh::enable_node),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/switch",
+            post(dashboard_mesh::switch_node_model),
         )
         .route(
             "/dashboard/api/mesh/models/disable",
@@ -349,6 +368,11 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
     let open = Router::new()
         .route("/dashboard/login", post(dashboard_login))
         .route("/dashboard/logout", post(dashboard_logout))
+        .route("/dashboard/auth/github/start", get(dashboard_github_start))
+        .route(
+            "/dashboard/auth/github/callback",
+            get(dashboard_github_callback),
+        )
         .route("/dashboard/auth/key-login", post(dashboard_key_login))
         .route("/dashboard/auth/logout", post(dashboard_auth_logout))
         .route("/debug/ws", get(debug_ws))
@@ -570,7 +594,10 @@ async fn require_management_access(
     };
 
     let (actor, cookie_or_dashboard_token) =
-        if dashboard_auth.authenticate(request.headers()).is_some() {
+        if let Some(session) = dashboard_auth.authenticate(request.headers()) {
+            if session.user.as_ref().is_some_and(|user| !user.is_admin) {
+                return management_error(StatusCode::FORBIDDEN, "administrator role required");
+            }
             (crate::dashboard_access::ManagementActor::Bootstrap, true)
         } else if let Some((session_id, _)) = dashboard_auth.delegated_session(request.headers()) {
             match gateway
@@ -2662,7 +2689,7 @@ async fn responses_ws_serve(
     // 2. Parse + force streaming (WS is inherently streaming; a non-stream
     //    `ResponsesRequest` would make the engine emit only the terminal
     //    `response.completed`, which is legal but not what a WS client expects).
-    let mut request: ResponsesRequest = match serde_json::from_slice(&request_bytes) {
+    let mut request: ResponsesRequest = match parse_responses_ws_request(&request_bytes) {
         Ok(r) => r,
         Err(err) => {
             let _ = send_responses_ws_error(
@@ -2772,6 +2799,19 @@ async fn responses_ws_serve(
                 }
             }
         }
+    }
+}
+
+fn parse_responses_ws_request(bytes: &[u8]) -> Result<ResponsesRequest, String> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|err| err.to_string())?;
+    if value.get("type").and_then(Value::as_str) == Some("response.create") {
+        let response = value
+            .get("response")
+            .cloned()
+            .ok_or_else(|| "response.create frame is missing `response`".to_string())?;
+        serde_json::from_value(response).map_err(|err| err.to_string())
+    } else {
+        serde_json::from_value(value).map_err(|err| err.to_string())
     }
 }
 
@@ -2980,14 +3020,164 @@ async fn post_chat_completions(
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
+    handle_chat_completions(
+        gateway,
+        auth.map(|value| value.0),
+        api_call_id.map(|extension| extension.0.0),
+        persistence.map(|extension| extension.0),
+        request,
+    )
+    .await
+}
+
+/// Dashboard-authenticated chat. It accepts the OpenAI Chat Completions request shape
+/// and always streams the same SSE format as `/v1/chat/completions`.
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/chat",
+    tag = "dashboard",
+    operation_id = "dashboard_chat_completions",
+    request_body(content = serde_json::Value, content_type = "application/json", description = "OpenAI Chat Completions request. The dashboard client sets `stream: true`."),
+    responses(
+        (status = 200, description = "Chat completion SSE stream ending in `data: [DONE]`.", content((String = "text/event-stream"))),
+        (status = 400, body = crate::openapi::ApiError, description = "Malformed request."),
+        (status = 401, body = crate::openapi::DashboardError, description = "No valid dashboard session."),
+        (status = 403, body = crate::openapi::DashboardError, description = "CSRF validation failed or the account may not use the requested model."),
+        (status = 502, body = crate::openapi::ApiError, description = "No configured backend completed the request.")
+    ),
+    security(("session" = []))
+)]
+async fn dashboard_chat_completions(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(dashboard_auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    headers: HeaderMap,
+    api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
+    persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
+    Json(request): Json<ChatCompletionRequest>,
+) -> AppResult<Response> {
+    authorize_dashboard_chat_csrf(&gateway, &dashboard_auth, &headers).await?;
+    let access = dashboard_inference_access(&gateway, &dashboard_auth, &session, &headers).await?;
+    if !access.allows_model(&request.model) {
+        return Err(AppError::forbidden(
+            "the account is not authorized for the requested model",
+        ));
+    }
+    handle_chat_completions(
+        gateway,
+        access.auth_context().cloned(),
+        api_call_id.map(|extension| extension.0.0),
+        persistence.map(|extension| extension.0),
+        request,
+    )
+    .await
+}
+
+/// Effective inference scope of a dashboard session. A dashboard login never
+/// upgrades inference privileges: delegated sessions retain their policy snapshot,
+/// while SQL users receive the union of the model scopes on their active keys.
+pub(crate) enum DashboardInferenceAccess {
+    Unrestricted,
+    Policy(crate::authz::AuthContext),
+    Models(Vec<String>),
+    Denied,
+}
+
+impl DashboardInferenceAccess {
+    pub(crate) fn allows_model(&self, model: &str) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Policy(context) => context.allows_model("chat", model),
+            Self::Models(models) => models
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(model.trim())),
+            Self::Denied => false,
+        }
+    }
+
+    fn auth_context(&self) -> Option<&crate::authz::AuthContext> {
+        match self {
+            Self::Policy(context) => Some(context),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) async fn dashboard_inference_access(
+    gateway: &Gateway,
+    dashboard_auth: &DashboardAuth,
+    session: &AuthSession,
+    headers: &HeaderMap,
+) -> AppResult<DashboardInferenceAccess> {
+    if let Some((session_id, _)) = dashboard_auth.delegated_session(headers) {
+        return gateway
+            .authz()
+            .delegated_inference_context(&session_id)
+            .await
+            .map_err(|error| {
+                AppError::internal(format!("dashboard authorization failed: {error}"))
+            })?
+            .map(DashboardInferenceAccess::Policy)
+            .ok_or_else(|| AppError::forbidden("dashboard session is no longer authorized"));
+    }
+    let Some(user) = session.user.as_ref() else {
+        return Ok(DashboardInferenceAccess::Unrestricted);
+    };
+    if user.is_admin {
+        return Ok(DashboardInferenceAccess::Unrestricted);
+    }
+    Ok(
+        match gateway.client_auth().allowed_models_for_owner(&user.id) {
+            Some(models) if models.is_empty() => DashboardInferenceAccess::Unrestricted,
+            Some(models) => DashboardInferenceAccess::Models(models),
+            None => DashboardInferenceAccess::Denied,
+        },
+    )
+}
+
+async fn authorize_dashboard_chat_csrf(
+    gateway: &Gateway,
+    dashboard_auth: &DashboardAuth,
+    headers: &HeaderMap,
+) -> AppResult<()> {
+    if !dashboard_auth.verify_csrf(headers) {
+        return Err(AppError::forbidden("missing or invalid CSRF token"));
+    }
+    let Some((session_id, _)) = dashboard_auth.delegated_session(headers) else {
+        return Ok(());
+    };
+    let csrf = headers
+        .get(crate::dashboard_auth::CSRF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let digest = Sha256::digest(csrf.as_bytes());
+    match gateway
+        .authz()
+        .verify_delegated_csrf_digest(&session_id, digest.as_slice())
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::forbidden("missing or invalid CSRF token")),
+        Err(error) => Err(AppError::internal(format!(
+            "dashboard CSRF authorization failed: {error}"
+        ))),
+    }
+}
+
+async fn handle_chat_completions(
+    gateway: Arc<Gateway>,
+    auth: Option<crate::authz::AuthContext>,
+    api_call_id: Option<String>,
+    persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+    request: ChatCompletionRequest,
+) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
     let authorization = authorize_inference(
-        auth.as_ref().map(|value| &value.0),
+        auth.as_ref(),
         crate::upstream::InferenceEndpoint::ChatCompletions,
         &requested,
     )?;
-    let auth = auth.map(|value| value.0);
     let lease = acquire_inference_session(&gateway, auth.as_ref()).await?;
     let wants_stream = request.stream;
     let include_usage = request
@@ -2999,8 +3189,8 @@ async fn post_chat_completions(
         .clone()
         .stream_responses_with_capture_authorized_context(
             responses_request,
-            api_call_id.map(|extension| extension.0.0),
-            persistence.map(|extension| extension.0),
+            api_call_id,
+            persistence,
             authorization,
             crate::upstream::InferenceEndpoint::ChatCompletions,
             auth,

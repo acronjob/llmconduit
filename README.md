@@ -339,6 +339,15 @@ restricted to bootstrap dashboard sessions and administrator user sessions;
 delegated management sessions cannot use these controls. Mutations retain the
 dashboard's existing CSRF and mutation-policy checks.
 
+A downstream mesh worker that has local Fleet configured also advertises its
+current switchable model inventory. The controller can request a load only for
+an exact model id in that live inventory. The command travels over the worker's
+authenticated Iroh connection; Fleet remains bound to loopback on the worker,
+and its bearer token never leaves that machine. Set `LLMCONDUIT_FLEET_URL` and
+either `LLMCONDUIT_FLEET_TOKEN_FILE` or `LLMCONDUIT_FLEET_TOKEN` in the
+`llmconduit mesh-worker` environment to enable this capability. The controller
+and worker must both use mesh protocol v2.
+
 Mesh enrollment and disabled-model state remains in the mesh controller's
 dedicated SQLite database. `control_plane.storage: postgres` stores dashboard
 accounts, API keys, request history, and metrics; it intentionally does not move
@@ -832,14 +841,43 @@ docker run --rm -p 127.0.0.1:4000:4000 \
 ```
 
 `/debug` and `/dashboard` exist only when the global `--with-debug-ui` flag is
-passed. On the container's non-loopback bind, authenticated dashboard exposure
-also requires `LLMCONDUIT_DASHBOARD_TOKEN`, a stable base64 session key decoding
-to at least 32 bytes (`LLMCONDUIT_DASHBOARD_SESSION_KEY`), and an exact HTTPS
-`LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`. These env-only secrets must not be placed in
-`control_plane.auth` or persisted config. To deliberately run tokenless over
+passed. When GitHub SSO is configured, it replaces the browser login while the
+legacy programmatic token endpoint remains available. Create a GitHub OAuth App
+whose callback is `https://your-host/dashboard/auth/github/callback`, then set:
+
+```bash
+LLMCONDUIT_GITHUB_CLIENT_ID=...
+LLMCONDUIT_GITHUB_CLIENT_SECRET=...
+LLMCONDUIT_GITHUB_ALLOWED_USERS=octocat,another-login
+# Required for admin privileges; omitted means no GitHub user is an admin.
+LLMCONDUIT_GITHUB_ADMIN_USERS=octocat
+```
+
+On a non-loopback bind, authenticated dashboard exposure also requires a stable
+base64 session key decoding to at least 32 bytes
+(`LLMCONDUIT_DASHBOARD_SESSION_KEY`) and an exact HTTPS
+`LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`. The callback URL is derived from that
+origin and must be `https://<origin>/dashboard/auth/github/callback` with no
+credentials, query, or fragment; `LLMCONDUIT_GITHUB_CALLBACK_URL` can override it
+only when it keeps the same public origin and callback path.
+The legacy `LLMCONDUIT_DASHBOARD_TOKEN` remains a non-browser break-glass API
+credential, but is no longer exposed by the dashboard login UI. These env-only
+secrets must not be placed in `control_plane.auth` or persisted config. To deliberately run tokenless over
 plaintext on a trusted development network, set
 `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1`; startup logs a prominent warning because
 the debug surfaces are then fully unauthenticated.
+
+GitHub SSO requires SQL storage (`control_plane.storage` with SQLite or
+Postgres). Successful GitHub logins are provisioned as dashboard users so
+existing per-user API keys and model grants apply to both dashboard chat and key
+management.
+
+The production helper deliberately refuses to install on an unacknowledged
+machine. Validate it first with
+`scripts/install-github-sso-production.sh --confirm-production-host "$(hostname)" --dry-run`,
+then omit `--dry-run` on the intended production host. The generated unit reads
+ordinary gateway settings from `LLMCONDUIT_CONFIG_PATH` and env-only OAuth
+credentials from the mode-`0600` `LLMCONDUIT_ENV_FILE`.
 
 Dashboard mutations are disabled unless
 `LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`; the kill endpoint additionally enforces
@@ -854,8 +892,9 @@ The Providers view can also control a local [lil-fleet](https://github.com/local
 instance. Set `LLMCONDUIT_FLEET_URL` to its loopback origin and provide either
 `LLMCONDUIT_FLEET_TOKEN_FILE` (preferred, so the bearer token can remain in a
 mode-`0600` file) or `LLMCONDUIT_FLEET_TOKEN`. This integration intentionally
-rejects non-loopback URLs; remote/federated Fleet control is a separate trust
-boundary. Inventory reads require a dashboard administrator, while load/unload
+rejects non-loopback URLs. A mesh worker may advertise the same capability to
+its controller over authenticated Iroh, without exposing Fleet itself.
+Inventory reads require a dashboard administrator, while load/unload
 also require the global mutation gate and CSRF token. Fleet credentials remain
 server-side and are never returned to the browser.
 
@@ -886,8 +925,9 @@ server-side and are never returned to the browser.
 | `POST /dashboard/api/flows/:id/kill` | Abort a live flow when dashboard mutations are enabled; requires a session and CSRF token |
 | `GET /dashboard/api/fleet` | Administrator-only local Fleet model/deployment inventory when configured |
 | `POST /dashboard/api/fleet/models/:id/load`, `/unload` | Administrator-only, mutation- and CSRF-gated local Fleet GPU lifecycle controls |
+| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/switch` | Administrator-only request to load an exactly advertised model on a connected Fleet-capable mesh worker |
 | `GET /dashboard/api/me`, `/users`, `/keys` (+ `POST`/`PATCH`/`DELETE`) | Authenticated accounts API: the current user, user administration, API keys |
-| `POST /dashboard/login`, `POST /dashboard/logout` | Dashboard session (username/password or access token; cookie + CSRF token) |
+| `GET /dashboard/auth/github/start`, `GET /dashboard/auth/github/callback`, `POST /dashboard/logout` | GitHub SSO dashboard session (signed state + PKCE; session and CSRF cookies) |
 | `GET /dashboard/ws`, `GET /debug/ws` | Authenticated WebSocket feeds behind the dashboard and debug UI |
 
 ## Environment
@@ -922,6 +962,11 @@ LLMCONDUIT_DASHBOARD_SESSION_KEY
 LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN
 LLMCONDUIT_ALLOW_INSECURE_DASHBOARD
 LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS
+LLMCONDUIT_GITHUB_CLIENT_ID
+LLMCONDUIT_GITHUB_CLIENT_SECRET
+LLMCONDUIT_GITHUB_CALLBACK_URL
+LLMCONDUIT_GITHUB_ALLOWED_USERS
+LLMCONDUIT_GITHUB_ADMIN_USERS
 LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE
 LLMCONDUIT_DASHBOARD_CLIENT_HEADER
 LLMCONDUIT_FLEET_URL

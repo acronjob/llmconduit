@@ -27,6 +27,7 @@
 //! `active_streams` is the live count of OPEN flows (the metrics rings don't track
 //! liveness; the FlowStore does).
 
+use crate::dashboard_auth::{AuthSession, DashboardAuth, MutationPolicy};
 use crate::dashboard_flow::Attempt;
 use crate::dashboard_flow::ClientSource;
 use crate::dashboard_flow::FlowRecord;
@@ -47,9 +48,12 @@ use crate::metrics::StatusClass;
 use crate::metrics::WindowReport;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::{ProviderHealthSnapshot, ProviderInventoryEntry};
+use axum::Extension;
+use axum::Json;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -449,6 +453,32 @@ pub struct CatalogEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProvidersBody {
     pub providers: Vec<ProviderInventoryEntry>,
+}
+
+fn dashboard_error(status: StatusCode, message: impl Into<String>) -> Response {
+    json_no_store(
+        status,
+        &crate::openapi::DashboardError {
+            error: message.into(),
+        },
+    )
+}
+
+fn dashboard_admin_denial(session: &AuthSession) -> Option<Response> {
+    if session.user.as_ref().is_none_or(|user| user.is_admin) {
+        None
+    } else {
+        Some(dashboard_error(
+            StatusCode::FORBIDDEN,
+            "administrator role required",
+        ))
+    }
+}
+
+fn dashboard_mutation_denial(auth: &DashboardAuth, headers: &HeaderMap) -> Option<Response> {
+    auth.authorize_mutation(headers)
+        .err()
+        .map(|denied| dashboard_error(denied.status(), denied.message()))
 }
 
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut. Mirrors
@@ -1349,10 +1379,27 @@ pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response
         ),
     )
 )]
-pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response {
+pub async fn dashboard_catalog(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(dashboard_auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    headers: HeaderMap,
+) -> Response {
+    let access = match crate::http::dashboard_inference_access(
+        &gateway,
+        &dashboard_auth,
+        &session,
+        &headers,
+    )
+    .await
+    {
+        Ok(access) => access,
+        Err(error) => return error.into_response(),
+    };
     let entries = match gateway.upstream_client().supported_model_catalog().await {
         Ok(catalog) => catalog
             .into_iter()
+            .filter(|entry| access.allows_model(&entry.id))
             .map(|entry| CatalogEntry {
                 id: entry.id,
                 // Pass the parsed `Option<i64>` THROUGH unchanged: a known window
@@ -1386,6 +1433,128 @@ pub async fn dashboard_providers(State(gateway): State<Arc<Gateway>>) -> Respons
         .await
         .unwrap_or_default();
     json_no_store(StatusCode::OK, &ProvidersBody { providers })
+}
+
+/// `GET /dashboard/api/configured-providers` — dashboard-managed
+/// OpenAI-compatible providers. Credentials are never returned.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/configured-providers",
+    tag = "dashboard",
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn dashboard_configured_providers(State(gateway): State<Arc<Gateway>>) -> Response {
+    let Some(registry) = gateway.managed_providers() else {
+        return dashboard_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL storage is required for configured providers",
+        );
+    };
+    match registry.list().await {
+        Ok(providers) => json_no_store(
+            StatusCode::OK,
+            &crate::managed_providers::ConfiguredProvidersBody { providers },
+        ),
+        Err(err) => dashboard_error(err.status_code(), err.client_message),
+    }
+}
+
+/// `POST /dashboard/api/configured-providers` — add one provider after
+/// server-side `/v1/models` discovery.
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/configured-providers",
+    tag = "dashboard",
+    request_body(content = crate::managed_providers::CreateConfiguredProviderRequest),
+    responses(
+        (status = 201, body = serde_json::Value),
+        (status = 400, body = crate::openapi::DashboardError),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 502, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn create_configured_provider(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    headers: HeaderMap,
+    payload: Result<
+        Json<crate::managed_providers::CreateConfiguredProviderRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    if let Some(response) =
+        dashboard_admin_denial(&session).or_else(|| dashboard_mutation_denial(&auth, &headers))
+    {
+        return response;
+    }
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return dashboard_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid JSON body, expected {{name, base_url, api_key}}: {rejection}"),
+            );
+        }
+    };
+    let Some(registry) = gateway.managed_providers() else {
+        return dashboard_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL storage is required for configured providers",
+        );
+    };
+    match registry.add(payload).await {
+        Ok(provider) => json_no_store(StatusCode::CREATED, &provider),
+        Err(err) => dashboard_error(err.status_code(), err.client_message),
+    }
+}
+
+/// `DELETE /dashboard/api/configured-providers/{id}` — remove one provider.
+#[utoipa::path(
+    delete,
+    path = "/dashboard/api/configured-providers/{id}",
+    tag = "dashboard",
+    params(("id" = String, Path)),
+    responses(
+        (status = 204, description = "Deleted."),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 404, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn delete_configured_provider(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) =
+        dashboard_admin_denial(&session).or_else(|| dashboard_mutation_denial(&auth, &headers))
+    {
+        return response;
+    }
+    let Some(registry) = gateway.managed_providers() else {
+        return dashboard_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL storage is required for configured providers",
+        );
+    };
+    match registry.delete(&id).await {
+        Ok(true) => crate::dashboard_auth::no_store(StatusCode::NO_CONTENT.into_response()),
+        Ok(false) => dashboard_error(StatusCode::NOT_FOUND, "configured provider not found"),
+        Err(err) => dashboard_error(err.status_code(), err.client_message),
+    }
 }
 
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut from the D5

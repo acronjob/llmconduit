@@ -36,4 +36,8 @@ describe('bootstrap parsing — frozen field names (finding 6)', () => {
     auth_mode: 'token',
     });
   });
+
+  it('preserves the GitHub authentication mode', () => {
+    expect(parseBootstrap({ auth_mode: 'github' }).auth_mode).toBe('github');
+  });
 });

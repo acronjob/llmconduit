@@ -819,6 +819,7 @@ impl AuthStore {
             ),
         };
         Ok(AccessResult::Summary(AccessSummary {
+            enabled: true,
             policy_epoch: current_epoch(&self.connection).map_err(access_internal)?,
             actor: ActorSummary {
                 kind: kind.into(),

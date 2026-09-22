@@ -224,6 +224,10 @@ pub struct Gateway {
     /// Optional mesh controller admin handle. Present only when the controller is
     /// enabled; dashboard handlers use it for enrollment/node/model lifecycle.
     mesh_admin: Option<Arc<crate::mesh::controller::MeshAdmin>>,
+    /// Dashboard-managed OpenAI-compatible providers. Present only when a SQL
+    /// persistence store is configured; secrets stay in the store and this
+    /// handle exposes only redacted metadata to dashboard handlers.
+    managed_providers: Option<Arc<crate::managed_providers::ManagedProviderRegistry>>,
     /// D6 AbortHub: the live-cancellation registry keyed by `api_call_id`, so the
     /// dashboard kill route can cancel a stuck server-side stream. Gated identically to
     /// the FlowStore (enabled iff `flow_store.is_enabled()`), because the D3 L1 guard —
@@ -817,6 +821,7 @@ impl Gateway {
             users_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persistence_store: None,
             mesh_admin: None,
+            managed_providers: None,
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
@@ -1107,6 +1112,20 @@ impl Gateway {
 
     pub(crate) fn mesh_admin(&self) -> Option<Arc<crate::mesh::controller::MeshAdmin>> {
         self.mesh_admin.clone()
+    }
+
+    pub(crate) fn with_managed_providers(
+        mut self,
+        managed_providers: Option<Arc<crate::managed_providers::ManagedProviderRegistry>>,
+    ) -> Self {
+        self.managed_providers = managed_providers;
+        self
+    }
+
+    pub(crate) fn managed_providers(
+        &self,
+    ) -> Option<Arc<crate::managed_providers::ManagedProviderRegistry>> {
+        self.managed_providers.clone()
     }
 
     pub fn persistence_store(

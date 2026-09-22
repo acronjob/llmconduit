@@ -60,7 +60,7 @@ export function parseBootstrap(raw: unknown): DashboardBootstrap {
     csrf_token: typeof obj.csrf_token === 'string' ? obj.csrf_token : null,
     mutations_enabled: obj.mutations_enabled === true,
     user: parsedUser,
-    auth_mode: mode === 'users' || mode === 'open' ? mode : 'token',
+    auth_mode: mode === 'users' || mode === 'open' || mode === 'github' ? mode : 'token',
   };
 }
 

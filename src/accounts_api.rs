@@ -135,6 +135,9 @@ pub async fn me(
 /// created out of band (the CLI, another replica) are noticed here: while the
 /// in-memory flag is off, a cheap `count_users` refreshes it.
 pub async fn auth_mode(gateway: &Gateway, auth: &DashboardAuth) -> &'static str {
+    if auth.github_sso_enabled() {
+        return "github";
+    }
     if !gateway.users_configured()
         && let Some(store) = gateway.persistence_store()
         && let Ok(count) = store.count_users().await

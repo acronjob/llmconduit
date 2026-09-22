@@ -53,6 +53,54 @@ describe('DashboardClient — 401 bounce-to-login', () => {
 });
 
 describe('DashboardClient — typed reads against the D13 shapes (mock)', () => {
+  it('sends the selected reasoning and sampling controls to the chat route', async () => {
+    let sent: Record<string, unknown> = {};
+    const fetchChat: typeof fetch = async (_input, init) => {
+      sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response('data: [DONE]\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    const client = new DashboardClient({ fetchImpl: fetchChat, getCsrfToken: () => 'test-csrf' });
+
+    await client.streamChat({
+      model: 'reasoning-model',
+      messages: [{ role: 'user', content: 'think' }],
+      reasoning_effort: 'xhigh',
+      top_p: 0.85,
+      max_tokens: 8192,
+    }, () => undefined);
+
+    expect(sent).toMatchObject({ reasoning_effort: 'xhigh', top_p: 0.85, max_tokens: 8192, stream: true });
+  });
+
+  it('streams chat deltas, usage, and the terminal reason through the dashboard route', async () => {
+    const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
+    const deltas: Array<{ kind: 'content' | 'reasoning'; text: string }> = [];
+    const result = await client.streamChat(
+      { model: 'gpt-4o', messages: [{ role: 'user', content: 'ping' }] },
+      (delta) => deltas.push(delta),
+    );
+
+    expect(deltas.filter((delta) => delta.kind === 'reasoning').map((delta) => delta.text).join('')).toBe('**Checking** the request.');
+    expect(deltas.filter((delta) => delta.kind === 'content').map((delta) => delta.text).join('')).toBe('Mock response from gpt-4o: ping');
+    expect(result).toMatchObject({ model: 'gpt-4o', finishReason: 'stop' });
+    expect(result.usage?.total_tokens).toBe(20);
+  });
+
+  it('reports a stream that closes without the terminal marker', async () => {
+    const fetchIncomplete: typeof fetch = async () => new Response(
+      'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    );
+    const client = new DashboardClient({ fetchImpl: fetchIncomplete, getCsrfToken: () => 'test-csrf' });
+    const deltas: Array<{ kind: 'content' | 'reasoning'; text: string }> = [];
+
+    await expect(client.streamChat(
+      { model: 'gpt-4o', messages: [{ role: 'user', content: 'ping' }] },
+      (delta) => deltas.push(delta),
+    )).rejects.toThrow(/terminal \[DONE\]/);
+    expect(deltas.map((delta) => delta.text).join('')).toBe('partial');
+  });
+
   it('flows() returns the cursor-bearing FlowsResponse', async () => {
     const client = new DashboardClient({ fetchImpl: mockFetch });
     const res = await client.flows();
@@ -89,6 +137,23 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     expect(vllm?.cache_hit_rate).toBeGreaterThan(0);
   });
 
+  it('manages additional providers without returning their API keys', async () => {
+    const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
+    const initial = await client.configuredProviders();
+    expect(initial.providers[0]).not.toHaveProperty('api_key');
+
+    const created = await client.createConfiguredProvider({
+      name: 'Test provider',
+      base_url: 'https://inference.example/v1',
+      api_key: 'secret-value',
+    });
+    expect(created).toMatchObject({ name: 'Test provider', api_key_present: true });
+    expect(created).not.toHaveProperty('api_key');
+
+    await client.deleteConfiguredProvider(created.id);
+    expect((await client.configuredProviders()).providers.some((provider) => provider.id === created.id)).toBe(false);
+  });
+
   it('mesh admin methods validate reads and send CSRF for mutations', async () => {
     const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
     const mesh = await client.mesh();
@@ -97,6 +162,9 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
 
     const created = await client.createMeshJoinKey({ label: 'fixture', max_uses: 1, expires_in_secs: 3600 });
     expect(created.token).toContain(created.join_key.id);
+
+    const switched = await client.switchMeshModel('vllm-a', 'qwen3-32b');
+    expect(switched).toMatchObject({ endpoint_id: 'vllm-a', model_id: 'qwen3-32b', accepted: true, changed: true });
 
     const node = await client.setMeshNodeEnabled('vllm-a', false);
     expect(node).toMatchObject({ endpoint_id: 'vllm-a', enabled: false, evicted: true });

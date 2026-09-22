@@ -19,7 +19,7 @@ use http::HeaderName;
 use regex::Regex;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Map as JsonMap;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -486,7 +486,7 @@ impl ProxyCompletionsRequest {
 /// `/v1/models` snapshot so they always describe the same provider/state (G3:
 /// a separate context-limit fetch could otherwise pair one provider's ids with
 /// another's limits under failover).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamModelEntry {
     pub id: String,
     pub context_limit: Option<i64>,
@@ -5354,9 +5354,12 @@ async fn stream_success_response(
                 "upstream SSE ended before the [DONE] marker",
             ));
         } else if !saw_finish_reason {
-            yield Err(AppError::upstream(
-                "upstream SSE ended without a terminal finish_reason",
-            ));
+            // [DONE] with a clean HTTP body is an explicit end of generation.
+            // Keep missing metadata observable, but do not turn already-delivered
+            // text/tool calls into a client error. The engine retains reason Other.
+            tracing::warn!(
+                "upstream SSE completed with [DONE] but without a terminal finish_reason"
+            );
         }
     };
     Ok(Box::pin(stream))
@@ -10209,7 +10212,7 @@ mod f1e_upstream_response_truthful_tests {
     }
 
     #[tokio::test]
-    async fn stream_success_rejects_done_without_finish_reason() {
+    async fn stream_success_accepts_done_without_finish_reason() {
         let response = reqwest::Response::from(
             http::Response::builder()
                 .status(200)
@@ -10224,12 +10227,10 @@ mod f1e_upstream_response_truthful_tests {
             .expect("stream built");
 
         assert!(stream.next().await.expect("content chunk").is_ok());
-        let error = stream
-            .next()
-            .await
-            .expect("missing finish reason error")
-            .expect_err("[DONE] without finish_reason must fail");
-        assert!(error.to_string().contains("finish_reason"), "{error}");
+        assert!(
+            stream.next().await.is_none(),
+            "clean [DONE] must not become a stream failure when finish metadata is absent"
+        );
     }
 
     /// Finding 2 (truthful-empty case): a 2xx upstream response with a CLEAN end-of-

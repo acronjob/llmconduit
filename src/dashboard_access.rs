@@ -80,6 +80,9 @@ impl ManagementActor {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AccessSummary {
+    /// Whether policy-backed inference authorization is enabled. When false,
+    /// read collections are empty and mutations are unavailable.
+    pub enabled: bool,
     pub policy_epoch: u64,
     pub actor: ActorSummary,
     pub counts: AccessCounts,
@@ -756,6 +759,7 @@ mod tests {
                 match operation {
                     AccessOperation::ListApiKeys => Ok(AccessResult::ApiKeys(Vec::new())),
                     AccessOperation::Summary => Ok(AccessResult::Summary(AccessSummary {
+                        enabled: true,
                         policy_epoch: 7,
                         actor: ActorSummary {
                             kind: "delegated".into(),

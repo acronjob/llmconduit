@@ -7,7 +7,8 @@ use crate::mesh::identity::load_or_create;
 use crate::mesh::protocol::{
     ENROLL_ALPN, EnrollRequest, EnrollResponse, HubToWorker, PROTOCOL_VERSION, WORKER_ALPN,
     WorkerToHub, read_control, validate_enroll_request, validate_heartbeat, validate_model_catalog,
-    validate_resource_advertisement, validate_worker_advertisement, write_control,
+    validate_model_switching, validate_resource_advertisement, validate_worker_advertisement,
+    write_control,
 };
 use crate::mesh::registry::MeshRegistry;
 use crate::mesh::store::{DisabledMeshModelRecord, JoinKeyDecision, MeshStore, StoreError};
@@ -368,6 +369,24 @@ async fn handle_worker_control(
                     })?;
                     session.update_model_catalog(&resource_id, models, revision);
                 }
+                Ok(WorkerToHub::ModelSwitchingUpdate(update)) => {
+                    ensure_worker_still_authorized(&authorizer, &connection, endpoint_id).await?;
+                    validate_model_switching(&update).map_err(|err| {
+                        AppError::bad_request(format!("invalid mesh switching update: {err}"))
+                    })?;
+                    if let Some(update) = filter_model_switching(
+                        endpoint_id,
+                        model_allowlist.as_ref(),
+                        update,
+                    ) {
+                        session.update_model_switching(update);
+                    } else {
+                        tracing::warn!(
+                            endpoint_id = %endpoint_id,
+                            "mesh worker attempted to advertise switching without an approved endpoint"
+                        );
+                    }
+                }
                 Ok(WorkerToHub::Hello(advertisement)) => {
                     ensure_worker_still_authorized(&authorizer, &connection, endpoint_id).await?;
                     validate_worker_advertisement(&advertisement).map_err(|err| {
@@ -428,9 +447,10 @@ fn filter_worker_advertisement(
     allowlist: &MeshModelAllowlist,
     mut advertisement: crate::mesh::protocol::WorkerAdvertisement,
 ) -> crate::mesh::protocol::WorkerAdvertisement {
-    let endpoint_id = endpoint_id.to_string();
-    let Some(resources) = allowlist.get(&endpoint_id) else {
+    let endpoint_key = endpoint_id.to_string();
+    let Some(resources) = allowlist.get(&endpoint_key) else {
         advertisement.resources.clear();
+        advertisement.model_switching = None;
         return advertisement;
     };
     advertisement.resources.retain_mut(|resource| {
@@ -440,7 +460,27 @@ fn filter_worker_advertisement(
         filter_resource_models(resources, resource);
         true
     });
+    advertisement.model_switching = advertisement
+        .model_switching
+        .and_then(|switching| filter_model_switching(endpoint_id, allowlist, switching));
     advertisement
+}
+
+fn filter_model_switching(
+    endpoint_id: iroh::EndpointId,
+    allowlist: &MeshModelAllowlist,
+    mut switching: crate::mesh::protocol::ModelSwitchingAdvertisement,
+) -> Option<crate::mesh::protocol::ModelSwitchingAdvertisement> {
+    let endpoint_id = endpoint_id.to_string();
+    let resources = allowlist.get(&endpoint_id)?;
+    switching.models.retain(|model| {
+        resources.values().any(|allowed_models| {
+            allowed_models
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&model.id))
+        })
+    });
+    Some(switching)
 }
 
 fn filter_resource_update(
@@ -503,7 +543,10 @@ fn default_controller_identity_path() -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::AvailabilitySchedule;
-    use crate::mesh::protocol::{ModelAdvertisement, ResourceAdvertisement, WorkerAdvertisement};
+    use crate::mesh::protocol::{
+        ModelAdvertisement, ModelSwitchingAdvertisement, ResourceAdvertisement,
+        SwitchableModelAdvertisement, WorkerAdvertisement,
+    };
     use crate::mesh::store::MeshStore;
     use iroh::SecretKey;
     use uuid::Uuid;
@@ -545,6 +588,24 @@ mod tests {
                     revision: 1,
                 },
             ],
+            model_switching: Some(ModelSwitchingAdvertisement {
+                provider: "lil-fleet".to_string(),
+                models: vec![
+                    SwitchableModelAdvertisement {
+                        id: "allowed-model".to_string(),
+                        description: None,
+                        phase: "ready".to_string(),
+                        desired_state: "loaded".to_string(),
+                    },
+                    SwitchableModelAdvertisement {
+                        id: "surprise-model".to_string(),
+                        description: None,
+                        phase: "unloaded".to_string(),
+                        desired_state: "unloaded".to_string(),
+                    },
+                ],
+                revision: 1,
+            }),
         }
     }
 
@@ -565,6 +626,9 @@ mod tests {
         assert_eq!(filtered.resources[0].resource_id, "gpu-a");
         assert_eq!(filtered.resources[0].models.len(), 1);
         assert_eq!(filtered.resources[0].models[0].id, "allowed-model");
+        let switching = filtered.model_switching.expect("filtered switching");
+        assert_eq!(switching.models.len(), 1);
+        assert_eq!(switching.models[0].id, "allowed-model");
     }
 
     #[test]
@@ -578,6 +642,7 @@ mod tests {
         let filtered = filter_worker_advertisement(endpoint, &allowlist, advertisement());
 
         assert!(filtered.resources.is_empty());
+        assert!(filtered.model_switching.is_none());
     }
 
     #[test]
@@ -587,6 +652,25 @@ mod tests {
         let filtered = filter_worker_advertisement(endpoint, &BTreeMap::new(), advertisement());
 
         assert!(filtered.resources.is_empty());
+        assert!(filtered.model_switching.is_none());
+    }
+
+    #[test]
+    fn controller_model_allowlist_filters_later_switching_updates() {
+        let endpoint = SecretKey::generate().public();
+        let allowlist = BTreeMap::from([(
+            endpoint.to_string(),
+            BTreeMap::from([("gpu-a".to_string(), vec!["allowed-model".to_string()])]),
+        )]);
+        let switching = advertisement()
+            .model_switching
+            .expect("switching inventory");
+
+        let filtered = filter_model_switching(endpoint, &allowlist, switching)
+            .expect("approved endpoint retains an inventory");
+
+        assert_eq!(filtered.models.len(), 1);
+        assert_eq!(filtered.models[0].id, "allowed-model");
     }
 
     #[test]
@@ -637,6 +721,7 @@ mod tests {
                     healthy: true,
                     revision: 1,
                 }],
+                model_switching: None,
             },
         );
         let admin = MeshAdmin {

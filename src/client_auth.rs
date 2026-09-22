@@ -160,6 +160,42 @@ impl ClientAuth {
         state.require || !state.by_digest.is_empty()
     }
 
+    /// Return the union of client-facing models granted by keys owned by `owner_id`.
+    /// `None` means the owner has no active keys; `Some([])` means at least one key is
+    /// unrestricted; otherwise the returned names are the case-insensitive union.
+    pub fn allowed_models_for_owner(&self, owner_id: &str) -> Option<Vec<String>> {
+        let owner_id = owner_id.trim();
+        let state = self.state.read().expect("client auth lock poisoned");
+        let mut identities = state
+            .by_digest
+            .values()
+            .filter(|identity| identity.owner_id.as_deref() == Some(owner_id))
+            .collect::<Vec<_>>();
+        identities.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        if identities.is_empty() {
+            return None;
+        }
+        if identities
+            .iter()
+            .any(|identity| identity.allowed_models.is_empty())
+        {
+            return Some(Vec::new());
+        }
+        let mut models = Vec::new();
+        for identity in identities {
+            for model in identity.allowed_models.iter() {
+                if !models
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(model))
+                {
+                    models.push(model.clone());
+                }
+            }
+        }
+        models.sort_by_key(|model| model.to_ascii_lowercase());
+        Some(models)
+    }
+
     pub fn authenticate_headers(&self, headers: &HeaderMap) -> ClientAuthOutcome {
         self.authenticate(presented_key(headers).as_deref())
     }
@@ -284,6 +320,40 @@ mod tests {
             panic!("expected authenticated identity");
         };
         assert!(identity.allows_model("anything"));
+    }
+
+    #[test]
+    fn owner_model_access_unions_restricted_keys_and_honors_unrestricted_keys() {
+        let mut other_owner = spec("other", "other-secret", &["private"]);
+        other_owner.owner_id = Some("owner-2".to_string());
+        let auth = ClientAuth::from_specs(
+            true,
+            [
+                spec("first", "first-secret", &["small", "shared"]),
+                spec("second", "second-secret", &["LARGE", "SHARED"]),
+                other_owner,
+            ],
+        )
+        .expect("registry");
+        assert_eq!(
+            auth.allowed_models_for_owner("owner-1"),
+            Some(vec![
+                "LARGE".to_string(),
+                "shared".to_string(),
+                "small".to_string()
+            ])
+        );
+        assert_eq!(auth.allowed_models_for_owner("missing"), None);
+
+        auth.replace(
+            true,
+            [
+                spec("restricted", "restricted-secret", &["small"]),
+                spec("unrestricted", "unrestricted-secret", &[]),
+            ],
+        )
+        .expect("replacement");
+        assert_eq!(auth.allowed_models_for_owner("owner-1"), Some(Vec::new()));
     }
 
     #[test]

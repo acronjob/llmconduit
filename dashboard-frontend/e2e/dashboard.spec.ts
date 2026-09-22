@@ -552,6 +552,26 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the control-room overview').toEqual([]);
   });
 
+  test('chat streams a complete response without narrow-screen overflow', async ({ page, consoleErrors }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    await login(page);
+    await openView(page, VIEWS.find((view) => view.name === 'chat')!);
+    await expect(page.getByLabel('Thinking level')).toHaveValue('medium');
+    await expect(page.getByLabel('Temperature')).toHaveValue('1');
+    await expect(page.getByLabel('Top P')).toHaveValue('0.95');
+    await expect(page.getByLabel('Max context length')).toHaveValue('4096');
+    await page.getByLabel('Message').fill('ping');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+
+    await expect(page.getByTestId('chat-message-assistant')).toContainText('Mock response from gpt-4o: ping');
+    await expect(page.getByTestId('chat-thinking')).toContainText('Checking the request.');
+    await expect(page.getByTestId('chat-thinking').locator('strong')).toContainText('Checking');
+    await expect(page.getByTestId('chat-run-status')).toContainText('finish: stop');
+    const widths = await page.evaluate(() => ({ viewport: innerWidth, document: document.documentElement.scrollWidth }));
+    expect(widths.document).toBeLessThanOrEqual(widths.viewport);
+    expect(consoleErrors, 'console errors on dashboard chat').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

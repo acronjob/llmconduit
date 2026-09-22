@@ -1,4 +1,4 @@
-import { ROUTES, navigate, type RouteName } from '../router/useHashRoute';
+import { navigate, type RouteName } from '../router/useHashRoute';
 import { Button } from './ui/Button';
 import { cn } from '../lib/cn';
 
@@ -7,6 +7,7 @@ const LABELS: Record<RouteName, string> = {
   sessions: 'Sessions',
   throughput: 'Throughput',
   activity: 'Activity',
+  chat: 'Chat',
   account: 'Account',
   topology: 'Topology',
   sankey: 'Sankey',
@@ -15,6 +16,13 @@ const LABELS: Record<RouteName, string> = {
   providers: 'Providers',
   access: 'Access',
 };
+
+const SECTIONS: Array<{ label: string; landing: RouteName; routes: RouteName[] }> = [
+  { label: 'Chat', landing: 'chat', routes: ['chat'] },
+  { label: 'Observe', landing: 'overview', routes: ['overview', 'flows', 'sessions', 'throughput', 'activity'] },
+  { label: 'Infrastructure', landing: 'providers', routes: ['providers', 'topology', 'sankey', 'theater'] },
+  { label: 'Admin', landing: 'access', routes: ['access', 'account'] },
+];
 
 /** The Argus eye — the hundred-eyed watchman's iris, the brand mark. Keeps a slow watch. */
 function ArgusEye({ className }: { className?: string }) {
@@ -33,8 +41,9 @@ function ArgusEye({ className }: { className?: string }) {
 }
 
 export function NavTabs({ active, onLogout }: { active: RouteName; onLogout: () => void }) {
+  const activeSection = SECTIONS.find((section) => section.routes.includes(active)) ?? SECTIONS[0]!;
   return (
-    <nav className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-line bg-panel px-5 py-2.5">
+    <nav className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-line bg-panel px-5 py-2.5" aria-label="Dashboard">
       {/* Masthead: the Argus eye + tracked wordmark; llmconduit rides below as the eyebrow. */}
       <div className="flex shrink-0 items-center gap-2.5 pr-1">
         <ArgusEye className="argus-eye h-[18px] w-[18px] text-accent" />
@@ -45,26 +54,43 @@ export function NavTabs({ active, onLogout }: { active: RouteName; onLogout: () 
           </div>
         </div>
       </div>
-      <div className="order-3 flex w-full flex-wrap items-center gap-1 lg:order-none lg:w-auto">
-        {ROUTES.map((r) => (
+      <div className="order-3 flex w-full flex-wrap items-center gap-1 lg:order-none lg:w-auto" aria-label="Dashboard sections">
+        {SECTIONS.map((section) => (
           <button
-            key={r}
-            onClick={() => navigate(r)}
-            aria-current={r === active ? 'page' : undefined}
+            key={section.label}
+            onClick={() => navigate(section.landing)}
+            aria-pressed={section === activeSection}
             className={cn(
               'rounded-md px-3 py-1.5 text-xs font-medium uppercase tracking-[0.14em] transition-colors',
-              r === active
+              section === activeSection
                 ? 'bg-accent/12 text-accent'
                 : 'text-text-muted hover:bg-line/40 hover:text-text',
             )}
           >
-            {LABELS[r]}
+            {section.label}
           </button>
         ))}
       </div>
       <Button variant="ghost" className="ml-auto shrink-0" onClick={onLogout}>
         Logout
       </Button>
+      {activeSection.routes.length > 1 && (
+        <div className="order-4 flex w-full flex-wrap items-center gap-1 border-t border-line/70 pt-2" aria-label={`${activeSection.label} views`}>
+          {activeSection.routes.map((route) => (
+            <button
+              key={route}
+              onClick={() => navigate(route)}
+              aria-current={route === active ? 'page' : undefined}
+              className={cn(
+                'rounded px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.12em] transition-colors',
+                route === active ? 'bg-line/60 text-text' : 'text-text-muted hover:text-text',
+              )}
+            >
+              {LABELS[route]}
+            </button>
+          ))}
+        </div>
+      )}
     </nav>
   );
 }

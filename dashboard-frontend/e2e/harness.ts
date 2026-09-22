@@ -13,6 +13,7 @@ export type ViewName =
   | 'sankey'
   | 'theater'
   | 'overview'
+  | 'chat'
   | 'providers'
   | 'access';
 
@@ -26,6 +27,7 @@ export const VIEWS: { name: ViewName; tab: string; ready: string | RegExp }[] = 
   { name: 'overview', tab: 'Overview', ready: /control room/i },
   // The live active-sessions board (the dashboard's primary view). Masthead subtitle is the ready marker.
   { name: 'sessions', tab: 'Sessions', ready: /active in the last 15 minutes/i },
+  { name: 'chat', tab: 'Chat', ready: /^chat$/i },
   { name: 'providers', tab: 'Providers', ready: /provider inventory/i },
   { name: 'access', tab: 'Access', ready: /Access control/i },
 ];

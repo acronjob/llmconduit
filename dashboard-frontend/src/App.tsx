@@ -52,7 +52,7 @@ function Dashboard() {
       {/* stats-strip slot */}
       <StatsStrip />
       {/* Access is current authorization state, not a historical telemetry surface. */}
-      {route !== 'access' && <Scrubber socket={socket} />}
+      {route !== 'access' && route !== 'chat' && <Scrubber socket={socket} />}
       {/* view router */}
       <main className="flex flex-1 overflow-hidden">
         <ActiveView />

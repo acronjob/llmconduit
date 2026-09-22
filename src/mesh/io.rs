@@ -1,11 +1,18 @@
 #![allow(dead_code)]
 
 use crate::error::{AppError, AppResult};
-pub use crate::mesh::protocol::{Admission, RequestOpen};
+pub use crate::mesh::protocol::{Admission, RequestOpen, StreamOpen, SwitchModelResponse};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::bytes::{Buf, BytesMut};
 
 pub async fn write_request_open<W>(writer: &mut W, open: &RequestOpen) -> AppResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_stream_open(writer, &StreamOpen::Inference(open.clone())).await
+}
+
+pub async fn write_stream_open<W>(writer: &mut W, open: &StreamOpen) -> AppResult<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -24,9 +31,46 @@ pub async fn read_request_open<R>(reader: &mut R) -> AppResult<RequestOpen>
 where
     R: AsyncRead + Unpin,
 {
+    match read_stream_open(reader).await? {
+        StreamOpen::Inference(open) => Ok(open),
+        StreamOpen::SwitchModel(_) => Err(AppError::bad_request("expected mesh inference stream")),
+    }
+}
+
+pub async fn read_stream_open<R>(reader: &mut R) -> AppResult<StreamOpen>
+where
+    R: AsyncRead + Unpin,
+{
     let bytes = read_len_prefixed(reader, crate::mesh::protocol::MAX_REQUEST_PREFACE_BYTES).await?;
     serde_json::from_slice(&bytes)
-        .map_err(|err| AppError::bad_request(format!("invalid mesh request preface: {err}")))
+        .map_err(|err| AppError::bad_request(format!("invalid mesh stream preface: {err}")))
+}
+
+pub async fn write_switch_response<W>(
+    writer: &mut W,
+    response: &SwitchModelResponse,
+) -> AppResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let bytes = serde_json::to_vec(response).map_err(|err| {
+        AppError::internal(format!("failed to encode mesh switch response: {err}"))
+    })?;
+    write_len_prefixed(
+        writer,
+        &bytes,
+        crate::mesh::protocol::MAX_CONTROL_FRAME_BYTES,
+    )
+    .await
+}
+
+pub async fn read_switch_response<R>(reader: &mut R) -> AppResult<SwitchModelResponse>
+where
+    R: AsyncRead + Unpin,
+{
+    let bytes = read_len_prefixed(reader, crate::mesh::protocol::MAX_CONTROL_FRAME_BYTES).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| AppError::bad_request(format!("invalid mesh switch response: {err}")))
 }
 
 pub async fn write_admission<W>(writer: &mut W, admission: &Admission) -> AppResult<()>
@@ -239,6 +283,37 @@ mod tests {
         let got = read_request_open(&mut b).await.expect("read");
         write.await.expect("join").expect("write");
         assert_eq!(got.resource_id, "primary");
+    }
+
+    #[tokio::test]
+    async fn switch_response_round_trips_inventory_larger_than_request_preface_limit() {
+        let (mut a, mut b) = duplex(crate::mesh::protocol::MAX_CONTROL_FRAME_BYTES * 2);
+        let response = SwitchModelResponse {
+            request_id: Uuid::nil(),
+            model_id: "qwen3-flash".to_string(),
+            accepted: true,
+            changed: true,
+            error: None,
+            model_switching: Some(crate::mesh::protocol::ModelSwitchingAdvertisement {
+                provider: "lil-fleet".to_string(),
+                models: (0..32)
+                    .map(
+                        |index| crate::mesh::protocol::SwitchableModelAdvertisement {
+                            id: format!("model-{index}"),
+                            description: Some("x".repeat(256)),
+                            phase: "unloaded".to_string(),
+                            desired_state: "unloaded".to_string(),
+                        },
+                    )
+                    .collect(),
+                revision: 2,
+            }),
+        };
+        let write = tokio::spawn(async move { write_switch_response(&mut a, &response).await });
+        let got = read_switch_response(&mut b).await.expect("read response");
+        write.await.expect("join").expect("write response");
+        assert_eq!(got.model_id, "qwen3-flash");
+        assert_eq!(got.model_switching.expect("inventory").models.len(), 32);
     }
 
     #[test]

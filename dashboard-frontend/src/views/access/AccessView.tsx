@@ -231,6 +231,18 @@ export function AccessView() {
   if (query.isLoading) return <div className="p-5 text-sm text-text-muted">Loading access control...</div>;
   if (query.isError || !query.data) return <div className="p-5 text-sm text-status-down">Access control unavailable: {query.error instanceof Error ? query.error.message : 'invalid response'}</div>;
   const data = query.data;
+  if (!data.summary.enabled) {
+    return (
+      <div className="min-h-0 flex-1 overflow-auto p-5" data-testid="access-view">
+        <Panel className="max-w-2xl p-5">
+          <h1 className="text-xl font-semibold text-text">Access control is not enabled</h1>
+          <p className="mt-2 text-sm leading-relaxed text-text-muted">
+            The dashboard is healthy, but policy-backed inference authorization is disabled. Set <code className="font-mono text-text">auth.mode: enforce</code> and configure its store before creating identities, keys, or policies.
+          </p>
+        </Panel>
+      </div>
+    );
+  }
   const overview = buildAccessOverview({
     users,
     groups: data.groups.groups,

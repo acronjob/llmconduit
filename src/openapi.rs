@@ -108,7 +108,7 @@ impl utoipa::Modify for SecuritySchemes {
             "session",
             SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
                 "llmconduit_session",
-                "Dashboard session cookie set by `POST /dashboard/login`. Mutations also need the `x-csrf-token` header equal to the `llmconduit_csrf` cookie.",
+                "Dashboard session cookie set by GitHub SSO (or the legacy programmatic login endpoint). Mutations also need the `x-csrf-token` header equal to the `llmconduit_csrf` cookie.",
             ))),
         );
     }
@@ -147,6 +147,7 @@ impl utoipa::Modify for SecuritySchemes {
         crate::http::post_count_tokens,
         crate::http::get_models,
         crate::http::dashboard_flow_kill,
+        crate::http::dashboard_chat_completions,
         crate::http::dashboard_key_login,
         crate::http::dashboard_auth_logout,
         crate::persistent_history_api::history_requests,
@@ -166,6 +167,9 @@ impl utoipa::Modify for SecuritySchemes {
         crate::dashboard_api::dashboard_catalog,
         crate::dashboard_api::dashboard_snapshot,
         crate::dashboard_api::dashboard_providers,
+        crate::dashboard_api::dashboard_configured_providers,
+        crate::dashboard_api::create_configured_provider,
+        crate::dashboard_api::delete_configured_provider,
         crate::dashboard_fleet::fleet_models,
         crate::dashboard_fleet::fleet_load_model,
         crate::dashboard_fleet::fleet_unload_model,
@@ -174,6 +178,7 @@ impl utoipa::Modify for SecuritySchemes {
         crate::dashboard_mesh::revoke_join_key,
         crate::dashboard_mesh::disable_node,
         crate::dashboard_mesh::enable_node,
+        crate::dashboard_mesh::switch_node_model,
         crate::dashboard_mesh::disable_model,
         crate::dashboard_mesh::enable_model,
         crate::accounts_api::me,
@@ -186,6 +191,8 @@ impl utoipa::Modify for SecuritySchemes {
         crate::accounts_api::delete_key,
         crate::dashboard_auth::dashboard_login,
         crate::dashboard_auth::dashboard_logout,
+        crate::dashboard_auth::dashboard_github_start,
+        crate::dashboard_auth::dashboard_github_callback,
         crate::dashboard_ui::dashboard_index,
         crate::dashboard_ui::dashboard_asset,
         crate::debug_ui::debug_index,
@@ -272,6 +279,8 @@ impl utoipa::Modify for SecuritySchemes {
         crate::dashboard_mesh::MeshAdminState,
         crate::dashboard_mesh::MeshJoinKey,
         crate::dashboard_mesh::MeshNode,
+        crate::dashboard_mesh::MeshModelSwitching,
+        crate::dashboard_mesh::MeshSwitchableModel,
         crate::dashboard_mesh::MeshDisabledModel,
         crate::dashboard_mesh::CreateMeshJoinKeyRequest,
         crate::dashboard_mesh::CreateMeshJoinKeyResponse,
@@ -279,6 +288,7 @@ impl utoipa::Modify for SecuritySchemes {
         crate::dashboard_mesh::SetMeshNodeResponse,
         crate::dashboard_mesh::MeshModelOverrideRequest,
         crate::dashboard_mesh::SetMeshModelResponse,
+        crate::dashboard_mesh::SwitchMeshModelResponse,
     )),
     modifiers(&SecuritySchemes)
 )]

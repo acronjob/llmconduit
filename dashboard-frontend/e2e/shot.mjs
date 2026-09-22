@@ -5,7 +5,7 @@
 // Deterministic clock + seeded RNG (matches the e2e baselines) so shots are repeatable.
 import { chromium } from '@playwright/test';
 
-const TABS = { flows: 'Flows', topology: 'Topology', sankey: 'Sankey', theater: 'Theater', overview: 'Overview', providers: 'Providers', access: 'Access', 'access-policies': 'Access', 'access-limits': 'Access' };
+const TABS = { flows: 'Flows', topology: 'Topology', sankey: 'Sankey', theater: 'Theater', overview: 'Overview', chat: 'Chat', providers: 'Providers', access: 'Access', 'access-policies': 'Access', 'access-limits': 'Access' };
 const FIXED_NOW = Date.UTC(2026, 5, 21, 14, 20, 0);
 const BASE = process.env.ARGUS_URL || 'http://localhost:5273/dashboard/?mock=1';
 

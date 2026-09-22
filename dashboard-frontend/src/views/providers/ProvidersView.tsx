@@ -1,7 +1,7 @@
 import { useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { getConnection, queryKeys } from '../../api/connection';
-import type { FleetModelEntry, FleetModelsResponse, MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, ProviderHealth } from '../../api/types';
+import type { ConfiguredProvider, CreateConfiguredProviderRequest, FleetModelEntry, FleetModelsResponse, MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, ProviderHealth } from '../../api/types';
 import { EMPTY_FILTERS } from '../../components/FlowTable/filterTypes';
 import { useFlowRows } from '../../components/FlowTable/useFlowRows';
 import { fmtCost, fmtElapsed, fmtTokens } from '../../components/FlowTable/format';
@@ -37,10 +37,11 @@ export function ProvidersView() {
 
   const topologyQuery = useQuery({ queryKey: queryKeys.topology, queryFn: () => client.topology() });
   const providersQuery = useQuery({ queryKey: queryKeys.providers, queryFn: () => client.providers() });
-  const meshQuery = useQuery({ queryKey: queryKeys.mesh, queryFn: () => client.mesh(), retry: false });
+  const configuredProvidersQuery = useQuery({ queryKey: queryKeys.configuredProviders, queryFn: () => client.configuredProviders(), retry: false });
+  const meshQuery = useQuery({ queryKey: queryKeys.mesh, queryFn: () => client.mesh(), retry: false, refetchInterval: 5_000 });
   const fleetQuery = useQuery({ queryKey: queryKeys.fleet, queryFn: () => client.fleet(), retry: false });
   const providerMetricsQuery = useQuery({ queryKey: queryKeys.providerMetrics, queryFn: () => client.providerMetrics() });
-  const policiesQuery = useQuery({ queryKey: authPoliciesKey, queryFn: () => client.authPolicies() });
+  const policiesQuery = useQuery({ queryKey: authPoliciesKey, queryFn: () => client.authPolicies(), retry: false });
   const invalidateMesh = () => {
     void queryClient.invalidateQueries({ queryKey: queryKeys.mesh });
     void queryClient.invalidateQueries({ queryKey: queryKeys.providers });
@@ -59,6 +60,10 @@ export function ProvidersView() {
       client.setMeshModelDisabled({ endpoint_id: endpointId, resource_id: resourceId, model }, disabled),
     onSuccess: invalidateMesh,
   });
+  const switchMeshModel = useMutation({
+    mutationFn: ({ endpointId, modelId }: { endpointId: string; modelId: string }) => client.switchMeshModel(endpointId, modelId),
+    onSuccess: invalidateMesh,
+  });
   const invalidateFleet = () => {
     void queryClient.invalidateQueries({ queryKey: queryKeys.fleet });
     void queryClient.invalidateQueries({ queryKey: queryKeys.providers });
@@ -66,6 +71,20 @@ export function ProvidersView() {
   };
   const loadFleetModel = useMutation({ mutationFn: (id: string) => client.loadFleetModel(id), onSuccess: invalidateFleet });
   const unloadFleetModel = useMutation({ mutationFn: (id: string) => client.unloadFleetModel(id), onSuccess: invalidateFleet });
+  const invalidateConfiguredProviders = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.configuredProviders });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.providers });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.catalog });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.topology });
+  };
+  const createConfiguredProvider = useMutation({
+    mutationFn: (body: CreateConfiguredProviderRequest) => client.createConfiguredProvider(body),
+    onSuccess: invalidateConfiguredProviders,
+  });
+  const deleteConfiguredProvider = useMutation({
+    mutationFn: (id: string) => client.deleteConfiguredProvider(id),
+    onSuccess: invalidateConfiguredProviders,
+  });
 
   const inventory = useMemo(() => buildProviderInventory({
     providers: providersQuery.data?.providers ?? [],
@@ -100,7 +119,11 @@ export function ProvidersView() {
     return <div className="p-5 text-sm text-text-muted">Loading provider inventory...</div>;
   }
 
-  const error = providersQuery.error || providerMetricsQuery.error || topologyQuery.error || policiesQuery.error;
+  // Access policy inventory is optional when inference authorization is disabled. The backend
+  // advertises that state as 404, so it must not make an otherwise healthy provider inventory
+  // look partially broken.
+  const policiesError = isOptionalFeatureUnavailable(policiesQuery.error) ? null : policiesQuery.error;
+  const error = providersQuery.error || providerMetricsQuery.error || topologyQuery.error || policiesError;
 
   return (
     <div className="min-h-0 min-w-0 flex-1 overflow-auto p-4" data-testid="providers-view">
@@ -149,6 +172,16 @@ export function ProvidersView() {
       <SummaryStrip summary={inventory.summary} />
 
       <div className="mt-3 space-y-3">
+        <ConfiguredProvidersPanel
+          providers={configuredProvidersQuery.data?.providers ?? []}
+          loading={configuredProvidersQuery.isLoading}
+          error={configuredProvidersQuery.error ? String(configuredProvidersQuery.error) : null}
+          mutationsEnabled={mutationsEnabled}
+          busy={createConfiguredProvider.isPending || deleteConfiguredProvider.isPending}
+          mutationError={String(createConfiguredProvider.error ?? deleteConfiguredProvider.error ?? '') || null}
+          onCreate={(body) => createConfiguredProvider.mutate(body)}
+          onDelete={(id) => deleteConfiguredProvider.mutate(id)}
+        />
         <MeshAdminPanel
           mesh={meshQuery.data ?? null}
           rows={inventory.rows}
@@ -156,13 +189,14 @@ export function ProvidersView() {
           error={meshQuery.error ? String(meshQuery.error) : null}
           mutationsEnabled={mutationsEnabled}
           createdToken={createdToken}
-          busy={createJoinKey.isPending || revokeJoinKey.isPending || setNodeEnabled.isPending || setModelDisabled.isPending}
-          mutationError={String(createJoinKey.error ?? revokeJoinKey.error ?? setNodeEnabled.error ?? setModelDisabled.error ?? '') || null}
+          busy={createJoinKey.isPending || revokeJoinKey.isPending || setNodeEnabled.isPending || setModelDisabled.isPending || switchMeshModel.isPending}
+          mutationError={String(createJoinKey.error ?? revokeJoinKey.error ?? setNodeEnabled.error ?? setModelDisabled.error ?? switchMeshModel.error ?? '') || null}
           onCreate={(body) => createJoinKey.mutate(body)}
           onDismissToken={() => setCreatedToken(null)}
           onRevoke={(id) => revokeJoinKey.mutate(id)}
           onSetNode={(endpointId, enabled) => setNodeEnabled.mutate({ endpointId, enabled })}
           onSetModel={(endpointId, resourceId, model, disabled) => setModelDisabled.mutate({ endpointId, resourceId, model, disabled })}
+          onSwitchModel={(endpointId, modelId) => switchMeshModel.mutate({ endpointId, modelId })}
         />
         <FleetPanel
           fleet={fleetQuery.data ?? null}
@@ -178,6 +212,88 @@ export function ProvidersView() {
         <ModelsPanel models={inventory.unionCatalogModels} />
       </div>
     </div>
+  );
+}
+
+function ConfiguredProvidersPanel({
+  providers,
+  loading,
+  error,
+  mutationsEnabled,
+  busy,
+  mutationError,
+  onCreate,
+  onDelete,
+}: {
+  providers: ConfiguredProvider[];
+  loading: boolean;
+  error: string | null;
+  mutationsEnabled: boolean;
+  busy: boolean;
+  mutationError: string | null;
+  onCreate: (body: CreateConfiguredProviderRequest) => void;
+  onDelete: (id: string) => void;
+}) {
+  const [name, setName] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    onCreate({ name: name.trim(), base_url: baseUrl.trim(), api_key: apiKey });
+  };
+
+  return (
+    <Panel className="p-4" data-testid="configured-providers-panel">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">Additional providers</h2>
+          <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+            Add an OpenAI-compatible endpoint. LLMConduit discovers its models; API keys remain server-side.
+          </p>
+        </div>
+        {!mutationsEnabled && (
+          <span className="rounded-sm bg-status-cooling/15 px-2 py-1 text-[10px] uppercase tracking-wide text-status-cooling">
+            mutations disabled
+          </span>
+        )}
+      </div>
+
+      <form className="mt-3 grid gap-2 lg:grid-cols-[minmax(10rem,0.7fr)_minmax(16rem,1.4fr)_minmax(12rem,1fr)_auto]" onSubmit={submit}>
+        <input aria-label="Provider name" required value={name} onChange={(event) => setName(event.target.value)} placeholder="provider name" className={INPUT} />
+        <input aria-label="Provider URL" required type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" className={INPUT} />
+        <input aria-label="Provider API key" required type="password" autoComplete="new-password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="API key" className={INPUT} />
+        <Button type="submit" disabled={!mutationsEnabled || busy || !name.trim() || !baseUrl.trim() || !apiKey}>Discover &amp; add</Button>
+      </form>
+
+      {loading && <p className="mt-3 text-xs text-text-muted">Loading configured providers...</p>}
+      {error && <p className="mt-3 text-xs text-status-down">Could not load configured providers: {error}</p>}
+      {mutationError && <p className="mt-3 text-xs text-status-down">Provider change failed: {mutationError}</p>}
+
+      {!loading && providers.length === 0 && (
+        <p className="mt-3 text-xs text-text-muted" data-quality="unavailable">No additional providers configured.</p>
+      )}
+      {providers.length > 0 && (
+        <div className="mt-3 grid gap-2 lg:grid-cols-2">
+          {providers.map((provider) => (
+            <div key={provider.id} className="min-w-0 rounded border border-line/70 bg-bg p-3" data-testid="configured-provider-card">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate text-xs font-medium text-text">{provider.name}</div>
+                  <div className="mt-1 truncate font-mono text-[10px] text-text-muted" title={provider.base_url}>{provider.base_url}</div>
+                </div>
+                <Button type="button" variant="danger" className="px-2 py-1 text-[10px]" disabled={!mutationsEnabled || busy} onClick={() => onDelete(provider.id)}>Remove</Button>
+              </div>
+              <div className="mt-2 text-[10px] text-text-muted">
+                {provider.models.length} model{provider.models.length === 1 ? '' : 's'} discovered · key {provider.api_key_present ? 'configured' : 'missing'}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1">
+                {provider.models.map((model) => <code key={model.id} className="rounded bg-panel px-1.5 py-0.5 text-[10px] text-text">{model.id}</code>)}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
   );
 }
 
@@ -276,7 +392,11 @@ function FleetModelCard({
         <FleetFact label="health" value={entry.status.health ?? entry.status.container_status ?? DASH} />
         <FleetFact label="checked" value={entry.status.last_checked ? fmtFleetTime(entry.status.last_checked) : DASH} />
       </div>
-      {entry.status.last_error && <p className="mt-2 text-[10px] text-status-down">{entry.status.last_error}</p>}
+      {entry.status.last_error && (
+        <p className={cn('mt-2 text-[10px]', transitioning ? 'text-status-cooling' : 'text-status-down')}>
+          {transitioning ? 'Waiting for readiness: ' : ''}{entry.status.last_error}
+        </p>
+      )}
       <div className="mt-3 flex justify-end gap-2">
         <Button type="button" disabled={!mutationsEnabled || busy || active || transitioning} onClick={() => onLoad(entry.model.id)} className="px-2 py-1 text-[10px]">Load</Button>
         <Button type="button" variant="danger" disabled={!mutationsEnabled || busy || !active || transitioning} onClick={() => onUnload(entry.model.id)} className="px-2 py-1 text-[10px]">Unload</Button>
@@ -296,6 +416,10 @@ function FleetFact({ label, value }: { label: string; value: string }) {
 
 function isFleetActive(entry: FleetModelEntry): boolean {
   return entry.status.phase === 'ready' || entry.status.desired_state === 'loaded';
+}
+
+function isOptionalFeatureUnavailable(error: unknown): boolean {
+  return error instanceof Error && /failed: 404$/.test(error.message);
 }
 
 function fleetPhaseClass(phase: string): string {
@@ -319,6 +443,7 @@ function MeshAdminPanel({
   onRevoke,
   onSetNode,
   onSetModel,
+  onSwitchModel,
 }: {
   mesh: MeshAdminState | null;
   rows: ProviderInventoryRow[];
@@ -333,6 +458,7 @@ function MeshAdminPanel({
   onRevoke: (id: string) => void;
   onSetNode: (endpointId: string, enabled: boolean) => void;
   onSetModel: (endpointId: string, resourceId: string, model: string, disabled: boolean) => void;
+  onSwitchModel: (endpointId: string, modelId: string) => void;
 }) {
   const [label, setLabel] = useState('');
   const [maxUses, setMaxUses] = useState('1');
@@ -394,6 +520,7 @@ function MeshAdminPanel({
             <NodeList nodes={mesh.nodes} busy={busy} mutationsEnabled={mutationsEnabled} onSetNode={onSetNode} />
             <ModelOverrideList rows={meshRows} disabledModels={disabledModels} busy={busy} mutationsEnabled={mutationsEnabled} onSetModel={onSetModel} />
           </div>
+          <SwitchableModelList nodes={mesh.nodes} busy={busy} mutationsEnabled={mutationsEnabled} onSwitchModel={onSwitchModel} />
         </>
       )}
     </Panel>
@@ -473,6 +600,82 @@ function ModelOverrideList({
       })}
       {entries.length === 0 && <EmptyMeshLine>No mesh models advertised.</EmptyMeshLine>}
     </MeshList>
+  );
+}
+
+function SwitchableModelList({
+  nodes,
+  busy,
+  mutationsEnabled,
+  onSwitchModel,
+}: {
+  nodes: MeshNode[];
+  busy: boolean;
+  mutationsEnabled: boolean;
+  onSwitchModel: (endpointId: string, modelId: string) => void;
+}) {
+  const providers = nodes.filter((node) => node.model_switching);
+  const count = providers.reduce((total, node) => total + (node.model_switching?.models.length ?? 0), 0);
+  return (
+    <div className="mt-3 overflow-hidden rounded border border-line/70 bg-bg" data-testid="remote-model-switcher">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/70 bg-panel/60 px-3 py-2">
+        <div>
+          <h3 className="text-[10px] uppercase tracking-[0.14em] text-text-muted">remote model switching</h3>
+          <p className="mt-0.5 text-[10px] text-text-muted">Fleet-capable downstream providers</p>
+        </div>
+        <span className="rounded-full border border-line px-2 py-0.5 font-mono text-[10px] text-text-muted">{count} models</span>
+      </div>
+      <div className={cn('grid gap-3 p-3', providers.length > 1 && 'xl:grid-cols-2')}>
+        {providers.map((node) => (
+          <section key={node.endpoint_id} className="min-w-0 rounded-md border border-line/70 bg-panel/40 p-3">
+            <div className="mb-2 flex min-w-0 items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="truncate text-xs font-medium text-text" title={node.endpoint_id}>{node.label || node.endpoint_id}</div>
+                <div className="mt-0.5 truncate font-mono text-[9px] text-text-muted">{node.model_switching?.provider} · rev {node.model_switching?.revision}</div>
+              </div>
+              <span className="shrink-0 rounded-full bg-status-healthy/10 px-2 py-0.5 text-[9px] uppercase tracking-wide text-status-healthy">connected</span>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {node.model_switching?.models.map((model) => {
+                const loaded = model.desired_state === 'loaded' && model.phase === 'ready';
+                const transitioning = model.phase === 'loading' || model.phase === 'stopping';
+                return (
+                  <div
+                    key={model.id}
+                    className="flex min-w-0 items-center gap-3 rounded border border-line/60 bg-bg/70 px-3 py-2"
+                    data-testid="remote-switch-model"
+                  >
+                    <span className={cn(
+                      'h-2 w-2 shrink-0 rounded-full',
+                      loaded ? 'bg-status-healthy' : transitioning ? 'bg-status-cooling' : 'bg-text-muted/40',
+                    )} aria-hidden />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate font-mono text-[11px] text-text" title={model.id}>{model.id}</div>
+                      <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[9px] text-text-muted">
+                        <span className={cn(
+                          'shrink-0 uppercase tracking-wide',
+                          loaded ? 'text-status-healthy' : transitioning ? 'text-status-cooling' : 'text-text-muted',
+                        )}>{model.phase}</span>
+                        {model.description && <span className="truncate" title={model.description}>· {model.description}</span>}
+                      </div>
+                    </div>
+                    <Button
+                      type="button"
+                      disabled={!mutationsEnabled || busy || loaded || transitioning}
+                      onClick={() => onSwitchModel(node.endpoint_id, model.id)}
+                      className="shrink-0 px-2.5 py-1 text-[10px]"
+                    >
+                      {loaded ? 'Active' : transitioning ? model.phase : 'Switch'}
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        ))}
+        {providers.length === 0 && <div className="xl:col-span-2"><EmptyMeshLine>No downstream provider advertises model switching.</EmptyMeshLine></div>}
+      </div>
+    </div>
   );
 }
 

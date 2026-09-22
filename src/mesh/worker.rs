@@ -4,11 +4,13 @@ use crate::config::{
 use crate::error::{AppError, AppResult};
 use crate::mesh::capacity::CapacityGate;
 use crate::mesh::identity::load_or_create;
-use crate::mesh::io::{Admission, read_request_open, write_admission};
+use crate::mesh::io::{Admission, read_stream_open, write_admission, write_switch_response};
 use crate::mesh::protocol::{
     AdmissionRejectCode, ENROLL_ALPN, EnrollRequest, EnrollResponse, Heartbeat, HubToWorker,
-    ModelAdvertisement, PROTOCOL_VERSION, ResourceAdvertisement, ResourceRuntimeState, WORKER_ALPN,
-    WorkerAdvertisement, WorkerToHub, read_control, write_control,
+    ModelAdvertisement, ModelSwitchingAdvertisement, PROTOCOL_VERSION, ResourceAdvertisement,
+    ResourceRuntimeState, StreamOpen, SwitchModelRequest, SwitchModelResponse,
+    SwitchableModelAdvertisement, WORKER_ALPN, WorkerAdvertisement, WorkerToHub, read_control,
+    write_control,
 };
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -27,6 +29,8 @@ use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 pub(super) struct WorkerRuntime {
     config: MeshWorkerConfig,
     resources: HashMap<String, Arc<LocalResource>>,
+    fleet: Option<Arc<crate::dashboard_fleet::FleetClient>>,
+    model_switching: Mutex<Option<ModelSwitchingAdvertisement>>,
 }
 
 #[derive(Debug)]
@@ -77,7 +81,21 @@ impl WorkerRuntime {
                 }),
             );
         }
-        Self { config, resources }
+        let fleet = match crate::dashboard_fleet::FleetClient::from_env(reqwest::Client::new()) {
+            Ok(fleet) => fleet.map(Arc::new),
+            Err(err) => {
+                tracing::warn!(error = %err, "mesh worker Fleet capability is misconfigured");
+                None
+            }
+        };
+        let runtime = Self {
+            config,
+            resources,
+            fleet,
+            model_switching: Mutex::new(None),
+        };
+        runtime.refresh_model_switching().await;
+        runtime
     }
 
     async fn advertisement(&self) -> WorkerAdvertisement {
@@ -90,7 +108,42 @@ impl WorkerRuntime {
             node_name: None,
             agent_version: crate::VERSION.to_string(),
             resources,
+            model_switching: self.model_switching.lock().await.clone(),
         }
+    }
+
+    async fn refresh_model_switching(&self) -> Option<ModelSwitchingAdvertisement> {
+        let fleet = self.fleet.as_ref()?;
+        let models = match fleet.list_models().await {
+            Ok(response) => response
+                .models
+                .into_iter()
+                .map(|entry| SwitchableModelAdvertisement {
+                    id: entry.model.id,
+                    description: entry.model.description,
+                    phase: entry.status.phase,
+                    desired_state: entry.status.desired_state,
+                })
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                tracing::warn!(error = %err, "mesh worker failed to refresh Fleet inventory");
+                return None;
+            }
+        };
+        let mut current = self.model_switching.lock().await;
+        if current.as_ref().is_some_and(|value| value.models == models) {
+            return None;
+        }
+        let revision = current
+            .as_ref()
+            .map_or(1, |value| value.revision.saturating_add(1));
+        let update = ModelSwitchingAdvertisement {
+            provider: "lil-fleet".to_string(),
+            models,
+            revision,
+        };
+        *current = Some(update.clone());
+        Some(update)
     }
 
     async fn heartbeat(&self, sequence: u64) -> Heartbeat {
@@ -273,7 +326,7 @@ async fn run_connected(
 async fn control_task(
     connection: iroh::endpoint::Connection,
     runtime: Arc<WorkerRuntime>,
-    mut updates: mpsc::Receiver<ResourceAdvertisement>,
+    mut updates: mpsc::Receiver<WorkerToHub>,
     mut shutdown: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let (mut send, mut recv) = connection
@@ -318,7 +371,7 @@ async fn control_task(
                 schedule_sleep.as_mut().reset(TokioInstant::now() + runtime.next_schedule_delay());
             }
             Some(update) = updates.recv() => {
-                write_control(&mut send, &WorkerToHub::ResourceUpdate(update)).await?;
+                write_control(&mut send, &update).await?;
             }
         }
     }
@@ -327,7 +380,7 @@ async fn control_task(
 
 async fn model_refresh_task(
     runtime: Arc<WorkerRuntime>,
-    updates: mpsc::Sender<ResourceAdvertisement>,
+    updates: mpsc::Sender<WorkerToHub>,
     mut shutdown: watch::Receiver<bool>,
 ) -> AppResult<()> {
     let refresh_secs = runtime
@@ -350,9 +403,14 @@ async fn model_refresh_task(
             }
             _ = refresh.tick() => {
                 for update in refresh_models(&runtime).await {
-                    if updates.send(update).await.is_err() {
+                    if updates.send(WorkerToHub::ResourceUpdate(update)).await.is_err() {
                         return Ok(());
                     }
+                }
+                if let Some(update) = runtime.refresh_model_switching().await
+                    && updates.send(WorkerToHub::ModelSwitchingUpdate(update)).await.is_err()
+                {
+                    return Ok(());
                 }
             }
         }
@@ -378,7 +436,7 @@ async fn request_task(
                 })?;
                 let runtime = Arc::clone(&runtime);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_request(send, recv, runtime).await {
+                    if let Err(err) = handle_stream(send, recv, runtime).await {
                         tracing::warn!(error = %err, "mesh worker request failed");
                     }
                 });
@@ -388,12 +446,23 @@ async fn request_task(
     Ok(())
 }
 
+pub(super) async fn handle_stream(
+    send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    runtime: Arc<WorkerRuntime>,
+) -> AppResult<()> {
+    match read_stream_open(&mut recv).await? {
+        StreamOpen::Inference(open) => handle_request(send, recv, runtime, open).await,
+        StreamOpen::SwitchModel(request) => handle_switch_model(send, runtime, request).await,
+    }
+}
+
 pub(super) async fn handle_request(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     runtime: Arc<WorkerRuntime>,
+    open: crate::mesh::protocol::RequestOpen,
 ) -> AppResult<()> {
-    let open = read_request_open(&mut recv).await?;
     if let Err(err) = crate::mesh::protocol::validate_request_open(&open) {
         write_admission(
             &mut send,
@@ -480,6 +549,49 @@ pub(super) async fn handle_request(
     tokio::try_join!(forward_request, forward_response)
         .map_err(|err| AppError::upstream(format!("mesh request forwarding failed: {err}")))?;
     Ok(())
+}
+
+async fn handle_switch_model(
+    mut send: iroh::endpoint::SendStream,
+    runtime: Arc<WorkerRuntime>,
+    request: SwitchModelRequest,
+) -> AppResult<()> {
+    crate::mesh::protocol::validate_switch_model_request(&request)
+        .map_err(|err| AppError::bad_request(format!("invalid mesh switch request: {err}")))?;
+    let mut response = SwitchModelResponse {
+        request_id: request.request_id,
+        model_id: request.model_id.clone(),
+        accepted: false,
+        changed: false,
+        error: None,
+        model_switching: None,
+    };
+    let Some(fleet) = runtime.fleet.as_ref() else {
+        response.error = Some("model switching is not configured".to_string());
+        write_switch_response(&mut send, &response).await?;
+        return Ok(());
+    };
+    let advertised = runtime.model_switching.lock().await.clone();
+    if !advertised.as_ref().is_some_and(|capability| {
+        capability
+            .models
+            .iter()
+            .any(|model| model.id == request.model_id)
+    }) {
+        response.error = Some("model is not advertised as switchable".to_string());
+        write_switch_response(&mut send, &response).await?;
+        return Ok(());
+    }
+    match fleet.load_model(&request.model_id).await {
+        Ok(operation) => {
+            response.accepted = true;
+            response.changed = operation.changed;
+            runtime.refresh_model_switching().await;
+            response.model_switching = runtime.model_switching.lock().await.clone();
+        }
+        Err(err) => response.error = Some(err.to_string()),
+    }
+    write_switch_response(&mut send, &response).await
 }
 
 async fn refresh_models(runtime: &WorkerRuntime) -> Vec<ResourceAdvertisement> {

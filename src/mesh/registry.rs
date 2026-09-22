@@ -2,7 +2,8 @@
 
 use crate::mesh::capacity::{CapacityGate, CapacityPermit};
 use crate::mesh::protocol::{
-    Heartbeat, ModelAdvertisement, ResourceAdvertisement, WorkerAdvertisement,
+    Heartbeat, ModelAdvertisement, ModelSwitchingAdvertisement, ResourceAdvertisement, StreamOpen,
+    SwitchModelRequest, SwitchModelResponse, WorkerAdvertisement,
 };
 use crate::upstream::ProviderInventoryEntry;
 use iroh::EndpointId;
@@ -36,6 +37,7 @@ pub(crate) struct WorkerSession {
     connected_at: Instant,
     last_seen: Mutex<Instant>,
     resources: Mutex<HashMap<String, ResourceState>>,
+    model_switching: Mutex<Option<ModelSwitchingAdvertisement>>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +89,7 @@ impl MeshRegistry {
             generation,
             connected_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
+            model_switching: Mutex::new(advertisement.model_switching.clone()),
             resources: Mutex::new(resources_from_advertisement(advertisement)),
         });
         let old = {
@@ -114,6 +117,7 @@ impl MeshRegistry {
             generation,
             connected_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
+            model_switching: Mutex::new(advertisement.model_switching.clone()),
             resources: Mutex::new(resources_from_advertisement(advertisement)),
         });
         let mut state = self.inner.lock().expect("mesh registry lock poisoned");
@@ -277,6 +281,97 @@ impl MeshRegistry {
                 .iter()
                 .any(|advertised| advertised.id.eq_ignore_ascii_case(model))
         })
+    }
+
+    pub(crate) fn model_switching(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Option<ModelSwitchingAdvertisement> {
+        let session = self.current_session_any_generation(endpoint_id)?;
+        if session.is_stale(Instant::now(), self.heartbeat_timeout) {
+            return None;
+        }
+        session
+            .model_switching
+            .lock()
+            .expect("mesh model-switching lock poisoned")
+            .clone()
+    }
+
+    pub(crate) async fn switch_model(
+        &self,
+        endpoint_id: EndpointId,
+        model_id: String,
+    ) -> crate::error::AppResult<SwitchModelResponse> {
+        let session = self
+            .current_session_any_generation(endpoint_id)
+            .ok_or_else(|| crate::error::AppError::upstream("mesh worker is not connected"))?;
+        if session.is_stale(Instant::now(), self.heartbeat_timeout) {
+            return Err(crate::error::AppError::upstream("mesh worker is stale"));
+        }
+        let advertised = session
+            .model_switching
+            .lock()
+            .expect("mesh model-switching lock poisoned")
+            .clone()
+            .ok_or_else(|| {
+                crate::error::AppError::bad_request(
+                    "mesh worker does not advertise model switching",
+                )
+            })?;
+        if !advertised.models.iter().any(|model| model.id == model_id) {
+            return Err(crate::error::AppError::bad_request(
+                "model is not advertised as switchable",
+            ));
+        }
+        let request = SwitchModelRequest {
+            protocol_version: crate::mesh::protocol::REQUEST_PROTOCOL_VERSION,
+            request_id: uuid::Uuid::new_v4(),
+            model_id,
+        };
+        let connection = session.connection.as_ref().ok_or_else(|| {
+            crate::error::AppError::upstream("mesh worker connection is unavailable")
+        })?;
+        let (mut send, mut recv) =
+            tokio::time::timeout(Duration::from_secs(10), connection.open_bi())
+                .await
+                .map_err(|_| crate::error::AppError::upstream("mesh switch stream timed out"))?
+                .map_err(|err| {
+                    crate::error::AppError::upstream(format!(
+                        "failed to open mesh switch stream: {err}"
+                    ))
+                })?;
+        crate::mesh::io::write_stream_open(&mut send, &StreamOpen::SwitchModel(request.clone()))
+            .await?;
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::mesh::io::read_switch_response(&mut recv),
+        )
+        .await
+        .map_err(|_| crate::error::AppError::upstream("mesh switch request timed out"))??;
+        if response.request_id != request.request_id || response.model_id != request.model_id {
+            return Err(crate::error::AppError::upstream(
+                "mesh switch response did not match request",
+            ));
+        }
+        if let Some(mut update) = response.model_switching.clone() {
+            crate::mesh::protocol::validate_model_switching(&update).map_err(|err| {
+                crate::error::AppError::upstream(format!(
+                    "mesh worker returned invalid switching inventory: {err}"
+                ))
+            })?;
+            // A switch response is worker-controlled and must not expand the
+            // controller-filtered inventory that authorized this request.
+            update.models.retain(|model| {
+                advertised
+                    .models
+                    .iter()
+                    .any(|allowed| allowed.id.eq_ignore_ascii_case(&model.id))
+            });
+            session.update_model_switching(update.clone());
+            response.model_switching = Some(update);
+        }
+        Ok(response)
     }
 
     pub(crate) fn model_catalog(&self) -> Vec<ModelAdvertisement> {
@@ -561,6 +656,21 @@ impl WorkerSession {
         resource.revision = revision;
     }
 
+    pub(crate) fn update_model_switching(&self, update: ModelSwitchingAdvertisement) {
+        self.touch();
+        let mut current = self
+            .model_switching
+            .lock()
+            .expect("mesh model-switching lock poisoned");
+        if current
+            .as_ref()
+            .is_some_and(|value| update.revision < value.revision)
+        {
+            return;
+        }
+        *current = Some(update);
+    }
+
     fn is_stale(&self, now: Instant, timeout: Duration) -> bool {
         let last_seen = *self.last_seen.lock().expect("mesh last_seen lock poisoned");
         now.duration_since(last_seen) > timeout
@@ -606,7 +716,7 @@ impl ResourceState {
 mod tests {
     use super::*;
     use crate::config::AvailabilitySchedule;
-    use crate::mesh::protocol::PROTOCOL_VERSION;
+    use crate::mesh::protocol::{PROTOCOL_VERSION, SwitchableModelAdvertisement};
     use iroh::SecretKey;
 
     #[test]
@@ -631,6 +741,7 @@ mod tests {
                     healthy: true,
                     revision: 1,
                 }],
+                model_switching: None,
             },
         );
 
@@ -686,6 +797,7 @@ mod tests {
                     healthy: true,
                     revision: 1,
                 }],
+                model_switching: None,
             },
         );
 
@@ -731,6 +843,7 @@ mod tests {
                     healthy: true,
                     revision: 1,
                 }],
+                model_switching: None,
             },
         );
 
@@ -778,6 +891,7 @@ mod tests {
                     healthy: true,
                     revision: 1,
                 }],
+                model_switching: None,
             },
         );
 
@@ -799,5 +913,45 @@ mod tests {
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].id, "allowed-model");
         assert_eq!(catalog[0].context_limit, None);
+    }
+
+    #[test]
+    fn switching_inventory_ignores_stale_revisions() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        let session = registry.register_test(
+            endpoint,
+            WorkerAdvertisement {
+                protocol_version: PROTOCOL_VERSION,
+                node_name: None,
+                agent_version: "test".into(),
+                resources: Vec::new(),
+                model_switching: Some(ModelSwitchingAdvertisement {
+                    provider: "lil-fleet".into(),
+                    models: vec![SwitchableModelAdvertisement {
+                        id: "qwen3-flash".into(),
+                        description: None,
+                        phase: "ready".into(),
+                        desired_state: "loaded".into(),
+                    }],
+                    revision: 5,
+                }),
+            },
+        );
+        session.update_model_switching(ModelSwitchingAdvertisement {
+            provider: "lil-fleet".into(),
+            models: vec![SwitchableModelAdvertisement {
+                id: "stale-model".into(),
+                description: None,
+                phase: "unloaded".into(),
+                desired_state: "unloaded".into(),
+            }],
+            revision: 4,
+        });
+        let advertised = registry
+            .model_switching(endpoint)
+            .expect("switching inventory");
+        assert_eq!(advertised.revision, 5);
+        assert_eq!(advertised.models[0].id, "qwen3-flash");
     }
 }

@@ -27,11 +27,13 @@ const FLEET_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_TOKEN_BYTES: u64 = 16 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
+#[derive(Clone)]
 enum FleetTokenSource {
     Env(String),
     File(PathBuf),
 }
 
+#[derive(Clone)]
 pub struct FleetClient {
     client: Client,
     base_url: Url,
@@ -275,6 +277,14 @@ impl FleetProxyError {
         fleet_error(self.status, self.message)
     }
 }
+
+impl std::fmt::Display for FleetProxyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for FleetProxyError {}
 
 #[utoipa::path(
     get,

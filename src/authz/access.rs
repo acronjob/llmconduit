@@ -1,7 +1,8 @@
 use super::{AuthzService, ManagementPermission, keys::generate_api_key};
 use crate::dashboard_access::{
-    AccessApiKey, AccessBackend, AccessError, AccessFuture, AccessOperation, AccessResult,
-    CreatedAccessApiKey, ManagementActor, ManagementPermission as WirePermission,
+    AccessApiKey, AccessBackend, AccessCounts, AccessError, AccessFuture, AccessOperation,
+    AccessResult, AccessSummary, ActorSummary, CreatedAccessApiKey, ManagementActor,
+    ManagementPermission as WirePermission,
 };
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
@@ -33,7 +34,13 @@ impl AuthzService {
         actor: &ManagementActor,
         operation: AccessOperation,
     ) -> Result<AccessResult, AccessError> {
-        let inner = self.inner().map_err(internal)?;
+        let inner = match self.inner() {
+            Ok(inner) => inner,
+            Err(message) if message == "inference auth is disabled" => {
+                return disabled_access_result(actor, operation);
+            }
+            Err(message) => return Err(internal(message)),
+        };
         let mut store = inner
             .store
             .lock()
@@ -93,6 +100,48 @@ impl AuthzService {
         }
         Ok(result)
     }
+}
+
+fn disabled_access_result(
+    actor: &ManagementActor,
+    operation: AccessOperation,
+) -> Result<AccessResult, AccessError> {
+    let empty = match operation {
+        AccessOperation::Summary => AccessResult::Summary(AccessSummary {
+            enabled: false,
+            policy_epoch: 0,
+            actor: ActorSummary {
+                kind: match actor {
+                    ManagementActor::Bootstrap => "bootstrap",
+                    ManagementActor::Delegated { .. } => "delegated",
+                }
+                .into(),
+                principal_id: match actor {
+                    ManagementActor::Bootstrap => None,
+                    ManagementActor::Delegated { principal_id, .. } => Some(principal_id.clone()),
+                },
+                display_name: "Authorization disabled".into(),
+                permissions: Vec::new(),
+            },
+            counts: AccessCounts::default(),
+        }),
+        AccessOperation::ListUsers => AccessResult::Users(Vec::new()),
+        AccessOperation::ListGroups => AccessResult::Groups(Vec::new()),
+        AccessOperation::ListRoles => AccessResult::Roles(Vec::new()),
+        AccessOperation::ListPolicies => AccessResult::Policies(Vec::new()),
+        AccessOperation::ListApiKeys => AccessResult::ApiKeys(Vec::new()),
+        AccessOperation::ListSessions => AccessResult::Sessions(Vec::new()),
+        AccessOperation::Usage => AccessResult::Usage(Vec::new()),
+        AccessOperation::Audit => AccessResult::Audit(Vec::new()),
+        AccessOperation::Pricing => AccessResult::Pricing(Vec::new()),
+        _ => {
+            return Err(AccessError::new(
+                StatusCode::CONFLICT,
+                "enable inference authorization before changing access control",
+            ));
+        }
+    };
+    Ok(empty)
 }
 
 fn created_access(created: super::CreatedApiKey, raw_key: String) -> CreatedAccessApiKey {
@@ -168,6 +217,26 @@ mod tests {
         WritePricingRequest,
     };
     use axum::http::{HeaderMap, HeaderValue};
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn disabled_auth_management_returns_an_explicit_empty_read_model() {
+        let result = AuthzService::default()
+            .dispatch_access(&ManagementActor::Bootstrap, AccessOperation::ListPolicies)
+            .expect("disabled auth should remain inspectable");
+        assert!(matches!(result, AccessResult::Policies(policies) if policies.is_empty()));
+
+        let error = AuthzService::default()
+            .dispatch_access(
+                &ManagementActor::Bootstrap,
+                AccessOperation::CreateUser(CreateUserRequest {
+                    display_name: "blocked".into(),
+                    kind: "user".into(),
+                }),
+            )
+            .expect_err("disabled auth must reject mutations");
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+    }
 
     #[tokio::test]
     async fn every_access_operation_is_backed_by_live_storage() {
