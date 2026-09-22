@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { getConnection } from '../../api/connection';
+import { act, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { getConnection, queryKeys } from '../../api/connection';
 import type { ProviderInventoryEntry } from '../../api/types';
 import { renderWithQuery, resetWorld } from '../../components/testHarness';
 import { ProvidersView } from './ProvidersView';
@@ -34,6 +34,56 @@ function mockProviderSlots() {
 }
 
 describe('ProvidersView', () => {
+  it('pages slots in stable provider/slot order and resets when filters or page size change', async () => {
+    const providers = Array.from({ length: 12 }, (_, i) => slot(
+      i < 8 ? 'mesh:north' : 'mesh:south', i < 8 ? 'North lab' : 'South lab',
+      `gpu-${String(i).padStart(2, '0')}`, i !== 0,
+    )).reverse();
+    vi.spyOn(getConnection().client, 'providers').mockResolvedValue({ providers });
+    renderWithQuery(<ProvidersView />);
+    await waitFor(() => expect(screen.getAllByTestId('provider-row')).toHaveLength(5));
+    const table = screen.getByTestId('providers-table');
+    expect(table).toHaveTextContent('Showing 1–5 of 12 matching slots');
+    expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled();
+    expect(screen.getAllByTestId('provider-row').map((row) => row.dataset.resource)).toEqual(['gpu-00', 'gpu-01', 'gpu-02', 'gpu-03', 'gpu-04']);
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(screen.getAllByTestId('provider-group')).toHaveLength(2);
+    expect(table).toHaveTextContent('Showing 6–10 of 12 matching slots');
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(screen.getAllByTestId('provider-row')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled();
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Filter by provider' }), { target: { value: 'North lab' } });
+    expect(table).toHaveTextContent('Showing 1–5 of 8 matching slots');
+    expect(screen.getAllByTestId('provider-group')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    fireEvent.change(screen.getByRole('combobox', { name: 'Slots per page' }), { target: { value: '10' } });
+    expect(screen.getAllByTestId('provider-row')).toHaveLength(8);
+    expect(table).toHaveTextContent('Page 1 of 1');
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search providers' }), { target: { value: ' GPU-00-MODEL ' } });
+    expect(screen.getAllByTestId('provider-row')).toHaveLength(1);
+    fireEvent.change(screen.getByRole('combobox', { name: 'Filter by availability' }), { target: { value: 'accepting' } });
+    expect(screen.getByTestId('providers-empty')).toBeVisible();
+    expect(table).toHaveTextContent('Showing 0 of 0 matching slots');
+    fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(screen.getAllByTestId('provider-row')).toHaveLength(10);
+  });
+
+  it('clamps pagination when live slots disappear without restoring a stale page later', async () => {
+    const providers = Array.from({ length: 11 }, (_, i) => slot('mesh:north', 'North lab', `gpu-${i}`));
+    vi.spyOn(getConnection().client, 'providers').mockResolvedValue({ providers });
+    const { queryClient } = renderWithQuery(<ProvidersView />);
+    await waitFor(() => expect(screen.getAllByTestId('provider-row')).toHaveLength(5));
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    await act(async () => { queryClient.setQueryData(queryKeys.providers, { providers: providers.slice(0, 2) }); });
+    await waitFor(() => expect(screen.getAllByTestId('provider-row')).toHaveLength(2));
+    expect(screen.getByTestId('providers-table')).toHaveTextContent('Page 1 of 1');
+    await act(async () => { queryClient.setQueryData(queryKeys.providers, { providers }); });
+    await waitFor(() => expect(screen.getByTestId('providers-table')).toHaveTextContent('Page 1 of 3'));
+  });
+
   it('groups resource slots under provider-name headings without losing slot details', async () => {
     mockProviderSlots();
     renderWithQuery(<ProvidersView />);
@@ -122,13 +172,20 @@ describe('ProvidersView', () => {
   });
 
   it('renders and invokes model switching advertised by a downstream mesh worker', async () => {
+    const client = getConnection().client;
+    const mesh = await client.mesh();
+    const endpoint = mesh.nodes.find((node) => node.model_switching)!.endpoint_id;
+    vi.spyOn(client, 'providers').mockResolvedValue({ providers: [slot(`mesh:${endpoint}`, 'North lab', 'gpu-a')] });
+    const switchModel = vi.spyOn(client, 'switchMeshModel');
     renderWithQuery(<ProvidersView />);
 
     const panel = await screen.findByTestId('mesh-admin');
     await waitFor(() => expect(panel).toHaveTextContent('remote model switching'));
+    await waitFor(() => expect(within(screen.getByTestId('remote-model-switcher')).getByText('North lab')).toBeVisible());
     const model = within(panel).getByText('qwen3-32b').closest('[data-testid="remote-switch-model"]') as HTMLElement;
     fireEvent.click(within(model).getByRole('button', { name: 'Switch' }));
 
     await waitFor(() => expect(model).toHaveTextContent('loading'));
+    expect(switchModel).toHaveBeenCalledWith(endpoint, 'qwen3-32b');
   });
 });

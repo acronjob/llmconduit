@@ -146,7 +146,7 @@ export function buildProviderInventory(input: {
       resourceId: provider.resource_id,
       route: provider.route,
       baseUrl: provider.base_url,
-      status: provider.healthy ? (health?.status ?? 'healthy') : (health?.status ?? 'down'),
+      status: provider.healthy ? (health?.status ?? 'healthy') : 'down',
       lastError: health?.last_error ?? null,
       cooldownUntilMs: health?.cooling_until_ms ?? null,
       catalogFetchedMs: health?.catalog_fetched_ms ?? null,

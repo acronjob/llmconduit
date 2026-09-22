@@ -105,7 +105,7 @@ impl WorkerRuntime {
         }
         WorkerAdvertisement {
             protocol_version: PROTOCOL_VERSION,
-            node_name: None,
+            node_name: self.config.node_name.clone(),
             agent_version: crate::VERSION.to_string(),
             resources,
             model_switching: self.model_switching.lock().await.clone(),
@@ -219,7 +219,7 @@ impl LocalResource {
 async fn enroll(
     endpoint: &Endpoint,
     controller: EndpointAddr,
-    _config: &MeshWorkerConfig,
+    config: &MeshWorkerConfig,
     join_key: String,
 ) -> AppResult<()> {
     let connection = endpoint
@@ -230,12 +230,7 @@ async fn enroll(
         .open_bi()
         .await
         .map_err(|err| AppError::upstream(format!("mesh enrollment stream failed: {err}")))?;
-    let request = EnrollRequest {
-        protocol_version: PROTOCOL_VERSION,
-        join_key,
-        node_name: None,
-        agent_version: crate::VERSION.to_string(),
-    };
+    let request = enroll_request(config, join_key);
     write_control(&mut send, &request).await?;
     let response: EnrollResponse = read_control(&mut recv).await?;
     match response {
@@ -243,6 +238,15 @@ async fn enroll(
         EnrollResponse::Rejected { reason } => Err(AppError::upstream(format!(
             "mesh enrollment rejected: {reason}"
         ))),
+    }
+}
+
+fn enroll_request(config: &MeshWorkerConfig, join_key: String) -> EnrollRequest {
+    EnrollRequest {
+        protocol_version: PROTOCOL_VERSION,
+        join_key,
+        node_name: config.node_name.clone(),
+        agent_version: crate::VERSION.to_string(),
     }
 }
 
@@ -910,6 +914,37 @@ mod tests {
                 context_limit: Some(4096),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn worker_advertisement_uses_configured_node_name() {
+        let runtime = WorkerRuntime {
+            config: MeshWorkerConfig {
+                node_name: Some("lab-worker".to_string()),
+                ..Default::default()
+            },
+            resources: HashMap::new(),
+            fleet: None,
+            model_switching: Mutex::new(None),
+        };
+
+        let advertisement = runtime.advertisement().await;
+
+        assert_eq!(advertisement.node_name.as_deref(), Some("lab-worker"));
+        assert!(advertisement.resources.is_empty());
+    }
+
+    #[test]
+    fn enrollment_request_uses_configured_node_name() {
+        let config = MeshWorkerConfig {
+            node_name: Some("lab-worker".to_string()),
+            ..Default::default()
+        };
+
+        let request = enroll_request(&config, "join-token".to_string());
+
+        assert_eq!(request.node_name.as_deref(), Some("lab-worker"));
+        assert_eq!(request.join_key, "join-token");
     }
 
     fn schedule(json: serde_json::Value) -> AvailabilitySchedule {

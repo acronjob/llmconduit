@@ -25,8 +25,6 @@ const DASH = '—';
 const INPUT = 'rounded-md border border-line bg-bg px-2 py-1.5 font-mono text-xs text-text outline-none focus:border-accent';
 
 export function ProvidersView() {
-  const [status, setStatus] = useState<'all' | ProviderHealth['status']>('all');
-  const [query, setQuery] = useState('');
   const [createdToken, setCreatedToken] = useState<{ label: string | null; token: string } | null>(null);
   const { client } = getConnection();
   const queryClient = useQueryClient();
@@ -98,24 +96,6 @@ export function ProvidersView() {
     perProviderById,
   }), [providersQuery.data, nodes, edges, flows, policiesQuery.data, providerMetricsQuery.data, topologyQuery.data, perProviderById]);
 
-  const filteredRows = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return inventory.rows.filter((row) => {
-      if (status !== 'all' && row.status !== status) return false;
-      if (!needle) return true;
-      return [
-        row.id,
-        row.name,
-        row.resourceId,
-        row.route,
-        row.baseUrl,
-        ...row.advertisedModels,
-        ...row.policy.subjects,
-        ...row.policy.endpoints,
-      ].filter(Boolean).join(' ').toLowerCase().includes(needle);
-    });
-  }, [inventory.rows, query, status]);
-
   if (providersQuery.isLoading && nodes.length === 0) {
     return <div className="p-5 text-sm text-text-muted">Loading provider inventory...</div>;
   }
@@ -134,33 +114,6 @@ export function ProvidersView() {
           <p className="mt-1 text-xs text-text-muted">
             upstream health · advertised catalog · access windows · limits · usage
           </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex overflow-hidden rounded-md border border-line text-xs" role="group" aria-label="Provider status">
-            {(['all', 'healthy', 'cooling', 'down'] as const).map((item) => (
-              <button
-                key={item}
-                type="button"
-                onClick={() => setStatus(item)}
-                className={cn(
-                  'px-3 py-1.5 uppercase tracking-[0.12em]',
-                  status === item ? 'bg-accent/15 text-accent' : 'bg-panel text-text-muted hover:text-text',
-                )}
-              >
-                {item}
-              </button>
-            ))}
-          </div>
-          <label className="relative">
-            <span className="absolute left-2.5 top-1.5 text-xs text-text-muted">⌕</span>
-            <input
-              aria-label="Search providers"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search provider, model, subject..."
-              className="w-72 rounded-md border border-line bg-bg py-1.5 pl-7 pr-2 text-xs outline-none focus:border-accent"
-            />
-          </label>
         </div>
       </div>
 
@@ -209,7 +162,7 @@ export function ProvidersView() {
           onLoad={(id) => loadFleetModel.mutate(id)}
           onUnload={(id) => unloadFleetModel.mutate(id)}
         />
-        <ProviderTable rows={filteredRows} allRows={inventory.rows} />
+        <ProviderTable allRows={inventory.rows} />
         <ModelsPanel models={inventory.unionCatalogModels} />
       </div>
     </div>
@@ -465,6 +418,11 @@ function MeshAdminPanel({
   const [maxUses, setMaxUses] = useState('1');
   const [expiresHours, setExpiresHours] = useState('24');
   const disabledModels = new Set((mesh?.disabled_models ?? []).map(disabledModelKey));
+  // Enrollment labels may predate a worker rename; prefer its live advertised name.
+  const namedNodes = (mesh?.nodes ?? []).map((node) => {
+    const advertised = rows.find((row) => row.id === `mesh:${node.endpoint_id}` && row.name.trim() && row.name !== row.id);
+    return advertised ? { ...node, label: advertised.name.trim() } : node;
+  });
   const meshEndpointIds = new Set((mesh?.nodes ?? []).map((node) => node.endpoint_id));
   const meshRows = rows
     .map((row) => ({ row, endpointId: endpointFromProvider(row.id) }))
@@ -518,10 +476,10 @@ function MeshAdminPanel({
           {mutationError && <p className="mt-2 text-xs text-status-down">{mutationError}</p>}
           <div className="mt-3 grid gap-3 xl:grid-cols-3">
             <JoinKeyList keys={mesh.join_keys} busy={busy} mutationsEnabled={mutationsEnabled} onRevoke={onRevoke} />
-            <NodeList nodes={mesh.nodes} busy={busy} mutationsEnabled={mutationsEnabled} onSetNode={onSetNode} />
+            <NodeList nodes={namedNodes} busy={busy} mutationsEnabled={mutationsEnabled} onSetNode={onSetNode} />
             <ModelOverrideList rows={meshRows} disabledModels={disabledModels} busy={busy} mutationsEnabled={mutationsEnabled} onSetModel={onSetModel} />
           </div>
-          <SwitchableModelList nodes={mesh.nodes} busy={busy} mutationsEnabled={mutationsEnabled} onSwitchModel={onSwitchModel} />
+          <SwitchableModelList nodes={namedNodes} busy={busy} mutationsEnabled={mutationsEnabled} onSwitchModel={onSwitchModel} />
         </>
       )}
     </Panel>
@@ -595,7 +553,7 @@ function ModelOverrideList({
                 {disabled ? 'Enable' : 'Disable'}
               </Button>
             </div>
-            <div className="mt-1 truncate text-[10px] text-text-muted">{endpointId} · {resourceId} · {disabled ? 'disabled' : 'routable'}</div>
+            <div className="mt-1 truncate text-[10px] text-text-muted" title={endpointId}>{row.name} · {resourceId} · {disabled ? 'disabled' : 'routable'}</div>
           </div>
         );
       })}
@@ -743,15 +701,39 @@ function SummaryStrip({ summary }: { summary: ProviderInventorySummary }) {
   );
 }
 
-function ProviderTable({ rows, allRows }: { rows: ProviderInventoryRow[]; allRows: ProviderInventoryRow[] }) {
-  const visibleKeys = new Set(rows.map((row) => row.key));
-  const groups = groupProviderSlots(allRows)
+function ProviderTable({ allRows }: { allRows: ProviderInventoryRow[] }) {
+  const [status, setStatus] = useState<'all' | ProviderHealth['status']>('all');
+  const [query, setQuery] = useState('');
+  const [provider, setProvider] = useState('');
+  const [availability, setAvailability] = useState('all');
+  const [pageSize, setPageSize] = useState(5);
+  const [page, setPage] = useState(1);
+  const allGroups = groupProviderSlots(allRows);
+  const needle = query.trim().toLowerCase();
+  const groups = allGroups
+    .filter((group) => !provider || group.name === provider)
     .map((group) => ({
       name: group.name,
       total: group.rows.length,
-      rows: group.rows.filter((row) => visibleKeys.has(row.key)),
+      rows: group.rows.filter((row) => {
+        if (status !== 'all' && row.status !== status) return false;
+        if (availability !== 'all' && row.capacity.accepting !== (availability === 'accepting')) return false;
+        return !needle || [row.id, row.name, row.resourceId, row.route, row.baseUrl,
+          ...row.advertisedModels, ...row.policy.subjects, ...row.policy.endpoints,
+        ].filter(Boolean).join(' ').toLowerCase().includes(needle);
+      // Live health and usage changes must not move slots between pages.
+      }).sort((a, b) => (a.resourceId ?? a.id).localeCompare(b.resourceId ?? b.id) || a.key.localeCompare(b.key)),
     }))
     .filter((group) => group.rows.length > 0);
+  const rows = groups.flatMap((group) => group.rows);
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  if (page !== currentPage) setPage(currentPage);
+  const start = (currentPage - 1) * pageSize;
+  const visibleKeys = new Set(rows.slice(start, start + pageSize).map((row) => row.key));
+  const visibleGroups = groups.map((group) => ({ ...group, visibleRows: group.rows.filter((row) => visibleKeys.has(row.key)) }))
+    .filter((group) => group.visibleRows.length > 0);
+  const hasFilters = Boolean(query || provider || status !== 'all' || availability !== 'all');
   return (
     <div className="space-y-3" data-testid="providers-table" data-available={rows.length > 0 ? 'true' : 'false'}>
       <div className="flex flex-wrap items-center justify-between gap-2 px-1">
@@ -760,12 +742,58 @@ function ProviderTable({ rows, allRows }: { rows: ProviderInventoryRow[]; allRow
           {groups.length} {groups.length === 1 ? 'provider' : 'providers'} · {rows.length} / {allRows.length} slots
         </span>
       </div>
-      {groups.map((group) => (
+      <Panel className="space-y-2 p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <input aria-label="Search providers" value={query}
+            onChange={(event) => { setQuery(event.target.value); setPage(1); }}
+            placeholder="Search provider, slot, model, subject..." className={cn(INPUT, 'min-w-0 flex-1 basis-64')} />
+          <select aria-label="Filter by provider" value={provider}
+            onChange={(event) => { setProvider(event.target.value); setPage(1); }} className={cn(INPUT, 'max-w-full')}>
+            <option value="">All providers</option>
+            {allGroups.map((group) => <option key={group.name} value={group.name}>{group.name}</option>)}
+            {provider && !allGroups.some((group) => group.name === provider) && <option value={provider}>{provider} (unavailable)</option>}
+          </select>
+          <select aria-label="Filter by availability" value={availability}
+            onChange={(event) => { setAvailability(event.target.value); setPage(1); }} className={INPUT}>
+            <option value="all">Any availability</option>
+            <option value="accepting">Accepting requests</option>
+            <option value="closed">Closed to requests</option>
+          </select>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex overflow-hidden rounded-md border border-line text-xs" role="group" aria-label="Provider status">
+            {(['all', 'healthy', 'cooling', 'down'] as const).map((item) => (
+              <button key={item} type="button" aria-pressed={status === item}
+                onClick={() => { setStatus(item); setPage(1); }}
+                className={cn('px-3 py-1.5 uppercase tracking-[0.12em]', status === item ? 'bg-accent/15 text-accent' : 'bg-panel text-text-muted hover:text-text')}>
+                {item}
+              </button>
+            ))}
+          </div>
+          {hasFilters && <Button type="button" variant="ghost" className="text-xs"
+            onClick={() => { setQuery(''); setProvider(''); setStatus('all'); setAvailability('all'); setPage(1); }}>Clear filters</Button>}
+        </div>
+      </Panel>
+      <nav aria-label="Provider slot pagination" className="flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-text-muted">
+        <span aria-live="polite">Showing {rows.length ? `${start + 1}–${Math.min(start + pageSize, rows.length)}` : '0'} of {rows.length} matching slots</span>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex items-center gap-2">Slots per page
+            <select value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value)); setPage(1); }} className={INPUT}>
+              {[5, 10, 25].map((size) => <option key={size} value={size}>{size}</option>)}
+            </select>
+          </label>
+          <Button type="button" aria-label="Previous page" variant="ghost" disabled={currentPage === 1} onClick={() => setPage(currentPage - 1)} className="text-xs">Previous</Button>
+          <span className="font-mono text-[10px]">Page {currentPage} of {pageCount}</span>
+          <Button type="button" aria-label="Next page" variant="ghost" disabled={currentPage === pageCount} onClick={() => setPage(currentPage + 1)} className="text-xs">Next</Button>
+        </div>
+      </nav>
+      {visibleGroups.map((group) => (
         <Panel key={group.name} className="overflow-hidden" role="region" aria-label={group.name} data-testid="provider-group">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line bg-accent/5 px-4 py-3">
             <h3 className="min-w-0 break-words text-sm font-semibold text-text">{group.name}</h3>
             <span className="shrink-0 font-mono text-[10px] text-text-muted">
               {group.rows.length} / {group.total} {group.total === 1 ? 'slot' : 'slots'}
+              {group.visibleRows.length < group.rows.length ? ` · ${group.visibleRows.length} on this page` : ''}
             </span>
           </div>
           <div className="overflow-auto">
@@ -781,7 +809,7 @@ function ProviderTable({ rows, allRows }: { rows: ProviderInventoryRow[]; allRow
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {group.rows.map((row) => <ProviderRow key={row.key} row={row} />)}
+                {group.visibleRows.map((row) => <ProviderRow key={row.key} row={row} />)}
               </tbody>
             </table>
           </div>

@@ -358,6 +358,11 @@ either `LLMCONDUIT_FLEET_TOKEN_FILE` or `LLMCONDUIT_FLEET_TOKEN` in the
 `llmconduit mesh-worker` environment to enable this capability. The controller
 and worker must both use mesh protocol v2.
 
+Set `mesh.worker.node_name` to a short friendly worker label when one physical
+provider exposes multiple resource slots. The worker sends that label during
+enrollment and in every live advertisement; routing ids remain the Iroh endpoint
+id plus resource id.
+
 Mesh enrollment and disabled-model state remains in the mesh controller's
 dedicated SQLite database. `control_plane.storage: postgres` stores dashboard
 accounts, API keys, request history, and metrics; it intentionally does not move

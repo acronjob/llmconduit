@@ -66,6 +66,15 @@ const policy = (overrides: Partial<AuthPolicy>): AuthPolicy => ({
 });
 
 describe('providersModel', () => {
+  it('keeps an unhealthy slot down when its provider connection is healthy', () => {
+    const inventory = buildProviderInventory({
+      providers: [{ ...inventoryProvider('mesh:lab'), healthy: false, accepting_requests: false }],
+      health: [provider('mesh:lab')], edges: [], flows: [], policies: [], cacheMetrics: [], priceTable: {},
+    });
+    expect(inventory.rows[0]!.status).toBe('down');
+    expect(inventory.summary.down).toBe(1);
+  });
+
   it('groups by display name while retaining distinct slot identities and order', () => {
     const inventory = buildProviderInventory({
       providers: [
