@@ -94,15 +94,19 @@ use std::convert::Infallible;
 use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 const API_LOG_PAYLOAD_DUMP_LIMIT_BYTES: usize = 16 * 1024;
 const API_LOG_PREVIEW_CHARS: usize = 160;
+const CONTENT_DECODE_CONCURRENCY_LIMIT: usize = 4;
+const ZSTD_WINDOW_LOG_MAX: u32 = 24;
 /// Fable review (Finding 1): inbound bodies at or below this size have their
 /// turn-capture redaction done INLINE; a larger body moves the parse+redact+
 /// re-serialize onto the blocking pool so a multi-MB Claude Code (1M-context)
@@ -407,9 +411,11 @@ async fn require_dashboard_session(
             .await
         {
             Ok(Some(actor)) => {
-                request
-                    .extensions_mut()
-                    .insert(AuthSession { exp, user: None });
+                if !delegated_dashboard_api_request_allowed(request.method(), request.uri().path())
+                {
+                    return management_error(StatusCode::FORBIDDEN, "administrator role required");
+                }
+                request.extensions_mut().insert(AuthSession::delegated(exp));
                 request.extensions_mut().insert(actor);
                 return next.run(request).await;
             }
@@ -423,6 +429,14 @@ async fn require_dashboard_session(
         }
     }
     management_error(StatusCode::UNAUTHORIZED, "unauthorized")
+}
+
+fn delegated_dashboard_api_request_allowed(method: &axum::http::Method, path: &str) -> bool {
+    // Delegated dashboard sessions are policy-scoped inference sessions. Allow
+    // only handlers that independently re-check inference scope; legacy reads
+    // and admin/inventory APIs can expose global operator state.
+    (*method == axum::http::Method::GET && path == "/dashboard/api/catalog")
+        || (*method == axum::http::Method::POST && path == "/dashboard/api/chat")
 }
 
 async fn resolve_optional_dashboard_session(
@@ -443,7 +457,7 @@ async fn resolve_optional_dashboard_session(
         {
             Ok(Some(actor)) => {
                 request.extensions_mut().insert(actor);
-                Some(AuthSession { exp, user: None })
+                Some(AuthSession::delegated(exp))
             }
             _ => None,
         }
@@ -1041,38 +1055,111 @@ fn body_log_fields(path: &str, body: &Bytes) -> Option<BodyLogFields> {
 /// Responses request bodies (`enable_request_compression`); without this the
 /// `Json` extractor parses still-compressed bytes and rejects with
 /// `expected value at line 1 column 1`. Bodies are already fully buffered by
-/// `log_api_call`, so this decodes synchronously in place. `identity`/absent ⇒
-/// passthrough. Unknown encodings ⇒ `Err` so the caller surfaces a 415.
-fn decode_content_encoding(body: &Bytes, encoding: &str) -> Result<Bytes, String> {
+/// `log_api_call`, then decoded behind a bounded blocking gate. `identity`/absent
+/// ⇒ passthrough. Unknown encodings ⇒ `Err` so the caller surfaces a 415.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodeContentError {
+    Invalid(String),
+    TooLarge,
+    Unsupported(String),
+}
+
+impl DecodeContentError {
+    fn message(&self) -> String {
+        match self {
+            Self::Invalid(message) => message.clone(),
+            Self::TooLarge => "decoded body exceeds request body limit".to_string(),
+            Self::Unsupported(encoding) => format!("unsupported content-encoding: {encoding}"),
+        }
+    }
+}
+
+fn content_decode_semaphore() -> Arc<Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(CONTENT_DECODE_CONCURRENCY_LIMIT))))
+}
+
+async fn decode_content_encoding_blocking(
+    body: Bytes,
+    encoding: String,
+    limit_bytes: usize,
+) -> Result<Bytes, DecodeContentError> {
+    let permit = content_decode_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|_| DecodeContentError::Invalid("content decoder unavailable".to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_content_encoding(&body, &encoding, limit_bytes)
+    })
+    .await
+    .map_err(|err| DecodeContentError::Invalid(format!("content decoder failed: {err}")))?
+}
+
+fn read_limited<R: Read>(reader: R, limit_bytes: usize) -> Result<Vec<u8>, DecodeContentError> {
+    let mut limited = reader.take(limit_bytes.saturating_add(1) as u64);
+    let mut out = Vec::new();
+    limited
+        .read_to_end(&mut out)
+        .map_err(|e| DecodeContentError::Invalid(e.to_string()))?;
+    if out.len() > limit_bytes {
+        return Err(DecodeContentError::TooLarge);
+    }
+    Ok(out)
+}
+
+fn decode_content_encoding(
+    body: &Bytes,
+    encoding: &str,
+    limit_bytes: usize,
+) -> Result<Bytes, DecodeContentError> {
     let enc = encoding.trim().to_ascii_lowercase();
     if enc.is_empty() || enc == "identity" {
+        if body.len() > limit_bytes {
+            return Err(DecodeContentError::TooLarge);
+        }
         return Ok(body.clone());
     }
-    let decoded = match enc.as_str() {
-        "gzip" => {
-            let mut out = Vec::with_capacity(body.len());
-            flate2::read::GzDecoder::new(&body[..])
-                .read_to_end(&mut out)
-                .map_err(|e| format!("gzip: {e}"))?;
-            out
-        }
-        "deflate" => {
-            let mut out = Vec::with_capacity(body.len());
-            flate2::read::ZlibDecoder::new(&body[..])
-                .read_to_end(&mut out)
-                .map_err(|e| format!("deflate: {e}"))?;
-            out
-        }
-        "br" => {
-            let mut out = Vec::with_capacity(body.len());
-            brotli::Decompressor::new(&body[..], 4096)
-                .read_to_end(&mut out)
-                .map_err(|e| format!("br: {e}"))?;
-            out
-        }
-        "zstd" => zstd::decode_all(&body[..]).map_err(|e| format!("zstd: {e}"))?,
-        other => return Err(format!("unsupported content-encoding: {other}")),
-    };
+    let decoded =
+        match enc.as_str() {
+            "gzip" => read_limited(flate2::read::GzDecoder::new(&body[..]), limit_bytes).map_err(
+                |err| match err {
+                    DecodeContentError::Invalid(err) => {
+                        DecodeContentError::Invalid(format!("gzip: {err}"))
+                    }
+                    other => other,
+                },
+            )?,
+            "deflate" => read_limited(flate2::read::ZlibDecoder::new(&body[..]), limit_bytes)
+                .map_err(|err| match err {
+                    DecodeContentError::Invalid(err) => {
+                        DecodeContentError::Invalid(format!("deflate: {err}"))
+                    }
+                    other => other,
+                })?,
+            "br" => read_limited(brotli::Decompressor::new(&body[..], 4096), limit_bytes).map_err(
+                |err| match err {
+                    DecodeContentError::Invalid(err) => {
+                        DecodeContentError::Invalid(format!("br: {err}"))
+                    }
+                    other => other,
+                },
+            )?,
+            "zstd" => {
+                let mut decoder = zstd::Decoder::new(&body[..])
+                    .map_err(|e| DecodeContentError::Invalid(format!("zstd: {e}")))?;
+                decoder
+                    .window_log_max(ZSTD_WINDOW_LOG_MAX)
+                    .map_err(|e| DecodeContentError::Invalid(format!("zstd: {e}")))?;
+                read_limited(decoder, limit_bytes).map_err(|err| match err {
+                    DecodeContentError::Invalid(err) => {
+                        DecodeContentError::Invalid(format!("zstd: {err}"))
+                    }
+                    other => other,
+                })?
+            }
+            other => return Err(DecodeContentError::Unsupported(other.to_string())),
+        };
     Ok(Bytes::from(decoded))
 }
 
@@ -1228,20 +1315,37 @@ async fn log_api_call(
         .and_then(|v| v.to_str().ok())
     {
         Some(encoding) if !encoding.trim().eq_ignore_ascii_case("identity") => {
-            match decode_content_encoding(&body_bytes, encoding) {
+            match decode_content_encoding_blocking(
+                body_bytes.clone(),
+                encoding.to_string(),
+                max_request_body_bytes,
+            )
+            .await
+            {
                 Ok(decoded) => decoded,
+                Err(DecodeContentError::TooLarge) => {
+                    tracing::warn!(
+                        api_call_id = %api_call_id,
+                        method = %method,
+                        path = %uri.path(),
+                        content_encoding = %encoding,
+                        limit_bytes = max_request_body_bytes,
+                        "rejected inbound API request: decoded body exceeded limit"
+                    );
+                    return payload_too_large(max_request_body_bytes);
+                }
                 Err(err) => {
                     tracing::warn!(
                         api_call_id = %api_call_id,
                         method = %method,
                         path = %uri.path(),
                         content_encoding = %encoding,
-                        error = %err,
+                        error = %err.message(),
                         "failed to decode inbound Content-Encoding"
                     );
                     return (
                         StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                        format!("failed to decode Content-Encoding: {err}"),
+                        format!("failed to decode Content-Encoding: {}", err.message()),
                     )
                         .into_response();
                 }
@@ -2630,6 +2734,8 @@ async fn get_responses(
 ) -> Response {
     match upgrade {
         Ok(upgrade) => upgrade
+            .max_frame_size(gateway.config().max_request_body_bytes)
+            .max_message_size(gateway.config().max_request_body_bytes)
             .on_upgrade(move |socket| {
                 responses_ws_serve(socket, gateway, auth.map(|value| value.0))
             })
@@ -2657,6 +2763,7 @@ async fn responses_ws_serve(
     gateway: Arc<Gateway>,
     auth: Option<crate::authz::AuthContext>,
 ) {
+    let max_request_body_bytes = gateway.config().max_request_body_bytes;
     // `split` so the inbound `recv` and outbound `send` can be raced in the same
     // `select!` without a double-`&mut` borrow conflict (the dashboard/debug WS
     // loops use the same pattern).
@@ -2666,17 +2773,43 @@ async fn responses_ws_serve(
     //    Close/EOF. codex sends a single Text (JSON) or Binary (zstd JSON).
     let request_bytes: Bytes = loop {
         match ws_rx.next().await {
-            Some(Ok(Message::Text(t))) => break Bytes::copy_from_slice(t.as_bytes()),
+            Some(Ok(Message::Text(t))) => {
+                if t.len() > max_request_body_bytes {
+                    let _ = send_responses_ws_error(
+                        &mut sink,
+                        "payload_too_large",
+                        "request body exceeds the configured limit",
+                    )
+                    .await;
+                    let _ = sink.send(Message::Close(None)).await;
+                    return;
+                }
+                break Bytes::copy_from_slice(t.as_bytes());
+            }
             Some(Ok(Message::Binary(b))) => {
-                break if b.starts_with(&ZSTD_MAGIC) {
-                    match zstd::decode_all(&b[..]) {
-                        Ok(decoded) => Bytes::from(decoded),
-                        // Not actually zstd — let JSON parsing produce the error.
-                        Err(_) => b,
+                match responses_ws_decode_binary_request(b, max_request_body_bytes).await {
+                    Ok(bytes) => break bytes,
+                    Err(DecodeContentError::TooLarge) => {
+                        let _ = send_responses_ws_error(
+                            &mut sink,
+                            "payload_too_large",
+                            "request body exceeds the configured limit",
+                        )
+                        .await;
+                        let _ = sink.send(Message::Close(None)).await;
+                        return;
                     }
-                } else {
-                    b
-                };
+                    Err(err) => {
+                        let _ = send_responses_ws_error(
+                            &mut sink,
+                            "invalid_request",
+                            &format!("invalid request body: {}", err.message()),
+                        )
+                        .await;
+                        let _ = sink.send(Message::Close(None)).await;
+                        return;
+                    }
+                }
             }
             Some(Ok(Message::Ping(p))) => {
                 let _ = sink.send(Message::Pong(p)).await;
@@ -2799,6 +2932,27 @@ async fn responses_ws_serve(
                 }
             }
         }
+    }
+}
+
+async fn responses_ws_decode_binary_request(
+    body: Bytes,
+    limit_bytes: usize,
+) -> Result<Bytes, DecodeContentError> {
+    if body.len() > limit_bytes {
+        return Err(DecodeContentError::TooLarge);
+    }
+    if body.starts_with(&ZSTD_MAGIC) {
+        match decode_content_encoding_blocking(body.clone(), "zstd".to_string(), limit_bytes).await
+        {
+            Ok(decoded) => Ok(decoded),
+            // Not actually zstd -- let JSON parsing produce the protocol error,
+            // preserving the old "binary can also be raw JSON" fallback.
+            Err(DecodeContentError::Invalid(_)) => Ok(body),
+            Err(err) => Err(err),
+        }
+    } else {
+        Ok(body)
     }
 }
 
@@ -4698,7 +4852,7 @@ mod tests {
         // zstd (the codex path — magic 28 b5 2f fd).
         let z = zstd::encode_all(&original[..], 3).expect("zstd encode");
         assert_eq!(
-            super::decode_content_encoding(&Bytes::from(z), "zstd").expect("zstd decode"),
+            super::decode_content_encoding(&Bytes::from(z), "zstd", 1024).expect("zstd decode"),
             original_bytes
         );
 
@@ -4710,7 +4864,7 @@ mod tests {
         let mut out = Vec::new();
         gz.read_to_end(&mut out).expect("gz encode");
         assert_eq!(
-            super::decode_content_encoding(&Bytes::from(out), "gzip").expect("gzip decode"),
+            super::decode_content_encoding(&Bytes::from(out), "gzip", 1024).expect("gzip decode"),
             original_bytes
         );
 
@@ -4722,7 +4876,8 @@ mod tests {
         let mut out = Vec::new();
         zlib.read_to_end(&mut out).expect("zlib encode");
         assert_eq!(
-            super::decode_content_encoding(&Bytes::from(out), "deflate").expect("deflate decode"),
+            super::decode_content_encoding(&Bytes::from(out), "deflate", 1024)
+                .expect("deflate decode"),
             original_bytes
         );
 
@@ -4731,8 +4886,72 @@ mod tests {
         let mut out = Vec::new();
         br.read_to_end(&mut out).expect("br encode");
         assert_eq!(
-            super::decode_content_encoding(&Bytes::from(out), "br").expect("br decode"),
+            super::decode_content_encoding(&Bytes::from(out), "br", 1024).expect("br decode"),
             original_bytes
+        );
+    }
+
+    #[test]
+    fn decode_content_encoding_rejects_decoded_over_limit() {
+        use std::io::Read as _;
+
+        let original = vec![b'a'; 4096];
+        let z = zstd::encode_all(&original[..], 3).expect("zstd encode");
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(z), "zstd", 1024),
+            Err(super::DecodeContentError::TooLarge)
+        );
+
+        let mut gz = flate2::read::GzEncoder::new(
+            std::io::Cursor::new(&original),
+            flate2::Compression::default(),
+        );
+        let mut out = Vec::new();
+        gz.read_to_end(&mut out).expect("gz encode");
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(out), "gzip", 1024),
+            Err(super::DecodeContentError::TooLarge)
+        );
+
+        let mut zlib = flate2::read::ZlibEncoder::new(
+            std::io::Cursor::new(&original),
+            flate2::Compression::default(),
+        );
+        let mut out = Vec::new();
+        zlib.read_to_end(&mut out).expect("zlib encode");
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(out), "deflate", 1024),
+            Err(super::DecodeContentError::TooLarge)
+        );
+
+        let mut br = brotli::CompressorReader::new(std::io::Cursor::new(&original), 4096, 11, 22);
+        let mut out = Vec::new();
+        br.read_to_end(&mut out).expect("br encode");
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(out), "br", 1024),
+            Err(super::DecodeContentError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn decode_content_encoding_rejects_oversized_zstd_window() {
+        use std::io::Write as _;
+
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = zstd::Encoder::new(&mut encoded, 0).expect("zstd encoder");
+            encoder
+                .window_log(super::ZSTD_WINDOW_LOG_MAX + 1)
+                .expect("window log");
+            encoder.write_all(b"small").expect("zstd write");
+            encoder.finish().expect("zstd finish");
+        }
+
+        let err = super::decode_content_encoding(&Bytes::from(encoded), "zstd", 1024)
+            .expect_err("decoder must reject frames with a window larger than the configured cap");
+        assert!(
+            matches!(err, super::DecodeContentError::Invalid(_)),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -4744,20 +4963,26 @@ mod tests {
     fn decode_content_encoding_identity_blank_case_insensitive_and_unknown() {
         let body = Bytes::from_static(b"hello");
         assert_eq!(
-            super::decode_content_encoding(&body, "identity").unwrap(),
+            super::decode_content_encoding(&body, "identity", 1024).unwrap(),
             body
         );
-        assert_eq!(super::decode_content_encoding(&body, "").unwrap(), body);
-        assert_eq!(super::decode_content_encoding(&body, "  ").unwrap(), body);
+        assert_eq!(
+            super::decode_content_encoding(&body, "", 1024).unwrap(),
+            body
+        );
+        assert_eq!(
+            super::decode_content_encoding(&body, "  ", 1024).unwrap(),
+            body
+        );
         // Header values are case-insensitive — codex sends lowercase, but a
         // generic client may send `ZSTD` / `GZIP`.
         let z = zstd::encode_all(&b"hello"[..], 3).unwrap();
         assert_eq!(
-            super::decode_content_encoding(&Bytes::from(z), "ZSTD").unwrap(),
+            super::decode_content_encoding(&Bytes::from(z), "ZSTD", 1024).unwrap(),
             body
         );
         // Unknown encoding ⇒ Err (caller returns 415, not a silent 400 JSON parse).
-        assert!(super::decode_content_encoding(&body, "snappy").is_err());
+        assert!(super::decode_content_encoding(&body, "snappy", 1024).is_err());
     }
 
     #[test]

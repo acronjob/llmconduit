@@ -57,15 +57,20 @@ fn store_or_503(gateway: &Gateway) -> Result<Arc<dyn PersistenceStore>, Response
 }
 
 fn is_admin(session: &AuthSession) -> bool {
-    session.user.as_ref().is_none_or(|user| user.is_admin)
-}
-
-fn actor(session: &AuthSession) -> String {
     session
         .user
         .as_ref()
-        .map(|user| user.username.clone())
-        .unwrap_or_else(|| "dashboard-token".to_string())
+        .map_or_else(|| session.bootstrap_admin(), |user| user.is_admin)
+}
+
+fn actor(session: &AuthSession) -> String {
+    if let Some(user) = session.user.as_ref() {
+        user.username.clone()
+    } else if session.bootstrap_admin() {
+        "dashboard-token".to_string()
+    } else {
+        "delegated-dashboard-session".to_string()
+    }
 }
 
 fn require_admin(session: &AuthSession) -> Result<(), Response> {
@@ -96,8 +101,8 @@ fn require_csrf(auth: &DashboardAuth, headers: &HeaderMap) -> Result<(), Respons
 pub(crate) struct MeBody {
     /// `null` for a token/dev-open session.
     user: Option<SessionUser>,
-    /// `true` for an admin user, and for any session without a user
-    /// (token login / dev-open), which is treated as admin.
+    /// `true` for an admin user, or for an explicit bootstrap session
+    /// (token login / dev-open). Delegated key sessions are not bootstrap admins.
     is_admin: bool,
     /// `users` when at least one account exists, `token` when only the env
     /// token gates the dashboard, `open` when nothing does (loopback dev).

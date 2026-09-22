@@ -682,12 +682,18 @@ impl DashboardAuth {
         if let Some(value) = cookie_value(headers, SESSION_COOKIE)
             && let Some((exp, user)) = self.verify_session(&value)
         {
-            return Some(AuthSession { exp, user });
+            let kind = if user.is_some() {
+                AuthSessionKind::User
+            } else {
+                AuthSessionKind::DashboardToken
+            };
+            return Some(AuthSession { exp, user, kind });
         }
         if self.dev_open() {
             return Some(AuthSession {
                 exp: u64::MAX,
                 user: None,
+                kind: AuthSessionKind::DevOpen,
             });
         }
         if let Some(token) = bearer_token(headers)
@@ -696,6 +702,7 @@ impl DashboardAuth {
             return Some(AuthSession {
                 exp: u64::MAX,
                 user: None,
+                kind: AuthSessionKind::DashboardToken,
             });
         }
         None
@@ -1541,8 +1548,36 @@ pub struct AuthSession {
     /// Session expiry (unix secs); `u64::MAX` for a bearer-authenticated
     /// (non-browser) request.
     pub exp: u64,
-    /// The user behind a username/password login; `None` for token/dev-open.
+    /// The user behind a username/password login; `None` for token/dev-open
+    /// and delegated dashboard sessions.
     pub user: Option<crate::accounts::SessionUser>,
+    /// The credential class that authenticated this dashboard session.
+    pub kind: AuthSessionKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthSessionKind {
+    User,
+    DashboardToken,
+    DevOpen,
+    Delegated,
+}
+
+impl AuthSession {
+    pub fn delegated(exp: u64) -> Self {
+        Self {
+            exp,
+            user: None,
+            kind: AuthSessionKind::Delegated,
+        }
+    }
+
+    pub fn bootstrap_admin(&self) -> bool {
+        matches!(
+            self.kind,
+            AuthSessionKind::DashboardToken | AuthSessionKind::DevOpen
+        )
+    }
 }
 
 /// `axum` middleware enforcing a valid session on the protected HTTP routes

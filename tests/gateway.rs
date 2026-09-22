@@ -2837,8 +2837,15 @@ async fn dashboard_ws_sends_initial_snapshot_frame() {
 /// upgrade. A fixed masking key is fine — the server accepts any 32-bit key; only
 /// the mask BIT + masked payload matter.
 async fn ws_write_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
+    ws_write_masked_frame(stream, 0x1, text.as_bytes()).await;
+}
+
+async fn ws_write_binary_frame(stream: &mut tokio::net::TcpStream, payload: &[u8]) {
+    ws_write_masked_frame(stream, 0x2, payload).await;
+}
+
+async fn ws_write_masked_frame(stream: &mut tokio::net::TcpStream, opcode: u8, payload: &[u8]) {
     use tokio::io::AsyncWriteExt;
-    let payload = text.as_bytes();
     let len = payload.len();
     let masking_key = [0x11u8, 0x22, 0x33, 0x44];
     let mut masked = Vec::with_capacity(len);
@@ -2846,8 +2853,8 @@ async fn ws_write_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
         masked.push(byte ^ masking_key[i % 4]);
     }
     let mut frame = Vec::new();
-    // FIN=1, opcode=1 (text).
-    frame.push(0x81);
+    // FIN=1 plus caller-selected opcode (1=text, 2=binary).
+    frame.push(0x80 | (opcode & 0x0f));
     // Mask bit set (0x80) + length form.
     if len < 126 {
         frame.push(0x80 | len as u8);
@@ -3009,6 +3016,30 @@ async fn responses_ws_accepts_response_create_envelope() {
     assert!(!types.iter().any(|ty| ty == "response.failed"), "{types:?}");
 }
 
+#[tokio::test]
+async fn responses_ws_rejects_zstd_binary_frame_when_decoded_body_exceeds_limit() {
+    let mut config = test_config();
+    config.max_request_body_bytes = 1024;
+    let gateway = test_gateway_with_config(MockUpstream::default(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let (mut stream, server) = responses_ws_connect(app).await;
+
+    let compressed = zstd::encode_all(&vec![b'a'; 4096][..], 3).expect("zstd encode");
+    ws_write_binary_frame(&mut stream, &compressed).await;
+
+    let (opcode, payload) = ws_read_frame(&mut stream).await;
+    drop(stream);
+    server.abort();
+
+    assert_eq!(opcode, 0x1, "expected response.failed text frame");
+    let value: serde_json::Value = serde_json::from_slice(&payload).expect("WS error is JSON");
+    assert_eq!(value["type"], "response.failed");
+    assert_eq!(
+        value["response"]["error"]["code"],
+        serde_json::json!("payload_too_large")
+    );
+}
+
 /// A plain GET `/v1/responses` (no `Upgrade: websocket` header) returns 426
 /// Upgrade Required (codex's WS attempt always sends the upgrade header, so it
 /// takes the 101 branch; this guards the fallback the `Result<WebSocketUpgrade,
@@ -3076,6 +3107,67 @@ async fn responses_post_decodes_zstd_content_encoding() {
             .any(|m| m.content.as_ref().and_then(|v| v.as_str()) == Some("hello")),
         "the decoded user message reached the upstream"
     );
+}
+
+#[tokio::test]
+async fn responses_post_decodes_zstd_under_small_body_limit() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let mut config = test_config();
+    config.max_request_body_bytes = 1024;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let request = base_request(vec![user_message("hello")]);
+    let json = serde_json::to_string(&request).expect("serialize request");
+    let zstd_body = zstd::encode_all(json.as_bytes(), 3).expect("zstd encode");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .header("content-encoding", "zstd")
+                .body(Body::from(zstd_body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "valid small zstd frames must not be rejected by the zstd window cap"
+    );
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn compressed_request_returns_413_when_decoded_body_exceeds_limit_before_auth_routes() {
+    let mut config = test_config();
+    config.max_request_body_bytes = 1024;
+    let gateway = test_gateway_with_config(MockUpstream::default(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let zstd_body = zstd::encode_all(&vec![b'a'; 4096][..], 3).expect("zstd encode");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/not-a-real-route")
+                .header("content-encoding", "zstd")
+                .body(Body::from(zstd_body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 /// An unsupported `Content-Encoding` surfaces 415 (not a misleading 400 JSON
@@ -8608,6 +8700,19 @@ fn scoped_authz(
     endpoints: &[&str],
     models: &[&str],
 ) -> (llmconduit::authz::AuthzService, String, std::path::PathBuf) {
+    let (service, key, path, _) = scoped_authz_with_bootstrap(endpoints, models);
+    (service, key, path)
+}
+
+fn scoped_authz_with_bootstrap(
+    endpoints: &[&str],
+    models: &[&str],
+) -> (
+    llmconduit::authz::AuthzService,
+    String,
+    std::path::PathBuf,
+    String,
+) {
     let _guard = AUTH_ENV_LOCK.lock().expect("auth env lock");
     let path = std::env::temp_dir().join(format!(
         "llmconduit-http-auth-test-{}.sqlite3",
@@ -8657,6 +8762,44 @@ fn scoped_authz(
         service,
         created.raw_key.expect("raw key returned exactly once"),
         path,
+        bootstrap,
+    )
+}
+
+async fn delegated_dashboard_cookie(
+    service: &llmconduit::authz::AuthzService,
+    dashboard_auth: &llmconduit::dashboard_auth::DashboardAuth,
+    bootstrap: &str,
+) -> (String, String) {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {bootstrap}")).unwrap(),
+    );
+    let context = service
+        .authenticate(&headers)
+        .expect("authz backend available")
+        .expect("bootstrap context");
+    let csrf = dashboard_auth.issue_csrf_token();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(csrf.as_bytes());
+    let actor = service
+        .create_delegated_session(
+            &context,
+            digest.as_slice(),
+            chrono::Utc::now().timestamp() + 300,
+        )
+        .await
+        .expect("delegated dashboard session");
+    let session_id = match actor {
+        llmconduit::dashboard_access::ManagementActor::Delegated { session_id, .. } => session_id,
+        llmconduit::dashboard_access::ManagementActor::Bootstrap => {
+            panic!("delegated session returned bootstrap actor")
+        }
+    };
+    (
+        dashboard_auth
+            .issue_delegated_session(&session_id, chrono::Utc::now().timestamp() as u64 + 300),
+        csrf,
     )
 }
 
@@ -8782,6 +8925,188 @@ async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
         .await
         .unwrap();
     assert_eq!(missing_csrf.status().as_u16(), 403);
+
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn delegated_dashboard_sessions_cannot_enter_legacy_dashboard_apis() {
+    let (authz, _delegated_key, store_path, bootstrap) =
+        scoped_authz_with_bootstrap(&["*"], &["*"]);
+    let env = d13_env(true);
+    let dashboard_auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "127.0.0.1:8765".parse().unwrap(),
+        &env,
+    )
+    .expect("dashboard auth builds")
+    .auth;
+    let (session, csrf) = delegated_dashboard_cookie(&authz, &dashboard_auth, &bootstrap).await;
+    let gateway = Arc::new(
+        test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&dashboard_auth)))
+            .with_authz(authz),
+    );
+    let app = llmconduit::http::build_router(
+        gateway,
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    );
+    let cookie = format!("llmconduit_session={session}; llmconduit_csrf={csrf}");
+
+    let catalog = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/catalog")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog.status().as_u16(), 200);
+
+    for (method, uri, body) in [
+        ("GET", "/dashboard/api/me", Body::empty()),
+        ("GET", "/dashboard/api/flows", Body::empty()),
+        ("GET", "/dashboard/api/users", Body::empty()),
+        ("GET", "/dashboard/api/providers", Body::empty()),
+        ("GET", "/dashboard/api/configured-providers", Body::empty()),
+        (
+            "POST",
+            "/dashboard/api/configured-providers",
+            Body::from(r#"{"name":"x","base_url":"http://127.0.0.1:9999","api_key":"k"}"#),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(axum::http::header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            403,
+            "{method} {uri} rejected delegated legacy access"
+        );
+    }
+
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn delegated_dashboard_session_is_not_legacy_accounts_admin() {
+    let store_path = std::env::temp_dir().join(format!(
+        "llmconduit-delegated-accounts-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    ));
+    let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+    let _guard = AUTH_ENV_LOCK.lock().expect("auth env lock");
+    let old_pepper = std::env::var_os("LLMCONDUIT_AUTH_PEPPER");
+    let old_bootstrap = std::env::var_os("LLMCONDUIT_AUTH_BOOTSTRAP_KEY");
+    // SAFETY: this integration-test binary serializes mutation of these two
+    // process-local variables, restores both below, and no production code
+    // mutates the environment.
+    unsafe {
+        std::env::set_var("LLMCONDUIT_AUTH_PEPPER", "delegated-accounts-test-pepper");
+        std::env::set_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY", &bootstrap);
+    }
+    let authz = llmconduit::authz::AuthzService::from_config(&llmconduit::config::AuthConfig {
+        mode: llmconduit::config::AuthMode::Enforce,
+        store_path: store_path.clone(),
+    })
+    .expect("authz service");
+    // SAFETY: see the serialized environment mutation above.
+    unsafe {
+        match old_pepper {
+            Some(value) => std::env::set_var("LLMCONDUIT_AUTH_PEPPER", value),
+            None => std::env::remove_var("LLMCONDUIT_AUTH_PEPPER"),
+        }
+        match old_bootstrap {
+            Some(value) => std::env::set_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY", value),
+            None => std::env::remove_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY"),
+        }
+    }
+    drop(_guard);
+    let mut auth_headers = axum::http::HeaderMap::new();
+    auth_headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {bootstrap}")).unwrap(),
+    );
+    let context = authz
+        .authenticate(&auth_headers)
+        .expect("bootstrap authenticates")
+        .expect("bootstrap context");
+    let csrf = "delegated-csrf-token";
+    let csrf_digest = <sha2::Sha256 as sha2::Digest>::digest(csrf.as_bytes());
+    let exp = chrono::Utc::now().timestamp().max(0) as u64 + 300;
+    let actor = authz
+        .create_delegated_session(
+            &context,
+            csrf_digest.as_slice(),
+            i64::try_from(exp).unwrap_or(i64::MAX),
+        )
+        .await
+        .expect("create delegated session");
+    let session_id = match actor {
+        llmconduit::dashboard_access::ManagementActor::Delegated { session_id, .. } => session_id,
+        llmconduit::dashboard_access::ManagementActor::Bootstrap => {
+            panic!("delegated session returned bootstrap actor")
+        }
+    };
+    let env = d13_env(true);
+    let dashboard_auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "127.0.0.1:8765".parse().unwrap(),
+        &env,
+    )
+    .expect("dashboard auth builds")
+    .auth;
+    let gateway = Arc::new(
+        test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&dashboard_auth)))
+            .with_authz(authz),
+    );
+    let app = llmconduit::http::build_router(
+        gateway,
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    );
+
+    let session = dashboard_auth.issue_delegated_session(&session_id, exp);
+
+    let list = accounts_request(&app, "GET", "/dashboard/api/users", &session, None, None).await;
+    assert_eq!(list.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let create = accounts_request(
+        &app,
+        "POST",
+        "/dashboard/api/users",
+        &session,
+        Some(csrf),
+        Some(json!({
+            "username": "delegated-created-admin",
+            "password": "password-2",
+            "is_admin": true
+        })),
+    )
+    .await;
+    assert_eq!(create.status(), axum::http::StatusCode::FORBIDDEN);
 
     remove_auth_store(&store_path);
 }

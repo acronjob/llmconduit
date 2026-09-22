@@ -660,7 +660,11 @@ pub(crate) fn authorize_mesh_admin_read(
             "administrator role required",
         ));
     }
-    if session.user.as_ref().is_none_or(|user| user.is_admin) {
+    if session
+        .user
+        .as_ref()
+        .map_or_else(|| session.bootstrap_admin(), |user| user.is_admin)
+    {
         None
     } else {
         Some(mesh_error(
@@ -833,6 +837,7 @@ mod tests {
                 username: "operator".to_string(),
                 is_admin,
             }),
+            kind: crate::dashboard_auth::AuthSessionKind::User,
         }
     }
 
@@ -840,6 +845,7 @@ mod tests {
         AuthSession {
             exp: u64::MAX,
             user: None,
+            kind: crate::dashboard_auth::AuthSessionKind::DashboardToken,
         }
     }
 

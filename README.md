@@ -74,6 +74,16 @@ gate, so start with `--with-debug-ui` and set
 dashboard CSRF token. The pepper and bootstrap key are never persisted in the
 YAML config or returned by read APIs.
 
+Signing in with a management API key creates a delegated session, not a
+dashboard administrator. Delegated sessions use the permission-checked
+`/dashboard/api/auth/*` routes; catalog and chat access also enforce the key's
+inference grants. Legacy account administration, provider inventory and global
+telemetry are not available to delegated sessions.
+
+`max_request_body_bytes` limits both received and decompressed request bodies,
+including Responses WebSocket messages. Oversized decoded HTTP bodies receive
+`413`; decompression runs with bounded concurrency and a bounded zstd window.
+
 To import current OpenRouter endpoint pricing into the authorization store,
 set the management credential in the environment and name each model to sync:
 
@@ -805,6 +815,9 @@ stage; Node, frontend sources, and SQL migration source files are not present in
 the final image. Migrations are copied into the Rust builder because
 `sqlx::migrate!` embeds them at compile time. The final image runs as distroless
 `nonroot`; `/data` is prepared with matching ownership for SQLite.
+
+Local dashboard builds and tests use Vite 7 and Vitest 4. Use Node 22.12+
+(22.x) or Node 24+; the Docker frontend stage uses Node 22.
 
 The quickest local deployment uses the checked-in Docker-ready config and a
 named data volume:

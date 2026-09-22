@@ -465,7 +465,11 @@ fn dashboard_error(status: StatusCode, message: impl Into<String>) -> Response {
 }
 
 fn dashboard_admin_denial(session: &AuthSession) -> Option<Response> {
-    if session.user.as_ref().is_none_or(|user| user.is_admin) {
+    if session
+        .user
+        .as_ref()
+        .map_or_else(|| session.bootstrap_admin(), |user| user.is_admin)
+    {
         None
     } else {
         Some(dashboard_error(
