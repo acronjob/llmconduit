@@ -34,6 +34,7 @@ pub(crate) struct WorkerSession {
     pub(crate) endpoint_id: EndpointId,
     pub(crate) connection: Option<Connection>,
     pub(crate) generation: u64,
+    worker_name: Option<String>,
     connected_at: Instant,
     last_seen: Mutex<Instant>,
     resources: Mutex<HashMap<String, ResourceState>>,
@@ -83,10 +84,12 @@ impl MeshRegistry {
         advertisement: WorkerAdvertisement,
     ) -> Arc<WorkerSession> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let worker_name = advertised_worker_name(advertisement.node_name.as_deref());
         let session = Arc::new(WorkerSession {
             endpoint_id,
             connection: Some(connection),
             generation,
+            worker_name,
             connected_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
             model_switching: Mutex::new(advertisement.model_switching.clone()),
@@ -111,10 +114,12 @@ impl MeshRegistry {
         advertisement: WorkerAdvertisement,
     ) -> Arc<WorkerSession> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let worker_name = advertised_worker_name(advertisement.node_name.as_deref());
         let session = Arc::new(WorkerSession {
             endpoint_id,
             connection: None,
             generation,
+            worker_name,
             connected_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
             model_switching: Mutex::new(advertisement.model_switching.clone()),
@@ -436,6 +441,7 @@ impl MeshRegistry {
         for session in sessions {
             let stale = session.is_stale(now, self.heartbeat_timeout);
             let provider_id = format!("mesh:{}", session.endpoint_id);
+            let provider_name = session.provider_name(&provider_id);
             let resources = session
                 .resources
                 .lock()
@@ -444,7 +450,7 @@ impl MeshRegistry {
                 let capacity = resource.gate.snapshot();
                 entries.push(ProviderInventoryEntry {
                     provider_id: provider_id.clone(),
-                    provider_name: resource.resource_id.clone(),
+                    provider_name: provider_name.clone(),
                     resource_id: Some(resource.resource_id.clone()),
                     route: Some(resource.resource_id.clone()),
                     base_url: format!("mesh://{}/{}", session.endpoint_id, resource.resource_id),
@@ -599,6 +605,12 @@ impl MeshRegistry {
 }
 
 impl WorkerSession {
+    fn provider_name(&self, fallback_provider_id: &str) -> String {
+        self.worker_name
+            .clone()
+            .unwrap_or_else(|| fallback_provider_id.to_string())
+    }
+
     pub(crate) fn touch(&self) {
         *self.last_seen.lock().expect("mesh last_seen lock poisoned") = Instant::now();
     }
@@ -675,6 +687,13 @@ impl WorkerSession {
         let last_seen = *self.last_seen.lock().expect("mesh last_seen lock poisoned");
         now.duration_since(last_seen) > timeout
     }
+}
+
+fn advertised_worker_name(node_name: Option<&str>) -> Option<String> {
+    node_name.and_then(|name| {
+        let trimmed = name.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 fn resources_from_advertisement(
@@ -813,6 +832,154 @@ mod tests {
         assert_eq!(provider.active_requests, Some(1));
         assert!(provider.accepting_requests);
         drop(reservation);
+    }
+
+    #[test]
+    fn provider_inventory_groups_resource_slots_under_advertised_worker_name() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            WorkerAdvertisement {
+                protocol_version: PROTOCOL_VERSION,
+                node_name: Some("  workstation-a  ".into()),
+                agent_version: "test".into(),
+                resources: vec![
+                    ResourceAdvertisement {
+                        resource_id: "slot-a".into(),
+                        models: vec![ModelAdvertisement {
+                            id: "model-a".into(),
+                            context_limit: None,
+                        }],
+                        availability: AvailabilitySchedule::default(),
+                        effective_capacity: 1,
+                        accepting_requests: true,
+                        healthy: true,
+                        revision: 1,
+                    },
+                    ResourceAdvertisement {
+                        resource_id: "slot-b".into(),
+                        models: vec![ModelAdvertisement {
+                            id: "model-b".into(),
+                            context_limit: None,
+                        }],
+                        availability: AvailabilitySchedule::default(),
+                        effective_capacity: 1,
+                        accepting_requests: true,
+                        healthy: true,
+                        revision: 1,
+                    },
+                ],
+                model_switching: None,
+            },
+        );
+
+        let inventory = registry.provider_inventory();
+        assert_eq!(inventory.len(), 2);
+        assert!(
+            inventory
+                .iter()
+                .all(|entry| entry.provider_id == format!("mesh:{endpoint}"))
+        );
+        assert!(
+            inventory
+                .iter()
+                .all(|entry| entry.provider_name == "workstation-a")
+        );
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|entry| entry.resource_id.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["slot-a", "slot-b"]
+        );
+    }
+
+    #[test]
+    fn provider_inventory_falls_back_to_endpoint_provider_id_for_missing_worker_name() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint_without_name = SecretKey::generate().public();
+        let endpoint_with_blank_name = SecretKey::generate().public();
+        for (endpoint, node_name, resource_prefix) in [
+            (endpoint_without_name, None, "none"),
+            (endpoint_with_blank_name, Some(" \t "), "blank"),
+        ] {
+            registry.register_test(
+                endpoint,
+                WorkerAdvertisement {
+                    protocol_version: PROTOCOL_VERSION,
+                    node_name: node_name.map(str::to_string),
+                    agent_version: "test".into(),
+                    resources: ["a", "b"]
+                        .into_iter()
+                        .map(|slot| {
+                            let resource_id = format!("slot-{resource_prefix}-{slot}");
+                            ResourceAdvertisement {
+                                resource_id: resource_id.clone(),
+                                models: vec![ModelAdvertisement {
+                                    id: format!("{resource_id}-model"),
+                                    context_limit: None,
+                                }],
+                                availability: AvailabilitySchedule::default(),
+                                effective_capacity: 1,
+                                accepting_requests: true,
+                                healthy: true,
+                                revision: 1,
+                            }
+                        })
+                        .collect(),
+                    model_switching: None,
+                },
+            );
+        }
+
+        let inventory = registry.provider_inventory();
+        assert_eq!(inventory.len(), 4);
+        let mut rows_by_provider = HashMap::new();
+        for entry in &inventory {
+            assert_eq!(entry.provider_name, entry.provider_id);
+            assert!(entry.provider_id.starts_with("mesh:"));
+            *rows_by_provider
+                .entry(entry.provider_id.clone())
+                .or_insert(0) += 1;
+        }
+        assert_eq!(rows_by_provider.len(), 2);
+        assert!(rows_by_provider.values().all(|rows| *rows == 2));
+    }
+
+    #[test]
+    fn provider_inventory_uses_latest_worker_name_after_reregistration() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        for node_name in ["worker-old", "worker-new"] {
+            registry.register_test(
+                endpoint,
+                WorkerAdvertisement {
+                    protocol_version: PROTOCOL_VERSION,
+                    node_name: Some(node_name.to_string()),
+                    agent_version: "test".into(),
+                    resources: vec![ResourceAdvertisement {
+                        resource_id: "slot".into(),
+                        models: vec![ModelAdvertisement {
+                            id: "model".into(),
+                            context_limit: None,
+                        }],
+                        availability: AvailabilitySchedule::default(),
+                        effective_capacity: 1,
+                        accepting_requests: true,
+                        healthy: true,
+                        revision: 1,
+                    }],
+                    model_switching: None,
+                },
+            );
+        }
+
+        let inventory = registry.provider_inventory();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].provider_name, "worker-new");
+        assert_eq!(inventory[0].provider_id, format!("mesh:{endpoint}"));
+        assert_eq!(inventory[0].resource_id.as_deref(), Some("slot"));
     }
 
     #[test]

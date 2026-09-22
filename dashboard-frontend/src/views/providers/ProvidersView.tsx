@@ -15,6 +15,7 @@ import {
   buildProviderInventory,
   costQuality,
   formatPercent,
+  groupProviderSlots,
   type ProviderInventoryRow,
   type ProviderInventorySummary,
 } from './providersModel';
@@ -208,7 +209,7 @@ export function ProvidersView() {
           onLoad={(id) => loadFleetModel.mutate(id)}
           onUnload={(id) => unloadFleetModel.mutate(id)}
         />
-        <ProviderTable rows={filteredRows} total={inventory.rows.length} />
+        <ProviderTable rows={filteredRows} allRows={inventory.rows} />
         <ModelsPanel models={inventory.unionCatalogModels} />
       </div>
     </div>
@@ -719,7 +720,7 @@ function fmtFleetTime(value: string): string {
 
 function SummaryStrip({ summary }: { summary: ProviderInventorySummary }) {
   const cells = [
-    { label: 'providers', value: String(summary.providers), quality: 'measured' },
+    { label: 'slots', value: String(summary.providers), quality: 'measured' },
     { label: 'healthy', value: String(summary.healthy), quality: 'measured', accent: 'text-status-healthy' },
     { label: 'cooling', value: String(summary.cooling), quality: 'measured', accent: 'text-status-cooling' },
     { label: 'down', value: String(summary.down), quality: 'measured', accent: 'text-status-down' },
@@ -742,36 +743,56 @@ function SummaryStrip({ summary }: { summary: ProviderInventorySummary }) {
   );
 }
 
-function ProviderTable({ rows, total }: { rows: ProviderInventoryRow[]; total: number }) {
+function ProviderTable({ rows, allRows }: { rows: ProviderInventoryRow[]; allRows: ProviderInventoryRow[] }) {
+  const visibleKeys = new Set(rows.map((row) => row.key));
+  const groups = groupProviderSlots(allRows)
+    .map((group) => ({
+      name: group.name,
+      total: group.rows.length,
+      rows: group.rows.filter((row) => visibleKeys.has(row.key)),
+    }))
+    .filter((group) => group.rows.length > 0);
   return (
-    <Panel className="overflow-hidden" data-testid="providers-table" data-available={rows.length > 0 ? 'true' : 'false'}>
-      <div className="flex items-center justify-between border-b border-line px-4 py-3">
-        <h2 className="text-sm font-semibold">Providers</h2>
-        <span className="font-mono text-[10px] text-text-muted">{rows.length} / {total}</span>
+    <div className="space-y-3" data-testid="providers-table" data-available={rows.length > 0 ? 'true' : 'false'}>
+      <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+        <h2 className="text-sm font-semibold">Provider slots</h2>
+        <span className="font-mono text-[10px] text-text-muted">
+          {groups.length} {groups.length === 1 ? 'provider' : 'providers'} · {rows.length} / {allRows.length} slots
+        </span>
       </div>
-      <div className="overflow-auto">
-        <table className="w-full min-w-[1180px] text-left text-xs">
-          <thead className="bg-panel text-[10px] uppercase tracking-[0.12em] text-text-muted">
-            <tr>
-              <th className="px-4 py-2">Provider</th>
-              <th className="px-3 py-2">Advertised models</th>
-              <th className="px-3 py-2">Windows & limits</th>
-              <th className="px-3 py-2">Usage</th>
-              <th className="px-3 py-2">Latency</th>
-              <th className="px-3 py-2">Traffic</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-line">
-            {rows.map((row) => <ProviderRow key={row.key} row={row} />)}
-          </tbody>
-        </table>
-      </div>
+      {groups.map((group) => (
+        <Panel key={group.name} className="overflow-hidden" role="region" aria-label={group.name} data-testid="provider-group">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line bg-accent/5 px-4 py-3">
+            <h3 className="min-w-0 break-words text-sm font-semibold text-text">{group.name}</h3>
+            <span className="shrink-0 font-mono text-[10px] text-text-muted">
+              {group.rows.length} / {group.total} {group.total === 1 ? 'slot' : 'slots'}
+            </span>
+          </div>
+          <div className="overflow-auto">
+            <table className="w-full min-w-[1180px] text-left text-xs" aria-label={`${group.name} slots`}>
+              <thead className="bg-panel text-[10px] uppercase tracking-[0.12em] text-text-muted">
+                <tr>
+                  <th className="px-4 py-2">Slot</th>
+                  <th className="px-3 py-2">Advertised models</th>
+                  <th className="px-3 py-2">Windows & limits</th>
+                  <th className="px-3 py-2">Usage</th>
+                  <th className="px-3 py-2">Latency</th>
+                  <th className="px-3 py-2">Traffic</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {group.rows.map((row) => <ProviderRow key={row.key} row={row} />)}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      ))}
       {rows.length === 0 && (
-        <div className="p-6 text-center text-xs italic text-text-muted" data-testid="providers-empty" data-quality="unavailable">
+        <Panel className="p-6 text-center text-xs italic text-text-muted" data-testid="providers-empty" data-quality="unavailable">
           No providers match this filter.
-        </div>
+        </Panel>
       )}
-    </Panel>
+    </div>
   );
 }
 
@@ -784,9 +805,9 @@ function ProviderRow({ row }: { row: ProviderInventoryRow }) {
         <div className="flex items-center gap-2">
           <span className={cn('h-2.5 w-2.5 rounded-full', statusDot(row.status))} aria-hidden />
           <div>
-            <div className="font-medium text-text">{row.name}</div>
+            <div className="font-medium text-text">{row.resourceId ?? row.route ?? row.id}</div>
             <div className="mt-0.5 font-mono text-[10px] text-text-muted">
-              {row.id}{row.resourceId ? ` · ${row.resourceId}` : ''}{row.route ? ` · ${row.route}` : ''}
+              {row.id}{row.route ? ` · ${row.route}` : ''}
             </div>
           </div>
         </div>
