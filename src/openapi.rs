@@ -179,6 +179,8 @@ impl utoipa::Modify for SecuritySchemes {
         crate::dashboard_mesh::disable_node,
         crate::dashboard_mesh::enable_node,
         crate::dashboard_mesh::switch_node_model,
+        crate::dashboard_mesh::load_node_model,
+        crate::dashboard_mesh::unload_node_model,
         crate::dashboard_mesh::disable_model,
         crate::dashboard_mesh::enable_model,
         crate::accounts_api::me,

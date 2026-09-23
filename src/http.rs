@@ -239,19 +239,6 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
             delete(delete_configured_provider),
         )
         .route(
-            "/dashboard/api/fleet",
-            get(crate::dashboard_fleet::fleet_models),
-        )
-        .route(
-            "/dashboard/api/fleet/models/{id}/load",
-            post(crate::dashboard_fleet::fleet_load_model),
-        )
-        .route(
-            "/dashboard/api/fleet/models/{id}/unload",
-            post(crate::dashboard_fleet::fleet_unload_model),
-        )
-        .route("/dashboard/api/mesh", get(dashboard_mesh::mesh_state))
-        .route(
             "/dashboard/api/mesh/join-keys",
             post(dashboard_mesh::create_join_key),
         )
@@ -266,10 +253,6 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         .route(
             "/dashboard/api/mesh/nodes/{endpoint_id}/enable",
             post(dashboard_mesh::enable_node),
-        )
-        .route(
-            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/switch",
-            post(dashboard_mesh::switch_node_model),
         )
         .route(
             "/dashboard/api/mesh/models/disable",
@@ -337,6 +320,37 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
                 Arc::clone(&gateway),
                 require_management_access,
             ));
+    let fleet_routes = Router::new()
+        .route("/dashboard/api/mesh", get(dashboard_mesh::mesh_state))
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/switch",
+            post(dashboard_mesh::switch_node_model),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/load",
+            post(dashboard_mesh::load_node_model),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/unload",
+            post(dashboard_mesh::unload_node_model),
+        )
+        .route(
+            "/dashboard/api/fleet",
+            get(crate::dashboard_fleet::fleet_models),
+        )
+        .route(
+            "/dashboard/api/fleet/models/{id}/load",
+            post(crate::dashboard_fleet::fleet_load_model),
+        )
+        .route(
+            "/dashboard/api/fleet/models/{id}/unload",
+            post(crate::dashboard_fleet::fleet_unload_model),
+        )
+        .route_layer(middleware::map_response(dashboard_api_no_store))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            require_management_access,
+        ));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
     // headers in-handler (they serve HTML, not the JSON `no-store` set), so they are
@@ -386,6 +400,7 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
     api_gated
         .merge(debug_gated)
         .merge(access_routes)
+        .merge(fleet_routes)
         .merge(dashboard_shell)
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).

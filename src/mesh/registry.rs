@@ -2,8 +2,9 @@
 
 use crate::mesh::capacity::{CapacityGate, CapacityPermit};
 use crate::mesh::protocol::{
-    Heartbeat, ModelAdvertisement, ModelSwitchingAdvertisement, ResourceAdvertisement, StreamOpen,
-    SwitchModelRequest, SwitchModelResponse, WorkerAdvertisement,
+    Heartbeat, ModelAdvertisement, ModelLifecycleAction, ModelSwitchingAdvertisement,
+    ResourceAdvertisement, StreamOpen, SwitchModelRequest, SwitchModelResponse,
+    WorkerAdvertisement,
 };
 use crate::upstream::ProviderInventoryEntry;
 use iroh::EndpointId;
@@ -308,6 +309,25 @@ impl MeshRegistry {
         endpoint_id: EndpointId,
         model_id: String,
     ) -> crate::error::AppResult<SwitchModelResponse> {
+        self.set_model_state(endpoint_id, model_id, ModelLifecycleAction::Load)
+            .await
+    }
+
+    pub(crate) async fn unload_model(
+        &self,
+        endpoint_id: EndpointId,
+        model_id: String,
+    ) -> crate::error::AppResult<SwitchModelResponse> {
+        self.set_model_state(endpoint_id, model_id, ModelLifecycleAction::Unload)
+            .await
+    }
+
+    async fn set_model_state(
+        &self,
+        endpoint_id: EndpointId,
+        model_id: String,
+        action: ModelLifecycleAction,
+    ) -> crate::error::AppResult<SwitchModelResponse> {
         let session = self
             .current_session_any_generation(endpoint_id)
             .ok_or_else(|| crate::error::AppError::upstream("mesh worker is not connected"))?;
@@ -346,8 +366,11 @@ impl MeshRegistry {
                         "failed to open mesh switch stream: {err}"
                     ))
                 })?;
-        crate::mesh::io::write_stream_open(&mut send, &StreamOpen::SwitchModel(request.clone()))
-            .await?;
+        let stream_open = match action {
+            ModelLifecycleAction::Load => StreamOpen::SwitchModel(request.clone()),
+            ModelLifecycleAction::Unload => StreamOpen::UnloadModel(request.clone()),
+        };
+        crate::mesh::io::write_stream_open(&mut send, &stream_open).await?;
         let mut response = tokio::time::timeout(
             Duration::from_secs(30),
             crate::mesh::io::read_switch_response(&mut recv),
@@ -1100,6 +1123,8 @@ mod tests {
                         description: None,
                         phase: "ready".into(),
                         desired_state: "loaded".into(),
+                        gpu_count: 1,
+                        assigned_gpus: vec![0],
                     }],
                     revision: 5,
                 }),
@@ -1112,6 +1137,8 @@ mod tests {
                 description: None,
                 phase: "unloaded".into(),
                 desired_state: "unloaded".into(),
+                gpu_count: 1,
+                assigned_gpus: Vec::new(),
             }],
             revision: 4,
         });

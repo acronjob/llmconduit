@@ -1,3 +1,4 @@
+use crate::dashboard_access::{ManagementActor, ManagementPermission};
 use crate::dashboard_api::json_no_store;
 use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
@@ -73,6 +74,8 @@ pub struct MeshSwitchableModel {
     pub description: Option<String>,
     pub phase: String,
     pub desired_state: String,
+    pub gpu_count: u32,
+    pub assigned_gpus: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -150,12 +153,10 @@ pub struct SwitchMeshModelResponse {
 )]
 pub async fn mesh_state(
     State(gateway): State<Arc<Gateway>>,
-    Extension(auth): Extension<Arc<DashboardAuth>>,
-    Extension(session): Extension<AuthSession>,
-    headers: HeaderMap,
+    Extension(actor): Extension<ManagementActor>,
 ) -> Response {
-    if let Some(response) = authorize_mesh_admin_read(auth.as_ref(), &session, &headers) {
-        return response;
+    if !actor.allows(ManagementPermission::FleetModelsRead) {
+        return mesh_error(StatusCode::FORBIDDEN, "management permission denied");
     }
     let Some(admin) = gateway.mesh_admin() else {
         return mesh_error(StatusCode::NOT_FOUND, "mesh controller is disabled");
@@ -393,13 +394,78 @@ pub async fn enable_node(
 )]
 pub async fn switch_node_model(
     State(gateway): State<Arc<Gateway>>,
-    Extension(auth): Extension<Arc<DashboardAuth>>,
-    Extension(session): Extension<AuthSession>,
+    Extension(actor): Extension<ManagementActor>,
     Path((endpoint_id, model_id)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = authorize_mesh_mutation(auth.as_ref(), &session, &headers).await {
-        return response;
+    set_node_model_state(gateway, actor, endpoint_id, model_id, false).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/load",
+    tag = "dashboard",
+    params(
+        ("endpoint_id" = String, Path, description = "Iroh endpoint id."),
+        ("model_id" = String, Path, description = "Advertised Fleet model id.")
+    ),
+    responses(
+        (status = 200, body = SwitchMeshModelResponse),
+        (status = 202, body = SwitchMeshModelResponse),
+        (status = 400, body = crate::openapi::DashboardError),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 404, body = crate::openapi::DashboardError),
+        (status = 409, body = crate::openapi::DashboardError),
+        (status = 502, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn load_node_model(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(actor): Extension<ManagementActor>,
+    Path((endpoint_id, model_id)): Path<(String, String)>,
+) -> Response {
+    set_node_model_state(gateway, actor, endpoint_id, model_id, false).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/unload",
+    tag = "dashboard",
+    params(
+        ("endpoint_id" = String, Path, description = "Iroh endpoint id."),
+        ("model_id" = String, Path, description = "Advertised Fleet model id.")
+    ),
+    responses(
+        (status = 200, body = SwitchMeshModelResponse),
+        (status = 202, body = SwitchMeshModelResponse),
+        (status = 400, body = crate::openapi::DashboardError),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 404, body = crate::openapi::DashboardError),
+        (status = 409, body = crate::openapi::DashboardError),
+        (status = 502, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn unload_node_model(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(actor): Extension<ManagementActor>,
+    Path((endpoint_id, model_id)): Path<(String, String)>,
+) -> Response {
+    set_node_model_state(gateway, actor, endpoint_id, model_id, true).await
+}
+
+async fn set_node_model_state(
+    gateway: Arc<Gateway>,
+    actor: ManagementActor,
+    endpoint_id: String,
+    model_id: String,
+    unload: bool,
+) -> Response {
+    let permission = fleet_model_permission(unload);
+    if !actor.allows(permission) {
+        return mesh_error(StatusCode::FORBIDDEN, "management permission denied");
     }
     let Some(admin) = gateway.mesh_admin() else {
         return mesh_error(StatusCode::NOT_FOUND, "mesh controller is disabled");
@@ -417,11 +483,18 @@ pub async fn switch_node_model(
         tracing::error!(error = %err, "failed to initialize mesh admin store");
         return mesh_error(StatusCode::INTERNAL_SERVER_ERROR, "mesh state unavailable");
     }
-    match admin
-        .registry()
-        .switch_model(endpoint, model_id.clone())
-        .await
-    {
+    let result = if unload {
+        admin
+            .registry()
+            .unload_model(endpoint, model_id.clone())
+            .await
+    } else {
+        admin
+            .registry()
+            .switch_model(endpoint, model_id.clone())
+            .await
+    };
+    match result {
         Ok(result) if result.accepted => json_no_store(
             if result.changed {
                 StatusCode::ACCEPTED
@@ -447,6 +520,14 @@ pub async fn switch_node_model(
             tracing::warn!(error = %err, endpoint_id, model_id, "mesh model switch failed");
             mesh_error(err.status_code(), &err.client_message)
         }
+    }
+}
+
+fn fleet_model_permission(unload: bool) -> ManagementPermission {
+    if unload {
+        ManagementPermission::FleetModelsUnload
+    } else {
+        ManagementPermission::FleetModelsLoad
     }
 }
 
@@ -782,6 +863,8 @@ impl From<ModelSwitchingAdvertisement> for MeshModelSwitching {
                     description: model.description,
                     phase: model.phase,
                     desired_state: model.desired_state,
+                    gpu_count: model.gpu_count,
+                    assigned_gpus: model.assigned_gpus,
                 })
                 .collect(),
             revision: value.revision,
@@ -858,6 +941,28 @@ mod tests {
             HeaderValue::from_str(&format!("{CSRF_COOKIE}={csrf}")).expect("cookie"),
         );
         headers
+    }
+
+    #[test]
+    fn remote_fleet_actions_require_distinct_management_permissions() {
+        assert_eq!(
+            fleet_model_permission(false),
+            ManagementPermission::FleetModelsLoad
+        );
+        assert_eq!(
+            fleet_model_permission(true),
+            ManagementPermission::FleetModelsUnload
+        );
+
+        let read_only = ManagementActor::Delegated {
+            session_id: "sess_mesh_fleet_read".into(),
+            principal_id: "usr_mesh_fleet_read".into(),
+            key_id: "key_mesh_fleet_read".into(),
+            permissions: Arc::from([ManagementPermission::FleetModelsRead]),
+        };
+        assert!(read_only.allows(ManagementPermission::FleetModelsRead));
+        assert!(!read_only.allows(ManagementPermission::FleetModelsLoad));
+        assert!(!read_only.allows(ManagementPermission::FleetModelsUnload));
     }
 
     #[test]

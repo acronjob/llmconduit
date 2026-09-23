@@ -58,6 +58,12 @@ pub enum ManagementPermission {
     SessionsRead,
     #[serde(rename = "auth.sessions.terminate")]
     SessionsTerminate,
+    #[serde(rename = "fleet.models.read")]
+    FleetModelsRead,
+    #[serde(rename = "fleet.models.load")]
+    FleetModelsLoad,
+    #[serde(rename = "fleet.models.unload")]
+    FleetModelsUnload,
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +78,7 @@ pub enum ManagementActor {
 }
 
 impl ManagementActor {
-    fn allows(&self, permission: ManagementPermission) -> bool {
+    pub(crate) fn allows(&self, permission: ManagementPermission) -> bool {
         matches!(self, Self::Bootstrap)
             || matches!(self, Self::Delegated { permissions, .. } if permissions.contains(&permission))
     }

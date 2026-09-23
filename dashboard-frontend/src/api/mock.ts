@@ -122,8 +122,8 @@ let MESH_NODES: MeshNode[] = [
       provider: 'fleet',
       revision: 1,
       models: [
-        { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', phase: 'ready', desired_state: 'loaded' },
-        { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded' },
+        { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', phase: 'ready', desired_state: 'loaded', gpu_count: 4, assigned_gpus: [0, 1, 6, 7] },
+        { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 8, assigned_gpus: [] },
       ],
     },
   },
@@ -864,12 +864,13 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     });
     return updated ? json({ updated, endpoint_id: endpointId, enabled, evicted: !enabled }) : json({ error: 'mesh node not found' }, 404);
   }
-  const meshSwitchMatch = path.match(/^\/dashboard\/api\/mesh\/nodes\/([^/]+)\/models\/([^/]+)\/switch$/);
+  const meshSwitchMatch = path.match(/^\/dashboard\/api\/mesh\/nodes\/([^/]+)\/models\/([^/]+)\/(switch|load|unload)$/);
   if (meshSwitchMatch && method === 'POST') {
     const csrf = headerValue(init?.headers, 'X-CSRF-Token');
     if (!csrf) return json({ error: 'missing csrf' }, 403);
     const endpointId = decodeURIComponent(meshSwitchMatch[1] ?? '');
     const modelId = decodeURIComponent(meshSwitchMatch[2] ?? '');
+    const unload = meshSwitchMatch[3] === 'unload';
     const node = MESH_NODES.find((entry) => entry.endpoint_id === endpointId);
     if (!node?.model_switching?.models.some((model) => model.id === modelId)) {
       return json({ error: 'model is not advertised as switchable' }, 400);
@@ -879,8 +880,9 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       revision: node.model_switching.revision + 1,
       models: node.model_switching.models.map((model) => ({
         ...model,
-        phase: model.id === modelId ? 'loading' : model.phase,
-        desired_state: model.id === modelId ? 'loaded' : model.desired_state,
+        phase: model.id === modelId ? (unload ? 'unloaded' : 'loading') : model.phase,
+        desired_state: model.id === modelId ? (unload ? 'unloaded' : 'ready') : model.desired_state,
+        assigned_gpus: model.id === modelId && unload ? [] : model.assigned_gpus,
       })),
     };
     return json({ endpoint_id: endpointId, model_id: modelId, accepted: true, changed: true });

@@ -7,10 +7,10 @@ use crate::mesh::identity::load_or_create;
 use crate::mesh::io::{Admission, read_stream_open, write_admission, write_switch_response};
 use crate::mesh::protocol::{
     AdmissionRejectCode, ENROLL_ALPN, EnrollRequest, EnrollResponse, Heartbeat, HubToWorker,
-    ModelAdvertisement, ModelSwitchingAdvertisement, PROTOCOL_VERSION, ResourceAdvertisement,
-    ResourceRuntimeState, StreamOpen, SwitchModelRequest, SwitchModelResponse,
-    SwitchableModelAdvertisement, WORKER_ALPN, WorkerAdvertisement, WorkerToHub, read_control,
-    write_control,
+    ModelAdvertisement, ModelLifecycleAction, ModelSwitchingAdvertisement, PROTOCOL_VERSION,
+    ResourceAdvertisement, ResourceRuntimeState, StreamOpen, SwitchModelRequest,
+    SwitchModelResponse, SwitchableModelAdvertisement, WORKER_ALPN, WorkerAdvertisement,
+    WorkerToHub, read_control, write_control,
 };
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -123,6 +123,13 @@ impl WorkerRuntime {
                     description: entry.model.description,
                     phase: entry.status.phase,
                     desired_state: entry.status.desired_state,
+                    gpu_count: entry.model.gpu_count.unwrap_or(0),
+                    assigned_gpus: entry
+                        .status
+                        .assigned_gpus
+                        .into_iter()
+                        .filter_map(|gpu| u32::try_from(gpu).ok())
+                        .collect(),
                 })
                 .collect::<Vec<_>>(),
             Err(err) => {
@@ -457,7 +464,12 @@ pub(super) async fn handle_stream(
 ) -> AppResult<()> {
     match read_stream_open(&mut recv).await? {
         StreamOpen::Inference(open) => handle_request(send, recv, runtime, open).await,
-        StreamOpen::SwitchModel(request) => handle_switch_model(send, runtime, request).await,
+        StreamOpen::SwitchModel(request) => {
+            handle_switch_model(send, runtime, request, ModelLifecycleAction::Load).await
+        }
+        StreamOpen::UnloadModel(request) => {
+            handle_switch_model(send, runtime, request, ModelLifecycleAction::Unload).await
+        }
     }
 }
 
@@ -559,6 +571,7 @@ async fn handle_switch_model(
     mut send: iroh::endpoint::SendStream,
     runtime: Arc<WorkerRuntime>,
     request: SwitchModelRequest,
+    action: ModelLifecycleAction,
 ) -> AppResult<()> {
     crate::mesh::protocol::validate_switch_model_request(&request)
         .map_err(|err| AppError::bad_request(format!("invalid mesh switch request: {err}")))?;
@@ -586,7 +599,11 @@ async fn handle_switch_model(
         write_switch_response(&mut send, &response).await?;
         return Ok(());
     }
-    match fleet.load_model(&request.model_id).await {
+    let operation = match action {
+        ModelLifecycleAction::Load => fleet.load_model(&request.model_id).await,
+        ModelLifecycleAction::Unload => fleet.unload_model(&request.model_id).await,
+    };
+    match operation {
         Ok(operation) => {
             response.accepted = true;
             response.changed = operation.changed;

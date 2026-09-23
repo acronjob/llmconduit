@@ -1606,6 +1606,9 @@ fn wire_permission_name(permission: WirePermission) -> &'static str {
         WirePermission::PricingWrite => "auth.pricing.write",
         WirePermission::SessionsRead => "auth.sessions.read",
         WirePermission::SessionsTerminate => "auth.sessions.terminate",
+        WirePermission::FleetModelsRead => "fleet.models.read",
+        WirePermission::FleetModelsLoad => "fleet.models.load",
+        WirePermission::FleetModelsUnload => "fleet.models.unload",
     }
 }
 fn wire_permission(v: &str) -> Option<WirePermission> {
@@ -1664,6 +1667,9 @@ impl WirePermissionSet for WirePermission {
             WirePermission::PricingWrite,
             WirePermission::SessionsRead,
             WirePermission::SessionsTerminate,
+            WirePermission::FleetModelsRead,
+            WirePermission::FleetModelsLoad,
+            WirePermission::FleetModelsUnload,
         ]
     }
 }

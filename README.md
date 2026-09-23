@@ -344,10 +344,12 @@ An administrator can also disable or re-enable a single node, or disable an
 exact advertised `(endpoint, resource, model)` tuple without restarting the
 gateway. Model-level disables are an operational routing control, not a security
 quarantine: if a provider is untrusted or may advertise another model alias,
-disable its node or revoke its enrollment key instead. Mesh administration is
-restricted to bootstrap dashboard sessions and administrator user sessions;
-delegated management sessions cannot use these controls. Mutations retain the
-dashboard's existing CSRF and mutation-policy checks.
+disable its node or revoke its enrollment key instead. Mesh enrollment and
+routing administration is restricted to bootstrap dashboard sessions and
+administrator user sessions. The mesh-state read and remote Fleet model
+lifecycle endpoints additionally accept delegated management credentials with
+the corresponding `fleet.models.*` permission. Mutations retain the dashboard's
+existing CSRF and mutation-policy checks.
 
 A downstream mesh worker that has local Fleet configured also advertises its
 current switchable model inventory. The controller can request a load only for
@@ -941,9 +943,12 @@ server-side and are never returned to the browser.
 | `GET /dashboard/api/history/usage` | Authenticated durable usage rollups (SQL storage) |
 | `GET /dashboard/api/history/metrics` | Authenticated durable minute-level provider health/counter history (SQL storage) |
 | `POST /dashboard/api/flows/:id/kill` | Abort a live flow when dashboard mutations are enabled; requires a session and CSRF token |
-| `GET /dashboard/api/fleet` | Administrator-only local Fleet model/deployment inventory when configured |
-| `POST /dashboard/api/fleet/models/:id/load`, `/unload` | Administrator-only, mutation- and CSRF-gated local Fleet GPU lifecycle controls |
-| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/switch` | Administrator-only request to load an exactly advertised model on a connected Fleet-capable mesh worker |
+| `GET /dashboard/api/fleet` | Local Fleet model/deployment inventory when configured; requires administrator access or `fleet.models.read` |
+| `POST /dashboard/api/fleet/models/:id/load` | Mutation- and CSRF-gated local Fleet load control; requires administrator access or `fleet.models.load` |
+| `POST /dashboard/api/fleet/models/:id/unload` | Mutation- and CSRF-gated local Fleet unload control; requires administrator access or `fleet.models.unload` |
+| `GET /dashboard/api/mesh` | Mesh state, including remote Fleet model load state; requires administrator access or `fleet.models.read` |
+| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/switch`, `/load` | Load an exactly advertised model on a connected Fleet-capable mesh worker; requires administrator access or `fleet.models.load` |
+| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/unload` | Unload an exactly advertised model on a connected Fleet-capable mesh worker; requires administrator access or `fleet.models.unload` |
 | `GET /dashboard/api/me`, `/users`, `/keys` (+ `POST`/`PATCH`/`DELETE`) | Authenticated accounts API: the current user, user administration, API keys |
 | `GET /dashboard/auth/github/start`, `GET /dashboard/auth/github/callback`, `POST /dashboard/logout` | GitHub SSO dashboard session (signed state + PKCE; session and CSRF cookies) |
 | `GET /dashboard/ws`, `GET /debug/ws` | Authenticated WebSocket feeds behind the dashboard and debug UI |

@@ -1080,6 +1080,7 @@ export interface FleetModel {
   id: string;
   description?: string;
   image: string;
+  gpu_count?: number;
 }
 
 export interface FleetDeploymentStatus {
@@ -1151,6 +1152,8 @@ export interface MeshSwitchableModel {
   description?: string;
   phase: string;
   desired_state: string;
+  gpu_count?: number;
+  assigned_gpus?: number[];
 }
 
 export interface MeshDisabledModel {
@@ -1404,7 +1407,10 @@ export type ManagementPermission =
   | 'auth.pricing.sync'
   | 'auth.pricing.write'
   | 'auth.sessions.read'
-  | 'auth.sessions.terminate';
+  | 'auth.sessions.terminate'
+  | 'fleet.models.read'
+  | 'fleet.models.load'
+  | 'fleet.models.unload';
 
 export interface AuthSummary {
   enabled: boolean;
@@ -1700,7 +1706,8 @@ export const isProviderMetricsResponse = (v: unknown): v is ProviderMetricsRespo
   isObj(v) && isUint(v.generated_at_ms) && Array.isArray(v.providers) && v.providers.every(isProviderCacheMetrics);
 
 function isFleetModel(v: unknown): v is FleetModel {
-  return isObj(v) && isStr(v.id) && isOptStr(v.description) && isStr(v.image);
+  return isObj(v) && isStr(v.id) && isOptStr(v.description) && isStr(v.image)
+    && (v.gpu_count === undefined || isUint(v.gpu_count));
 }
 
 function isFleetDeploymentStatus(v: unknown): v is FleetDeploymentStatus {
@@ -1741,7 +1748,9 @@ function isMeshNode(v: unknown): v is MeshNode {
 function isMeshModelSwitching(v: unknown): v is MeshModelSwitching {
   return isObj(v) && isStr(v.provider) && isUint(v.revision)
     && Array.isArray(v.models) && v.models.every((model) => isObj(model) && isStr(model.id)
-      && isOptStr(model.description) && isStr(model.phase) && isStr(model.desired_state));
+      && isOptStr(model.description) && isStr(model.phase) && isStr(model.desired_state)
+      && (model.gpu_count === undefined || isUint(model.gpu_count))
+      && (model.assigned_gpus === undefined || (Array.isArray(model.assigned_gpus) && model.assigned_gpus.every(isUint))));
 }
 
 function isMeshDisabledModel(v: unknown): v is MeshDisabledModel {

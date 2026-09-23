@@ -3,13 +3,12 @@
 //! The first integration is deliberately loopback-only. Fleet credentials are read from
 //! the environment or an env-selected file and never cross the dashboard API boundary.
 
+use crate::dashboard_access::{ManagementActor, ManagementPermission};
 use crate::dashboard_api::json_no_store;
-use crate::dashboard_auth::{AuthSession, DashboardAuth};
-use crate::dashboard_mesh::{authorize_mesh_admin_read, authorize_mesh_mutation};
 use crate::engine::Gateway;
 use axum::Extension;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::Response;
 use futures::StreamExt;
 use reqwest::{Client, Url};
@@ -67,6 +66,8 @@ pub struct FleetModel {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -302,12 +303,10 @@ impl std::error::Error for FleetProxyError {}
 )]
 pub async fn fleet_models(
     State(gateway): State<Arc<Gateway>>,
-    Extension(auth): Extension<Arc<DashboardAuth>>,
-    Extension(session): Extension<AuthSession>,
-    headers: HeaderMap,
+    Extension(actor): Extension<ManagementActor>,
 ) -> Response {
-    if let Some(response) = authorize_mesh_admin_read(auth.as_ref(), &session, &headers) {
-        return response;
+    if !actor.allows(ManagementPermission::FleetModelsRead) {
+        return fleet_error(StatusCode::FORBIDDEN, "management permission denied");
     }
     let Some(fleet) = gateway.fleet() else {
         return fleet_error(StatusCode::NOT_FOUND, "Fleet is not configured");
@@ -338,12 +337,10 @@ pub async fn fleet_models(
 )]
 pub async fn fleet_load_model(
     State(gateway): State<Arc<Gateway>>,
-    Extension(auth): Extension<Arc<DashboardAuth>>,
-    Extension(session): Extension<AuthSession>,
+    Extension(actor): Extension<ManagementActor>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Response {
-    fleet_model_action(gateway, auth, session, headers, id, true).await
+    fleet_model_action(gateway, actor, id, true).await
 }
 
 #[utoipa::path(
@@ -366,24 +363,21 @@ pub async fn fleet_load_model(
 )]
 pub async fn fleet_unload_model(
     State(gateway): State<Arc<Gateway>>,
-    Extension(auth): Extension<Arc<DashboardAuth>>,
-    Extension(session): Extension<AuthSession>,
+    Extension(actor): Extension<ManagementActor>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Response {
-    fleet_model_action(gateway, auth, session, headers, id, false).await
+    fleet_model_action(gateway, actor, id, false).await
 }
 
 async fn fleet_model_action(
     gateway: Arc<Gateway>,
-    auth: Arc<DashboardAuth>,
-    session: AuthSession,
-    headers: HeaderMap,
+    actor: ManagementActor,
     model_id: String,
     load: bool,
 ) -> Response {
-    if let Some(response) = authorize_mesh_mutation(auth.as_ref(), &session, &headers).await {
-        return response;
+    let permission = fleet_action_permission(load);
+    if !actor.allows(permission) {
+        return fleet_error(StatusCode::FORBIDDEN, "management permission denied");
     }
     let Some(fleet) = gateway.fleet() else {
         return fleet_error(StatusCode::NOT_FOUND, "Fleet is not configured");
@@ -403,6 +397,14 @@ async fn fleet_model_action(
             &operation,
         ),
         Err(error) => error.into_response(),
+    }
+}
+
+fn fleet_action_permission(load: bool) -> ManagementPermission {
+    if load {
+        ManagementPermission::FleetModelsLoad
+    } else {
+        ManagementPermission::FleetModelsUnload
     }
 }
 
@@ -469,6 +471,7 @@ fn fleet_error(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dashboard_access::ManagementActor;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -478,6 +481,28 @@ mod tests {
             base_url: parse_loopback_url(base_url).expect("loopback mock URL"),
             token: FleetTokenSource::Env("secret-token".to_owned()),
         }
+    }
+
+    #[test]
+    fn fleet_actions_require_distinct_management_permissions() {
+        assert_eq!(
+            fleet_action_permission(true),
+            ManagementPermission::FleetModelsLoad
+        );
+        assert_eq!(
+            fleet_action_permission(false),
+            ManagementPermission::FleetModelsUnload
+        );
+
+        let read_only = ManagementActor::Delegated {
+            session_id: "sess_fleet_read".into(),
+            principal_id: "usr_fleet_read".into(),
+            key_id: "key_fleet_read".into(),
+            permissions: Arc::from([ManagementPermission::FleetModelsRead]),
+        };
+        assert!(read_only.allows(ManagementPermission::FleetModelsRead));
+        assert!(!read_only.allows(ManagementPermission::FleetModelsLoad));
+        assert!(!read_only.allows(ManagementPermission::FleetModelsUnload));
     }
 
     #[test]

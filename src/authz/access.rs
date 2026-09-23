@@ -204,6 +204,9 @@ pub(crate) fn wire_permission(permission: ManagementPermission) -> Option<WirePe
         ManagementPermission::PricingWrite => WirePermission::PricingWrite,
         ManagementPermission::SessionsRead => WirePermission::SessionsRead,
         ManagementPermission::SessionsTerminate => WirePermission::SessionsTerminate,
+        ManagementPermission::FleetModelsRead => WirePermission::FleetModelsRead,
+        ManagementPermission::FleetModelsLoad => WirePermission::FleetModelsLoad,
+        ManagementPermission::FleetModelsUnload => WirePermission::FleetModelsUnload,
     })
 }
 

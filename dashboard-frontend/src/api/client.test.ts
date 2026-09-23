@@ -166,6 +166,12 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     const switched = await client.switchMeshModel('vllm-a', 'qwen3-32b');
     expect(switched).toMatchObject({ endpoint_id: 'vllm-a', model_id: 'qwen3-32b', accepted: true, changed: true });
 
+    const unloaded = await client.unloadMeshModel('vllm-a', 'qwen3-8b-flash');
+    expect(unloaded).toMatchObject({ endpoint_id: 'vllm-a', model_id: 'qwen3-8b-flash', accepted: true, changed: true });
+
+    const loaded = await client.loadMeshModel('vllm-a', 'qwen3-8b-flash');
+    expect(loaded).toMatchObject({ endpoint_id: 'vllm-a', model_id: 'qwen3-8b-flash', accepted: true, changed: true });
+
     const node = await client.setMeshNodeEnabled('vllm-a', false);
     expect(node).toMatchObject({ endpoint_id: 'vllm-a', enabled: false, evicted: true });
 

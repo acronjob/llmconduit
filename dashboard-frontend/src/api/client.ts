@@ -395,6 +395,20 @@ export class DashboardClient {
     });
   }
 
+  loadMeshModel(endpointId: string, modelId: string): Promise<SwitchMeshModelResponse> {
+    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/load`, 'POST').then((value) => {
+      if (!isSwitchMeshModelResponse(value)) throw new Error('/mesh/nodes/:endpoint_id/models/:model_id/load returned an invalid response');
+      return value;
+    });
+  }
+
+  unloadMeshModel(endpointId: string, modelId: string): Promise<SwitchMeshModelResponse> {
+    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/unload`, 'POST').then((value) => {
+      if (!isSwitchMeshModelResponse(value)) throw new Error('/mesh/nodes/:endpoint_id/models/:model_id/unload returned an invalid response');
+      return value;
+    });
+  }
+
   /** Bare array — no cursor (D13: static-ish catalog read). */
   catalog(): Promise<CatalogEntry[]> {
     return this.request<CatalogEntry[]>('/catalog');

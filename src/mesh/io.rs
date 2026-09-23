@@ -33,7 +33,9 @@ where
 {
     match read_stream_open(reader).await? {
         StreamOpen::Inference(open) => Ok(open),
-        StreamOpen::SwitchModel(_) => Err(AppError::bad_request("expected mesh inference stream")),
+        StreamOpen::SwitchModel(_) | StreamOpen::UnloadModel(_) => {
+            Err(AppError::bad_request("expected mesh inference stream"))
+        }
     }
 }
 
@@ -303,6 +305,8 @@ mod tests {
                             description: Some("x".repeat(256)),
                             phase: "unloaded".to_string(),
                             desired_state: "unloaded".to_string(),
+                            gpu_count: 1,
+                            assigned_gpus: Vec::new(),
                         },
                     )
                     .collect(),

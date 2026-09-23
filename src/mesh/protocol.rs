@@ -71,6 +71,10 @@ pub struct SwitchableModelAdvertisement {
     pub description: Option<String>,
     pub phase: String,
     pub desired_state: String,
+    #[serde(default)]
+    pub gpu_count: u32,
+    #[serde(default)]
+    pub assigned_gpus: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +143,7 @@ pub struct RequestOpen {
 pub enum StreamOpen {
     Inference(RequestOpen),
     SwitchModel(SwitchModelRequest),
+    UnloadModel(SwitchModelRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +151,12 @@ pub struct SwitchModelRequest {
     pub protocol_version: u16,
     pub request_id: Uuid,
     pub model_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLifecycleAction {
+    Load,
+    Unload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +235,12 @@ pub fn validate_model_switching(
     }
     for model in &switching.models {
         validate_model_id(&model.id)?;
+        if model.gpu_count > 64 || model.assigned_gpus.len() > 64 {
+            return Err(ProtocolError::CapacityTooLarge {
+                capacity: model.gpu_count.max(model.assigned_gpus.len() as u32),
+                max: 64,
+            });
+        }
         if let Some(description) = &model.description {
             if description.len() > MAX_SWITCHING_DESCRIPTION_BYTES {
                 return Err(ProtocolError::SwitchingDescriptionTooLong {
@@ -647,6 +664,8 @@ mod tests {
                 description: Some("fast lane".to_string()),
                 phase: "ready".to_string(),
                 desired_state: "loaded".to_string(),
+                gpu_count: 1,
+                assigned_gpus: vec![0],
             }],
             revision: 1,
         };
@@ -662,6 +681,22 @@ mod tests {
             validate_model_switching(&switching),
             Err(ProtocolError::ControlCharacter { .. })
         ));
+    }
+
+    #[test]
+    fn unload_model_uses_a_distinct_stream_variant() {
+        let request = SwitchModelRequest {
+            protocol_version: REQUEST_PROTOCOL_VERSION,
+            request_id: Uuid::nil(),
+            model_id: "qwen3-flash".to_string(),
+        };
+        let value = serde_json::to_value(StreamOpen::UnloadModel(request.clone()))
+            .expect("serialize unload request");
+        assert_eq!(value["type"], "unload_model");
+        assert_eq!(
+            serde_json::from_value::<StreamOpen>(value).expect("deserialize unload request"),
+            StreamOpen::UnloadModel(request)
+        );
     }
 
     #[test]
