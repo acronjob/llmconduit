@@ -1488,6 +1488,7 @@ export interface AuthApiKey {
   created_at: string;
   expires_at: string | null;
   last_used_at: string | null;
+  capture_payloads: boolean;
 }
 
 /** Returned only by create/rotate. `raw_key` must never be persisted or fetched later. */
@@ -1565,6 +1566,7 @@ export interface CreateAuthApiKeyRequest {
   principal_id: string;
   name: string;
   expires_at?: string | null;
+  capture_payloads?: boolean;
 }
 export interface CreateAuthPolicyRequest {
   name: string;
@@ -1619,7 +1621,7 @@ function isAuthPolicy(v: unknown): v is AuthPolicy {
 function isAuthApiKey(v: unknown): v is AuthApiKey {
   return isObj(v) && isStr(v.id) && isStr(v.principal_id) && isStr(v.name) && isStr(v.prefix)
     && typeof v.enabled === 'boolean' && isStr(v.created_at) && isNullableStr(v.expires_at)
-    && isNullableStr(v.last_used_at);
+    && isNullableStr(v.last_used_at) && typeof v.capture_payloads === 'boolean';
 }
 function isAuthSession(v: unknown): v is AuthSession {
   return isObj(v) && isStr(v.id) && isOneOf(v.kind, ['inference', 'dashboard'] as const)

@@ -54,6 +54,7 @@ impl AuthzService {
                 | AccessOperation::CreateApiKey(_)
                 | AccessOperation::RevokeApiKey(_)
                 | AccessOperation::RotateApiKey(_)
+                | AccessOperation::UpdateApiKeyPayloadCapture(_, _)
                 | AccessOperation::RevokeSession(_)
                 | AccessOperation::WritePricing(_)
         );
@@ -75,6 +76,7 @@ impl AuthzService {
                         &raw,
                         &digest,
                         expires_at,
+                        body.capture_payloads,
                         actor,
                     )
                     .map_err(internal)?;
@@ -88,6 +90,15 @@ impl AuthzService {
                     .rotate_key(&id, &raw, &digest, actor)
                     .map_err(internal)?;
                 Ok(AccessResult::CreatedApiKey(created_access(created, raw)))
+            }
+            AccessOperation::UpdateApiKeyPayloadCapture(id, capture_payloads) => {
+                if !store
+                    .set_key_payload_capture(&id, capture_payloads, actor)
+                    .map_err(internal)?
+                {
+                    return Err(AccessError::new(StatusCode::NOT_FOUND, "API key not found"));
+                }
+                store.list_access_keys().map(AccessResult::ApiKeys)
             }
             operation => store.dispatch_access(actor, operation),
         }?;
@@ -156,6 +167,7 @@ fn created_access(created: super::CreatedApiKey, raw_key: String) -> CreatedAcce
             created_at: timestamp(key.created_at),
             expires_at: key.expires_at.map(timestamp),
             last_used_at: key.last_used_at.map(timestamp),
+            capture_payloads: key.capture_payloads,
         },
         raw_key,
     }
@@ -375,6 +387,7 @@ mod tests {
                     principal_id: principal_id.clone(),
                     name: "primary".into(),
                     expires_at: None,
+                    capture_payloads: false,
                 }),
             )
             .unwrap();
@@ -390,6 +403,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_str(&raw).unwrap());
         let context = service.authenticate(&headers).unwrap().unwrap();
+        assert!(!context.capture_payloads());
+        assert!(matches!(
+            service.dispatch_access(
+                &actor,
+                AccessOperation::UpdateApiKeyPayloadCapture(key_id.clone(), true)
+            ),
+            Ok(AccessResult::ApiKeys(ref keys))
+                if keys.iter().any(|key| key.id == key_id && key.capture_payloads)
+        ));
+        let context = service.authenticate(&headers).unwrap().unwrap();
+        assert!(context.capture_payloads());
         assert!(context.allows_model("chat", "public-v1"));
         assert_eq!(context.effective_limits().max_concurrent_sessions, Some(2));
         assert!(matches!(
@@ -434,7 +458,10 @@ mod tests {
             .dispatch_access(&actor, AccessOperation::RotateApiKey(key_id))
             .unwrap();
         let rotated_id = match rotated {
-            AccessResult::CreatedApiKey(created) => created.api_key.id,
+            AccessResult::CreatedApiKey(created) => {
+                assert!(created.api_key.capture_payloads);
+                created.api_key.id
+            }
             _ => panic!("unexpected rotate-key result"),
         };
         assert!(matches!(

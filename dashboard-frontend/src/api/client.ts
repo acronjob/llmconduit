@@ -588,6 +588,9 @@ export class DashboardClient {
   rotateAuthApiKey(id: string): Promise<CreatedAuthApiKey> {
     return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/rotate`, undefined, isCreatedAuthApiKey);
   }
+  updateAuthApiKeyPayloadCapture(id: string, capturePayloads: boolean): Promise<AuthApiKeysResponse> {
+    return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/payload-capture`, { capture_payloads: capturePayloads }, isAuthApiKeysResponse);
+  }
   revokeAuthSession(id: string): Promise<AuthSessionsResponse> {
     return this.authMutation(`/auth/sessions/${encodeURIComponent(id)}/revoke`, undefined, isAuthSessionsResponse);
   }

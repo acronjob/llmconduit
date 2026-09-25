@@ -730,6 +730,16 @@ async fn require_inference_auth(
     if !gateway.authz().is_enabled() {
         return next.run(request).await;
     }
+    if let Some(context) = request.extensions().get::<crate::authz::AuthContext>() {
+        let endpoint = auth_endpoint(request.uri().path());
+        if !context.allows_endpoint(endpoint) {
+            return auth_failure_response(
+                request.uri().path(),
+                crate::authz::AuthFailure::Forbidden,
+            );
+        }
+        return next.run(request).await;
+    }
     let endpoint = auth_endpoint(request.uri().path());
     let context = match gateway.authz().authenticate(request.headers()) {
         Ok(Some(context)) => context,
@@ -1055,14 +1065,18 @@ struct BodyLogFields {
 /// Compute the body-derived log fields for `path`/`body`, returning `None` for a
 /// dashboard auth endpoint so the caller emits no body-derived field (D7a R3 #1
 /// — the digest + length are a token-verification oracle).
-fn body_log_fields(path: &str, body: &Bytes) -> Option<BodyLogFields> {
+fn body_log_fields(path: &str, body: &Bytes, summarize_payload: bool) -> Option<BodyLogFields> {
     if is_dashboard_auth_path(path) {
         return None;
     }
     Some(BodyLogFields {
         bytes: body.len(),
         sha256: hex::encode(Sha256::digest(body)),
-        summary: summarize_api_body(path, body),
+        summary: if summarize_payload {
+            summarize_api_body(path, body)
+        } else {
+            "payload_capture=disabled".to_owned()
+        },
     })
 }
 
@@ -1246,6 +1260,26 @@ async fn log_api_call(
     } else {
         None
     };
+    // The outer logging middleware needs the RBAC key's payload-capture policy
+    // before any body-bearing sink runs. Authenticate once here and let the
+    // inner authorization middleware reuse this context for endpoint checks.
+    let auth_context = if gateway.authz().is_enabled()
+        && is_authenticated_client_api_request(&method, uri.path())
+    {
+        match gateway.authz().authenticate(&headers) {
+            Ok(Some(context)) => Some(context),
+            Ok(None) => None,
+            Err(failure) => return auth_failure_response(uri.path(), failure),
+        }
+    } else {
+        None
+    };
+    let capture_payloads = auth_context
+        .as_ref()
+        .map(crate::authz::AuthContext::capture_payloads)
+        // Auth-disabled deployments preserve their existing global capture
+        // behavior. Enforced RBAC keys are metadata-only unless opted in.
+        .unwrap_or(!gateway.authz().is_enabled());
 
     // The configurable inbound body cap (default 10 MiB), read from the gateway
     // config — the SAME value `build_router` hands `DefaultBodyLimit::max`, so the
@@ -1563,34 +1597,38 @@ async fn log_api_call(
         let inbound = persistence_inbound
             .take()
             .expect("persistence gate has inbound capture");
-        match inbound.split {
-            Some(split) => {
-                let _ = queue.try_body(crate::flow_persistence::body_write(
-                    &api_call_id,
-                    crate::flow_persistence::PayloadSection::InboundRequest,
-                    epoch_millis(),
-                    u64::try_from(body_bytes.len()).unwrap_or(u64::MAX),
-                    split,
-                    inbound.partial,
-                    Some(&headers),
-                ));
-            }
-            None => {
-                let _ = queue.try_event(crate::flow_persistence::redacted_request_payload_event(
-                    &api_call_id,
-                    crate::flow_persistence::PayloadSection::InboundRequest,
-                    epoch_millis(),
-                    body_bytes.len(),
-                    &inbound.redacted,
-                    inbound.partial,
-                    Some(&headers),
-                ));
+        if capture_payloads {
+            match inbound.split {
+                Some(split) => {
+                    let _ = queue.try_body(crate::flow_persistence::body_write(
+                        &api_call_id,
+                        crate::flow_persistence::PayloadSection::InboundRequest,
+                        epoch_millis(),
+                        u64::try_from(body_bytes.len()).unwrap_or(u64::MAX),
+                        split,
+                        inbound.partial,
+                        Some(&headers),
+                    ));
+                }
+                None => {
+                    let _ =
+                        queue.try_event(crate::flow_persistence::redacted_request_payload_event(
+                            &api_call_id,
+                            crate::flow_persistence::PayloadSection::InboundRequest,
+                            epoch_millis(),
+                            body_bytes.len(),
+                            &inbound.redacted,
+                            inbound.partial,
+                            Some(&headers),
+                        ));
+                }
             }
         }
-        let capture = crate::flow_persistence::PersistenceCapture::with_options(
+        let capture = crate::flow_persistence::PersistenceCapture::with_capture_options(
             queue,
             &api_call_id,
             gateway.persistence_keep_media(),
+            capture_payloads,
         );
         parts.extensions.insert(Arc::clone(&capture));
         Some(capture)
@@ -1600,6 +1638,9 @@ async fn log_api_call(
     if let Some(identity) = client_identity {
         parts.extensions.insert(identity);
     }
+    if let Some(context) = auth_context {
+        parts.extensions.insert(context);
+    }
 
     // D7a R3 #1: for a dashboard auth endpoint (login/logout) NO body-derived
     // field may be logged — a `body_sha256` + `body_bytes` length on the login
@@ -1607,7 +1648,7 @@ async fn log_api_call(
     // `None` there so we emit only non-body metadata; every other path logs the
     // length, hex digest, and the redacted summary.
     let is_auth_path = is_dashboard_auth_path(uri.path());
-    match body_log_fields(uri.path(), &body_bytes) {
+    match body_log_fields(uri.path(), &body_bytes, capture_payloads) {
         Some(fields) => tracing::info!(
             api_call_id = %api_call_id,
             method = %method,
@@ -1645,7 +1686,7 @@ async fn log_api_call(
     }
     // Never dump the auth-endpoint body (it carries the token, and even its
     // length/digest are an oracle — handled above).
-    if !is_auth_path && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
+    if capture_payloads && !is_auth_path && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
         tracing::info!(
             api_call_id = %api_call_id,
             method = %method,
@@ -1665,7 +1706,7 @@ async fn log_api_call(
     // keyed on `turn_capture().is_enabled()` INDEPENDENT of the flow store / debug
     // UI — so `api_call_id` reaches the engine and the artifact is written with the
     // dashboard OFF.
-    let capture_gate = instrument && gateway.turn_capture().is_enabled();
+    let capture_gate = instrument && capture_payloads && gateway.turn_capture().is_enabled();
 
     // The `api_call_id` extension the engine reads to link `response_id →
     // api_call_id` (D1) and to reach the per-turn capture state (F1c) is inserted
@@ -1686,7 +1727,8 @@ async fn log_api_call(
     // + `Failed("unhandled")` — no orphan stuck `Open`. If the engine claimed it
     // (`ClaimedL1`), the L0 `Drop` is inert and L1 owns finalization.
     let _l0_guard = if flow_gate {
-        let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
+        let inbound_body =
+            capture_payloads.then(|| crate::dashboard_flow::capture_body(&body_bytes));
         // Gap 04: derive the client attribution from the RAW headers BEFORE they are
         // redacted — this is the only point the raw API key is still readable, and
         // `derive` hashes it in-place (a one-way SHA-256 prefix becomes the label; the
@@ -1700,7 +1742,7 @@ async fn log_api_call(
             dashboard_client_header().as_deref(),
         );
         let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
-        gateway.flow_store().open_with_session(
+        gateway.flow_store().open_with_session_capture(
             api_call_id.clone(),
             method.to_string(),
             uri.path().to_string(),
@@ -1708,6 +1750,7 @@ async fn log_api_call(
             inbound_body,
             client,
             session_facts.clone(),
+            capture_payloads,
         );
         gateway.flow_store().middleware_guard(&api_call_id)
     } else {
@@ -3137,6 +3180,11 @@ async fn handle_count_tokens(
         None,
     )
     .with_thinking_override(thinking_override)
+    .with_payload_capture(
+        auth.as_ref()
+            .map(crate::authz::AuthContext::capture_payloads)
+            .unwrap_or(true),
+    )
     .with_authorization(
         authorization,
         crate::upstream::InferenceEndpoint::CountTokens,
@@ -4748,23 +4796,28 @@ mod tests {
 
         // The login endpoint suppresses every body-derived field.
         assert!(
-            body_log_fields("/dashboard/login", &body).is_none(),
+            body_log_fields("/dashboard/login", &body, true).is_none(),
             "login body must produce no body-derived log fields (token oracle)"
         );
         // Logout is symmetric (bodyless, but the same path class).
-        assert!(body_log_fields("/dashboard/logout", &Bytes::new()).is_none());
-        assert!(body_log_fields("/dashboard/auth/key-login", &body).is_none());
-        assert!(body_log_fields("/dashboard/auth/logout", &Bytes::new()).is_none());
+        assert!(body_log_fields("/dashboard/logout", &Bytes::new(), true).is_none());
+        assert!(body_log_fields("/dashboard/auth/key-login", &body, true).is_none());
+        assert!(body_log_fields("/dashboard/auth/logout", &Bytes::new(), true).is_none());
 
         // A normal inference path still logs the length + digest + summary, and
         // that digest is over the body (never resembles the bare-token digest).
-        let normal =
-            body_log_fields("/v1/messages", &body).expect("non-auth path logs body-derived fields");
+        let normal = body_log_fields("/v1/messages", &body, true)
+            .expect("non-auth path logs body-derived fields");
         assert_eq!(normal.bytes, body.len());
         assert_eq!(normal.sha256, body_sha);
         // Sanity: the body digest is not the standalone token digest, so even the
         // normal path never logs a digest of the bare token.
         assert_ne!(normal.sha256, token_sha);
+
+        let metadata_only = body_log_fields("/v1/messages", &body, false).unwrap();
+        assert_eq!(metadata_only.bytes, body.len());
+        assert_eq!(metadata_only.summary, "payload_capture=disabled");
+        assert!(!metadata_only.summary.contains(token));
     }
 
     /// The full RFC 7230 §6.1 hop-by-hop set; must match the canonical list and

@@ -727,6 +727,9 @@ pub struct FlowRecord {
     /// Capped + redacted inbound request body. `None` once evicted by the
     /// summary-byte quota (the record then survives as a body-free summary).
     pub inbound_body: Option<Arc<[u8]>>,
+    /// Whether this key opted into retaining body payloads. Metadata mutations
+    /// continue regardless of this flag.
+    pub capture_payloads: bool,
     /// Capped + redacted canonical/normalized body (set by D2).
     pub normalized: Option<Arc<[u8]>>,
     /// Capped + redacted upstream chat body (set by D2).
@@ -1323,6 +1326,30 @@ impl DashboardFlowStore {
         client: ClientAttribution,
         session: FlowSessionFacts,
     ) {
+        self.open_with_session_capture(
+            api_call_id,
+            method,
+            uri,
+            headers,
+            inbound_body,
+            client,
+            session,
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_session_capture(
+        &self,
+        api_call_id: String,
+        method: String,
+        uri: String,
+        headers: CapturedHeaders,
+        inbound_body: Option<CapturedBody>,
+        client: ClientAttribution,
+        session: FlowSessionFacts,
+        capture_payloads: bool,
+    ) {
         if !self.enabled {
             return;
         }
@@ -1338,6 +1365,7 @@ impl DashboardFlowStore {
             uri: cap_scalar(uri),
             headers: headers.0,
             inbound_body: inbound_body.map(CapturedBody::into_arc),
+            capture_payloads,
             normalized: None,
             upstream_body: None,
             // Gap 05: the upstream RESPONSE/ERROR body is captured later (and only when
@@ -1435,7 +1463,7 @@ impl DashboardFlowStore {
             if model_served.is_some() {
                 record.model_served = model_served.clone();
             }
-            if upstream_body.is_some() {
+            if record.capture_payloads && upstream_body.is_some() {
                 record.upstream_body = upstream_body.clone();
             }
         });
@@ -1468,7 +1496,9 @@ impl DashboardFlowStore {
         let mut state = self.lock();
         state.prune_expired(now_ms());
         state.update(id, |record| {
-            record.upstream_response = Some(response.clone());
+            if record.capture_payloads {
+                record.upstream_response = Some(response.clone());
+            }
         });
         state.enforce_caps(self.summary_quota_bytes);
     }
@@ -1497,7 +1527,7 @@ impl DashboardFlowStore {
             if model_requested.is_some() {
                 record.model_requested = model_requested.clone();
             }
-            if normalized.is_some() {
+            if record.capture_payloads && normalized.is_some() {
                 record.normalized = normalized.clone();
             }
         });
@@ -2449,6 +2479,40 @@ mod tests {
         assert!(store.list().is_empty(), "disabled store records nothing");
         assert!(store.detail("api_1").is_none());
         assert!(store.snapshot_summaries().is_empty());
+    }
+
+    #[test]
+    fn metadata_only_flow_retains_identity_without_request_bodies() {
+        let store = DashboardFlowStore::new();
+        store.open_with_session_capture(
+            "api_metadata_only".into(),
+            "POST".into(),
+            "/v1/responses".into(),
+            no_headers(),
+            None,
+            ClientAttribution::none(),
+            FlowSessionFacts::default(),
+            false,
+        );
+        store.set_normalized(
+            "api_metadata_only",
+            Some("model-a".into()),
+            Some(cap(br#"{"input":"secret"}"#)),
+        );
+        store.set_upstream(
+            "api_metadata_only",
+            Some("provider-a".into()),
+            Some("model-a".into()),
+            Some(cap(br#"{"messages":["secret"]}"#)),
+        );
+
+        let record = store.detail("api_metadata_only").unwrap();
+        assert_eq!(record.model_requested.as_deref(), Some("model-a"));
+        assert_eq!(record.model_served.as_deref(), Some("model-a"));
+        assert_eq!(record.upstream_target.as_deref(), Some("provider-a"));
+        assert!(record.inbound_body.is_none());
+        assert!(record.normalized.is_none());
+        assert!(record.upstream_body.is_none());
     }
 
     #[test]

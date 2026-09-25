@@ -674,6 +674,7 @@ pub struct PersistenceCapture {
     queue: PersistenceQueue,
     api_call_id: String,
     keep_media: bool,
+    capture_payloads: bool,
     owner: AtomicU8,
     upstream_emitted: AtomicBool,
     served_emitted: AtomicBool,
@@ -701,10 +702,20 @@ impl PersistenceCapture {
         api_call_id: impl Into<String>,
         keep_media: bool,
     ) -> Arc<Self> {
+        Self::with_capture_options(queue, api_call_id, keep_media, true)
+    }
+
+    pub fn with_capture_options(
+        queue: PersistenceQueue,
+        api_call_id: impl Into<String>,
+        keep_media: bool,
+        capture_payloads: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             queue,
             api_call_id: api_call_id.into(),
             keep_media,
+            capture_payloads,
             owner: AtomicU8::new(OWNER_UNCLAIMED),
             upstream_emitted: AtomicBool::new(false),
             served_emitted: AtomicBool::new(false),
@@ -733,6 +744,9 @@ impl PersistenceCapture {
     /// redacted per item) so the upstream hop shares storage with the inbound
     /// hop and with every other request in the same conversation.
     pub fn stage_upstream_request<T: Serialize>(&self, request: &T) {
+        if !self.capture_payloads {
+            return;
+        }
         let captured = captured_request_value(request, self.keep_media);
         let mut upstream = self
             .upstream
@@ -757,6 +771,9 @@ impl PersistenceCapture {
     }
 
     pub fn push_upstream_response(&self, bytes: &[u8]) {
+        if !self.capture_payloads {
+            return;
+        }
         let mut upstream = self
             .upstream
             .lock()
@@ -781,6 +798,9 @@ impl PersistenceCapture {
     /// `truncated` records that the retained prefix is not the whole provider
     /// body; `partial` is reserved for an actual body-stream read failure.
     pub fn stage_upstream_error_response(&self, body: &[u8], partial: bool, truncated: bool) {
+        if !self.capture_payloads {
+            return;
+        }
         let mut capture = ModelOutputCapture::new();
         capture.push(body);
         if truncated {
@@ -799,6 +819,9 @@ impl PersistenceCapture {
     }
 
     pub fn push_served_response(&self, bytes: &[u8]) {
+        if !self.capture_payloads {
+            return;
+        }
         if self.served_emitted.load(Ordering::Acquire) {
             return;
         }
@@ -812,6 +835,9 @@ impl PersistenceCapture {
     /// is explicitly partial; queue pressure is recorded by the queue itself and
     /// never back-pressures the response stream.
     pub fn finish_served_response(&self, partial: bool) {
+        if !self.capture_payloads {
+            return;
+        }
         if self.served_emitted.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -861,6 +887,9 @@ impl PersistenceCapture {
 
     fn finish_upstream_hops(&self) {
         if self.upstream_emitted.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if !self.capture_payloads {
             return;
         }
         let mut upstream = self
@@ -1377,6 +1406,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingWriter {
         finishes: Mutex<Vec<(String, RequestFinish)>>,
+        events: Mutex<Vec<EventRow>>,
     }
 
     #[async_trait]
@@ -1385,7 +1415,8 @@ mod tests {
             Ok(())
         }
 
-        async fn append_event(&self, _event: EventRow) -> StoreResult<()> {
+        async fn append_event(&self, event: EventRow) -> StoreResult<()> {
+            self.events.lock().unwrap().push(event);
             Ok(())
         }
 
@@ -1393,6 +1424,31 @@ mod tests {
             self.finishes.lock().unwrap().push((id.to_owned(), finish));
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_only_capture_emits_no_payload_events() {
+        let writer = Arc::new(RecordingWriter::default());
+        let queue = PersistenceQueue::spawn(
+            Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let capture = PersistenceCapture::with_capture_options(
+            queue.clone(),
+            "api_metadata_only",
+            false,
+            false,
+        );
+        capture.stage_upstream_request(&serde_json::json!({"messages":[{"content":"secret"}]}));
+        capture.push_upstream_response(b"provider output");
+        capture.finish_upstream_response(false);
+        capture.push_served_response(b"client output");
+        capture.finish_served_response(false);
+        capture.finish_unclaimed(400);
+        queue.flush().await.unwrap();
+
+        assert!(writer.events.lock().unwrap().is_empty());
+        assert_eq!(writer.finishes.lock().unwrap().len(), 1);
     }
 
     fn attempt(provider: &str, model: &str, status: AttemptStatus, start_ms: u128) -> Attempt {

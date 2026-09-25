@@ -181,6 +181,9 @@ pub struct AccessApiKey {
     pub created_at: String,
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
+    /// Opt-in retention of request/response bodies. Flow metadata is retained
+    /// independently of this setting.
+    pub capture_payloads: bool,
 }
 
 /// Only the create/rotate response carries `raw_key`; list responses cannot recover it.
@@ -269,6 +272,13 @@ pub struct CreateApiKeyRequest {
     pub principal_id: String,
     pub name: String,
     pub expires_at: Option<String>,
+    #[serde(default)]
+    pub capture_payloads: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePayloadCaptureRequest {
+    pub capture_payloads: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,6 +354,7 @@ pub enum AccessOperation {
     CreateApiKey(CreateApiKeyRequest),
     RevokeApiKey(String),
     RotateApiKey(String),
+    UpdateApiKeyPayloadCapture(String, bool),
     ListSessions,
     RevokeSession(String),
     Usage,
@@ -447,6 +458,10 @@ where
         .route(
             "/dashboard/api/auth/api-keys/{id}/rotate",
             post(rotate_api_key),
+        )
+        .route(
+            "/dashboard/api/auth/api-keys/{id}/payload-capture",
+            post(update_api_key_payload_capture),
         )
         .route("/dashboard/api/auth/sessions", get(sessions))
         .route(
@@ -690,6 +705,24 @@ async fn rotate_api_key(
     }
 }
 
+async fn update_api_key_payload_capture(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdatePayloadCaptureRequest>,
+) -> Result<Json<Value>, AccessError> {
+    match execute(
+        (backend, actor),
+        ManagementPermission::KeysCreate,
+        AccessOperation::UpdateApiKeyPayloadCapture(id, body.capture_payloads),
+    )
+    .await?
+    {
+        AccessResult::ApiKeys(value) => Ok(Json(json!({ "api_keys": value }))),
+        _ => Err(AccessError::contract()),
+    }
+}
+
 async fn revoke_session(
     backend: Extension<Arc<dyn AccessBackend>>,
     actor: Extension<ManagementActor>,
@@ -791,6 +824,7 @@ mod tests {
                                 created_at: "now".into(),
                                 expires_at: body.expires_at,
                                 last_used_at: None,
+                                capture_payloads: body.capture_payloads,
                             },
                             raw_key: "llmc_secret_once".into(),
                         }))
@@ -828,6 +862,7 @@ mod tests {
                 created_at: "now".into(),
                 expires_at: None,
                 last_used_at: None,
+                capture_payloads: false,
             },
             raw_key: "llmc_extremely_secret".into(),
         };
@@ -984,6 +1019,7 @@ mod tests {
                 "created_at": "now",
                 "expires_at": null,
                 "last_used_at": null,
+                "capture_payloads": false,
                 "raw_key": "llmc_secret_once"
             })
         );

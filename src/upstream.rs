@@ -1407,11 +1407,13 @@ impl ReqwestUpstreamClient {
         &self,
         url: &Url,
         request: &ChatCompletionRequest,
+        capture_payloads: bool,
         response_id: Option<&str>,
         capture: Option<&Arc<TurnCaptureState>>,
         persistence: Option<&Arc<crate::flow_persistence::PersistenceCapture>>,
     ) -> AppResult<reqwest::Response> {
-        if let Some(ref logger) = self.request_logger
+        if capture_payloads
+            && let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(request).await
         {
             tracing::warn!(
@@ -1420,7 +1422,9 @@ impl ReqwestUpstreamClient {
                 "failed to append upstream request log"
             );
         }
-        self.capture_upstream_body(response_id, request);
+        if capture_payloads {
+            self.capture_upstream_body(response_id, request);
+        }
         // Finding 1: redact the `upstream_request` section OFF the tokio worker for
         // large requests (spawn_blocking), AWAITED here — before the send and before
         // `write_upstream_request` — so the last-writer-wins `replace` lands well
@@ -1503,8 +1507,10 @@ impl ReqwestUpstreamClient {
     /// the first send's). The redaction is consistent with the existing request-capture
     /// surface; this is a diagnostic body shown to the authenticated operator, captured ONLY
     /// when explicitly opted in.
+    #[allow(clippy::too_many_arguments)]
     fn capture_upstream_response_body(
         &self,
+        capture_payloads: bool,
         serving: Option<&Arc<ServingToken>>,
         capture: Option<&Arc<TurnCaptureState>>,
         persistence: Option<&Arc<crate::flow_persistence::PersistenceCapture>>,
@@ -1512,6 +1518,9 @@ impl ReqwestUpstreamClient {
         persistence_partial: bool,
         truncated: bool,
     ) {
+        if !capture_payloads {
+            return;
+        }
         if let Some(persistence) = persistence {
             persistence.stage_upstream_error_response(
                 body.as_bytes(),
@@ -1658,10 +1667,12 @@ impl ReqwestUpstreamClient {
     /// wrap the result for gap-03 attempt recording WITHOUT duplicating the recording
     /// across this method's several return sites. `response_id` keys the D2 on-wire body
     /// capture (already performed by `logged_send_chat_request`).
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_chat_stream(
         &self,
         url: &Url,
         request: ChatCompletionRequest,
+        capture_payloads: bool,
         response_id: Option<&str>,
         serving: Option<&Arc<ServingToken>>,
         capture: Option<&Arc<TurnCaptureState>>,
@@ -1689,7 +1700,14 @@ impl ReqwestUpstreamClient {
         // leaf client so the failover/routing layers never see a context-limit
         // error as a provider failure (it is a same-provider shrink-and-retry).
         let response = self
-            .logged_send_chat_request(url, &request, response_id, capture, persistence)
+            .logged_send_chat_request(
+                url,
+                &request,
+                capture_payloads,
+                response_id,
+                capture,
+                persistence,
+            )
             .await?;
         // Gap 03 round-1 review (F1): the upstream response HEADERS just arrived — this is
         // the TRUE on-wire first-byte time. Stamp it BEFORE inspecting the status, so a
@@ -1738,7 +1756,14 @@ impl ReqwestUpstreamClient {
             // `response_id`; F1d is last-writer-wins so this overwrites the first
             // oversized attempt's write — AC-10).
             let retry_response = self
-                .logged_send_chat_request(url, &retried, response_id, capture, persistence)
+                .logged_send_chat_request(
+                    url,
+                    &retried,
+                    capture_payloads,
+                    response_id,
+                    capture,
+                    persistence,
+                )
                 .await?;
             let retry_status = retry_response.status();
             if retry_status.is_success() {
@@ -1762,6 +1787,7 @@ impl ReqwestUpstreamClient {
             // attempt's body) so the dashboard shows the upstream's final word.
             // F1e also stages it onto the turn-capture handle.
             self.capture_upstream_response_body(
+                capture_payloads,
                 serving,
                 capture,
                 persistence,
@@ -1809,6 +1835,7 @@ impl ReqwestUpstreamClient {
         // is cleared if a later failover provider serves; committed at finalize otherwise).
         // F1e also stages it onto the turn-capture handle (final failed HTTP body).
         self.capture_upstream_response_body(
+            capture_payloads,
             serving,
             capture,
             persistence,
@@ -1930,6 +1957,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 .dispatch_chat_stream(
                     &url,
                     request,
+                    backend.capture_payloads,
                     response_id.as_deref(),
                     serving.as_ref(),
                     capture.as_ref(),
@@ -1973,6 +2001,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         self.dispatch_chat_stream(
             &url,
             request,
+            backend.capture_payloads,
             response_id.as_deref(),
             serving.as_ref(),
             capture.as_ref(),
@@ -2309,6 +2338,7 @@ impl FailoverUpstreamClient {
             // turn keeps capturing across a failover provider rebuild.
             capture: backend.capture.clone(),
             persistence_capture: backend.persistence_capture.clone(),
+            capture_payloads: backend.capture_payloads,
             authorization: backend.authorization.clone(),
             endpoint: backend.endpoint,
             authorization_route: backend.authorization_route.clone(),
@@ -2905,6 +2935,7 @@ impl RoutingUpstreamClient {
             // failover rebuild above, `request_for_provider`).
             capture: backend.capture.clone(),
             persistence_capture: backend.persistence_capture.clone(),
+            capture_payloads: backend.capture_payloads,
             authorization: backend.authorization.clone(),
             endpoint: backend.endpoint,
             authorization_route: Some(provider_name.to_string()),
@@ -4319,6 +4350,9 @@ pub struct BackendChatRequest {
     /// Bounded in-memory four-hop capture. Unlike `capture`, this never enables
     /// disk diagnostics and every database write remains a terminal `try_*`.
     pub persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+    /// Whether this request may be retained in any observability body sink.
+    /// Metadata, timing, usage, and terminal status remain available when false.
+    pub capture_payloads: bool,
     /// Request-local provider/route authorization. Unrestricted unless inference
     /// auth is enforced. Rebuilds must clone this exact immutable scope.
     pub authorization: AuthorizationScope,
@@ -4356,6 +4390,7 @@ impl BackendChatRequest {
             serving,
             capture: None,
             persistence_capture: None,
+            capture_payloads: true,
             authorization: AuthorizationScope::unrestricted(),
             endpoint: InferenceEndpoint::Responses,
             authorization_route: None,
@@ -4387,6 +4422,11 @@ impl BackendChatRequest {
         capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
     ) -> Self {
         self.persistence_capture = capture;
+        self
+    }
+
+    pub fn with_payload_capture(mut self, capture_payloads: bool) -> Self {
+        self.capture_payloads = capture_payloads;
         self
     }
 
@@ -5840,6 +5880,30 @@ fn stringify_json_value(value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn stream_timeout_is_idle_time_between_chunks_not_total_generation_time() {
+        use futures::StreamExt;
+
+        let stream = async_stream::stream! {
+            tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+            yield Ok(serde_json::from_value(serde_json::json!({"id":"first","choices":[]})).unwrap());
+            tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+            yield Ok(serde_json::from_value(serde_json::json!({"id":"second","choices":[]})).unwrap());
+            tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+            yield Ok(serde_json::from_value(serde_json::json!({"id":"late","choices":[]})).unwrap());
+        };
+        let mut guarded =
+            super::timeout_upstream_stream(Box::pin(stream), std::time::Duration::from_secs(10));
+
+        assert_eq!(guarded.next().await.unwrap().unwrap().id, "first");
+        assert_eq!(guarded.next().await.unwrap().unwrap().id, "second");
+        assert_eq!(
+            guarded.next().await.unwrap().unwrap_err().to_string(),
+            "upstream stream timed out"
+        );
+        assert!(guarded.next().await.is_none());
+    }
+
     use super::ReqwestUpstreamClient;
     use super::UpstreamModelEntry;
     use super::UpstreamRequestLogger;
@@ -7308,7 +7372,8 @@ mod tests {
         // `request_for_provider` is the failover production rebuild. It must carry
         // `response_id` forward AND clone the SAME `Arc<ServingToken>` (so a tag set
         // on the rebuilt request is visible on the original — they share the token).
-        let backend = d2_backend_with_identity("glm-x", "resp_failover");
+        let backend =
+            d2_backend_with_identity("glm-x", "resp_failover").with_payload_capture(false);
         let provider = FailoverUpstreamProvider::new(
             "p0",
             d2_leaf_client(),
@@ -7318,6 +7383,7 @@ mod tests {
         );
         let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
         assert_eq!(rebuilt.response_id.as_deref(), Some("resp_failover"));
+        assert!(!rebuilt.capture_payloads);
         let orig = backend.serving.as_ref().expect("original token");
         let reb = rebuilt.serving.as_ref().expect("rebuilt token");
         assert!(
@@ -7334,7 +7400,8 @@ mod tests {
     fn routing_rebuild_preserves_response_id_and_shares_serving_arc() {
         // `routed_request` is the routing production rebuild. Same contract.
         let routing = super::RoutingUpstreamClient::new(Vec::new());
-        let backend = d2_backend_with_identity("requested", "resp_routing");
+        let backend =
+            d2_backend_with_identity("requested", "resp_routing").with_payload_capture(false);
         let rebuilt = routing.routed_request(
             &backend,
             "served-model",
@@ -7342,6 +7409,7 @@ mod tests {
             super::MatchKind::ExactId,
         );
         assert_eq!(rebuilt.response_id.as_deref(), Some("resp_routing"));
+        assert!(!rebuilt.capture_payloads);
         assert_eq!(rebuilt.request.model, "served-model");
         let orig = backend.serving.as_ref().expect("original token");
         let reb = rebuilt.serving.as_ref().expect("rebuilt token");
@@ -7659,6 +7727,46 @@ mod tests {
             record.model_served.as_deref(),
             Some("served-model"),
             "leaf populated model_served with the finalized request model"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_capture_policy_suppresses_global_upstream_request_log() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-disabled-payload-log-{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let client = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            Some(path.clone()),
+            true,
+            4096,
+        );
+        let backend = BackendChatRequest::new(family_request("served-model"), None, None, None)
+            .with_payload_capture(false);
+
+        let mut stream = client
+            .stream_chat_completion(&backend)
+            .await
+            .expect("stream opens");
+        while stream.next().await.is_some() {}
+
+        assert!(
+            !path.exists(),
+            "metadata-only keys must not create an upstream payload log entry"
         );
     }
 

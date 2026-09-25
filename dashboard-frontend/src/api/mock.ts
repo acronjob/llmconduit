@@ -77,7 +77,7 @@ let AUTH_POLICIES: AuthPolicy[] = [
   { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], models: [], requested_models: ['*'], served_models: ['*'], providers: ['vllm-b'], routes: ['local'], time_windows: [], max_concurrent_sessions: null, max_daily_session_starts: null, management_permissions: [] },
 ];
 let AUTH_KEYS: AuthApiKey[] = [
-  { id: 'key_ops', principal_id: 'usr_ops', name: 'operator laptop', prefix: 'llmc_7ad2', enabled: true, created_at: '2026-06-03T10:00:00Z', expires_at: null, last_used_at: '2026-06-21T14:19:40Z' },
+  { id: 'key_ops', principal_id: 'usr_ops', name: 'operator laptop', prefix: 'llmc_7ad2', enabled: true, created_at: '2026-06-03T10:00:00Z', expires_at: null, last_used_at: '2026-06-21T14:19:40Z', capture_payloads: false },
 ];
 let AUTH_SESSIONS: AuthSession[] = [
   { id: 'sess_admin', kind: 'dashboard', principal_id: 'usr_ops', key_id: 'key_ops', endpoint: null, requested_model: null, started_at: '2026-06-21T14:00:00Z', expires_at: '2026-06-21T22:00:00Z' },
@@ -735,20 +735,25 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   }
   if (path === '/dashboard/api/auth/api-keys') {
     if (method === 'POST') {
-      const body = JSON.parse(String(init?.body ?? '{}')) as { principal_id?: string; name?: string; expires_at?: string | null };
+      const body = JSON.parse(String(init?.body ?? '{}')) as { principal_id?: string; name?: string; expires_at?: string | null; capture_payloads?: boolean };
       if (!body.principal_id || !body.name) return json({ error: 'invalid key' }, 400);
-      const apiKey: AuthApiKey = { id: `key_${AUTH_KEYS.length + 1}`, principal_id: body.principal_id, name: body.name, prefix: 'llmc_demo', enabled: true, created_at: new Date().toISOString(), expires_at: body.expires_at ?? null, last_used_at: null };
+      const apiKey: AuthApiKey = { id: `key_${AUTH_KEYS.length + 1}`, principal_id: body.principal_id, name: body.name, prefix: 'llmc_demo', enabled: true, created_at: new Date().toISOString(), expires_at: body.expires_at ?? null, last_used_at: null, capture_payloads: body.capture_payloads ?? false };
       AUTH_KEYS = [...AUTH_KEYS, apiKey];
       return json({ ...apiKey, raw_key: `llmc_mock_${apiKey.id}_copy_once` });
     }
     return json({ api_keys: AUTH_KEYS });
   }
-  const keyAction = path.match(/^\/dashboard\/api\/auth\/api-keys\/([^/]+)\/(revoke|rotate)$/);
+  const keyAction = path.match(/^\/dashboard\/api\/auth\/api-keys\/([^/]+)\/(revoke|rotate|payload-capture)$/);
   if (keyAction && method === 'POST') {
     if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
     const id = decodeURIComponent(keyAction[1] ?? '');
     const found = AUTH_KEYS.find((key) => key.id === id);
     if (!found) return json({ error: 'unknown key' }, 404);
+    if (keyAction[2] === 'payload-capture') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { capture_payloads?: boolean };
+      AUTH_KEYS = AUTH_KEYS.map((key) => key.id === id ? { ...key, capture_payloads: body.capture_payloads === true } : key);
+      return json({ api_keys: AUTH_KEYS });
+    }
     if (keyAction[2] === 'revoke') {
       AUTH_KEYS = AUTH_KEYS.map((key) => key.id === id ? { ...key, enabled: false } : key);
       return json({ api_keys: AUTH_KEYS });

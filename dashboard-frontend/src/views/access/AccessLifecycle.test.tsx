@@ -7,6 +7,23 @@ beforeEach(() => resetWorld({ mock: true }));
 afterEach(cleanup);
 
 describe('AccessView management lifecycle', () => {
+  it('keeps flow metadata while payload capture is explicitly toggled per key', async () => {
+    renderWithQuery(<AccessView />);
+    await screen.findByTestId('access-view');
+
+    fireEvent.click(screen.getByRole('button', { name: /close create access/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /^model api keys$/i }));
+    expect(screen.getByText(/flow metadata, timings, usage, and status are always retained/i)).toBeInTheDocument();
+    const toggle = screen.getByRole('switch', { name: 'metadata only' });
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      const enabled = screen.getByRole('switch', { name: 'captured' });
+      expect(enabled).toHaveAttribute('aria-checked', 'true');
+    });
+  });
+
   it('rotates a key with copy-once disclosure and then forgets the raw secret', async () => {
     renderWithQuery(<AccessView />);
     await screen.findByTestId('access-view');

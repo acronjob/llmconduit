@@ -2072,6 +2072,10 @@ impl Gateway {
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
         let accounting_context = auth_context.clone();
+        let capture_payloads = auth_context
+            .as_ref()
+            .map(crate::authz::AuthContext::capture_payloads)
+            .unwrap_or(true);
         let accounting_api_call_id = api_call_id.clone();
         let accounting_requested_model = model_requested.clone();
         let accounting_serving_token = Arc::clone(&serving_token);
@@ -2104,6 +2108,7 @@ impl Gateway {
                     // Bounded four-hop state shared with the concrete upstream
                     // leaves. It is independent of disk turn capture.
                     persistence_capture,
+                    capture_payloads,
                     authorization,
                     endpoint,
                     tx.clone(),
@@ -2482,6 +2487,9 @@ impl Gateway {
         // FlowStore so persistence-only production records true client TTFT.
         persistence_phases: Option<crate::flow_persistence::PersistencePhaseClock>,
         persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+        // Per-key payload-retention policy. Metadata telemetry remains active when
+        // false, but no request or response body may enter an observability sink.
+        capture_payloads: bool,
         // Request-local authorization is immutable and reused for every turn in
         // the server-tool loop. Provider/route selection still occurs downstream,
         // where candidates are checked before dispatch or capacity mutation.
@@ -2945,7 +2953,8 @@ impl Gateway {
             // F1d: attach the turn-capture handle (see above) so the leaf's
             // `upstream_request` write can reach this turn's artifact.
             .with_capture(capture.clone())
-            .with_persistence_capture(persistence_capture.clone());
+            .with_persistence_capture(persistence_capture.clone())
+            .with_payload_capture(capture_payloads);
             let stream_result = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
