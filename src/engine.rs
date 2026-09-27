@@ -2460,6 +2460,7 @@ impl Gateway {
                 return Err(AppError::cancelled());
             }
             upstream_request_index += 1;
+            accumulated_usage.record_upstream_turn_started();
             // Idempotent, tail-scoped role-adjacency normalization before EVERY
             // upstream send: fold any repair-injected same-role run (e.g. a
             // rewritten `developer` note) into its neighbor. Scoped to the tail
@@ -4628,6 +4629,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            cost: None,
+            cost_details: None,
             reasoning_tokens: None,
             prompt_tokens_details: Some(crate::models::chat::PromptTokensDetails {
                 cached_tokens: 50,
@@ -4646,6 +4649,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            cost: None,
+            cost_details: None,
             reasoning_tokens: None,
             prompt_tokens_details: None,
             completion_tokens_details: Some(crate::models::chat::CompletionTokensDetails {
@@ -4664,6 +4669,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            cost: None,
+            cost_details: None,
             reasoning_tokens: Some(30),
             prompt_tokens_details: None,
             completion_tokens_details: None,
@@ -4680,6 +4687,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            cost: None,
+            cost_details: None,
             reasoning_tokens: Some(10),
             prompt_tokens_details: None,
             completion_tokens_details: Some(crate::models::chat::CompletionTokensDetails {
@@ -4688,6 +4697,101 @@ mod tests {
         });
         let result = usage.into_response_usage().unwrap();
         assert_eq!(result.output_tokens_details.unwrap().reasoning_tokens, 30);
+    }
+
+    #[test]
+    fn accumulated_usage_sums_complete_openrouter_costs() {
+        let mut usage = AccumulatedUsage::default();
+        usage.record_upstream_turn_started();
+        usage.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            cost: Some(0.01),
+            cost_details: Some(serde_json::json!({ "upstream_inference_cost": 0.008 })),
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        usage.record_upstream_turn_started();
+        usage.add(ChunkUsage {
+            prompt_tokens: 200,
+            completion_tokens: 30,
+            total_tokens: 230,
+            cost: Some(0.02),
+            cost_details: Some(serde_json::json!({ "upstream_inference_cost": 0.015 })),
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.cost, Some(0.03));
+        assert_eq!(result.cost_source.as_deref(), Some("openrouter"));
+        assert_eq!(
+            result.cost_details.unwrap()["upstream_requests"]
+                .as_array()
+                .expect("aggregated cost details")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn accumulated_usage_omits_partial_or_invalid_provider_cost() {
+        let mut missing_round = AccumulatedUsage::default();
+        missing_round.record_upstream_turn_started();
+        missing_round.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            cost: Some(0.01),
+            cost_details: None,
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        missing_round.record_upstream_turn_started();
+        let result = missing_round.into_response_usage().unwrap();
+        assert_eq!(result.cost, None);
+        assert_eq!(result.cost_source, None);
+
+        let mut invalid = AccumulatedUsage::default();
+        invalid.record_upstream_turn_started();
+        invalid.add(ChunkUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cost: Some(f64::NAN),
+            cost_details: None,
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        let result = invalid.into_response_usage().unwrap();
+        assert_eq!(result.cost, None);
+        assert_eq!(result.cost_source, None);
+    }
+
+    #[test]
+    fn accumulated_usage_preserves_explicit_zero_cost() {
+        let mut usage = AccumulatedUsage::default();
+        usage.record_upstream_turn_started();
+        usage.add(ChunkUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost: Some(0.0),
+            cost_details: Some(serde_json::json!({ "upstream_inference_cost": 0.0 })),
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.total_tokens, 0);
+        assert_eq!(result.cost, Some(0.0));
+        assert_eq!(result.cost_source.as_deref(), Some("openrouter"));
     }
 
     #[test]
@@ -5049,6 +5153,10 @@ struct AccumulatedUsage {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
+    provider_cost: f64,
+    upstream_turns: usize,
+    provider_cost_turns: usize,
+    provider_cost_details: Vec<serde_json::Value>,
     /// Cache-read prompt tokens, or `None` until a chunk REPORTS a cached breakdown
     /// (gap 07): an upstream that never sends `prompt_tokens_details` leaves this
     /// `None` (UNAVAILABLE), distinct from a reported `Some(0)`. Once any chunk
@@ -5071,10 +5179,21 @@ fn accumulate_optional(slot: &mut Option<i64>, reported: Option<i64>) {
 }
 
 impl AccumulatedUsage {
+    fn record_upstream_turn_started(&mut self) {
+        self.upstream_turns += 1;
+    }
+
     fn add(&mut self, usage: ChunkUsage) {
         self.input_tokens += usage.prompt_tokens;
         self.output_tokens += usage.completion_tokens;
         self.total_tokens += usage.total_tokens;
+        if let Some(cost) = usage.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+            self.provider_cost += cost;
+            self.provider_cost_turns += 1;
+            if let Some(details) = usage.cost_details {
+                self.provider_cost_details.push(details);
+            }
+        }
         accumulate_optional(
             &mut self.cached_input_tokens,
             usage.prompt_tokens_details.map(|d| d.cached_tokens),
@@ -5102,13 +5221,27 @@ impl AccumulatedUsage {
     }
 
     fn into_response_usage(self) -> Option<ResponseUsage> {
-        if self.total_tokens == 0 {
+        let has_complete_provider_cost =
+            self.upstream_turns > 0 && self.provider_cost_turns == self.upstream_turns;
+        if self.total_tokens == 0 && !has_complete_provider_cost {
             return None;
         }
+        let cost_details = if has_complete_provider_cost {
+            match self.provider_cost_details.as_slice() {
+                [] => None,
+                [details] => Some(details.clone()),
+                details => Some(serde_json::json!({ "upstream_requests": details })),
+            }
+        } else {
+            None
+        };
         Some(ResponseUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             total_tokens: self.total_tokens,
+            cost: has_complete_provider_cost.then_some(self.provider_cost),
+            cost_source: has_complete_provider_cost.then_some("openrouter".to_string()),
+            cost_details,
             // The CLIENT-facing canonical `ResponseUsage` keeps its integer-only shape
             // (gap 07's UNAVAILABLE distinction is a dashboard concern, not a client
             // contract change): an unreported cached/reasoning class projects to `0` here.
