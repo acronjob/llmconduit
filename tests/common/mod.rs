@@ -712,6 +712,8 @@ pub fn usage_chunk(
                 .try_into()
                 .expect("completion_tokens fits in i64"),
             total_tokens: total_tokens.try_into().expect("total_tokens fits in i64"),
+            cost: None,
+            cost_details: None,
             reasoning_tokens: None,
             prompt_tokens_details: None::<PromptTokensDetails>,
             completion_tokens_details: None::<CompletionTokensDetails>,
