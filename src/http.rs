@@ -17,6 +17,7 @@ use crate::dashboard_api::dashboard_providers;
 use crate::dashboard_api::dashboard_snapshot;
 use crate::dashboard_api::dashboard_topology;
 use crate::dashboard_api::delete_configured_provider;
+use crate::dashboard_api::update_configured_provider;
 use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationDenied;
@@ -49,6 +50,7 @@ use crate::persistent_history_api::history_usage;
 use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
 use crate::upstream::BackendChatRequest;
+use crate::upstream::RequestAffinity;
 use crate::upstream::collect_models_response;
 use axum::Extension;
 use axum::Json;
@@ -236,21 +238,8 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         )
         .route(
             "/dashboard/api/configured-providers/{id}",
-            delete(delete_configured_provider),
+            delete(delete_configured_provider).patch(update_configured_provider),
         )
-        .route(
-            "/dashboard/api/fleet",
-            get(crate::dashboard_fleet::fleet_models),
-        )
-        .route(
-            "/dashboard/api/fleet/models/{id}/load",
-            post(crate::dashboard_fleet::fleet_load_model),
-        )
-        .route(
-            "/dashboard/api/fleet/models/{id}/unload",
-            post(crate::dashboard_fleet::fleet_unload_model),
-        )
-        .route("/dashboard/api/mesh", get(dashboard_mesh::mesh_state))
         .route(
             "/dashboard/api/mesh/join-keys",
             post(dashboard_mesh::create_join_key),
@@ -266,10 +255,6 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         .route(
             "/dashboard/api/mesh/nodes/{endpoint_id}/enable",
             post(dashboard_mesh::enable_node),
-        )
-        .route(
-            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/switch",
-            post(dashboard_mesh::switch_node_model),
         )
         .route(
             "/dashboard/api/mesh/models/disable",
@@ -337,6 +322,37 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
                 Arc::clone(&gateway),
                 require_management_access,
             ));
+    let fleet_routes = Router::new()
+        .route("/dashboard/api/mesh", get(dashboard_mesh::mesh_state))
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/switch",
+            post(dashboard_mesh::switch_node_model),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/load",
+            post(dashboard_mesh::load_node_model),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/unload",
+            post(dashboard_mesh::unload_node_model),
+        )
+        .route(
+            "/dashboard/api/fleet",
+            get(crate::dashboard_fleet::fleet_models),
+        )
+        .route(
+            "/dashboard/api/fleet/models/{id}/load",
+            post(crate::dashboard_fleet::fleet_load_model),
+        )
+        .route(
+            "/dashboard/api/fleet/models/{id}/unload",
+            post(crate::dashboard_fleet::fleet_unload_model),
+        )
+        .route_layer(middleware::map_response(dashboard_api_no_store))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            require_management_access,
+        ));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
     // headers in-handler (they serve HTML, not the JSON `no-store` set), so they are
@@ -386,6 +402,7 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
     api_gated
         .merge(debug_gated)
         .merge(access_routes)
+        .merge(fleet_routes)
         .merge(dashboard_shell)
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).
@@ -715,6 +732,16 @@ async fn require_inference_auth(
     if !gateway.authz().is_enabled() {
         return next.run(request).await;
     }
+    if let Some(context) = request.extensions().get::<crate::authz::AuthContext>() {
+        let endpoint = auth_endpoint(request.uri().path());
+        if !context.allows_endpoint(endpoint) {
+            return auth_failure_response(
+                request.uri().path(),
+                crate::authz::AuthFailure::Forbidden,
+            );
+        }
+        return next.run(request).await;
+    }
     let endpoint = auth_endpoint(request.uri().path());
     let context = match gateway.authz().authenticate(request.headers()) {
         Ok(Some(context)) => context,
@@ -1040,14 +1067,18 @@ struct BodyLogFields {
 /// Compute the body-derived log fields for `path`/`body`, returning `None` for a
 /// dashboard auth endpoint so the caller emits no body-derived field (D7a R3 #1
 /// — the digest + length are a token-verification oracle).
-fn body_log_fields(path: &str, body: &Bytes) -> Option<BodyLogFields> {
+fn body_log_fields(path: &str, body: &Bytes, summarize_payload: bool) -> Option<BodyLogFields> {
     if is_dashboard_auth_path(path) {
         return None;
     }
     Some(BodyLogFields {
         bytes: body.len(),
         sha256: hex::encode(Sha256::digest(body)),
-        summary: summarize_api_body(path, body),
+        summary: if summarize_payload {
+            summarize_api_body(path, body)
+        } else {
+            "payload_capture=disabled".to_owned()
+        },
     })
 }
 
@@ -1231,6 +1262,26 @@ async fn log_api_call(
     } else {
         None
     };
+    // The outer logging middleware needs the RBAC key's payload-capture policy
+    // before any body-bearing sink runs. Authenticate once here and let the
+    // inner authorization middleware reuse this context for endpoint checks.
+    let auth_context = if gateway.authz().is_enabled()
+        && is_authenticated_client_api_request(&method, uri.path())
+    {
+        match gateway.authz().authenticate(&headers) {
+            Ok(Some(context)) => Some(context),
+            Ok(None) => None,
+            Err(failure) => return auth_failure_response(uri.path(), failure),
+        }
+    } else {
+        None
+    };
+    let capture_payloads = auth_context
+        .as_ref()
+        .map(crate::authz::AuthContext::capture_payloads)
+        // Auth-disabled deployments preserve their existing global capture
+        // behavior. Enforced RBAC keys are metadata-only unless opted in.
+        .unwrap_or(!gateway.authz().is_enabled());
 
     // The configurable inbound body cap (default 10 MiB), read from the gateway
     // config — the SAME value `build_router` hands `DefaultBodyLimit::max`, so the
@@ -1461,9 +1512,22 @@ async fn log_api_call(
         let client_source = attribution
             .source
             .map(crate::flow_persistence::client_source_name);
-        let virtual_key_id = client_identity
+        let virtual_key_id = auth_context
             .as_ref()
-            .map(|identity| identity.key_id.as_str());
+            .map(|context| context.key_id.as_str())
+            .or_else(|| {
+                client_identity
+                    .as_ref()
+                    .map(|identity| identity.key_id.as_str())
+            });
+        let user_id = auth_context
+            .as_ref()
+            .map(|context| context.principal_id.as_str())
+            .or_else(|| {
+                client_identity
+                    .as_ref()
+                    .and_then(|identity| identity.owner_id.as_deref())
+            });
         let now_ms = epoch_millis();
         // Session-tree linkage: warm the in-memory index from durable rows
         // for a session we have not seen since startup, then link.
@@ -1476,19 +1540,15 @@ async fn log_api_call(
                         .iter()
                         .map(crate::sessions::ItemFingerprint::from)
                         .collect::<Vec<_>>();
-                    Some(
-                        gateway.session_linker().link(crate::sessions::LinkInput {
-                            api_call_id: &api_call_id,
-                            identity,
-                            client_label: attribution.label.as_deref(),
-                            virtual_key_id,
-                            user_id: client_identity
-                                .as_ref()
-                                .and_then(|identity| identity.owner_id.as_deref()),
-                            items: &items,
-                            now_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
-                        }),
-                    )
+                    Some(gateway.session_linker().link(crate::sessions::LinkInput {
+                        api_call_id: &api_call_id,
+                        identity,
+                        client_label: attribution.label.as_deref(),
+                        virtual_key_id,
+                        user_id,
+                        items: &items,
+                        now_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    }))
                 }
                 _ => None,
             },
@@ -1539,51 +1599,72 @@ async fn log_api_call(
                 link: link.as_ref(),
                 client_label: attribution.label.as_deref(),
                 client_source,
-                user_id: client_identity
-                    .as_ref()
-                    .and_then(|identity| identity.owner_id.as_deref()),
+                user_id,
             },
         );
         let _ = queue.try_begin(row);
         let inbound = persistence_inbound
             .take()
             .expect("persistence gate has inbound capture");
-        match inbound.split {
-            Some(split) => {
-                let _ = queue.try_body(crate::flow_persistence::body_write(
-                    &api_call_id,
-                    crate::flow_persistence::PayloadSection::InboundRequest,
-                    epoch_millis(),
-                    u64::try_from(body_bytes.len()).unwrap_or(u64::MAX),
-                    split,
-                    inbound.partial,
-                    Some(&headers),
-                ));
-            }
-            None => {
-                let _ = queue.try_event(crate::flow_persistence::redacted_request_payload_event(
-                    &api_call_id,
-                    crate::flow_persistence::PayloadSection::InboundRequest,
-                    epoch_millis(),
-                    body_bytes.len(),
-                    &inbound.redacted,
-                    inbound.partial,
-                    Some(&headers),
-                ));
+        if capture_payloads {
+            match inbound.split {
+                Some(split) => {
+                    let _ = queue.try_body(crate::flow_persistence::body_write(
+                        &api_call_id,
+                        crate::flow_persistence::PayloadSection::InboundRequest,
+                        epoch_millis(),
+                        u64::try_from(body_bytes.len()).unwrap_or(u64::MAX),
+                        split,
+                        inbound.partial,
+                        Some(&headers),
+                    ));
+                }
+                None => {
+                    let _ =
+                        queue.try_event(crate::flow_persistence::redacted_request_payload_event(
+                            &api_call_id,
+                            crate::flow_persistence::PayloadSection::InboundRequest,
+                            epoch_millis(),
+                            body_bytes.len(),
+                            &inbound.redacted,
+                            inbound.partial,
+                            Some(&headers),
+                        ));
+                }
             }
         }
-        let capture = crate::flow_persistence::PersistenceCapture::with_options(
+        let capture = crate::flow_persistence::PersistenceCapture::with_capture_options(
             queue,
             &api_call_id,
             gateway.persistence_keep_media(),
+            capture_payloads,
         );
         parts.extensions.insert(Arc::clone(&capture));
         Some(capture)
     } else {
         None
     };
+    // Scheduling identity must work with observability disabled. Never retain
+    // the raw credential or depend on persistence having linked a session.
+    if instrument && body_is_json {
+        let namespace =
+            affinity_namespace(&headers, auth_context.as_ref(), client_identity.as_ref());
+        if let Some(affinity) = detect_request_affinity(
+            Arc::clone(gateway.harness_detector()),
+            headers.clone(),
+            body_bytes.clone(),
+            namespace,
+        )
+        .await
+        {
+            parts.extensions.insert(affinity);
+        }
+    }
     if let Some(identity) = client_identity {
         parts.extensions.insert(identity);
+    }
+    if let Some(context) = auth_context {
+        parts.extensions.insert(context);
     }
 
     // D7a R3 #1: for a dashboard auth endpoint (login/logout) NO body-derived
@@ -1592,7 +1673,7 @@ async fn log_api_call(
     // `None` there so we emit only non-body metadata; every other path logs the
     // length, hex digest, and the redacted summary.
     let is_auth_path = is_dashboard_auth_path(uri.path());
-    match body_log_fields(uri.path(), &body_bytes) {
+    match body_log_fields(uri.path(), &body_bytes, capture_payloads) {
         Some(fields) => tracing::info!(
             api_call_id = %api_call_id,
             method = %method,
@@ -1630,7 +1711,7 @@ async fn log_api_call(
     }
     // Never dump the auth-endpoint body (it carries the token, and even its
     // length/digest are an oracle — handled above).
-    if !is_auth_path && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
+    if capture_payloads && !is_auth_path && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
         tracing::info!(
             api_call_id = %api_call_id,
             method = %method,
@@ -1650,7 +1731,7 @@ async fn log_api_call(
     // keyed on `turn_capture().is_enabled()` INDEPENDENT of the flow store / debug
     // UI — so `api_call_id` reaches the engine and the artifact is written with the
     // dashboard OFF.
-    let capture_gate = instrument && gateway.turn_capture().is_enabled();
+    let capture_gate = instrument && capture_payloads && gateway.turn_capture().is_enabled();
 
     // The `api_call_id` extension the engine reads to link `response_id →
     // api_call_id` (D1) and to reach the per-turn capture state (F1c) is inserted
@@ -1671,7 +1752,8 @@ async fn log_api_call(
     // + `Failed("unhandled")` — no orphan stuck `Open`. If the engine claimed it
     // (`ClaimedL1`), the L0 `Drop` is inert and L1 owns finalization.
     let _l0_guard = if flow_gate {
-        let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
+        let inbound_body =
+            capture_payloads.then(|| crate::dashboard_flow::capture_body(&body_bytes));
         // Gap 04: derive the client attribution from the RAW headers BEFORE they are
         // redacted — this is the only point the raw API key is still readable, and
         // `derive` hashes it in-place (a one-way SHA-256 prefix becomes the label; the
@@ -1685,7 +1767,7 @@ async fn log_api_call(
             dashboard_client_header().as_deref(),
         );
         let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
-        gateway.flow_store().open_with_session(
+        gateway.flow_store().open_with_session_capture(
             api_call_id.clone(),
             method.to_string(),
             uri.path().to_string(),
@@ -1693,6 +1775,7 @@ async fn log_api_call(
             inbound_body,
             client,
             session_facts.clone(),
+            capture_payloads,
         );
         gateway.flow_store().middleware_guard(&api_call_id)
     } else {
@@ -2091,6 +2174,98 @@ async fn warm_session_index(
             tracing::warn!(harness = %identity.harness, "session warm-up timed out; linking cold");
         }
     }
+}
+
+fn affinity_namespace(
+    headers: &HeaderMap,
+    auth: Option<&crate::authz::AuthContext>,
+    client: Option<&ClientIdentity>,
+) -> String {
+    if let Some(auth) = auth {
+        return format!("auth:{}:{}", auth.principal_id, auth.key_id);
+    }
+    if let Some(client) = client {
+        return format!("client:{}", client.key_id);
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty());
+    let key = bearer.or_else(|| {
+        headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    key.map(|key| format!("credential:{:x}", Sha256::digest(key.as_bytes())))
+        .unwrap_or_else(|| "anonymous".to_owned())
+}
+
+fn affinity_from_value(
+    detector: &crate::harness::HarnessDetector,
+    mut headers: HeaderMap,
+    mut body: Value,
+    namespace: &str,
+) -> Option<RequestAffinity> {
+    // Explicit thread metadata is more specific than a per-turn request id.
+    // Keep the configured harness fallback when no thread metadata is present.
+    if body.get("type").and_then(Value::as_str) == Some("response.create")
+        && let Some(response) = body.get_mut("response")
+        && response.is_object()
+    {
+        body = response.take();
+    }
+    if body
+        .pointer("/client_metadata/thread_id")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        headers.remove("x-client-request-id");
+    }
+    // The generic `user` field identifies a caller, rather than a conversation.
+    if let Some(object) = body.as_object_mut() {
+        object.remove("user");
+    }
+    let identity = detector.detect(&headers, Some(&body));
+    let session = identity
+        .session_id
+        .as_deref()
+        .or_else(|| body.get("prompt_cache_key").and_then(Value::as_str))?
+        .trim();
+    if session.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    for value in [
+        namespace,
+        identity.harness.as_str(),
+        session,
+        identity.sub_session_id.as_deref().unwrap_or_default(),
+    ] {
+        let bytes = value.as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    Some(RequestAffinity(format!("{:x}", digest.finalize())))
+}
+
+async fn detect_request_affinity(
+    detector: Arc<crate::harness::HarnessDetector>,
+    headers: HeaderMap,
+    body: Bytes,
+    namespace: String,
+) -> Option<RequestAffinity> {
+    tokio::task::spawn_blocking(move || {
+        let body = serde_json::from_slice(&body).ok()?;
+        affinity_from_value(&detector, headers, body, &namespace)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The inbound capture handed from the middleware to the persistence seam.
@@ -2662,6 +2837,7 @@ async fn post_responses(
     auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
+    affinity: Option<Extension<RequestAffinity>>,
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
@@ -2683,6 +2859,7 @@ async fn post_responses(
             authorization,
             crate::upstream::InferenceEndpoint::Responses,
             auth,
+            affinity.map(|value| value.0),
         )
         .await?;
     let response = if wants_stream {
@@ -2730,6 +2907,8 @@ async fn post_responses(
 async fn get_responses(
     State(gateway): State<Arc<Gateway>>,
     auth: Option<Extension<crate::authz::AuthContext>>,
+    client: Option<Extension<ClientIdentity>>,
+    headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     match upgrade {
@@ -2737,7 +2916,13 @@ async fn get_responses(
             .max_frame_size(gateway.config().max_request_body_bytes)
             .max_message_size(gateway.config().max_request_body_bytes)
             .on_upgrade(move |socket| {
-                responses_ws_serve(socket, gateway, auth.map(|value| value.0))
+                responses_ws_serve(
+                    socket,
+                    gateway,
+                    auth.map(|value| value.0),
+                    client.map(|value| value.0),
+                    headers,
+                )
             })
             .into_response(),
         Err(_) => {
@@ -2762,6 +2947,8 @@ async fn responses_ws_serve(
     socket: WebSocket,
     gateway: Arc<Gateway>,
     auth: Option<crate::authz::AuthContext>,
+    client: Option<ClientIdentity>,
+    headers: HeaderMap,
 ) {
     let max_request_body_bytes = gateway.config().max_request_body_bytes;
     // `split` so the inbound `recv` and outbound `send` can be raced in the same
@@ -2865,15 +3052,26 @@ async fn responses_ws_serve(
         }
     };
 
+    let namespace = affinity_namespace(&headers, auth.as_ref(), client.as_ref());
+    let affinity = detect_request_affinity(
+        Arc::clone(gateway.harness_detector()),
+        headers,
+        request_bytes,
+        namespace,
+    )
+    .await;
+
     // 3. Run the turn through the SAME engine path as the HTTP POST.
     let event_stream = match gateway
         .clone()
-        .stream_responses_authorized_with_context(
+        .stream_responses_with_capture_authorized_context(
             request,
+            None,
             None,
             authorization,
             crate::upstream::InferenceEndpoint::Responses,
             auth,
+            affinity,
         )
         .await
     {
@@ -3015,6 +3213,7 @@ async fn post_messages(
     auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
+    affinity: Option<Extension<RequestAffinity>>,
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
     let api_call_id = api_call_id.map(|extension| extension.0.0);
@@ -3024,6 +3223,7 @@ async fn post_messages(
         api_call_id,
         persistence.map(|extension| extension.0),
         auth.map(|value| value.0),
+        affinity.map(|value| value.0),
     )
     .await
     {
@@ -3122,6 +3322,11 @@ async fn handle_count_tokens(
         None,
     )
     .with_thinking_override(thinking_override)
+    .with_payload_capture(
+        auth.as_ref()
+            .map(crate::authz::AuthContext::capture_payloads)
+            .unwrap_or(true),
+    )
     .with_authorization(
         authorization,
         crate::upstream::InferenceEndpoint::CountTokens,
@@ -3172,6 +3377,7 @@ async fn post_chat_completions(
     auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
+    affinity: Option<Extension<RequestAffinity>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     handle_chat_completions(
@@ -3180,6 +3386,7 @@ async fn post_chat_completions(
         api_call_id.map(|extension| extension.0.0),
         persistence.map(|extension| extension.0),
         request,
+        affinity.map(|value| value.0),
     )
     .await
 }
@@ -3217,12 +3424,26 @@ async fn dashboard_chat_completions(
             "the account is not authorized for the requested model",
         ));
     }
+    let namespace = session
+        .user
+        .as_ref()
+        .map(|user| format!("dashboard-user:{}", user.id))
+        .unwrap_or_else(|| affinity_namespace(&headers, access.auth_context(), None));
+    let body = Value::Object(
+        request
+            .extra_body
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let affinity = affinity_from_value(gateway.harness_detector(), headers, body, &namespace);
     handle_chat_completions(
         gateway,
         access.auth_context().cloned(),
         api_call_id.map(|extension| extension.0.0),
         persistence.map(|extension| extension.0),
         request,
+        affinity,
     )
     .await
 }
@@ -3324,6 +3545,7 @@ async fn handle_chat_completions(
     api_call_id: Option<String>,
     persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
     request: ChatCompletionRequest,
+    affinity: Option<RequestAffinity>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
@@ -3348,6 +3570,7 @@ async fn handle_chat_completions(
             authorization,
             crate::upstream::InferenceEndpoint::ChatCompletions,
             auth,
+            affinity,
         )
         .await?;
 
@@ -3434,6 +3657,7 @@ async fn handle_post_messages(
     api_call_id: Option<String>,
     persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
     auth: Option<crate::authz::AuthContext>,
+    affinity: Option<RequestAffinity>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
@@ -3458,6 +3682,7 @@ async fn handle_post_messages(
             authorization,
             crate::upstream::InferenceEndpoint::Messages,
             auth,
+            affinity,
         )
         .await?;
 
@@ -4544,6 +4769,41 @@ fn model_id_from_value(model: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn affinity_uses_conversations_and_threads_not_per_turn_request_ids() {
+        let detector = crate::harness::HarnessDetector::builtin();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("originator", "codex_cli_rs".parse().unwrap());
+        headers.insert("session-id", "root-session".parse().unwrap());
+        headers.insert("x-client-request-id", "request-1".parse().unwrap());
+        let body = serde_json::json!({"client_metadata":{"thread_id":"thread-a"}});
+        let first =
+            super::affinity_from_value(&detector, headers.clone(), body.clone(), "caller-a");
+        headers.insert("x-client-request-id", "request-2".parse().unwrap());
+        assert_eq!(
+            first,
+            super::affinity_from_value(&detector, headers.clone(), body, "caller-a")
+        );
+        assert_ne!(
+            first,
+            super::affinity_from_value(
+                &detector,
+                headers,
+                serde_json::json!({"client_metadata":{"thread_id":"thread-b"}}),
+                "caller-a"
+            )
+        );
+        assert_eq!(
+            None,
+            super::affinity_from_value(
+                &detector,
+                axum::http::HeaderMap::new(),
+                serde_json::json!({"user":"user-a"}),
+                "caller-a"
+            )
+        );
+    }
+
     use super::body_log_fields;
     use super::responses_wire_event_data;
     use super::should_proxy_response_header;
@@ -4733,23 +4993,28 @@ mod tests {
 
         // The login endpoint suppresses every body-derived field.
         assert!(
-            body_log_fields("/dashboard/login", &body).is_none(),
+            body_log_fields("/dashboard/login", &body, true).is_none(),
             "login body must produce no body-derived log fields (token oracle)"
         );
         // Logout is symmetric (bodyless, but the same path class).
-        assert!(body_log_fields("/dashboard/logout", &Bytes::new()).is_none());
-        assert!(body_log_fields("/dashboard/auth/key-login", &body).is_none());
-        assert!(body_log_fields("/dashboard/auth/logout", &Bytes::new()).is_none());
+        assert!(body_log_fields("/dashboard/logout", &Bytes::new(), true).is_none());
+        assert!(body_log_fields("/dashboard/auth/key-login", &body, true).is_none());
+        assert!(body_log_fields("/dashboard/auth/logout", &Bytes::new(), true).is_none());
 
         // A normal inference path still logs the length + digest + summary, and
         // that digest is over the body (never resembles the bare-token digest).
-        let normal =
-            body_log_fields("/v1/messages", &body).expect("non-auth path logs body-derived fields");
+        let normal = body_log_fields("/v1/messages", &body, true)
+            .expect("non-auth path logs body-derived fields");
         assert_eq!(normal.bytes, body.len());
         assert_eq!(normal.sha256, body_sha);
         // Sanity: the body digest is not the standalone token digest, so even the
         // normal path never logs a digest of the bare token.
         assert_ne!(normal.sha256, token_sha);
+
+        let metadata_only = body_log_fields("/v1/messages", &body, false).unwrap();
+        assert_eq!(metadata_only.bytes, body.len());
+        assert_eq!(metadata_only.summary, "payload_capture=disabled");
+        assert!(!metadata_only.summary.contains(token));
     }
 
     /// The full RFC 7230 §6.1 hop-by-hop set; must match the canonical list and

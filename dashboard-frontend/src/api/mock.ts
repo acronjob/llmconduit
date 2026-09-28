@@ -77,7 +77,7 @@ let AUTH_POLICIES: AuthPolicy[] = [
   { id: 'pol_deny_local', name: 'Block local fallback', effect: 'deny', enabled: true, subjects: ['grp_prod'], endpoints: ['*'], models: [], requested_models: ['*'], served_models: ['*'], providers: ['vllm-b'], routes: ['local'], time_windows: [], max_concurrent_sessions: null, max_daily_session_starts: null, management_permissions: [] },
 ];
 let AUTH_KEYS: AuthApiKey[] = [
-  { id: 'key_ops', principal_id: 'usr_ops', name: 'operator laptop', prefix: 'llmc_7ad2', enabled: true, created_at: '2026-06-03T10:00:00Z', expires_at: null, last_used_at: '2026-06-21T14:19:40Z' },
+  { id: 'key_ops', principal_id: 'usr_ops', name: 'operator laptop', prefix: 'llmc_7ad2', enabled: true, created_at: '2026-06-03T10:00:00Z', expires_at: null, last_used_at: '2026-06-21T14:19:40Z', capture_payloads: false },
 ];
 let AUTH_SESSIONS: AuthSession[] = [
   { id: 'sess_admin', kind: 'dashboard', principal_id: 'usr_ops', key_id: 'key_ops', endpoint: null, requested_model: null, started_at: '2026-06-21T14:00:00Z', expires_at: '2026-06-21T22:00:00Z' },
@@ -106,7 +106,10 @@ let CONFIGURED_PROVIDERS: ConfiguredProvider[] = [
     name: 'Local lab',
     base_url: 'http://127.0.0.1:8101/v1',
     api_key_present: true,
-    models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }],
+    auto_discover: true,
+    allowed_models: null,
+    disabled_models: [],
+    models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }, { id: 'qwen3-32b', context_limit: 131072 }],
   },
 ];
 
@@ -122,8 +125,8 @@ let MESH_NODES: MeshNode[] = [
       provider: 'fleet',
       revision: 1,
       models: [
-        { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', phase: 'ready', desired_state: 'loaded' },
-        { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded' },
+        { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', phase: 'ready', desired_state: 'loaded', gpu_count: 4, max_instances: 2, desired_instances: 1, ready_instances: 1, assigned_gpus: [0, 1, 6, 7], instances: [{ instance_id: 'qwen3-8b-flash-0', index: 0, port: 8101, phase: 'ready', container_status: 'running', assigned_gpus: [0, 1, 6, 7] }] },
+        { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 8, max_instances: 1, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] },
       ],
     },
   },
@@ -136,24 +139,30 @@ let MESH_DISABLED_MODELS: MeshDisabledModel[] = [
 
 let FLEET_MODELS: FleetModelEntry[] = [
   {
-    model: { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', image: 'qwen3:8b-flash' },
+    model: { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', image: 'qwen3:8b-flash', gpu_count: 1, max_instances: 2 },
     status: {
       model_id: 'qwen3-8b-flash',
       phase: 'ready',
       desired_state: 'loaded',
+      desired_instances: 1,
+      ready_instances: 1,
       container_status: 'running',
       health: 'healthy',
       assigned_gpus: [0],
+      instances: [{ instance_id: 'qwen3-8b-flash-0', index: 0, port: 8101, phase: 'ready', container_status: 'running', assigned_gpus: [0] }],
       last_checked: new Date(Date.now() - 2_000).toISOString(),
     },
   },
   {
-    model: { id: 'qwen3-32b', description: 'larger local model', image: 'qwen3:32b' },
+    model: { id: 'qwen3-32b', description: 'larger local model', image: 'qwen3:32b', gpu_count: 8, max_instances: 1 },
     status: {
       model_id: 'qwen3-32b',
       phase: 'unloaded',
       desired_state: 'unloaded',
+      desired_instances: 0,
+      ready_instances: 0,
       assigned_gpus: [],
+      instances: [],
       last_checked: new Date(Date.now() - 30_000).toISOString(),
     },
   },
@@ -735,20 +744,25 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   }
   if (path === '/dashboard/api/auth/api-keys') {
     if (method === 'POST') {
-      const body = JSON.parse(String(init?.body ?? '{}')) as { principal_id?: string; name?: string; expires_at?: string | null };
+      const body = JSON.parse(String(init?.body ?? '{}')) as { principal_id?: string; name?: string; expires_at?: string | null; capture_payloads?: boolean };
       if (!body.principal_id || !body.name) return json({ error: 'invalid key' }, 400);
-      const apiKey: AuthApiKey = { id: `key_${AUTH_KEYS.length + 1}`, principal_id: body.principal_id, name: body.name, prefix: 'llmc_demo', enabled: true, created_at: new Date().toISOString(), expires_at: body.expires_at ?? null, last_used_at: null };
+      const apiKey: AuthApiKey = { id: `key_${AUTH_KEYS.length + 1}`, principal_id: body.principal_id, name: body.name, prefix: 'llmc_demo', enabled: true, created_at: new Date().toISOString(), expires_at: body.expires_at ?? null, last_used_at: null, capture_payloads: body.capture_payloads ?? false };
       AUTH_KEYS = [...AUTH_KEYS, apiKey];
       return json({ ...apiKey, raw_key: `llmc_mock_${apiKey.id}_copy_once` });
     }
     return json({ api_keys: AUTH_KEYS });
   }
-  const keyAction = path.match(/^\/dashboard\/api\/auth\/api-keys\/([^/]+)\/(revoke|rotate)$/);
+  const keyAction = path.match(/^\/dashboard\/api\/auth\/api-keys\/([^/]+)\/(revoke|rotate|payload-capture)$/);
   if (keyAction && method === 'POST') {
     if (!headerValue(init?.headers, 'X-CSRF-Token')) return json({ error: 'missing csrf' }, 403);
     const id = decodeURIComponent(keyAction[1] ?? '');
     const found = AUTH_KEYS.find((key) => key.id === id);
     if (!found) return json({ error: 'unknown key' }, 404);
+    if (keyAction[2] === 'payload-capture') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { capture_payloads?: boolean };
+      AUTH_KEYS = AUTH_KEYS.map((key) => key.id === id ? { ...key, capture_payloads: body.capture_payloads === true } : key);
+      return json({ api_keys: AUTH_KEYS });
+    }
     if (keyAction[2] === 'revoke') {
       AUTH_KEYS = AUTH_KEYS.map((key) => key.id === id ? { ...key, enabled: false } : key);
       return json({ api_keys: AUTH_KEYS });
@@ -801,16 +815,46 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       name: body.name.trim(),
       base_url: body.base_url.trim(),
       api_key_present: true,
-      models: [{ id: 'discovered-model', context_limit: null }],
+      auto_discover: true,
+      allowed_models: null,
+      disabled_models: [],
+      models: [{ id: 'discovered-model', context_limit: null }, { id: 'backup-discovered-model', context_limit: 65536 }],
     };
     CONFIGURED_PROVIDERS = [...CONFIGURED_PROVIDERS, provider];
     return json(provider, 201);
   }
-  const configuredProviderDelete = path.match(/^\/dashboard\/api\/configured-providers\/([^/]+)$/);
-  if (configuredProviderDelete && method === 'DELETE') {
+  const configuredProviderById = path.match(/^\/dashboard\/api\/configured-providers\/([^/]+)$/);
+  if (configuredProviderById && method === 'PATCH') {
     const csrf = headerValue(init?.headers, 'X-CSRF-Token');
     if (!csrf) return json({ error: 'missing csrf' }, 403);
-    const id = decodeURIComponent(configuredProviderDelete[1] ?? '');
+    const id = decodeURIComponent(configuredProviderById[1] ?? '');
+    const index = CONFIGURED_PROVIDERS.findIndex((provider) => provider.id === id);
+    if (index < 0) return json({ error: 'unknown configured provider' }, 404);
+    const body = JSON.parse(String(init?.body ?? '{}')) as { auto_discover?: unknown; allowed_models?: unknown; disabled_models?: unknown };
+    const current = CONFIGURED_PROVIDERS[index]!;
+    const knownModels = new Set(current.models.map((model) => model.id));
+    if (body.auto_discover !== undefined && typeof body.auto_discover !== 'boolean') return json({ error: 'invalid auto_discover' }, 400);
+    if (Object.hasOwn(body, 'allowed_models') && body.allowed_models !== null && (!Array.isArray(body.allowed_models) || body.allowed_models.some((model) => typeof model !== 'string' || !knownModels.has(model)))) {
+      return json({ error: 'allowed_models must be null or known model ids' }, 400);
+    }
+    if (body.disabled_models !== undefined && (!Array.isArray(body.disabled_models) || body.disabled_models.some((model) => typeof model !== 'string' || !knownModels.has(model)))) {
+      return json({ error: 'disabled_models must be known model ids' }, 400);
+    }
+    const updated: ConfiguredProvider = {
+      ...current,
+      auto_discover: body.auto_discover ?? current.auto_discover,
+      allowed_models: Object.hasOwn(body, 'allowed_models')
+        ? (body.allowed_models === null ? null : [...new Set(body.allowed_models as string[])])
+        : current.allowed_models,
+      disabled_models: body.disabled_models === undefined ? current.disabled_models : [...new Set(body.disabled_models as string[])],
+    };
+    CONFIGURED_PROVIDERS = CONFIGURED_PROVIDERS.map((provider) => provider.id === id ? updated : provider);
+    return json(updated);
+  }
+  if (configuredProviderById && method === 'DELETE') {
+    const csrf = headerValue(init?.headers, 'X-CSRF-Token');
+    if (!csrf) return json({ error: 'missing csrf' }, 403);
+    const id = decodeURIComponent(configuredProviderById[1] ?? '');
     CONFIGURED_PROVIDERS = CONFIGURED_PROVIDERS.filter((provider) => provider.id !== id);
     return new Response(null, { status: 204 });
   }
@@ -864,12 +908,15 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     });
     return updated ? json({ updated, endpoint_id: endpointId, enabled, evicted: !enabled }) : json({ error: 'mesh node not found' }, 404);
   }
-  const meshSwitchMatch = path.match(/^\/dashboard\/api\/mesh\/nodes\/([^/]+)\/models\/([^/]+)\/switch$/);
+  const meshSwitchMatch = path.match(/^\/dashboard\/api\/mesh\/nodes\/([^/]+)\/models\/([^/]+)\/(switch|load|unload)$/);
   if (meshSwitchMatch && method === 'POST') {
     const csrf = headerValue(init?.headers, 'X-CSRF-Token');
     if (!csrf) return json({ error: 'missing csrf' }, 403);
     const endpointId = decodeURIComponent(meshSwitchMatch[1] ?? '');
     const modelId = decodeURIComponent(meshSwitchMatch[2] ?? '');
+    const unload = meshSwitchMatch[3] === 'unload';
+    const body = parseBody(init?.body);
+    const requestedInstances = positiveInstanceCount(body.instances);
     const node = MESH_NODES.find((entry) => entry.endpoint_id === endpointId);
     if (!node?.model_switching?.models.some((model) => model.id === modelId)) {
       return json({ error: 'model is not advertised as switchable' }, 400);
@@ -879,8 +926,12 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       revision: node.model_switching.revision + 1,
       models: node.model_switching.models.map((model) => ({
         ...model,
-        phase: model.id === modelId ? 'loading' : model.phase,
-        desired_state: model.id === modelId ? 'loaded' : model.desired_state,
+        phase: model.id === modelId ? (unload ? 'unloaded' : 'loading') : model.phase,
+        desired_state: model.id === modelId ? (unload ? 'unloaded' : 'ready') : model.desired_state,
+        desired_instances: model.id === modelId ? (unload ? 0 : requestedInstances ?? model.desired_instances ?? 1) : model.desired_instances,
+        ready_instances: model.id === modelId ? (unload ? 0 : 0) : model.ready_instances,
+        assigned_gpus: model.id === modelId ? (unload ? [] : mockAssignedGpus(model.gpu_count ?? 1, requestedInstances ?? model.desired_instances ?? 1)) : model.assigned_gpus,
+        instances: model.id === modelId ? (unload ? [] : mockInstances(model.id, model.gpu_count ?? 1, requestedInstances ?? model.desired_instances ?? 1, 8200, 'loading')) : model.instances,
       })),
     };
     return json({ endpoint_id: endpointId, model_id: modelId, accepted: true, changed: true });
@@ -931,6 +982,8 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     if (!csrf) return json({ error: 'missing csrf' }, 403);
     const id = decodeURIComponent(fleetAction[1] ?? '');
     const load = fleetAction[2] === 'load';
+    const body = parseBody(init?.body);
+    const requestedInstances = positiveInstanceCount(body.instances);
     const found = FLEET_MODELS.find((entry) => entry.model.id === id);
     if (!found) return json({ error: 'unknown Fleet model' }, 404);
     const now = new Date().toISOString();
@@ -940,7 +993,10 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
         ...entry.status,
         phase: load ? 'loading' : 'stopping',
         desired_state: load ? 'loaded' : 'unloaded',
-        assigned_gpus: load ? entry.status.assigned_gpus.length ? entry.status.assigned_gpus : [0] : [],
+        desired_instances: load ? requestedInstances ?? entry.status.desired_instances ?? 1 : 0,
+        ready_instances: load ? 0 : 0,
+        assigned_gpus: load ? mockAssignedGpus(entry.model.gpu_count ?? 1, requestedInstances ?? entry.status.desired_instances ?? 1) : [],
+        instances: load ? mockInstances(entry.model.id, entry.model.gpu_count ?? 1, requestedInstances ?? entry.status.desired_instances ?? 1, 8101, 'loading') : [],
         last_checked: now,
       },
     } : entry);
@@ -1165,6 +1221,25 @@ function parseBody(body: BodyInit | null | undefined): Record<string, unknown> {
   }
 }
 
+function positiveInstanceCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function mockAssignedGpus(gpuCount: number, instances: number): number[] {
+  return Array.from({ length: Math.max(0, gpuCount * instances) }, (_, index) => index);
+}
+
+function mockInstances(modelId: string, gpuCount: number, instances: number, basePort: number, phase: string) {
+  return Array.from({ length: instances }, (_, index) => ({
+    instance_id: `${modelId}-${index}`,
+    index,
+    port: basePort + index,
+    phase,
+    container_status: phase === 'ready' ? 'running' : 'starting',
+    assigned_gpus: Array.from({ length: gpuCount }, (_unused, gpuIndex) => index * gpuCount + gpuIndex),
+  }));
+}
+
 /** The mock's signed-in user (null after a token login). */
 let mockSessionUser: SessionUser | null = null;
 
@@ -1186,7 +1261,10 @@ export function resetMockAccounts(): void {
     name: 'Local lab',
     base_url: 'http://127.0.0.1:8101/v1',
     api_key_present: true,
-    models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }],
+    auto_discover: true,
+    allowed_models: null,
+    disabled_models: [],
+    models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }, { id: 'qwen3-32b', context_limit: 131072 }],
   }];
   MOCK_USERS.splice(0, MOCK_USERS.length,
     { id: 'user_admin', username: 'admin', is_admin: true, created_at_ms: Date.now() - 86_400_000 * 30, updated_at_ms: Date.now() - 86_400_000 * 30 },
@@ -1196,6 +1274,55 @@ export function resetMockAccounts(): void {
     { id: 'key_admin_laptop', label: 'laptop', user_id: 'user_admin', allowed_models: [], created_at_ms: Date.now() - 86_400_000 * 20, updated_at_ms: Date.now() - 86_400_000 * 20 },
     { id: 'key_dev_ci', label: 'ci', user_id: 'user_dev', allowed_models: ['local'], created_at_ms: Date.now() - 86_400_000 * 2, updated_at_ms: Date.now() - 86_400_000 * 2 },
   );
+  MESH_NODES = [
+    {
+      endpoint_id: 'vllm-a',
+      label: 'mesh worker a',
+      enabled: true,
+      joined_at_ms: Date.now() - 3_300_000,
+      join_key_id: 'jk_mock_used',
+      last_seen_at_ms: Date.now() - 5_000,
+      model_switching: {
+        provider: 'fleet',
+        revision: 1,
+        models: [
+          { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', phase: 'ready', desired_state: 'loaded', gpu_count: 4, max_instances: 2, desired_instances: 1, ready_instances: 1, assigned_gpus: [0, 1, 6, 7], instances: [{ instance_id: 'qwen3-8b-flash-0', index: 0, port: 8101, phase: 'ready', container_status: 'running', assigned_gpus: [0, 1, 6, 7] }] },
+          { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 8, max_instances: 1, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] },
+        ],
+      },
+    },
+    { endpoint_id: 'vllm-b', label: 'mesh worker b', enabled: true, joined_at_ms: Date.now() - 2_400_000, join_key_id: 'jk_mock_spare', last_seen_at_ms: Date.now() - 45_000 },
+  ];
+  FLEET_MODELS = [
+    {
+      model: { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', image: 'qwen3:8b-flash', gpu_count: 1, max_instances: 2 },
+      status: {
+        model_id: 'qwen3-8b-flash',
+        phase: 'ready',
+        desired_state: 'loaded',
+        desired_instances: 1,
+        ready_instances: 1,
+        container_status: 'running',
+        health: 'healthy',
+        assigned_gpus: [0],
+        instances: [{ instance_id: 'qwen3-8b-flash-0', index: 0, port: 8101, phase: 'ready', container_status: 'running', assigned_gpus: [0] }],
+        last_checked: new Date(Date.now() - 2_000).toISOString(),
+      },
+    },
+    {
+      model: { id: 'qwen3-32b', description: 'larger local model', image: 'qwen3:32b', gpu_count: 8, max_instances: 1 },
+      status: {
+        model_id: 'qwen3-32b',
+        phase: 'unloaded',
+        desired_state: 'unloaded',
+        desired_instances: 0,
+        ready_instances: 0,
+        assigned_gpus: [],
+        instances: [],
+        last_checked: new Date(Date.now() - 30_000).toISOString(),
+      },
+    },
+  ];
 }
 
 /** Deterministic per-model throughput buckets for the last hour. */
@@ -1232,6 +1359,7 @@ function seedActivity(bucketMs: number): ActivityBucket[] {
     const wave = 1 + Math.cos(i / 4) * 0.5;
     out.push({ bucket_ms: t, user_id: 'user_admin', virtual_key_id: 'key_admin_laptop', requests: Math.round(30 * wave), failed: i % 5 === 0 ? 1 : 0, input_tokens: Math.round(60_000 * wave), output_tokens: Math.round(9_000 * wave), cached_tokens: Math.round(40_000 * wave) });
     out.push({ bucket_ms: t, user_id: 'user_dev', virtual_key_id: 'key_dev_ci', requests: Math.round(8 * wave), failed: 0, input_tokens: Math.round(9_000 * wave), output_tokens: Math.round(2_000 * wave), cached_tokens: 0 });
+    out.push({ bucket_ms: t, user_id: 'usr_ops', virtual_key_id: 'key_ops', requests: 3, failed: 0, input_tokens: 1_500, output_tokens: 300, cached_tokens: 0 });
     if (i % 3 === 0) out.push({ bucket_ms: t, user_id: null, virtual_key_id: null, requests: 2, failed: 0, input_tokens: 800, output_tokens: 200, cached_tokens: 0 });
   }
   return out;

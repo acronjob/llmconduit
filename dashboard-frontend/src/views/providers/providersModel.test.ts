@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AuthPolicy, FlowSummary, ProviderHealth, ProviderInventoryEntry, TopologyEdge } from '../../api/types';
-import { buildProviderInventory, formatTimeWindow } from './providersModel';
+import { buildProviderInventory, formatTimeWindow, groupProviderSlots } from './providersModel';
 
 const provider = (id: string, status: ProviderHealth['status'] = 'healthy'): ProviderHealth => ({
   id,
@@ -66,6 +66,35 @@ const policy = (overrides: Partial<AuthPolicy>): AuthPolicy => ({
 });
 
 describe('providersModel', () => {
+  it('keeps an unhealthy slot down when its provider connection is healthy', () => {
+    const inventory = buildProviderInventory({
+      providers: [{ ...inventoryProvider('mesh:lab'), healthy: false, accepting_requests: false }],
+      health: [provider('mesh:lab')], edges: [], flows: [], policies: [], cacheMetrics: [], priceTable: {},
+    });
+    expect(inventory.rows[0]!.status).toBe('down');
+    expect(inventory.summary.down).toBe(1);
+  });
+
+  it('groups by display name while retaining distinct slot identities and order', () => {
+    const inventory = buildProviderInventory({
+      providers: [
+        { ...inventoryProvider('node-c'), provider_name: 'South lab', resource_id: 'gpu-c' },
+        { ...inventoryProvider('node-b'), provider_name: 'North lab', resource_id: 'gpu-b' },
+        { ...inventoryProvider('node-a'), provider_name: ' North lab ', resource_id: 'gpu-a' },
+        { ...inventoryProvider('unnamed'), provider_name: '  ', resource_id: null },
+      ],
+      health: [], edges: [], flows: [], policies: [], cacheMetrics: [], priceTable: {},
+    });
+    const original = [...inventory.rows];
+    const groups = groupProviderSlots(inventory.rows);
+
+    expect(groups.map((group) => group.name)).toEqual(['North lab', 'South lab', 'unnamed']);
+    expect(groups[0]!.rows).toEqual(inventory.rows.filter((row) => row.name.trim() === 'North lab'));
+    expect(groups[0]!.rows.map((row) => row.id)).toEqual(['node-a', 'node-b']);
+    expect(inventory.rows).toEqual(original);
+    expect(groupProviderSlots([])).toEqual([]);
+  });
+
   it('joins provider health, observed usage, policy windows, limits, and pricing', () => {
     const edges: TopologyEdge[] = [{ from: 'gateway', to: 'openai', throughput: 0.4, tokens_per_sec: 12, cost_per_sec: 0.01 }];
     const inventory = buildProviderInventory({

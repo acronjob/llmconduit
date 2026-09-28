@@ -3,6 +3,7 @@ import type { CreateAuthPolicyRequest } from '../../api/types';
 import {
   inferenceEndpointOptions,
   summarizeEndpoints,
+  summarizeManagementPermissions,
   summarizeMatcher,
   summarizePolicyIntent,
   validatePolicy,
@@ -73,6 +74,14 @@ describe('policyEditorModel', () => {
       providers: [],
       management_permissions: ['auth.policies.read'],
     }, 'administration')).toEqual([]);
+  });
+
+  it('exposes human-readable Fleet administration permissions', () => {
+    expect(summarizeManagementPermissions([
+      'fleet.models.read',
+      'fleet.models.load',
+      'fleet.models.unload',
+    ])).toBe('View Fleet model state, Load Fleet models, Unload Fleet models');
   });
 
   it('rejects policies that grant neither model access nor administration access', () => {

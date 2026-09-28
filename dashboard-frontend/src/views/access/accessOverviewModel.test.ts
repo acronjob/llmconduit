@@ -29,8 +29,8 @@ const baseInput: AccessOverviewInput = {
     },
   ],
   apiKeys: [
-    { id: 'key_ops', principal_id: 'usr_ops', name: 'laptop', prefix: 'llmc_abcd', enabled: true, created_at: '2026-01-01T00:00:00Z', expires_at: null, last_used_at: null },
-    { id: 'key_old', principal_id: 'usr_ops', name: 'old laptop', prefix: 'llmc_dead', enabled: false, created_at: '2026-01-01T00:00:00Z', expires_at: null, last_used_at: null },
+    { id: 'key_ops', principal_id: 'usr_ops', name: 'laptop', prefix: 'llmc_abcd', enabled: true, created_at: '2026-01-01T00:00:00Z', expires_at: null, last_used_at: null, capture_payloads: false },
+    { id: 'key_old', principal_id: 'usr_ops', name: 'old laptop', prefix: 'llmc_dead', enabled: false, created_at: '2026-01-01T00:00:00Z', expires_at: null, last_used_at: null, capture_payloads: false },
   ],
   sessions: [
     { id: 'sess_ops', kind: 'inference', principal_id: 'usr_ops', key_id: 'key_ops', endpoint: 'responses', requested_model: 'gpt-4.1', started_at: '2026-01-01T00:00:00Z', expires_at: null },

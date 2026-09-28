@@ -17,13 +17,15 @@ describe('ActivityView (mock history API)', () => {
 
   it('lists activity per user and key with names resolved, unattributed traffic included', async () => {
     const { getByTestId, getAllByTestId } = renderWithQuery(<ActivityView />);
-    await waitFor(() => expect(getAllByTestId('activity-row').length).toBe(3));
+    await waitFor(() => expect(getAllByTestId('activity-row').length).toBe(4));
     const users = getAllByTestId('activity-row').map((r) => r.getAttribute('data-user'));
-    expect(users).toEqual(['user_admin', 'user_dev', 'none']);
+    expect(users).toEqual(['user_admin', 'user_dev', 'usr_ops', 'none']);
     await waitFor(() => expect(getAllByTestId('activity-user')[0]!.textContent).toBe('admin'));
-    expect(getAllByTestId('activity-user')[2]!.textContent).toBe('unattributed');
+    await waitFor(() => expect(getAllByTestId('activity-user')[2]!.textContent).toBe('Operations'));
+    expect(getAllByTestId('activity-key')[2]!.textContent).toBe('operator laptop');
+    expect(getAllByTestId('activity-user')[3]!.textContent).toBe('unattributed');
     expect(getByTestId('act-requests').getAttribute('data-quality')).toBe('measured');
-    expect(getByTestId('act-principals').textContent).toContain('3 · 3');
+    expect(getByTestId('act-principals').textContent).toContain('4 · 4');
     // Each row carries a request sparkline with data.
     expect(getAllByTestId('activity-row')[0]!.querySelector('svg')!.getAttribute('data-available')).toBe('true');
   });

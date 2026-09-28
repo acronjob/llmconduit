@@ -12,6 +12,8 @@ type ChatEntry = DashboardChatMessage & { id: number; reasoning?: string };
 type RunState = 'idle' | 'streaming' | 'complete' | 'stopped' | 'error';
 type RunRates = { tgPerSecond: number | null; ppPerSecond: number | null };
 
+const DEFAULT_MAX_CONTEXT_LENGTH = 256 * 1024;
+
 export function ChatView() {
   const { client } = getConnection();
   const catalog = useQuery({ queryKey: queryKeys.catalog, queryFn: () => client.catalog() });
@@ -20,7 +22,7 @@ export function ChatView() {
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>('medium');
   const [temperature, setTemperature] = useState('1');
   const [topP, setTopP] = useState('0.95');
-  const [maxContextLength, setMaxContextLength] = useState('4096');
+  const [maxContextOverride, setMaxContextOverride] = useState<string | null>(null);
   const [prompt, setPrompt] = useState('');
   const [messages, setMessages] = useState<ChatEntry[]>([]);
   const [runState, setRunState] = useState<RunState>('idle');
@@ -31,9 +33,14 @@ export function ChatView() {
   const abortRef = useRef<AbortController | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const nextId = useRef(1);
+  const promptCacheKeyRef = useRef(newPromptCacheKey());
 
   const models = useMemo(() => catalog.data?.map((entry) => entry.id) ?? [], [catalog.data]);
   const advertisedContextLimit = catalog.data?.find((entry) => entry.id === model)?.context_limit ?? null;
+  const defaultContextLength = advertisedContextLimit !== null && Number.isSafeInteger(advertisedContextLimit) && advertisedContextLimit > 0
+    ? Math.min(DEFAULT_MAX_CONTEXT_LENGTH, advertisedContextLimit)
+    : DEFAULT_MAX_CONTEXT_LENGTH;
+  const maxContextLength = maxContextOverride ?? String(defaultContextLength);
   useEffect(() => {
     if (!model && models[0]) setModel(models[0]);
   }, [model, models]);
@@ -78,6 +85,7 @@ export function ChatView() {
           top_p: parseOptionalNumber(topP),
           max_tokens: parseOptionalInteger(maxContextLength),
           reasoning_effort: thinkingLevel,
+          prompt_cache_key: promptCacheKeyRef.current,
         },
         (delta) => {
           if (delta.text && firstTokenAt === null) firstTokenAt = performance.now();
@@ -120,6 +128,7 @@ export function ChatView() {
     setElapsedMs(null);
     setRates({ tgPerSecond: null, ppPerSecond: null });
     setRunState('idle');
+    promptCacheKeyRef.current = newPromptCacheKey();
   }
 
   function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -146,7 +155,7 @@ export function ChatView() {
           <select
             id="chat-model"
             value={model}
-            onChange={(event) => setModel(event.target.value)}
+            onChange={(event) => { setModel(event.target.value); setMaxContextOverride(null); }}
             disabled={busy || models.length === 0}
             className="mt-1 w-full rounded border border-line bg-bg px-2.5 py-2 font-mono text-xs text-text outline-none focus:border-accent"
           >
@@ -181,7 +190,7 @@ export function ChatView() {
             <NumberField label="Top P" value={topP} onChange={setTopP} disabled={busy} />
           </div>
           <div className="mt-3">
-            <NumberField label="Max context length" value={maxContextLength} onChange={setMaxContextLength} disabled={busy} />
+            <NumberField label="Max context length" value={maxContextLength} onChange={setMaxContextOverride} disabled={busy} />
             <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
               Maximum generated tokens for this turn{advertisedContextLimit ? ` · model window ${advertisedContextLimit.toLocaleString()}` : ''}.
             </p>
@@ -323,6 +332,10 @@ function parseOptionalNumber(value: string): number | undefined {
 function parseOptionalInteger(value: string): number | undefined {
   const parsed = Number.parseInt(value, 10);
   return value.trim() && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function newPromptCacheKey(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `dashboard-chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function statusColor(state: RunState): string {

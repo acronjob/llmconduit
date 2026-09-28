@@ -225,6 +225,35 @@ covers `/v1` data routes, including models, token counting, and raw completions
 key verification so requests can be attributed; leave `keys: []` with
 `require: false` for an open development gateway.
 
+### Configured provider model discovery
+
+Providers added through the dashboard discover new models automatically at startup
+and every five minutes. Discovery is additive: models missing from a later provider
+response remain in the saved catalog, and a failed refresh leaves the catalog intact.
+Existing providers also default to automatic discovery after upgrading.
+
+Admins can turn off automatic discovery for a provider, allow only selected saved
+models, or disable individual models in the Providers page. Disabling discovery
+freezes the saved catalog; it does not turn off inference for enabled models.
+`allowed_models: null` means all saved models are allowed, `allowed_models: []`
+means none are allowed, and a non-empty list permits only those model ids.
+`disabled_models` wins over the allowlist. Models remain visible in the admin list
+but non-enabled models are excluded from the public model catalog and that
+provider's routing. Refreshes and gateway restarts preserve these settings.
+
+The same controls are available through the authenticated, CSRF-protected
+`PATCH /dashboard/api/configured-providers/{id}` endpoint:
+
+```json
+{"auto_discover": false, "allowed_models": ["vendor/model-id"], "disabled_models": []}
+```
+
+All fields are optional. Omit `allowed_models` to leave the current allowlist
+unchanged, pass `null` to allow all saved models, or pass an array to replace the
+allowlist. `disabled_models` replaces that provider's disabled-model list; pass an
+empty array to enable all allowlisted saved models again. Disabling or omitting a
+model on one provider does not disable another provider that serves the same model.
+
 ### Harness and session detection
 
 Every persisted request records which harness sent it and the session
@@ -344,10 +373,12 @@ An administrator can also disable or re-enable a single node, or disable an
 exact advertised `(endpoint, resource, model)` tuple without restarting the
 gateway. Model-level disables are an operational routing control, not a security
 quarantine: if a provider is untrusted or may advertise another model alias,
-disable its node or revoke its enrollment key instead. Mesh administration is
-restricted to bootstrap dashboard sessions and administrator user sessions;
-delegated management sessions cannot use these controls. Mutations retain the
-dashboard's existing CSRF and mutation-policy checks.
+disable its node or revoke its enrollment key instead. Mesh enrollment and
+routing administration is restricted to bootstrap dashboard sessions and
+administrator user sessions. The mesh-state read and remote Fleet model
+lifecycle endpoints additionally accept delegated management credentials with
+the corresponding `fleet.models.*` permission. Mutations retain the dashboard's
+existing CSRF and mutation-policy checks.
 
 A downstream mesh worker that has local Fleet configured also advertises its
 current switchable model inventory. The controller can request a load only for
@@ -357,6 +388,11 @@ and its bearer token never leaves that machine. Set `LLMCONDUIT_FLEET_URL` and
 either `LLMCONDUIT_FLEET_TOKEN_FILE` or `LLMCONDUIT_FLEET_TOKEN` in the
 `llmconduit mesh-worker` environment to enable this capability. The controller
 and worker must both use mesh protocol v2.
+
+Set `mesh.worker.node_name` to a short friendly worker label when one physical
+provider exposes multiple resource slots. The worker sends that label during
+enrollment and in every live advertisement; routing ids remain the Iroh endpoint
+id plus resource id.
 
 Mesh enrollment and disabled-model state remains in the mesh controller's
 dedicated SQLite database. `control_plane.storage: postgres` stores dashboard
@@ -936,9 +972,12 @@ server-side and are never returned to the browser.
 | `GET /dashboard/api/history/usage` | Authenticated durable usage rollups (SQL storage) |
 | `GET /dashboard/api/history/metrics` | Authenticated durable minute-level provider health/counter history (SQL storage) |
 | `POST /dashboard/api/flows/:id/kill` | Abort a live flow when dashboard mutations are enabled; requires a session and CSRF token |
-| `GET /dashboard/api/fleet` | Administrator-only local Fleet model/deployment inventory when configured |
-| `POST /dashboard/api/fleet/models/:id/load`, `/unload` | Administrator-only, mutation- and CSRF-gated local Fleet GPU lifecycle controls |
-| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/switch` | Administrator-only request to load an exactly advertised model on a connected Fleet-capable mesh worker |
+| `GET /dashboard/api/fleet` | Local Fleet model/deployment inventory when configured; requires administrator access or `fleet.models.read` |
+| `POST /dashboard/api/fleet/models/:id/load` | Mutation- and CSRF-gated local Fleet load control; requires administrator access or `fleet.models.load` |
+| `POST /dashboard/api/fleet/models/:id/unload` | Mutation- and CSRF-gated local Fleet unload control; requires administrator access or `fleet.models.unload` |
+| `GET /dashboard/api/mesh` | Mesh state, including remote Fleet model load state; requires administrator access or `fleet.models.read` |
+| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/switch`, `/load` | Load an exactly advertised model on a connected Fleet-capable mesh worker; requires administrator access or `fleet.models.load` |
+| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/unload` | Unload an exactly advertised model on a connected Fleet-capable mesh worker; requires administrator access or `fleet.models.unload` |
 | `GET /dashboard/api/me`, `/users`, `/keys` (+ `POST`/`PATCH`/`DELETE`) | Authenticated accounts API: the current user, user administration, API keys |
 | `GET /dashboard/auth/github/start`, `GET /dashboard/auth/github/callback`, `POST /dashboard/logout` | GitHub SSO dashboard session (signed state + PKCE; session and CSRF cookies) |
 | `GET /dashboard/ws`, `GET /debug/ws` | Authenticated WebSocket feeds behind the dashboard and debug UI |

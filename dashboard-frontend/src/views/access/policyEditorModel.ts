@@ -39,6 +39,9 @@ export const managementPermissionLabels: Record<ManagementPermission, string> = 
   'auth.pricing.write': 'Manage pricing',
   'auth.sessions.read': 'View sessions',
   'auth.sessions.terminate': 'Terminate sessions',
+  'fleet.models.read': 'View Fleet model state',
+  'fleet.models.load': 'Load Fleet models',
+  'fleet.models.unload': 'Unload Fleet models',
 };
 
 export function validatePolicy(policy: CreateAuthPolicyRequest, kind: PolicyEditorKind = 'model'): string[] {

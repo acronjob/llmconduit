@@ -591,18 +591,22 @@ mod tests {
             model_switching: Some(ModelSwitchingAdvertisement {
                 provider: "lil-fleet".to_string(),
                 models: vec![
-                    SwitchableModelAdvertisement {
-                        id: "allowed-model".to_string(),
-                        description: None,
-                        phase: "ready".to_string(),
-                        desired_state: "loaded".to_string(),
-                    },
-                    SwitchableModelAdvertisement {
-                        id: "surprise-model".to_string(),
-                        description: None,
-                        phase: "unloaded".to_string(),
-                        desired_state: "unloaded".to_string(),
-                    },
+                    SwitchableModelAdvertisement::legacy(
+                        "allowed-model",
+                        None,
+                        "ready",
+                        "loaded",
+                        1,
+                        vec![0],
+                    ),
+                    SwitchableModelAdvertisement::legacy(
+                        "surprise-model",
+                        None,
+                        "unloaded",
+                        "unloaded",
+                        1,
+                        Vec::new(),
+                    ),
                 ],
                 revision: 1,
             }),

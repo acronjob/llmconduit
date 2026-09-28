@@ -27,6 +27,7 @@ pub struct AuthContext {
     identity: PolicyIdentity,
     policy: Arc<PolicySnapshot>,
     usage_admission: Option<UsageAdmission>,
+    capture_payloads: bool,
 }
 
 impl AuthContext {
@@ -86,6 +87,10 @@ impl AuthContext {
     pub fn effective_limits(&self) -> LimitSet {
         self.policy
             .effective_limits(&self.identity, chrono::Utc::now())
+    }
+
+    pub fn capture_payloads(&self) -> bool {
+        self.capture_payloads
     }
 
     pub(crate) fn record_usage(&self, event: crate::usage_accounting::UsageEvent) {
@@ -399,6 +404,7 @@ impl AuthzService {
             identity,
             policy: Arc::clone(&authority.policy),
             usage_admission: Some(usage_admission),
+            capture_payloads: credential.capture_payloads,
         }))
     }
 
@@ -585,6 +591,11 @@ impl AuthzService {
             .read()
             .map_err(|_| AuthError::PolicyUnavailable)?
             .clone();
+        let capture_payloads = authority
+            .credentials
+            .iter()
+            .find(|credential| credential.id == session.key_id)
+            .is_some_and(|credential| credential.capture_payloads);
         let identity = PolicyIdentity {
             request_id: AuthRequestId::new(),
             key_id: session.key_id,
@@ -603,6 +614,7 @@ impl AuthzService {
             identity,
             policy: Arc::clone(&authority.policy),
             usage_admission: Some(usage_admission),
+            capture_payloads,
         }))
     }
 
@@ -1129,6 +1141,7 @@ mod tests {
             identity,
             policy,
             usage_admission: None,
+            capture_payloads: false,
         };
 
         let scope = context

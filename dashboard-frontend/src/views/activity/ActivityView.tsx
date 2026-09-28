@@ -23,6 +23,7 @@ const WINDOWS: Array<{ label: string; ms: number; bucketSecs: number }> = [
 
 export function ActivityView() {
   const { client } = getConnection();
+  const currentUser = useAuth((s) => s.user);
   const isAdmin = useAuth((s) => s.user?.is_admin ?? s.authMode !== 'users');
   const [windowIdx, setWindowIdx] = useState(1);
   const win = WINDOWS[windowIdx]!;
@@ -34,9 +35,11 @@ export function ActivityView() {
   });
   const users = useQuery({ queryKey: queryKeys.users, queryFn: () => client.listUsers(), enabled: isAdmin, retry: false });
   const keys = useQuery({ queryKey: queryKeys.keys('all'), queryFn: () => client.listKeys(isAdmin ? 'all' : undefined), retry: false });
+  const authUsers = useQuery({ queryKey: queryKeys.authUsers, queryFn: () => client.authUsers(), retry: false });
+  const authKeys = useQuery({ queryKey: queryKeys.authApiKeys, queryFn: () => client.authApiKeys(), retry: false });
   const rows = useMemo(() => activityRows(activity.data?.buckets ?? []), [activity.data]);
-  const userName = (id: string | null) => (id == null ? 'unattributed' : users.data?.users.find((u) => u.id === id)?.username ?? id.slice(0, 8));
-  const keyLabel = (id: string | null) => (id == null ? DASH : keys.data?.keys.find((k) => k.id === id)?.label ?? id.slice(0, 8));
+  const userName = (id: string | null) => (id == null ? 'unattributed' : authUsers.data?.users.find((u) => u.id === id)?.display_name ?? users.data?.users.find((u) => u.id === id)?.username ?? (currentUser?.id === id ? currentUser.username : null) ?? id.slice(0, 8));
+  const keyLabel = (id: string | null) => (id == null ? DASH : authKeys.data?.api_keys.find((k) => k.id === id)?.name ?? keys.data?.keys.find((k) => k.id === id)?.label ?? id.slice(0, 8));
   const totals = rows.reduce((a, r) => ({ requests: a.requests + r.requests, failed: a.failed + r.failed }), { requests: 0, failed: 0 });
 
   return (
@@ -73,7 +76,7 @@ export function ActivityView() {
           {rows.map((row) => (
             <div key={`${row.user_id}/${row.virtual_key_id}`} className="grid grid-cols-[minmax(100px,1fr)_minmax(100px,1fr)_72px_72px_64px_80px_80px_80px_160px] items-center gap-2 border-b border-line/50 px-3 py-1 text-xs" data-testid="activity-row" data-user={row.user_id ?? 'none'}>
               <span className={cn('truncate', row.user_id == null && 'italic text-text-muted')} data-testid="activity-user">{userName(row.user_id)}</span>
-              <span className="truncate font-mono text-text-muted" title={row.virtual_key_id ?? undefined}>{keyLabel(row.virtual_key_id)}</span>
+              <span className="truncate font-mono text-text-muted" title={row.virtual_key_id ?? undefined} data-testid="activity-key">{keyLabel(row.virtual_key_id)}</span>
               <span className="text-right tabular-nums">{row.requests}</span>
               <span className={cn('text-right tabular-nums', row.failed > 0 && 'text-status-down')}>{row.failed}</span>
               <span className="text-right tabular-nums text-text-muted">{row.error_pct == null ? DASH : row.error_pct.toFixed(1)}</span>

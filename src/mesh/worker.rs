@@ -7,10 +7,10 @@ use crate::mesh::identity::load_or_create;
 use crate::mesh::io::{Admission, read_stream_open, write_admission, write_switch_response};
 use crate::mesh::protocol::{
     AdmissionRejectCode, ENROLL_ALPN, EnrollRequest, EnrollResponse, Heartbeat, HubToWorker,
-    ModelAdvertisement, ModelSwitchingAdvertisement, PROTOCOL_VERSION, ResourceAdvertisement,
-    ResourceRuntimeState, StreamOpen, SwitchModelRequest, SwitchModelResponse,
-    SwitchableModelAdvertisement, WORKER_ALPN, WorkerAdvertisement, WorkerToHub, read_control,
-    write_control,
+    ModelAdvertisement, ModelLifecycleAction, ModelSwitchingAdvertisement, PROTOCOL_VERSION,
+    ResourceAdvertisement, ResourceRuntimeState, StreamOpen, SwitchModelRequest,
+    SwitchModelResponse, SwitchableModelAdvertisement, SwitchableModelInstanceAdvertisement,
+    WORKER_ALPN, WorkerAdvertisement, WorkerToHub, read_control, write_control,
 };
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -105,7 +105,7 @@ impl WorkerRuntime {
         }
         WorkerAdvertisement {
             protocol_version: PROTOCOL_VERSION,
-            node_name: None,
+            node_name: self.config.node_name.clone(),
             agent_version: crate::VERSION.to_string(),
             resources,
             model_switching: self.model_switching.lock().await.clone(),
@@ -123,6 +123,22 @@ impl WorkerRuntime {
                     description: entry.model.description,
                     phase: entry.status.phase,
                     desired_state: entry.status.desired_state,
+                    gpu_count: entry.model.gpu_count.unwrap_or(0),
+                    max_instances: entry.model.max_instances,
+                    desired_instances: entry.status.desired_instances,
+                    ready_instances: entry.status.ready_instances,
+                    instances: entry
+                        .status
+                        .instances
+                        .into_iter()
+                        .map(SwitchableModelInstanceAdvertisement::from_fleet)
+                        .collect(),
+                    assigned_gpus: entry
+                        .status
+                        .assigned_gpus
+                        .into_iter()
+                        .filter_map(|gpu| u32::try_from(gpu).ok())
+                        .collect(),
                 })
                 .collect::<Vec<_>>(),
             Err(err) => {
@@ -219,7 +235,7 @@ impl LocalResource {
 async fn enroll(
     endpoint: &Endpoint,
     controller: EndpointAddr,
-    _config: &MeshWorkerConfig,
+    config: &MeshWorkerConfig,
     join_key: String,
 ) -> AppResult<()> {
     let connection = endpoint
@@ -230,12 +246,7 @@ async fn enroll(
         .open_bi()
         .await
         .map_err(|err| AppError::upstream(format!("mesh enrollment stream failed: {err}")))?;
-    let request = EnrollRequest {
-        protocol_version: PROTOCOL_VERSION,
-        join_key,
-        node_name: None,
-        agent_version: crate::VERSION.to_string(),
-    };
+    let request = enroll_request(config, join_key);
     write_control(&mut send, &request).await?;
     let response: EnrollResponse = read_control(&mut recv).await?;
     match response {
@@ -243,6 +254,15 @@ async fn enroll(
         EnrollResponse::Rejected { reason } => Err(AppError::upstream(format!(
             "mesh enrollment rejected: {reason}"
         ))),
+    }
+}
+
+fn enroll_request(config: &MeshWorkerConfig, join_key: String) -> EnrollRequest {
+    EnrollRequest {
+        protocol_version: PROTOCOL_VERSION,
+        join_key,
+        node_name: config.node_name.clone(),
+        agent_version: crate::VERSION.to_string(),
     }
 }
 
@@ -453,7 +473,12 @@ pub(super) async fn handle_stream(
 ) -> AppResult<()> {
     match read_stream_open(&mut recv).await? {
         StreamOpen::Inference(open) => handle_request(send, recv, runtime, open).await,
-        StreamOpen::SwitchModel(request) => handle_switch_model(send, runtime, request).await,
+        StreamOpen::SwitchModel(request) => {
+            handle_switch_model(send, runtime, request, ModelLifecycleAction::Load).await
+        }
+        StreamOpen::UnloadModel(request) => {
+            handle_switch_model(send, runtime, request, ModelLifecycleAction::Unload).await
+        }
     }
 }
 
@@ -555,6 +580,7 @@ async fn handle_switch_model(
     mut send: iroh::endpoint::SendStream,
     runtime: Arc<WorkerRuntime>,
     request: SwitchModelRequest,
+    action: ModelLifecycleAction,
 ) -> AppResult<()> {
     crate::mesh::protocol::validate_switch_model_request(&request)
         .map_err(|err| AppError::bad_request(format!("invalid mesh switch request: {err}")))?;
@@ -582,7 +608,15 @@ async fn handle_switch_model(
         write_switch_response(&mut send, &response).await?;
         return Ok(());
     }
-    match fleet.load_model(&request.model_id).await {
+    let operation = match action {
+        ModelLifecycleAction::Load => {
+            fleet
+                .load_model_instances(&request.model_id, request.instances)
+                .await
+        }
+        ModelLifecycleAction::Unload => fleet.unload_model(&request.model_id).await,
+    };
+    match operation {
         Ok(operation) => {
             response.accepted = true;
             response.changed = operation.changed;
@@ -910,6 +944,37 @@ mod tests {
                 context_limit: Some(4096),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn worker_advertisement_uses_configured_node_name() {
+        let runtime = WorkerRuntime {
+            config: MeshWorkerConfig {
+                node_name: Some("lab-worker".to_string()),
+                ..Default::default()
+            },
+            resources: HashMap::new(),
+            fleet: None,
+            model_switching: Mutex::new(None),
+        };
+
+        let advertisement = runtime.advertisement().await;
+
+        assert_eq!(advertisement.node_name.as_deref(), Some("lab-worker"));
+        assert!(advertisement.resources.is_empty());
+    }
+
+    #[test]
+    fn enrollment_request_uses_configured_node_name() {
+        let config = MeshWorkerConfig {
+            node_name: Some("lab-worker".to_string()),
+            ..Default::default()
+        };
+
+        let request = enroll_request(&config, "join-token".to_string());
+
+        assert_eq!(request.node_name.as_deref(), Some("lab-worker"));
+        assert_eq!(request.join_key, "join-token");
     }
 
     fn schedule(json: serde_json::Value) -> AvailabilitySchedule {

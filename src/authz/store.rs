@@ -30,6 +30,7 @@ pub(crate) struct StoredCredential {
     pub principal_id: String,
     pub prefix: String,
     pub digest: [u8; 32],
+    pub capture_payloads: bool,
 }
 
 pub(crate) struct StoredAuthority {
@@ -55,6 +56,7 @@ pub struct ApiKeySummary {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub last_used_at: Option<i64>,
+    pub capture_payloads: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -88,6 +90,8 @@ impl AuthStore {
         connection
             .execute_batch(SCHEMA)
             .map_err(|err| format!("failed to migrate auth store: {err}"))?;
+        migrate_api_key_payload_capture(&connection)
+            .map_err(|err| format!("failed to migrate auth key payload capture: {err}"))?;
         crate::usage_accounting::migrate_usage_schema(&connection)
             .map_err(|err| format!("failed to migrate auth usage store: {err}"))?;
         crate::openrouter_pricing::migrate_pricing_schema(&connection)
@@ -273,7 +277,7 @@ impl AuthStore {
             "INSERT INTO auth_principals(id,kind,display_name,enabled,created_at) VALUES(?1,'service_account',?2,1,?3)",
             params![principal_id, required(principal_name, "principal_name")?, now],
         ).map_err(db)?;
-        let created = insert_key(&tx, &principal_id, key_name, raw, digest, None, now)?;
+        let created = insert_key(&tx, &principal_id, key_name, raw, digest, None, false, now)?;
         let policy_id = format!("pol_{}", Uuid::new_v4().simple());
         tx.execute(
             "INSERT INTO auth_policies(id,name,effect,enabled,created_at,updated_at) VALUES(?1,?2,'allow',1,?3,?3)",
@@ -311,6 +315,7 @@ impl AuthStore {
         Ok(created)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_key_for_principal(
         &mut self,
         principal_id: &str,
@@ -318,6 +323,7 @@ impl AuthStore {
         raw: &str,
         digest: &[u8; 32],
         expires_at: Option<i64>,
+        capture_payloads: bool,
         actor: &ManagementActor,
     ) -> Result<CreatedApiKey, String> {
         let now = Utc::now().timestamp();
@@ -336,7 +342,16 @@ impl AuthStore {
         if exists != Some(1) {
             return Err("principal does not exist or is disabled".into());
         }
-        let created = insert_key(&tx, principal_id, name, raw, digest, expires_at, now)?;
+        let created = insert_key(
+            &tx,
+            principal_id,
+            name,
+            raw,
+            digest,
+            expires_at,
+            capture_payloads,
+            now,
+        )?;
         bump_epoch(&tx)?;
         audit(
             &tx,
@@ -370,6 +385,7 @@ impl AuthStore {
             raw,
             digest,
             old.expires_at,
+            old.capture_payloads,
             now,
         )?;
         tx.execute(
@@ -427,9 +443,40 @@ impl AuthStore {
         Ok(changed)
     }
 
+    pub(crate) fn set_key_payload_capture(
+        &mut self,
+        key_id: &str,
+        capture_payloads: bool,
+        actor: &ManagementActor,
+    ) -> Result<bool, String> {
+        let tx = self.connection.transaction().map_err(db)?;
+        let changed = tx
+            .execute(
+                "UPDATE auth_api_keys SET capture_payloads=?2 WHERE id=?1",
+                params![key_id, i64::from(capture_payloads)],
+            )
+            .map_err(db)?
+            > 0;
+        if changed {
+            bump_epoch(&tx)?;
+            let mut metadata = BTreeMap::new();
+            metadata.insert("capture_payloads".into(), Value::Bool(capture_payloads));
+            audit(
+                &tx,
+                &actor_name(actor),
+                "key.payload_capture_updated",
+                key_id,
+                "ok",
+                metadata,
+            )?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(changed)
+    }
+
     pub fn list_keys(&self) -> Result<Vec<ApiKeySummary>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at FROM auth_api_keys ORDER BY created_at DESC,id"
+            "SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at,capture_payloads FROM auth_api_keys ORDER BY created_at DESC,id"
         ).map_err(db)?;
         statement
             .query_map([], map_key)
@@ -442,7 +489,7 @@ impl AuthStore {
         let now = Utc::now().timestamp();
         let epoch = current_epoch(&self.connection)?;
         let mut stmt = self.connection.prepare(
-            "SELECT id,principal_id,prefix,hmac_sha256_digest FROM auth_api_keys WHERE enabled=1 AND (expires_at IS NULL OR expires_at>?1)"
+            "SELECT id,principal_id,prefix,hmac_sha256_digest,capture_payloads FROM auth_api_keys WHERE enabled=1 AND (expires_at IS NULL OR expires_at>?1)"
         ).map_err(db)?;
         let credentials = stmt
             .query_map([now], |row| {
@@ -459,6 +506,7 @@ impl AuthStore {
                     principal_id: row.get(1)?,
                     prefix: row.get(2)?,
                     digest,
+                    capture_payloads: row.get::<_, i64>(4)? != 0,
                 })
             })
             .map_err(db)?
@@ -783,12 +831,12 @@ impl AuthStore {
                 self.write_pricing(actor, body)?;
                 self.pricing().map(AccessResult::Pricing)
             }
-            AccessOperation::CreateApiKey(_) | AccessOperation::RotateApiKey(_) => {
-                Err(AccessError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "key secret operation must be handled by AuthzService",
-                ))
-            }
+            AccessOperation::CreateApiKey(_)
+            | AccessOperation::RotateApiKey(_)
+            | AccessOperation::UpdateApiKeyPayloadCapture(_, _) => Err(AccessError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "key secret operation must be handled by AuthzService",
+            )),
         }
     }
 
@@ -1252,7 +1300,7 @@ impl AuthStore {
         tx.commit().map_err(access_db)
     }
 
-    fn list_access_keys(&self) -> Result<Vec<AccessApiKey>, AccessError> {
+    pub(crate) fn list_access_keys(&self) -> Result<Vec<AccessApiKey>, AccessError> {
         Ok(self
             .list_keys()
             .map_err(access_internal)?
@@ -1429,6 +1477,7 @@ impl AuthStore {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_key(
     tx: &Transaction<'_>,
     principal_id: &str,
@@ -1436,11 +1485,12 @@ fn insert_key(
     raw: &str,
     digest: &[u8; 32],
     expires_at: Option<i64>,
+    capture_payloads: bool,
     now: i64,
 ) -> Result<CreatedApiKey, String> {
     let id = format!("key_{}", Uuid::new_v4().simple());
     let prefix = display_prefix(raw);
-    tx.execute("INSERT INTO auth_api_keys(id,principal_id,name,prefix,hmac_sha256_digest,enabled,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,1,?6,?7)",params![id,principal_id,required(name,"name")?,prefix,digest.as_slice(),now,expires_at]).map_err(db)?;
+    tx.execute("INSERT INTO auth_api_keys(id,principal_id,name,prefix,hmac_sha256_digest,enabled,created_at,expires_at,capture_payloads) VALUES(?1,?2,?3,?4,?5,1,?6,?7,?8)",params![id,principal_id,required(name,"name")?,prefix,digest.as_slice(),now,expires_at,i64::from(capture_payloads)]).map_err(db)?;
     Ok(CreatedApiKey {
         summary: ApiKeySummary {
             id,
@@ -1451,12 +1501,13 @@ fn insert_key(
             created_at: now,
             expires_at,
             last_used_at: None,
+            capture_payloads,
         },
         raw_key: None,
     })
 }
 fn query_key(tx: &Transaction<'_>, id: &str) -> Result<Option<ApiKeySummary>, String> {
-    tx.query_row("SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at FROM auth_api_keys WHERE id=?1",[id],map_key).optional().map_err(db)
+    tx.query_row("SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at,capture_payloads FROM auth_api_keys WHERE id=?1",[id],map_key).optional().map_err(db)
 }
 fn map_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeySummary> {
     Ok(ApiKeySummary {
@@ -1468,6 +1519,7 @@ fn map_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeySummary> {
         created_at: r.get(5)?,
         expires_at: r.get(6)?,
         last_used_at: r.get(7)?,
+        capture_payloads: r.get::<_, i64>(8)? != 0,
     })
 }
 fn access_key(k: ApiKeySummary) -> AccessApiKey {
@@ -1480,7 +1532,22 @@ fn access_key(k: ApiKeySummary) -> AccessApiKey {
         created_at: timestamp(k.created_at),
         expires_at: k.expires_at.map(timestamp),
         last_used_at: k.last_used_at.map(timestamp),
+        capture_payloads: k.capture_payloads,
     }
+}
+
+fn migrate_api_key_payload_capture(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(auth_api_keys)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    if !columns.contains("capture_payloads") {
+        connection.execute(
+            "ALTER TABLE auth_api_keys ADD COLUMN capture_payloads INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 fn parse_subject(kind: &str, id: String) -> Result<PolicySubject, String> {
     match kind {
@@ -1606,6 +1673,9 @@ fn wire_permission_name(permission: WirePermission) -> &'static str {
         WirePermission::PricingWrite => "auth.pricing.write",
         WirePermission::SessionsRead => "auth.sessions.read",
         WirePermission::SessionsTerminate => "auth.sessions.terminate",
+        WirePermission::FleetModelsRead => "fleet.models.read",
+        WirePermission::FleetModelsLoad => "fleet.models.load",
+        WirePermission::FleetModelsUnload => "fleet.models.unload",
     }
 }
 fn wire_permission(v: &str) -> Option<WirePermission> {
@@ -1617,7 +1687,7 @@ fn wire_permission(v: &str) -> Option<WirePermission> {
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS auth_principals(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN('user','service_account')),display_name TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS auth_api_keys(id TEXT PRIMARY KEY,principal_id TEXT NOT NULL REFERENCES auth_principals(id),name TEXT NOT NULL,prefix TEXT NOT NULL,hmac_sha256_digest BLOB NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,expires_at INTEGER,last_used_at INTEGER,revoked_at INTEGER);
+CREATE TABLE IF NOT EXISTS auth_api_keys(id TEXT PRIMARY KEY,principal_id TEXT NOT NULL REFERENCES auth_principals(id),name TEXT NOT NULL,prefix TEXT NOT NULL,hmac_sha256_digest BLOB NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,expires_at INTEGER,last_used_at INTEGER,revoked_at INTEGER,capture_payloads INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS auth_api_keys_prefix_idx ON auth_api_keys(prefix);
 CREATE TABLE IF NOT EXISTS auth_groups(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS auth_group_members(group_id TEXT NOT NULL REFERENCES auth_groups(id) ON DELETE CASCADE,principal_id TEXT NOT NULL REFERENCES auth_principals(id) ON DELETE CASCADE,PRIMARY KEY(group_id,principal_id));
@@ -1664,6 +1734,9 @@ impl WirePermissionSet for WirePermission {
             WirePermission::PricingWrite,
             WirePermission::SessionsRead,
             WirePermission::SessionsTerminate,
+            WirePermission::FleetModelsRead,
+            WirePermission::FleetModelsLoad,
+            WirePermission::FleetModelsUnload,
         ]
     }
 }
