@@ -33,7 +33,9 @@ where
 {
     match read_stream_open(reader).await? {
         StreamOpen::Inference(open) => Ok(open),
-        StreamOpen::SwitchModel(_) => Err(AppError::bad_request("expected mesh inference stream")),
+        StreamOpen::SwitchModel(_) | StreamOpen::UnloadModel(_) => {
+            Err(AppError::bad_request("expected mesh inference stream"))
+        }
     }
 }
 
@@ -297,14 +299,16 @@ mod tests {
             model_switching: Some(crate::mesh::protocol::ModelSwitchingAdvertisement {
                 provider: "lil-fleet".to_string(),
                 models: (0..32)
-                    .map(
-                        |index| crate::mesh::protocol::SwitchableModelAdvertisement {
-                            id: format!("model-{index}"),
-                            description: Some("x".repeat(256)),
-                            phase: "unloaded".to_string(),
-                            desired_state: "unloaded".to_string(),
-                        },
-                    )
+                    .map(|index| {
+                        crate::mesh::protocol::SwitchableModelAdvertisement::legacy(
+                            format!("model-{index}"),
+                            Some("x".repeat(256)),
+                            "unloaded",
+                            "unloaded",
+                            1,
+                            Vec::new(),
+                        )
+                    })
                     .collect(),
                 revision: 2,
             }),

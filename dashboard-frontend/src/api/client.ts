@@ -25,6 +25,7 @@ import type {
   ConfiguredProvider,
   ConfiguredProvidersResponse,
   CreateConfiguredProviderRequest,
+  UpdateConfiguredProviderRequest,
   CreateAuthApiKeyRequest,
   CreateAuthGroupRequest,
   CreateAuthPolicyRequest,
@@ -101,6 +102,7 @@ export interface DashboardChatRequest {
   top_p?: number;
   max_tokens?: number;
   reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  prompt_cache_key?: string;
 }
 
 export interface DashboardChatDelta {
@@ -328,6 +330,13 @@ export class DashboardClient {
     });
   }
 
+  updateConfiguredProvider(id: string, body: UpdateConfiguredProviderRequest): Promise<ConfiguredProvider> {
+    return this.mutate(`/configured-providers/${encodeURIComponent(id)}`, 'PATCH', body).then((value) => {
+      if (!isConfiguredProviderResponse(value)) throw new Error('/configured-providers/:id returned an invalid response');
+      return value;
+    });
+  }
+
   deleteConfiguredProvider(id: string): Promise<void> {
     return this.mutate(`/configured-providers/${encodeURIComponent(id)}`, 'DELETE');
   }
@@ -340,8 +349,8 @@ export class DashboardClient {
     return this.request('/fleet', undefined, isFleetModelsResponse);
   }
 
-  loadFleetModel(id: string): Promise<FleetOperationResponse> {
-    return this.mutate(`/fleet/models/${encodeURIComponent(id)}/load`, 'POST').then((value) => {
+  loadFleetModel(id: string, instances?: number): Promise<FleetOperationResponse> {
+    return this.mutate(`/fleet/models/${encodeURIComponent(id)}/load`, 'POST', instances === undefined ? undefined : { instances }).then((value) => {
       if (!isFleetOperationResponse(value)) throw new Error('/fleet/models/:id/load returned an invalid response');
       return value;
     });
@@ -391,6 +400,20 @@ export class DashboardClient {
   switchMeshModel(endpointId: string, modelId: string): Promise<SwitchMeshModelResponse> {
     return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/switch`, 'POST').then((value) => {
       if (!isSwitchMeshModelResponse(value)) throw new Error('/mesh/nodes/:endpoint_id/models/:model_id/switch returned an invalid response');
+      return value;
+    });
+  }
+
+  loadMeshModel(endpointId: string, modelId: string, instances?: number): Promise<SwitchMeshModelResponse> {
+    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/load`, 'POST', instances === undefined ? undefined : { instances }).then((value) => {
+      if (!isSwitchMeshModelResponse(value)) throw new Error('/mesh/nodes/:endpoint_id/models/:model_id/load returned an invalid response');
+      return value;
+    });
+  }
+
+  unloadMeshModel(endpointId: string, modelId: string): Promise<SwitchMeshModelResponse> {
+    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/unload`, 'POST').then((value) => {
+      if (!isSwitchMeshModelResponse(value)) throw new Error('/mesh/nodes/:endpoint_id/models/:model_id/unload returned an invalid response');
       return value;
     });
   }
@@ -573,6 +596,9 @@ export class DashboardClient {
   }
   rotateAuthApiKey(id: string): Promise<CreatedAuthApiKey> {
     return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/rotate`, undefined, isCreatedAuthApiKey);
+  }
+  updateAuthApiKeyPayloadCapture(id: string, capturePayloads: boolean): Promise<AuthApiKeysResponse> {
+    return this.authMutation(`/auth/api-keys/${encodeURIComponent(id)}/payload-capture`, { capture_payloads: capturePayloads }, isAuthApiKeysResponse);
   }
   revokeAuthSession(id: string): Promise<AuthSessionsResponse> {
     return this.authMutation(`/auth/sessions/${encodeURIComponent(id)}/revoke`, undefined, isAuthSessionsResponse);

@@ -23,7 +23,14 @@ use uuid::Uuid;
 pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesRequest> {
     let input = convert_messages(&request.messages)?;
     let tools = convert_tools(&request.tools);
-    let extra_body = request.extra_body.clone();
+    let mut extra_body = request.extra_body.clone();
+    // Conversation affinity belongs to the canonical request, rather than
+    // becoming an unknown vendor kwarg on the upstream chat request.
+    let prompt_cache_key = match extra_body.remove("prompt_cache_key") {
+        Some(Value::String(key)) => Some(key),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err(AppError::bad_request("prompt_cache_key must be a string")),
+    };
     Ok(ResponsesRequest {
         model: request.model,
         instructions: String::new(),
@@ -43,7 +50,7 @@ pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesReq
         stream: true,
         include: Vec::new(),
         service_tier: None,
-        prompt_cache_key: None,
+        prompt_cache_key,
         text: convert_response_format(request.response_format.as_ref()),
         client_metadata: None,
         previous_response_id: None,

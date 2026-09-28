@@ -92,6 +92,19 @@ export interface ProviderInventory {
   unionCatalogModels: Array<{ id: string; contextLimit: number | null; priced: boolean }>;
 }
 
+export function groupProviderSlots(rows: ProviderInventoryRow[]): Array<{ name: string; rows: ProviderInventoryRow[] }> {
+  const groups = new Map<string, ProviderInventoryRow[]>();
+  for (const row of rows) {
+    const name = row.name.trim() || row.id;
+    const slots = groups.get(name);
+    if (slots) slots.push(row);
+    else groups.set(name, [row]);
+  }
+  return [...groups.entries()]
+    .map(([name, slots]) => ({ name, rows: slots }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
 const DASH = '—';
 const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
 
@@ -133,7 +146,7 @@ export function buildProviderInventory(input: {
       resourceId: provider.resource_id,
       route: provider.route,
       baseUrl: provider.base_url,
-      status: provider.healthy ? (health?.status ?? 'healthy') : (health?.status ?? 'down'),
+      status: provider.healthy ? (health?.status ?? 'healthy') : 'down',
       lastError: health?.last_error ?? null,
       cooldownUntilMs: health?.cooling_until_ms ?? null,
       catalogFetchedMs: health?.catalog_fetched_ms ?? null,

@@ -1521,6 +1521,63 @@ pub async fn create_configured_provider(
     }
 }
 
+/// `PATCH /dashboard/api/configured-providers/{id}` — update discovery and model selection.
+#[utoipa::path(
+    patch,
+    path = "/dashboard/api/configured-providers/{id}",
+    tag = "dashboard",
+    params(("id" = String, Path)),
+    request_body(content = crate::managed_providers::UpdateConfiguredProviderRequest),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 400, body = crate::openapi::DashboardError),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 404, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn update_configured_provider(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<
+        Json<crate::managed_providers::UpdateConfiguredProviderRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    if let Some(response) =
+        dashboard_admin_denial(&session).or_else(|| dashboard_mutation_denial(&auth, &headers))
+    {
+        return response;
+    }
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return dashboard_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid JSON body, expected optional {{auto_discover, allowed_models, disabled_models}}: {rejection}"
+                ),
+            );
+        }
+    };
+    let Some(registry) = gateway.managed_providers() else {
+        return dashboard_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL storage is required for configured providers",
+        );
+    };
+    match registry.update(&id, payload).await {
+        Ok(Some(provider)) => json_no_store(StatusCode::OK, &provider),
+        Ok(None) => dashboard_error(StatusCode::NOT_FOUND, "configured provider not found"),
+        Err(err) => dashboard_error(err.status_code(), err.client_message),
+    }
+}
+
 /// `DELETE /dashboard/api/configured-providers/{id}` — remove one provider.
 #[utoipa::path(
     delete,

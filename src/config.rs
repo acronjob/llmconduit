@@ -719,6 +719,7 @@ pub struct MeshWorkerConfig {
     pub controller_addr: Option<String>,
     pub controller_endpoint_id: Option<String>,
     pub identity_path: Option<PathBuf>,
+    pub node_name: Option<String>,
     pub heartbeat_interval_secs: u64,
     pub resources: Vec<MeshWorkerResourceConfig>,
 }
@@ -729,6 +730,7 @@ impl Default for MeshWorkerConfig {
             controller_addr: None,
             controller_endpoint_id: None,
             identity_path: None,
+            node_name: None,
             heartbeat_interval_secs: 10,
             resources: Vec::new(),
         }
@@ -1554,6 +1556,8 @@ pub struct PersistedMeshWorkerConfig {
     pub controller_endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
     #[serde(default = "default_mesh_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1566,6 +1570,7 @@ impl Default for PersistedMeshWorkerConfig {
             controller_addr: None,
             controller_endpoint_id: None,
             identity_path: None,
+            node_name: None,
             heartbeat_interval_secs: default_mesh_heartbeat_interval_secs(),
             resources: Vec::new(),
         }
@@ -2414,6 +2419,7 @@ fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String>
     let worker_configured = config.worker.controller_addr.is_some()
         || config.worker.controller_endpoint_id.is_some()
         || config.worker.identity_path.is_some()
+        || config.worker.node_name.is_some()
         || !config.worker.resources.is_empty()
         || config.worker.heartbeat_interval_secs != default_mesh_heartbeat_interval_secs();
     let worker_controller_addr = trim_nonempty(config.worker.controller_addr.as_deref());
@@ -2421,6 +2427,8 @@ fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String>
         trim_nonempty(config.worker.controller_endpoint_id.as_deref());
     let worker_identity_path =
         trim_nonempty(config.worker.identity_path.as_deref()).map(PathBuf::from);
+    let worker_node_name =
+        parse_optional_mesh_worker_node_name(config.worker.node_name.as_deref())?;
     if worker_configured {
         if worker_controller_addr.is_none() {
             return Err("mesh.worker.controller_addr is required for worker mode".to_string());
@@ -2467,10 +2475,29 @@ fn parse_mesh_config(config: &PersistedMeshConfig) -> Result<MeshConfig, String>
             controller_addr: worker_controller_addr,
             controller_endpoint_id: worker_controller_endpoint_id,
             identity_path: worker_identity_path,
+            node_name: worker_node_name,
             heartbeat_interval_secs: config.worker.heartbeat_interval_secs,
             resources,
         },
     })
+}
+
+fn parse_optional_mesh_worker_node_name(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("mesh.worker.node_name must not be blank".to_string());
+    }
+    let max = crate::mesh::protocol::MAX_NODE_NAME_BYTES;
+    if trimmed.len() > max {
+        return Err(format!("mesh.worker.node_name must be at most {max} bytes"));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("mesh.worker.node_name must not contain control characters".to_string());
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn validate_mesh_model_allowlist(
@@ -3406,6 +3433,7 @@ mod tests {
     use super::PersistedConfig;
     use super::PersistedFallbackUpstream;
     use super::PersistedMeshConfig;
+    use super::PersistedMeshWorkerConfig;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
     use super::RolesConfig;
@@ -5820,6 +5848,7 @@ mesh:
     controller_addr: "mesh.example.com:4433"
     controller_endpoint_id: "controller-id"
     identity_path: "/var/lib/llmconduit/worker.key"
+    node_name: "  lab-worker  "
     resources:
       - id: "primary"
         target: "127.0.0.1:8000"
@@ -5848,6 +5877,7 @@ mesh:
         assert_eq!(reparsed.mesh, persisted.mesh);
 
         let config = Config::from_persisted(&persisted).expect("config");
+        assert_eq!(config.mesh.worker.node_name.as_deref(), Some("lab-worker"));
         let resource = &config.mesh.worker.resources[0];
         assert_eq!(resource.id, "primary");
         assert_eq!(resource.models, ["qwen3", "llama-vision"]);
@@ -5855,6 +5885,44 @@ mesh:
         assert_eq!(resource.availability.timezone, "America/Chicago");
         assert_eq!(resource.availability.weekly.len(), 2);
         assert_eq!(resource.availability.exceptions.len(), 1);
+    }
+
+    #[test]
+    fn mesh_worker_node_name_rejects_blank_control_and_oversized_values() {
+        let blank: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    node_name: "  "
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&blank).expect_err("blank node name rejected");
+        assert!(err.contains("mesh.worker.node_name must not be blank"));
+
+        let control: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    node_name: "node\nname"
+"#,
+        )
+        .expect("yaml");
+        let err = Config::from_persisted(&control).expect_err("control character rejected");
+        assert!(err.contains("mesh.worker.node_name must not contain control characters"));
+
+        let oversized = PersistedConfig {
+            mesh: PersistedMeshConfig {
+                worker: PersistedMeshWorkerConfig {
+                    node_name: Some("x".repeat(crate::mesh::protocol::MAX_NODE_NAME_BYTES + 1)),
+                    ..PersistedMeshWorkerConfig::default()
+                },
+                ..PersistedMeshConfig::default()
+            },
+            ..PersistedConfig::default()
+        };
+        let err = Config::from_persisted(&oversized).expect_err("oversized node name rejected");
+        assert!(err.contains("mesh.worker.node_name must be at most"));
     }
 
     #[test]

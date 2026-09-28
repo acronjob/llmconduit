@@ -37,6 +37,7 @@ const managementPermissions: ManagementPermission[] = [
   'auth.roles.read', 'auth.roles.write', 'auth.policies.read', 'auth.policies.write',
   'auth.usage.read', 'auth.audit.read', 'auth.pricing.read', 'auth.pricing.sync',
   'auth.pricing.write', 'auth.sessions.read', 'auth.sessions.terminate',
+  'fleet.models.read', 'fleet.models.load', 'fleet.models.unload',
 ];
 const accessTabs = ['overview', 'keys', 'people', 'policies', 'administration', 'sessions', 'audit'] as const;
 type AccessTab = typeof accessTabs[number];
@@ -86,6 +87,7 @@ export function AccessView() {
   const [rolePermissions, setRolePermissions] = useState<ManagementPermission[]>([]);
   const [keyName, setKeyName] = useState('');
   const [keyPrincipal, setKeyPrincipal] = useState('');
+  const [keyCapturePayloads, setKeyCapturePayloads] = useState(false);
   const [revealedKey, setRevealedKey] = useState<CreatedAuthApiKey | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -288,16 +290,20 @@ export function AccessView() {
           apiKeys={data.apiKeys.api_keys}
           principal={principal}
           keyName={keyName}
+          capturePayloads={keyCapturePayloads}
           busy={busy}
           setKeyPrincipal={setKeyPrincipal}
           setKeyName={setKeyName}
+          setCapturePayloads={setKeyCapturePayloads}
           onCreateKey={() => void run(async () => {
-            const created = await client.createAuthApiKey({ principal_id: principal, name: keyName.trim() });
+            const created = await client.createAuthApiKey({ principal_id: principal, name: keyName.trim(), capture_payloads: keyCapturePayloads });
             setRevealedKey(created);
             setKeyName('');
+            setKeyCapturePayloads(false);
           })}
           onRevoke={(key) => void run(() => client.revokeAuthApiKey(key.id))}
           onRotate={(key) => void run(async () => setRevealedKey(await client.rotateAuthApiKey(key.id)))}
+          onTogglePayloadCapture={(key) => void run(() => client.updateAuthApiKeyPayloadCapture(key.id, !key.capture_payloads))}
         />
       )}
       {tab === 'people' && (
@@ -500,26 +506,31 @@ function AccessOverview({ overview, onNavigate }: { overview: ReturnType<typeof 
   </div>;
 }
 
-function ApiKeysSection({ users, apiKeys, principal, keyName, busy, setKeyPrincipal, setKeyName, onCreateKey, onRevoke, onRotate }: {
+function ApiKeysSection({ users, apiKeys, principal, keyName, capturePayloads, busy, setKeyPrincipal, setKeyName, setCapturePayloads, onCreateKey, onRevoke, onRotate, onTogglePayloadCapture }: {
   users: AuthUser[];
   apiKeys: AuthApiKey[];
   principal: string;
   keyName: string;
+  capturePayloads: boolean;
   busy: boolean;
   setKeyPrincipal: (value: string) => void;
   setKeyName: (value: string) => void;
+  setCapturePayloads: (value: boolean) => void;
   onCreateKey: () => void;
   onRevoke: (key: AuthApiKey) => void;
   onRotate: (key: AuthApiKey) => void;
+  onTogglePayloadCapture: (key: AuthApiKey) => void;
 }) {
   return (
     <Section title="Model API keys" count={apiKeys.length}>
-      <form className="grid gap-2 p-3 md:grid-cols-[1fr_1fr_auto]" onSubmit={(event) => { event.preventDefault(); if (principal && keyName.trim()) onCreateKey(); }}>
+      <form className="grid gap-2 p-3 md:grid-cols-[1fr_1fr_auto_auto]" onSubmit={(event) => { event.preventDefault(); if (principal && keyName.trim()) onCreateKey(); }}>
         <select aria-label="Key owner" value={principal} onChange={(event) => setKeyPrincipal(event.target.value)} className="rounded border border-line bg-bg px-2 py-1.5 text-xs">{users.map((user) => <option key={user.id} value={user.id}>{user.display_name}</option>)}</select>
         <input aria-label="Key name" value={keyName} onChange={(event) => setKeyName(event.target.value)} placeholder="Key name" className="rounded border border-line bg-bg px-2 py-1.5 text-sm" />
+        <label className="flex items-center gap-2 rounded border border-line bg-bg px-3 py-1.5 text-xs"><input type="checkbox" checked={capturePayloads} onChange={(event) => setCapturePayloads(event.target.checked)} />Capture payloads</label>
         <Button disabled={busy || !principal || !keyName.trim()} type="submit">Create key</Button>
       </form>
-      <Table headers={['Key', 'Last used', 'Status', '']}>{apiKeys.map((key) => <KeyRow key={key.id} apiKey={key} busy={busy} onRevoke={() => onRevoke(key)} onRotate={() => onRotate(key)} />)}</Table>
+      <p className="border-t border-line px-3 py-2 text-[10px] text-text-muted">Flow metadata, timings, usage, and status are always retained. Payload capture stores request and response bodies and is off by default.</p>
+      <Table headers={['Key', 'Last used', 'Payloads', 'Status', '']}>{apiKeys.map((key) => <KeyRow key={key.id} apiKey={key} busy={busy} onRevoke={() => onRevoke(key)} onRotate={() => onRotate(key)} onTogglePayloadCapture={() => onTogglePayloadCapture(key)} />)}</Table>
     </Section>
   );
 }
@@ -903,8 +914,8 @@ function tabLabel(tab: AccessTab): string {
   }
 }
 
-function KeyRow({ apiKey, busy, onRevoke, onRotate }: { apiKey: AuthApiKey; busy: boolean; onRevoke: () => void; onRotate: () => void }) {
-  return <tr><Cell><div>{apiKey.name}</div><div className="font-mono text-[10px] text-text-muted">{apiKey.prefix}... · {apiKey.id}</div></Cell><Cell muted>{timestamp(apiKey.last_used_at)}</Cell><Cell><Status enabled={apiKey.enabled} /></Cell><Cell><div className="flex justify-end gap-1"><Button variant="ghost" disabled={busy || !apiKey.enabled} onClick={onRotate}>Rotate</Button><Button variant="danger" disabled={busy || !apiKey.enabled} onClick={onRevoke}>Revoke</Button></div></Cell></tr>;
+function KeyRow({ apiKey, busy, onRevoke, onRotate, onTogglePayloadCapture }: { apiKey: AuthApiKey; busy: boolean; onRevoke: () => void; onRotate: () => void; onTogglePayloadCapture: () => void }) {
+  return <tr><Cell><div>{apiKey.name}</div><div className="font-mono text-[10px] text-text-muted">{apiKey.prefix}... · {apiKey.id}</div></Cell><Cell muted>{timestamp(apiKey.last_used_at)}</Cell><Cell><button type="button" role="switch" aria-checked={apiKey.capture_payloads} disabled={busy || !apiKey.enabled} onClick={onTogglePayloadCapture} className={cn('rounded px-2 py-1 text-[10px] font-semibold', apiKey.capture_payloads ? 'bg-status-cooling/15 text-status-cooling' : 'bg-line/50 text-text-muted')}>{apiKey.capture_payloads ? 'captured' : 'metadata only'}</button></Cell><Cell><Status enabled={apiKey.enabled} /></Cell><Cell><div className="flex justify-end gap-1"><Button variant="ghost" disabled={busy || !apiKey.enabled} onClick={onRotate}>Rotate</Button><Button variant="danger" disabled={busy || !apiKey.enabled} onClick={onRevoke}>Revoke</Button></div></Cell></tr>;
 }
 
 function SessionRow({ session, busy, onRevoke }: { session: AuthSession; busy: boolean; onRevoke: () => void }) {
