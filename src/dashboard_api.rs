@@ -1560,7 +1560,7 @@ pub async fn update_configured_provider(
             return dashboard_error(
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "invalid JSON body, expected optional {{auto_discover, disabled_models}}: {rejection}"
+                    "invalid JSON body, expected optional {{auto_discover, allowed_models, disabled_models}}: {rejection}"
                 ),
             );
         }

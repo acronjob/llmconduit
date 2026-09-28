@@ -285,17 +285,45 @@ function ConfiguredProviderCard({
 }) {
   const [modelQuery, setModelQuery] = useState('');
   const normalizedQuery = modelQuery.trim().toLowerCase();
+  const allowedModels = Array.isArray(provider.allowed_models) ? provider.allowed_models : null;
+  const allowlistMode = allowedModels !== null;
+  const allowed = new Set(allowedModels ?? []);
   const disabled = new Set(provider.disabled_models);
   const models = provider.models
     .filter((model) => !normalizedQuery || model.id.toLowerCase().includes(normalizedQuery))
     .sort((a, b) => a.id.localeCompare(b.id));
   const visibleModels = models.slice(0, CONFIGURED_PROVIDER_MODEL_LIMIT);
-  const enabledCount = provider.models.length - provider.disabled_models.length;
-  const toggleModel = (modelId: string) => {
-    const next = new Set(provider.disabled_models);
-    if (next.has(modelId)) next.delete(modelId);
-    else next.add(modelId);
-    onPatch(provider.id, { disabled_models: [...next].sort() });
+  const modelIsEnabled = (modelId: string) => (!allowlistMode || allowed.has(modelId)) && !disabled.has(modelId);
+  const enabledCount = provider.models.filter((model) => modelIsEnabled(model.id)).length;
+  const setAllowlistMode = (enabled: boolean) => {
+    if (!enabled) {
+      onPatch(provider.id, { allowed_models: null });
+      return;
+    }
+    onPatch(provider.id, {
+      allowed_models: provider.models.filter((model) => !disabled.has(model.id)).map((model) => model.id).sort(),
+    });
+  };
+  const setModelEnabled = (modelId: string, enabled: boolean) => {
+    if (allowlistMode) {
+      const nextAllowed = new Set(allowed);
+      const nextDisabled = new Set(disabled);
+      if (enabled) {
+        nextAllowed.add(modelId);
+        nextDisabled.delete(modelId);
+      } else {
+        nextAllowed.delete(modelId);
+      }
+      onPatch(provider.id, {
+        allowed_models: [...nextAllowed].sort(),
+        disabled_models: [...nextDisabled].sort(),
+      });
+      return;
+    }
+    const nextDisabled = new Set(disabled);
+    if (enabled) nextDisabled.delete(modelId);
+    else nextDisabled.add(modelId);
+    onPatch(provider.id, { disabled_models: [...nextDisabled].sort() });
   };
   return (
     <div className="min-w-0 rounded border border-line/70 bg-bg p-3" data-testid="configured-provider-card">
@@ -321,6 +349,18 @@ function ConfiguredProviderCard({
       <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
         {provider.auto_discover ? 'Refreshes about every 5 min and adds newly advertised models.' : 'Automatic catalog refresh is paused; existing model choices remain.'}
       </p>
+      <label className={cn('mt-2 inline-flex items-center gap-1.5 rounded border border-line/70 px-2 py-1 text-[10px] text-text-muted', !mutationsEnabled && 'opacity-70')} data-testid="configured-provider-allowlist">
+        <input
+          type="checkbox"
+          checked={allowlistMode}
+          disabled={!mutationsEnabled || busy}
+          onChange={(event) => setAllowlistMode(event.target.checked)}
+        />
+        <span>Only allow selected models</span>
+      </label>
+      <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+        {allowlistMode ? 'Newly discovered models stay visible but disabled until selected.' : 'Newly discovered models are enabled unless individually disabled.'}
+      </p>
       <div className="mt-2 flex items-center gap-2">
         <input
           aria-label={`Search models for ${provider.name}`}
@@ -333,22 +373,25 @@ function ConfiguredProviderCard({
       </div>
       <div className="mt-2 max-h-56 overflow-auto rounded border border-line/60">
         {visibleModels.map((model) => {
-          const isDisabled = disabled.has(model.id);
+          const isEnabled = modelIsEnabled(model.id);
+          const isBlacklisted = disabled.has(model.id);
           return (
             <div key={model.id} className="flex min-w-0 items-center gap-2 border-b border-line/50 px-2 py-1.5 last:border-b-0" data-testid="configured-provider-model">
-              <div className="min-w-0 flex-1">
-                <div className={cn('truncate font-mono text-[10px]', isDisabled ? 'text-text-muted line-through' : 'text-text')} title={model.id}>{model.id}</div>
-                <div className="text-[9px] text-text-muted">context {model.context_limit == null ? DASH : fmtTokens(model.context_limit)}</div>
-              </div>
-              <Button
-                type="button"
-                variant={isDisabled ? 'default' : 'ghost'}
-                className="px-2 py-1 text-[10px]"
+              <input
+                aria-label={`Enable ${model.id}`}
+                type="checkbox"
+                checked={isEnabled}
                 disabled={!mutationsEnabled || busy}
-                onClick={() => toggleModel(model.id)}
-              >
-                {isDisabled ? 'Enable' : 'Disable'}
-              </Button>
+                onChange={(event) => setModelEnabled(model.id, event.target.checked)}
+              />
+              <div className="min-w-0 flex-1">
+                <div className={cn('truncate font-mono text-[10px]', isEnabled ? 'text-text' : 'text-text-muted line-through')} title={model.id}>{model.id}</div>
+                <div className="text-[9px] text-text-muted">
+                  context {model.context_limit == null ? DASH : fmtTokens(model.context_limit)}
+                  {!isEnabled && allowlistMode && !allowed.has(model.id) ? ' · not selected' : ''}
+                  {isBlacklisted ? ' · disabled' : ''}
+                </div>
+              </div>
             </div>
           );
         })}

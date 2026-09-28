@@ -158,22 +158,26 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
     const initial = await client.configuredProviders();
     expect(initial.providers[0]).not.toHaveProperty('api_key');
-    expect(initial.providers[0]).toMatchObject({ auto_discover: true, disabled_models: [] });
+    expect(initial.providers[0]).toMatchObject({ auto_discover: true, allowed_models: null, disabled_models: [] });
 
     const created = await client.createConfiguredProvider({
       name: 'Test provider',
       base_url: 'https://inference.example/v1',
       api_key: 'secret-value',
     });
-    expect(created).toMatchObject({ name: 'Test provider', api_key_present: true, auto_discover: true, disabled_models: [] });
+    expect(created).toMatchObject({ name: 'Test provider', api_key_present: true, auto_discover: true, allowed_models: null, disabled_models: [] });
     expect(created).not.toHaveProperty('api_key');
 
     const disabledModel = created.models[0]!.id;
     const patched = await client.updateConfiguredProvider(created.id, {
       auto_discover: false,
+      allowed_models: [disabledModel],
       disabled_models: [disabledModel],
     });
-    expect(patched).toMatchObject({ id: created.id, auto_discover: false, disabled_models: [disabledModel] });
+    expect(patched).toMatchObject({ id: created.id, auto_discover: false, allowed_models: [disabledModel], disabled_models: [disabledModel] });
+
+    const unrestricted = await client.updateConfiguredProvider(created.id, { allowed_models: null });
+    expect(unrestricted.allowed_models).toBeNull();
 
     await client.deleteConfiguredProvider(created.id);
     expect((await client.configuredProviders()).providers.some((provider) => provider.id === created.id)).toBe(false);
@@ -187,6 +191,35 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
 
     const authed = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
     await expect(authed.updateConfiguredProvider(provider.id, { disabled_models: ['not-advertised'] })).rejects.toThrow(/400/);
+    await expect(authed.updateConfiguredProvider(provider.id, { allowed_models: ['not-advertised'] })).rejects.toThrow(/400/);
+  });
+
+  it('serializes configured-provider allowlist patches as omitted, null, or arrays', async () => {
+    const bodies: unknown[] = [];
+    const fetchMutations: typeof fetch = async (_input, init) => {
+      bodies.push(init?.body === undefined ? undefined : JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({
+        id: 'managed-local-lab',
+        name: 'Local lab',
+        base_url: 'http://127.0.0.1:8101/v1',
+        api_key_present: true,
+        auto_discover: true,
+        allowed_models: null,
+        disabled_models: [],
+        models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }],
+      }), { status: 200 });
+    };
+    const client = new DashboardClient({ fetchImpl: fetchMutations, getCsrfToken: () => 'test-csrf' });
+
+    await client.updateConfiguredProvider('managed-local-lab', { disabled_models: [] });
+    await client.updateConfiguredProvider('managed-local-lab', { allowed_models: null });
+    await client.updateConfiguredProvider('managed-local-lab', { allowed_models: ['qwen3-8b-flash'] });
+
+    expect(bodies).toEqual([
+      { disabled_models: [] },
+      { allowed_models: null },
+      { allowed_models: ['qwen3-8b-flash'] },
+    ]);
   });
 
   it('mesh admin methods validate reads and send CSRF for mutations', async () => {

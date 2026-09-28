@@ -107,6 +107,7 @@ let CONFIGURED_PROVIDERS: ConfiguredProvider[] = [
     base_url: 'http://127.0.0.1:8101/v1',
     api_key_present: true,
     auto_discover: true,
+    allowed_models: null,
     disabled_models: [],
     models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }, { id: 'qwen3-32b', context_limit: 131072 }],
   },
@@ -815,6 +816,7 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       base_url: body.base_url.trim(),
       api_key_present: true,
       auto_discover: true,
+      allowed_models: null,
       disabled_models: [],
       models: [{ id: 'discovered-model', context_limit: null }, { id: 'backup-discovered-model', context_limit: 65536 }],
     };
@@ -828,16 +830,22 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     const id = decodeURIComponent(configuredProviderById[1] ?? '');
     const index = CONFIGURED_PROVIDERS.findIndex((provider) => provider.id === id);
     if (index < 0) return json({ error: 'unknown configured provider' }, 404);
-    const body = JSON.parse(String(init?.body ?? '{}')) as { auto_discover?: unknown; disabled_models?: unknown };
+    const body = JSON.parse(String(init?.body ?? '{}')) as { auto_discover?: unknown; allowed_models?: unknown; disabled_models?: unknown };
     const current = CONFIGURED_PROVIDERS[index]!;
     const knownModels = new Set(current.models.map((model) => model.id));
     if (body.auto_discover !== undefined && typeof body.auto_discover !== 'boolean') return json({ error: 'invalid auto_discover' }, 400);
+    if (Object.hasOwn(body, 'allowed_models') && body.allowed_models !== null && (!Array.isArray(body.allowed_models) || body.allowed_models.some((model) => typeof model !== 'string' || !knownModels.has(model)))) {
+      return json({ error: 'allowed_models must be null or known model ids' }, 400);
+    }
     if (body.disabled_models !== undefined && (!Array.isArray(body.disabled_models) || body.disabled_models.some((model) => typeof model !== 'string' || !knownModels.has(model)))) {
       return json({ error: 'disabled_models must be known model ids' }, 400);
     }
     const updated: ConfiguredProvider = {
       ...current,
       auto_discover: body.auto_discover ?? current.auto_discover,
+      allowed_models: Object.hasOwn(body, 'allowed_models')
+        ? (body.allowed_models === null ? null : [...new Set(body.allowed_models as string[])])
+        : current.allowed_models,
       disabled_models: body.disabled_models === undefined ? current.disabled_models : [...new Set(body.disabled_models as string[])],
     };
     CONFIGURED_PROVIDERS = CONFIGURED_PROVIDERS.map((provider) => provider.id === id ? updated : provider);
@@ -1254,6 +1262,7 @@ export function resetMockAccounts(): void {
     base_url: 'http://127.0.0.1:8101/v1',
     api_key_present: true,
     auto_discover: true,
+    allowed_models: null,
     disabled_models: [],
     models: [{ id: 'qwen3-8b-flash', context_limit: 32768 }, { id: 'qwen3-32b', context_limit: 131072 }],
   }];

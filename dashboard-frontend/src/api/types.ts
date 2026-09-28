@@ -1064,6 +1064,7 @@ export interface ConfiguredProvider {
   base_url: string;
   api_key_present: boolean;
   auto_discover: boolean;
+  allowed_models?: string[] | null;
   disabled_models: string[];
   models: ProviderInventoryModel[];
 }
@@ -1080,6 +1081,7 @@ export interface CreateConfiguredProviderRequest {
 
 export interface UpdateConfiguredProviderRequest {
   auto_discover?: boolean;
+  allowed_models?: string[] | null;
   disabled_models?: string[];
 }
 
@@ -1726,6 +1728,7 @@ export const isProvidersResponse = (v: unknown): v is ProvidersResponse => isArr
 function isConfiguredProvider(v: unknown): v is ConfiguredProvider {
   return isObj(v) && isStr(v.id) && isStr(v.name) && isStr(v.base_url)
     && typeof v.api_key_present === 'boolean' && typeof v.auto_discover === 'boolean'
+    && (v.allowed_models === undefined || v.allowed_models === null || isStringArray(v.allowed_models))
     && isStringArray(v.disabled_models)
     && Array.isArray(v.models) && v.models.every(isProviderInventoryModel);
 }
