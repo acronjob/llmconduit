@@ -4,7 +4,10 @@ use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationPolicy;
 use crate::engine::Gateway;
-use crate::mesh::protocol::{ModelSwitchingAdvertisement, validate_model_id, validate_resource_id};
+use crate::mesh::protocol::{
+    MAX_SWITCH_MODEL_INSTANCES, ModelSwitchingAdvertisement, SwitchableModelInstanceAdvertisement,
+    validate_model_id, validate_resource_id,
+};
 use crate::mesh::store::CreatedJoinKey;
 use crate::mesh::store::DisabledMeshModelRecord;
 use crate::mesh::store::JoinKeyRecord;
@@ -12,6 +15,7 @@ use crate::mesh::store::MeshNodeRecord;
 use crate::mesh::store::now_ms;
 use axum::Extension;
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::Path;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -76,6 +80,25 @@ pub struct MeshSwitchableModel {
     pub desired_state: String,
     pub gpu_count: u32,
     pub assigned_gpus: Vec<u32>,
+    pub max_instances: u32,
+    pub desired_instances: u32,
+    pub ready_instances: u32,
+    pub instances: Vec<MeshSwitchableModelInstance>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MeshSwitchableModelInstance {
+    pub instance_id: String,
+    pub index: u32,
+    pub port: u16,
+    pub phase: String,
+    pub assigned_gpus: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -119,6 +142,12 @@ pub struct MeshModelOverrideRequest {
     pub endpoint_id: String,
     pub resource_id: String,
     pub model: String,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MeshModelLoadRequest {
+    pub instances: u32,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -380,6 +409,7 @@ pub async fn enable_node(
         ("endpoint_id" = String, Path, description = "Iroh endpoint id."),
         ("model_id" = String, Path, description = "Advertised Fleet model id.")
     ),
+    request_body(content = Option<MeshModelLoadRequest>),
     responses(
         (status = 200, body = SwitchMeshModelResponse),
         (status = 202, body = SwitchMeshModelResponse),
@@ -396,8 +426,13 @@ pub async fn switch_node_model(
     State(gateway): State<Arc<Gateway>>,
     Extension(actor): Extension<ManagementActor>,
     Path((endpoint_id, model_id)): Path<(String, String)>,
+    body: Bytes,
 ) -> Response {
-    set_node_model_state(gateway, actor, endpoint_id, model_id, false).await
+    let instances = match parse_mesh_model_load_body(&body) {
+        Ok(instances) => instances,
+        Err(error) => return error.into_response(),
+    };
+    set_node_model_state(gateway, actor, endpoint_id, model_id, false, instances).await
 }
 
 #[utoipa::path(
@@ -408,6 +443,7 @@ pub async fn switch_node_model(
         ("endpoint_id" = String, Path, description = "Iroh endpoint id."),
         ("model_id" = String, Path, description = "Advertised Fleet model id.")
     ),
+    request_body(content = Option<MeshModelLoadRequest>),
     responses(
         (status = 200, body = SwitchMeshModelResponse),
         (status = 202, body = SwitchMeshModelResponse),
@@ -424,8 +460,13 @@ pub async fn load_node_model(
     State(gateway): State<Arc<Gateway>>,
     Extension(actor): Extension<ManagementActor>,
     Path((endpoint_id, model_id)): Path<(String, String)>,
+    body: Bytes,
 ) -> Response {
-    set_node_model_state(gateway, actor, endpoint_id, model_id, false).await
+    let instances = match parse_mesh_model_load_body(&body) {
+        Ok(instances) => instances,
+        Err(error) => return error.into_response(),
+    };
+    set_node_model_state(gateway, actor, endpoint_id, model_id, false, instances).await
 }
 
 #[utoipa::path(
@@ -453,7 +494,7 @@ pub async fn unload_node_model(
     Extension(actor): Extension<ManagementActor>,
     Path((endpoint_id, model_id)): Path<(String, String)>,
 ) -> Response {
-    set_node_model_state(gateway, actor, endpoint_id, model_id, true).await
+    set_node_model_state(gateway, actor, endpoint_id, model_id, true, None).await
 }
 
 async fn set_node_model_state(
@@ -462,6 +503,7 @@ async fn set_node_model_state(
     endpoint_id: String,
     model_id: String,
     unload: bool,
+    instances: Option<u32>,
 ) -> Response {
     let permission = fleet_model_permission(unload);
     if !actor.allows(permission) {
@@ -491,7 +533,7 @@ async fn set_node_model_state(
     } else {
         admin
             .registry()
-            .switch_model(endpoint, model_id.clone())
+            .switch_model_instances(endpoint, model_id.clone(), instances)
             .await
     };
     match result {
@@ -529,6 +571,39 @@ fn fleet_model_permission(unload: bool) -> ManagementPermission {
     } else {
         ManagementPermission::FleetModelsLoad
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshLoadBodyError {
+    InvalidShape,
+    InvalidInstances,
+}
+
+impl MeshLoadBodyError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::InvalidShape => mesh_error(
+                StatusCode::BAD_REQUEST,
+                "load body must be empty or JSON with only instances",
+            ),
+            Self::InvalidInstances => mesh_error(
+                StatusCode::BAD_REQUEST,
+                "instances must be between 1 and 64",
+            ),
+        }
+    }
+}
+
+fn parse_mesh_model_load_body(body: &[u8]) -> Result<Option<u32>, MeshLoadBodyError> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let request: MeshModelLoadRequest =
+        serde_json::from_slice(body).map_err(|_| MeshLoadBodyError::InvalidShape)?;
+    if !(1..=MAX_SWITCH_MODEL_INSTANCES).contains(&request.instances) {
+        return Err(MeshLoadBodyError::InvalidInstances);
+    }
+    Ok(Some(request.instances))
 }
 
 #[utoipa::path(
@@ -865,9 +940,32 @@ impl From<ModelSwitchingAdvertisement> for MeshModelSwitching {
                     desired_state: model.desired_state,
                     gpu_count: model.gpu_count,
                     assigned_gpus: model.assigned_gpus,
+                    max_instances: model.max_instances,
+                    desired_instances: model.desired_instances,
+                    ready_instances: model.ready_instances,
+                    instances: model
+                        .instances
+                        .into_iter()
+                        .map(MeshSwitchableModelInstance::from)
+                        .collect(),
                 })
                 .collect(),
             revision: value.revision,
+        }
+    }
+}
+
+impl From<SwitchableModelInstanceAdvertisement> for MeshSwitchableModelInstance {
+    fn from(value: SwitchableModelInstanceAdvertisement) -> Self {
+        Self {
+            instance_id: value.instance_id,
+            index: value.index,
+            port: value.port,
+            phase: value.phase,
+            assigned_gpus: value.assigned_gpus,
+            container_status: value.container_status,
+            last_error: value.last_error,
+            health: value.health,
         }
     }
 }
@@ -963,6 +1061,19 @@ mod tests {
         assert!(read_only.allows(ManagementPermission::FleetModelsRead));
         assert!(!read_only.allows(ManagementPermission::FleetModelsLoad));
         assert!(!read_only.allows(ManagementPermission::FleetModelsUnload));
+    }
+
+    #[test]
+    fn mesh_load_body_is_empty_legacy_or_strict_instances() {
+        assert_eq!(parse_mesh_model_load_body(b"").unwrap(), None);
+        assert_eq!(
+            parse_mesh_model_load_body(br#"{"instances":2}"#).unwrap(),
+            Some(2)
+        );
+        assert!(parse_mesh_model_load_body(br#"{"instances":0}"#).is_err());
+        assert!(parse_mesh_model_load_body(br#"{"instances":65}"#).is_err());
+        assert!(parse_mesh_model_load_body(br#"{"instances":1,"extra":true}"#).is_err());
+        assert!(parse_mesh_model_load_body(br#"{}"#).is_err());
     }
 
     #[test]

@@ -9,8 +9,8 @@ use crate::mesh::protocol::{
     AdmissionRejectCode, ENROLL_ALPN, EnrollRequest, EnrollResponse, Heartbeat, HubToWorker,
     ModelAdvertisement, ModelLifecycleAction, ModelSwitchingAdvertisement, PROTOCOL_VERSION,
     ResourceAdvertisement, ResourceRuntimeState, StreamOpen, SwitchModelRequest,
-    SwitchModelResponse, SwitchableModelAdvertisement, WORKER_ALPN, WorkerAdvertisement,
-    WorkerToHub, read_control, write_control,
+    SwitchModelResponse, SwitchableModelAdvertisement, SwitchableModelInstanceAdvertisement,
+    WORKER_ALPN, WorkerAdvertisement, WorkerToHub, read_control, write_control,
 };
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -124,6 +124,15 @@ impl WorkerRuntime {
                     phase: entry.status.phase,
                     desired_state: entry.status.desired_state,
                     gpu_count: entry.model.gpu_count.unwrap_or(0),
+                    max_instances: entry.model.max_instances,
+                    desired_instances: entry.status.desired_instances,
+                    ready_instances: entry.status.ready_instances,
+                    instances: entry
+                        .status
+                        .instances
+                        .into_iter()
+                        .map(SwitchableModelInstanceAdvertisement::from_fleet)
+                        .collect(),
                     assigned_gpus: entry
                         .status
                         .assigned_gpus
@@ -600,7 +609,11 @@ async fn handle_switch_model(
         return Ok(());
     }
     let operation = match action {
-        ModelLifecycleAction::Load => fleet.load_model(&request.model_id).await,
+        ModelLifecycleAction::Load => {
+            fleet
+                .load_model_instances(&request.model_id, request.instances)
+                .await
+        }
         ModelLifecycleAction::Unload => fleet.unload_model(&request.model_id).await,
     };
     match operation {

@@ -41,6 +41,8 @@ export const queryKeys = {
   me: ['me'] as const,
   users: ['users'] as const,
   keys: (scope: string) => ['keys', scope] as const,
+  authUsers: ['auth', 'users'] as const,
+  authApiKeys: ['auth', 'api-keys'] as const,
 } as const;
 
 export interface Connection {

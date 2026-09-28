@@ -1624,6 +1624,7 @@ impl Gateway {
             crate::upstream::AuthorizationScope::unrestricted(),
             crate::upstream::InferenceEndpoint::Responses,
             None,
+            None,
         )
         .await
     }
@@ -1645,6 +1646,7 @@ impl Gateway {
             None,
             authorization,
             endpoint,
+            None,
             None,
         )
         .await
@@ -1668,10 +1670,14 @@ impl Gateway {
             authorization,
             endpoint,
             auth_context,
+            None,
         )
         .await
     }
 
+    // Each capability has an independent gate; keep identity separate from
+    // payload retention so sticky routing also works without diagnostics.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream_responses_with_capture_authorized_context(
         self: Arc<Self>,
         request: ResponsesRequest,
@@ -1680,6 +1686,7 @@ impl Gateway {
         authorization: crate::upstream::AuthorizationScope,
         endpoint: crate::upstream::InferenceEndpoint,
         auth_context: Option<crate::authz::AuthContext>,
+        affinity: Option<crate::upstream::RequestAffinity>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
         // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
         // telemetry guard built BELOW and every per-turn `BackendChatRequest` in
@@ -2111,6 +2118,7 @@ impl Gateway {
                     capture_payloads,
                     authorization,
                     endpoint,
+                    affinity,
                     tx.clone(),
                     // D6: the flow's kill token, composed with every `tx.closed()`
                     // client-hangup check inside `run_turn` + its helpers.
@@ -2495,6 +2503,7 @@ impl Gateway {
         // where candidates are checked before dispatch or capacity mutation.
         authorization: crate::upstream::AuthorizationScope,
         endpoint: crate::upstream::InferenceEndpoint,
+        affinity: Option<crate::upstream::RequestAffinity>,
         tx: mpsc::Sender<SseEvent>,
         // D6: the flow's cancellation token (registered in the AbortHub by the L1 guard
         // under `api_call_id`). COMPOSED with — never a replacement for — every existing
@@ -2949,6 +2958,7 @@ impl Gateway {
                 Some(Arc::clone(&serving_token)),
             )
             .with_authorization(authorization.clone(), endpoint)
+            .with_affinity(affinity.clone())
             .with_thinking_override(request.thinking)
             // F1d: attach the turn-capture handle (see above) so the leaf's
             // `upstream_request` write can reach this turn's artifact.
@@ -3751,6 +3761,11 @@ impl Gateway {
                 );
             }
             return (canonical, true);
+        }
+        if let Some(registry) = &self.managed_providers
+            && registry.disabled_model_blocks_default(model).await
+        {
+            return (model.to_string(), true);
         }
         // No exact id, ad-hoc route, or canonical-key match: fall back to the
         // first catalog model (claude-relay parity). A NON-BLANK requested model

@@ -72,6 +72,23 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     expect(sent).toMatchObject({ reasoning_effort: 'xhigh', top_p: 0.85, max_tokens: 8192, stream: true });
   });
 
+  it('sends strict instance counts for Fleet and mesh load requests only when requested', async () => {
+    const bodies: Array<Record<string, unknown> | undefined> = [];
+    const fetchMutations: typeof fetch = async (input, init) => {
+      const path = String(input);
+      bodies.push(init?.body === undefined ? undefined : JSON.parse(String(init.body)) as Record<string, unknown>);
+      if (path.includes('/fleet/')) return new Response(JSON.stringify({ changed: true }), { status: 200 });
+      return new Response(JSON.stringify({ endpoint_id: 'vllm-a', model_id: 'qwen', accepted: true, changed: true }), { status: 200 });
+    };
+    const client = new DashboardClient({ fetchImpl: fetchMutations, getCsrfToken: () => 'test-csrf' });
+
+    await client.loadFleetModel('qwen', 2);
+    await client.loadMeshModel('vllm-a', 'qwen', 3);
+    await client.loadFleetModel('qwen');
+
+    expect(bodies).toEqual([{ instances: 2 }, { instances: 3 }, undefined]);
+  });
+
   it('streams chat deltas, usage, and the terminal reason through the dashboard route', async () => {
     const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
     const deltas: Array<{ kind: 'content' | 'reasoning'; text: string }> = [];
@@ -141,17 +158,35 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
     const initial = await client.configuredProviders();
     expect(initial.providers[0]).not.toHaveProperty('api_key');
+    expect(initial.providers[0]).toMatchObject({ auto_discover: true, disabled_models: [] });
 
     const created = await client.createConfiguredProvider({
       name: 'Test provider',
       base_url: 'https://inference.example/v1',
       api_key: 'secret-value',
     });
-    expect(created).toMatchObject({ name: 'Test provider', api_key_present: true });
+    expect(created).toMatchObject({ name: 'Test provider', api_key_present: true, auto_discover: true, disabled_models: [] });
     expect(created).not.toHaveProperty('api_key');
+
+    const disabledModel = created.models[0]!.id;
+    const patched = await client.updateConfiguredProvider(created.id, {
+      auto_discover: false,
+      disabled_models: [disabledModel],
+    });
+    expect(patched).toMatchObject({ id: created.id, auto_discover: false, disabled_models: [disabledModel] });
 
     await client.deleteConfiguredProvider(created.id);
     expect((await client.configuredProviders()).providers.some((provider) => provider.id === created.id)).toBe(false);
+  });
+
+  it('rejects configured-provider PATCHes without CSRF and validates model ids', async () => {
+    const client = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => null });
+    const provider = (await client.configuredProviders()).providers[0]!;
+
+    await expect(client.updateConfiguredProvider(provider.id, { auto_discover: false })).rejects.toThrow(/403/);
+
+    const authed = new DashboardClient({ fetchImpl: mockFetch, getCsrfToken: () => 'test-csrf' });
+    await expect(authed.updateConfiguredProvider(provider.id, { disabled_models: ['not-advertised'] })).rejects.toThrow(/400/);
   });
 
   it('mesh admin methods validate reads and send CSRF for mutations', async () => {

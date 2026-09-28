@@ -27,6 +27,7 @@ pub const MAX_SWITCHING_PROVIDER_BYTES: usize = 64;
 pub const MAX_SWITCHING_DESCRIPTION_BYTES: usize = 1024;
 pub const MAX_SWITCHING_STATE_BYTES: usize = 64;
 pub const MAX_CAPACITY_PER_RESOURCE: u32 = 65_535;
+pub const MAX_SWITCH_MODEL_INSTANCES: u32 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollRequest {
@@ -75,6 +76,87 @@ pub struct SwitchableModelAdvertisement {
     pub gpu_count: u32,
     #[serde(default)]
     pub assigned_gpus: Vec<u32>,
+    #[serde(default = "default_max_instances")]
+    pub max_instances: u32,
+    #[serde(default)]
+    pub desired_instances: u32,
+    #[serde(default)]
+    pub ready_instances: u32,
+    #[serde(default)]
+    pub instances: Vec<SwitchableModelInstanceAdvertisement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchableModelInstanceAdvertisement {
+    pub instance_id: String,
+    pub index: u32,
+    pub port: u16,
+    pub phase: String,
+    #[serde(default)]
+    pub assigned_gpus: Vec<u32>,
+    pub container_status: Option<String>,
+    pub last_error: Option<String>,
+    pub health: Option<String>,
+}
+
+impl SwitchableModelAdvertisement {
+    #[cfg(test)]
+    pub(crate) fn legacy(
+        id: impl Into<String>,
+        description: Option<String>,
+        phase: impl Into<String>,
+        desired_state: impl Into<String>,
+        gpu_count: u32,
+        assigned_gpus: Vec<u32>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            description,
+            phase: phase.into(),
+            desired_state: desired_state.into(),
+            gpu_count,
+            assigned_gpus,
+            max_instances: 1,
+            desired_instances: 0,
+            ready_instances: 0,
+            instances: Vec::new(),
+        }
+    }
+}
+
+impl SwitchableModelInstanceAdvertisement {
+    pub(crate) fn from_fleet(value: crate::dashboard_fleet::FleetInstanceStatus) -> Self {
+        Self {
+            instance_id: value.instance_id,
+            index: value.index,
+            port: value.port,
+            phase: value.phase,
+            assigned_gpus: value
+                .assigned_gpus
+                .into_iter()
+                .filter_map(|gpu| u32::try_from(gpu).ok())
+                .collect(),
+            container_status: fleet_diagnostic_text(value.container_status),
+            last_error: fleet_diagnostic_text(value.last_error),
+            health: fleet_diagnostic_text(value.health),
+        }
+    }
+}
+
+fn fleet_diagnostic_text(value: Option<String>) -> Option<String> {
+    // Docker errors contain newlines and can be arbitrarily long; they must not
+    // invalidate the worker's entire advertisement or bypass its wire bounds.
+    let value = value?;
+    let mut normalized = String::new();
+    for ch in value.trim().chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if normalized.len() + ch.len_utf8() > MAX_SWITCHING_DESCRIPTION_BYTES {
+            break;
+        }
+        normalized.push(ch);
+    }
+    let normalized = normalized.trim().to_owned();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +233,8 @@ pub struct SwitchModelRequest {
     pub protocol_version: u16,
     pub request_id: Uuid,
     pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +325,25 @@ pub fn validate_model_switching(
                 max: 64,
             });
         }
+        for (field, count) in [
+            ("switching model max_instances", model.max_instances),
+            ("switching model desired_instances", model.desired_instances),
+            ("switching model ready_instances", model.ready_instances),
+        ] {
+            if count > MAX_SWITCH_MODEL_INSTANCES {
+                return Err(ProtocolError::InstanceCountOutOfRange {
+                    field,
+                    count,
+                    max: MAX_SWITCH_MODEL_INSTANCES,
+                });
+            }
+        }
+        if model.instances.len() > MAX_SWITCH_MODEL_INSTANCES as usize {
+            return Err(ProtocolError::TooManyModelInstances {
+                count: model.instances.len(),
+                max: MAX_SWITCH_MODEL_INSTANCES as usize,
+            });
+        }
         if let Some(description) = &model.description {
             if description.len() > MAX_SWITCHING_DESCRIPTION_BYTES {
                 return Err(ProtocolError::SwitchingDescriptionTooLong {
@@ -268,6 +371,58 @@ pub fn validate_model_switching(
                 });
             }
             reject_control_characters(value, field)?;
+        }
+        for instance in &model.instances {
+            validate_bounded_string(
+                &instance.instance_id,
+                MAX_RESOURCE_ID_BYTES,
+                ProtocolError::BlankSwitchingState {
+                    field: "switching model instance id",
+                },
+                |len, max| ProtocolError::SwitchingStateTooLong {
+                    field: "switching model instance id",
+                    len,
+                    max,
+                },
+            )?;
+            reject_control_characters(&instance.instance_id, "switching model instance id")?;
+            if instance.assigned_gpus.len() > 64 {
+                return Err(ProtocolError::CapacityTooLarge {
+                    capacity: instance.assigned_gpus.len() as u32,
+                    max: 64,
+                });
+            }
+            for (field, value) in [
+                (
+                    "switching model instance phase",
+                    Some(instance.phase.as_str()),
+                ),
+                (
+                    "switching model instance container status",
+                    instance.container_status.as_deref(),
+                ),
+                (
+                    "switching model instance last error",
+                    instance.last_error.as_deref(),
+                ),
+                (
+                    "switching model instance health",
+                    instance.health.as_deref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    if value.trim().is_empty() {
+                        return Err(ProtocolError::BlankSwitchingState { field });
+                    }
+                    if value.len() > MAX_SWITCHING_DESCRIPTION_BYTES {
+                        return Err(ProtocolError::SwitchingDescriptionTooLong {
+                            len: value.len(),
+                            max: MAX_SWITCHING_DESCRIPTION_BYTES,
+                        });
+                    }
+                    reject_control_characters(value, field)?;
+                }
+            }
         }
     }
     Ok(())
@@ -338,7 +493,11 @@ pub fn validate_request_open(request: &RequestOpen) -> Result<(), ProtocolError>
 
 pub fn validate_switch_model_request(request: &SwitchModelRequest) -> Result<(), ProtocolError> {
     validate_protocol_version(request.protocol_version)?;
-    validate_model_id(&request.model_id)
+    validate_model_id(&request.model_id)?;
+    if let Some(instances) = request.instances {
+        validate_instance_count("instances", instances)?;
+    }
+    Ok(())
 }
 
 pub fn validate_protocol_version(version: u16) -> Result<(), ProtocolError> {
@@ -397,6 +556,21 @@ fn reject_control_characters(value: &str, field: &'static str) -> Result<(), Pro
         return Err(ProtocolError::ControlCharacter { field });
     }
     Ok(())
+}
+
+fn validate_instance_count(field: &'static str, count: u32) -> Result<(), ProtocolError> {
+    if !(1..=MAX_SWITCH_MODEL_INSTANCES).contains(&count) {
+        return Err(ProtocolError::InstanceCountOutOfRange {
+            field,
+            count,
+            max: MAX_SWITCH_MODEL_INSTANCES,
+        });
+    }
+    Ok(())
+}
+
+fn default_max_instances() -> u32 {
+    1
 }
 
 fn validate_bounded_string<F>(
@@ -524,6 +698,8 @@ pub enum ProtocolError {
     TooManyResources { count: usize, max: usize },
     #[error("resource advertised {count} models, maximum is {max}")]
     TooManyModels { count: usize, max: usize },
+    #[error("model advertised {count} instances, maximum is {max}")]
+    TooManyModelInstances { count: usize, max: usize },
     #[error("model id must not be blank")]
     BlankModelId,
     #[error("model id is {len} bytes, maximum is {max}")]
@@ -544,6 +720,12 @@ pub enum ProtocolError {
     },
     #[error("{field} must not contain control characters")]
     ControlCharacter { field: &'static str },
+    #[error("{field} instance count {count} must be between 1 and {max}")]
+    InstanceCountOutOfRange {
+        field: &'static str,
+        count: u32,
+        max: u32,
+    },
     #[error("join key must not be blank")]
     BlankJoinKey,
 }
@@ -666,6 +848,19 @@ mod tests {
                 desired_state: "loaded".to_string(),
                 gpu_count: 1,
                 assigned_gpus: vec![0],
+                max_instances: 4,
+                desired_instances: 2,
+                ready_instances: 1,
+                instances: vec![SwitchableModelInstanceAdvertisement {
+                    instance_id: "qwen3-flash-0".to_string(),
+                    index: 0,
+                    port: 8114,
+                    phase: "ready".to_string(),
+                    assigned_gpus: vec![0],
+                    container_status: Some("running".to_string()),
+                    last_error: None,
+                    health: Some("healthy".to_string()),
+                }],
             }],
             revision: 1,
         };
@@ -681,6 +876,58 @@ mod tests {
             validate_model_switching(&switching),
             Err(ProtocolError::ControlCharacter { .. })
         ));
+        switching.models[0].phase = "ready".to_string();
+        switching.models[0].instances[0].phase = "ready\nforged".to_string();
+        assert!(matches!(
+            validate_model_switching(&switching),
+            Err(ProtocolError::ControlCharacter { .. })
+        ));
+        switching.models[0].instances[0].phase = "ready".to_string();
+        switching.models[0].desired_instances = MAX_SWITCH_MODEL_INSTANCES + 1;
+        assert!(matches!(
+            validate_model_switching(&switching),
+            Err(ProtocolError::InstanceCountOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn fleet_instance_diagnostics_do_not_invalidate_worker_inventory() {
+        for (input, expected) in [
+            (
+                "container failed\nGPU unavailable\t\0".to_string(),
+                Some("container failed GPU unavailable".to_string()),
+            ),
+            ("\n\t\0".to_string(), None),
+            (
+                "界".repeat(MAX_SWITCHING_DESCRIPTION_BYTES),
+                Some("界".repeat(MAX_SWITCHING_DESCRIPTION_BYTES / 3)),
+            ),
+        ] {
+            let instance = SwitchableModelInstanceAdvertisement::from_fleet(
+                serde_json::from_value(serde_json::json!({
+                    "instance_id": "qwen--2",
+                    "index": 2,
+                    "port": 8115,
+                    "phase": "failed",
+                    "last_error": input,
+                    "container_status": "\n",
+                    "health": "unhealthy\n"
+                }))
+                .unwrap(),
+            );
+            assert_eq!(instance.last_error, expected);
+            assert_eq!(instance.container_status, None);
+            assert_eq!(instance.health.as_deref(), Some("unhealthy"));
+            let mut model =
+                SwitchableModelAdvertisement::legacy("qwen", None, "failed", "ready", 1, vec![]);
+            model.instances = vec![instance];
+            validate_model_switching(&ModelSwitchingAdvertisement {
+                provider: "lil-fleet".to_string(),
+                models: vec![model],
+                revision: 1,
+            })
+            .unwrap();
+        }
     }
 
     #[test]
@@ -689,14 +936,37 @@ mod tests {
             protocol_version: REQUEST_PROTOCOL_VERSION,
             request_id: Uuid::nil(),
             model_id: "qwen3-flash".to_string(),
+            instances: Some(2),
         };
         let value = serde_json::to_value(StreamOpen::UnloadModel(request.clone()))
             .expect("serialize unload request");
         assert_eq!(value["type"], "unload_model");
+        assert_eq!(value["payload"]["instances"], serde_json::json!(2));
         assert_eq!(
             serde_json::from_value::<StreamOpen>(value).expect("deserialize unload request"),
             StreamOpen::UnloadModel(request)
         );
+    }
+
+    #[test]
+    fn switch_model_request_is_backward_compatible_and_bounds_instances() {
+        let request: SwitchModelRequest = serde_json::from_value(serde_json::json!({
+            "protocol_version": REQUEST_PROTOCOL_VERSION,
+            "request_id": Uuid::nil(),
+            "model_id": "qwen3-flash"
+        }))
+        .expect("legacy request");
+        assert_eq!(request.instances, None);
+        validate_switch_model_request(&request).unwrap();
+
+        let mut request = request;
+        request.instances = Some(0);
+        assert!(matches!(
+            validate_switch_model_request(&request),
+            Err(ProtocolError::InstanceCountOutOfRange { .. })
+        ));
+        request.instances = Some(MAX_SWITCH_MODEL_INSTANCES);
+        validate_switch_model_request(&request).unwrap();
     }
 
     #[test]

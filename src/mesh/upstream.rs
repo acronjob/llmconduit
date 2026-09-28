@@ -5,7 +5,7 @@ use crate::mesh::io::{
     split_http_response_head, write_request_open,
 };
 use crate::mesh::protocol::{AdmissionRejectCode, ModelAdvertisement, REQUEST_PROTOCOL_VERSION};
-use crate::mesh::registry::MeshRegistry;
+use crate::mesh::registry::{MeshRegistry, MeshReservationError};
 use crate::models::chat::{ChatCompletionChunk, ChatCompletionRequest};
 use crate::upstream::{
     BackendCandidate, BackendCandidatePlan, BackendChatRequest, BackendFinalizationPolicies,
@@ -86,9 +86,10 @@ impl UpstreamClient for MeshUpstreamClient {
         loop {
             let authorization = backend.authorization.clone();
             let route = backend.authorization_route.clone();
-            let Some(reservation) = self.registry.reserve_excluding_where(
+            let reservation = match self.registry.reserve_excluding_where_with_affinity(
                 &model,
                 &excluded,
+                backend.affinity.as_ref(),
                 |endpoint_id, resource_id| {
                     authorization.allows_candidate(
                         &format!("mesh:{endpoint_id}"),
@@ -97,33 +98,43 @@ impl UpstreamClient for MeshUpstreamClient {
                         backend.endpoint,
                     )
                 },
-            ) else {
-                let any_authorized =
-                    self.registry
-                        .has_candidate_where(&model, |endpoint_id, resource_id| {
-                            authorization.allows_candidate(
-                                &format!("mesh:{endpoint_id}"),
-                                route.as_deref().or(Some(resource_id)),
-                                &model,
-                                backend.endpoint,
-                            )
-                        });
-                if !any_authorized && self.registry.has_candidate_where(&model, |_, _| true) {
-                    return Err(AppError::forbidden(
-                        "no authorized mesh resource is available for this request",
-                    ));
+            ) {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    let any_authorized =
+                        self.registry
+                            .has_candidate_where(&model, |endpoint_id, resource_id| {
+                                authorization.allows_candidate(
+                                    &format!("mesh:{endpoint_id}"),
+                                    route.as_deref().or(Some(resource_id)),
+                                    &model,
+                                    backend.endpoint,
+                                )
+                            });
+                    if !any_authorized && self.registry.has_candidate_where(&model, |_, _| true) {
+                        return Err(AppError::forbidden(
+                            "no authorized mesh resource is available for this request",
+                        ));
+                    }
+                    return Err(last_error.unwrap_or_else(|| {
+                        AppError::upstream_with_disposition(
+                            "mesh capacity exhausted",
+                            FailoverDisposition::FailoverNoCooldown,
+                        )
+                    }));
                 }
-                return Err(last_error.unwrap_or_else(|| {
-                    AppError::upstream_with_disposition(
+                Err(MeshReservationError::PinnedCapacityExhausted) => {
+                    return Err(AppError::upstream_with_disposition(
                         "mesh capacity exhausted",
                         FailoverDisposition::FailoverNoCooldown,
-                    )
-                }));
+                    ));
+                }
             };
             let candidate = (
                 reservation.resource.endpoint_id,
                 reservation.resource.resource_id.clone(),
             );
+            let affinity_commit = reservation.affinity_commit();
             if let Some(capture) = backend.capture.as_ref() {
                 capture.reset_upstream_response();
             }
@@ -136,6 +147,9 @@ impl UpstreamClient for MeshUpstreamClient {
                         parse_sse_stream(stream, self.max_sse_frame_bytes, backend.capture.clone());
                     match stream.next().await {
                         Some(Ok(first)) => {
+                            if let Some(commit) = affinity_commit {
+                                self.registry.commit_affinity(commit);
+                            }
                             if let Some(serving) = &backend.serving {
                                 serving.set_provider(format!("mesh:{}", candidate.0));
                                 serving.set_model_served_final(model.clone());

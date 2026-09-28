@@ -58,6 +58,7 @@ type CannedResponses =
 
 #[derive(Clone, Default)]
 struct MockUpstream {
+    affinities: Arc<Mutex<Vec<Option<llmconduit::upstream::RequestAffinity>>>>,
     requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
     responses: CannedResponses,
     supported_models: Arc<Mutex<Vec<String>>>,
@@ -138,6 +139,7 @@ impl UpstreamClient for MockUpstream {
         // reasoning_effort_map is exercised against the real leaf in
         // port_config.rs. Tests asserting a RAW pre-leaf `reasoning_effort` rely
         // on non-family models where the leaf is a no-op on that field.
+        self.affinities.lock().await.push(backend.affinity.clone());
         let mut backend = backend.clone();
         let policies = self
             .finalization_policies
@@ -7573,6 +7575,24 @@ async fn dashboard_chat_requires_session_and_csrf_but_not_the_admin_mutation_gat
         .await
         .unwrap();
     assert_eq!(missing_csrf.status().as_u16(), 403);
+
+    let missing_csrf_patch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/dashboard/api/configured-providers/cfg_missing")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"auto_discover":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf_patch.status().as_u16(), 403);
     d13_assert_no_store(&missing_csrf);
 
     let csrf = auth.issue_csrf_token();
@@ -8874,6 +8894,7 @@ async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
     );
 
     let (session, _) = dashboard_auth.issue_session();
+    let csrf = dashboard_auth.issue_csrf_token();
     let summary = app
         .clone()
         .oneshot(
@@ -8925,6 +8946,25 @@ async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
         .await
         .unwrap();
     assert_eq!(missing_csrf.status().as_u16(), 403);
+
+    let invalid_patch_body = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/dashboard/api/configured-providers/cfg_missing")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}; llmconduit_csrf={csrf}"),
+                )
+                .header("x-csrf-token", &csrf)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"auto_discover":"nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_patch_body.status().as_u16(), 400);
 
     remove_auth_store(&store_path);
 }
@@ -8980,6 +9020,11 @@ async fn delegated_dashboard_sessions_cannot_enter_legacy_dashboard_apis() {
             "POST",
             "/dashboard/api/configured-providers",
             Body::from(r#"{"name":"x","base_url":"http://127.0.0.1:9999","api_key":"k"}"#),
+        ),
+        (
+            "PATCH",
+            "/dashboard/api/configured-providers/cfg_missing",
+            Body::from(r#"{"auto_discover":false}"#),
         ),
     ] {
         let response = app
@@ -9108,6 +9153,89 @@ async fn delegated_dashboard_session_is_not_legacy_accounts_admin() {
     .await;
     assert_eq!(create.status(), axum::http::StatusCode::FORBIDDEN);
 
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_attribution_reaches_durable_activity() {
+    use llmconduit::control_plane_store::{
+        PersistenceQueue, PersistenceStore, PersistenceWriter, SqlStore,
+    };
+    use std::num::NonZeroUsize;
+
+    let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),
+    );
+    let identity = authz.authenticate(&headers).unwrap().unwrap();
+    let store = Arc::new(SqlStore::connect_sqlite("sqlite::memory:").await.unwrap());
+    let writer: Arc<dyn PersistenceWriter> = store.clone();
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-activity", "allowed"))])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream,
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .unwrap()
+        .with_persistence_queue(PersistenceQueue::spawn(
+            writer,
+            NonZeroUsize::new(64).unwrap(),
+        ))
+        .with_persistence_store(store.clone());
+    let app = llmconduit::build_app_from_gateway(Arc::new(gateway));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .body(Body::from(
+                    json!({
+                        "model": "public-model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let buckets = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let buckets = store.activity_series(0, 60_000, 10).await.unwrap();
+            if !buckets.is_empty() {
+                break buckets;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("durable activity written");
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(
+        buckets[0].user_id.as_deref(),
+        Some(identity.principal_id.as_str())
+    );
+    assert_eq!(
+        buckets[0].virtual_key_id.as_deref(),
+        Some(identity.key_id.as_str())
+    );
     remove_auth_store(&store_path);
 }
 
@@ -15785,4 +15913,112 @@ async fn f1b_mid_stream_disconnect_marks_served_partial() {
         artifact["sections"]["served_response"]["partial"], true,
         "a mid-stream disconnect marks served_response partial: {artifact}"
     );
+}
+
+#[tokio::test]
+async fn affinity_reaches_every_http_protocol_without_debug_or_persistence() {
+    let upstream = MockUpstream::default();
+    for _ in 0..6 {
+        upstream
+            .push_response(vec![Ok(content_chunk("chat-affinity", "ok"))])
+            .await;
+    }
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    assert!(!gateway.persistence_enabled());
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let cases = [
+        (
+            "/v1/responses",
+            json!({"model":"glm-5.1","input":"hello","store":false}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"glm-5.1","prompt_cache_key":"conversation-a","messages":[{"role":"user","content":"hello"}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model":"glm-5.1","max_tokens":10,"messages":[{"role":"user","content":"hello"}]}),
+        ),
+    ];
+    for (path, body) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("x-llm-session-id", "conversation-a")
+                    .header("authorization", "Bearer first-caller")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+    for (key, session) in [
+        ("first-caller", "conversation-b"),
+        ("second-caller", "conversation-a"),
+        ("first-caller", ""),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .header("x-llm-session-id", session)
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(axum::body::Body::from(
+                        json!({"model":"glm-5.1","input":"hello","store":false}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+    let identities = upstream.affinities.lock().await;
+    assert_eq!(identities.len(), 6);
+    assert!(identities[0].is_some());
+    assert_eq!(identities[0], identities[1]);
+    assert_eq!(identities[0], identities[2]);
+    assert_ne!(identities[0], identities[3]);
+    assert_ne!(identities[0], identities[4]);
+    assert!(identities[5].is_none());
+    assert!(!identities[0].as_ref().unwrap().0.contains("conversation-a"));
+    assert!(
+        !upstream.requests().await[1]
+            .extra_body
+            .contains_key("prompt_cache_key")
+    );
+}
+
+#[tokio::test]
+async fn affinity_reaches_responses_websocket_envelope_without_observability() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-affinity-ws", "ok"))])
+        .await;
+    let app =
+        llmconduit::build_app_from_gateway(test_gateway(upstream.clone(), MockSearch::default()));
+    let (mut socket, server) = responses_ws_connect(app).await;
+    let frame = json!({"type":"response.create","response":{"model":"glm-5.1","input":"hello","store":false,"prompt_cache_key":"stable-ws-session"}});
+    ws_write_text_frame(&mut socket, &frame.to_string()).await;
+    for _ in 0..64 {
+        match ws_try_read_frame(&mut socket).await {
+            Some((0x8, _)) | None => break,
+            _ => {}
+        }
+    }
+    server.abort();
+    assert!(upstream.affinities.lock().await[0].is_some());
 }

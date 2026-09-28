@@ -6,15 +6,19 @@ use crate::mesh::protocol::{
     ResourceAdvertisement, StreamOpen, SwitchModelRequest, SwitchModelResponse,
     WorkerAdvertisement,
 };
-use crate::upstream::ProviderInventoryEntry;
+use crate::upstream::{ProviderInventoryEntry, RequestAffinity, canonical_model_key};
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+const AFFINITY_PIN_LIMIT: usize = 16 * 1024;
+const AFFINITY_PIN_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub(crate) struct MeshRegistry {
@@ -27,6 +31,7 @@ pub(crate) struct MeshRegistry {
 struct RegistryState {
     workers: HashMap<EndpointId, Arc<WorkerSession>>,
     disabled_models: HashSet<(EndpointId, String, String)>,
+    affinity_pins: HashMap<AffinityPinKey, AffinityPin>,
     rr: u64,
 }
 
@@ -66,7 +71,55 @@ struct ResourceState {
 #[derive(Debug)]
 pub(crate) struct MeshReservation {
     pub(crate) resource: ResourceSnapshot,
+    affinity: Option<AffinityReservation>,
     _permit: CapacityPermit,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MeshAffinityCommit {
+    key: AffinityPinKey,
+    observed: Option<AffinityPinTarget>,
+    endpoint_id: EndpointId,
+    resource_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum MeshReservationError {
+    PinnedCapacityExhausted,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct AffinityPinKey {
+    model: String,
+    affinity_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+struct AffinityPin {
+    endpoint_id: EndpointId,
+    resource_id: String,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct AffinityReservation {
+    key: AffinityPinKey,
+    observed: Option<AffinityPinTarget>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AffinityPinTarget {
+    endpoint_id: EndpointId,
+    resource_id: String,
+}
+
+impl AffinityPin {
+    fn target(&self) -> AffinityPinTarget {
+        AffinityPinTarget {
+            endpoint_id: self.endpoint_id,
+            resource_id: self.resource_id.clone(),
+        }
+    }
 }
 
 impl MeshRegistry {
@@ -217,7 +270,49 @@ impl MeshRegistry {
     where
         F: Fn(EndpointId, &str) -> bool,
     {
-        let mut candidates = self.candidates(model);
+        self.reserve_excluding_where_with_affinity(model, excluded, None, allows)
+            .unwrap_or(None)
+    }
+
+    pub(crate) fn reserve_excluding_where_with_affinity<F>(
+        &self,
+        model: &str,
+        excluded: &HashSet<(EndpointId, String)>,
+        affinity: Option<&RequestAffinity>,
+        allows: F,
+    ) -> Result<Option<MeshReservation>, MeshReservationError>
+    where
+        F: Fn(EndpointId, &str) -> bool,
+    {
+        self.reserve_excluding_where_with_affinity_at(
+            model,
+            excluded,
+            affinity,
+            allows,
+            Instant::now(),
+        )
+    }
+
+    fn reserve_excluding_where_with_affinity_at<F>(
+        &self,
+        model: &str,
+        excluded: &HashSet<(EndpointId, String)>,
+        affinity: Option<&RequestAffinity>,
+        allows: F,
+        now: Instant,
+    ) -> Result<Option<MeshReservation>, MeshReservationError>
+    where
+        F: Fn(EndpointId, &str) -> bool,
+    {
+        let affinity_context =
+            affinity.map(|affinity| self.affinity_reservation_context(model, affinity, now));
+        if let Some(affinity) = affinity
+            && let Some(result) = self.reserve_pinned(model, excluded, affinity, &allows, now)
+        {
+            return result.map(Some);
+        }
+
+        let mut candidates = self.candidates_at(model, now);
         candidates.retain(|candidate| {
             !excluded.contains(&(candidate.endpoint_id, candidate.resource_id.clone()))
                 && allows(candidate.endpoint_id, &candidate.resource_id)
@@ -250,13 +345,113 @@ impl MeshRegistry {
                 continue;
             };
             if let Some(permit) = resource.gate.try_acquire() {
-                return Some(MeshReservation {
+                return Ok(Some(MeshReservation {
                     resource: snapshot,
+                    affinity: affinity_context,
                     _permit: permit,
-                });
+                }));
             }
         }
-        None
+        Ok(None)
+    }
+
+    fn affinity_reservation_context(
+        &self,
+        model: &str,
+        affinity: &RequestAffinity,
+        now: Instant,
+    ) -> AffinityReservation {
+        let key = affinity_pin_key(model, affinity);
+        let observed = {
+            let mut state = self.inner.lock().expect("mesh registry lock poisoned");
+            prune_affinity_pins(&mut state, now);
+            state.affinity_pins.get_mut(&key).map(|pin| {
+                pin.last_seen = now;
+                pin.target()
+            })
+        };
+        AffinityReservation { key, observed }
+    }
+
+    fn reserve_pinned<F>(
+        &self,
+        model: &str,
+        excluded: &HashSet<(EndpointId, String)>,
+        affinity: &RequestAffinity,
+        allows: &F,
+        now: Instant,
+    ) -> Option<Result<MeshReservation, MeshReservationError>>
+    where
+        F: Fn(EndpointId, &str) -> bool,
+    {
+        let key = affinity_pin_key(model, affinity);
+        let pin = {
+            let mut state = self.inner.lock().expect("mesh registry lock poisoned");
+            prune_affinity_pins(&mut state, now);
+            state.affinity_pins.get_mut(&key).map(|pin| {
+                pin.last_seen = now;
+                pin.clone()
+            })
+        }?;
+        let candidate_id = (pin.endpoint_id, pin.resource_id.clone());
+        if excluded.contains(&candidate_id) {
+            return None;
+        }
+        let snapshot = self.pinned_candidate(model, &pin, now)?;
+        if !allows(snapshot.endpoint_id, &snapshot.resource_id) {
+            return None;
+        }
+        let session = self.current_session(snapshot.endpoint_id, snapshot.generation)?;
+        let resources = session
+            .resources
+            .lock()
+            .expect("mesh worker resources lock poisoned");
+        let resource = resources.get(&snapshot.resource_id)?;
+        Some(match resource.gate.try_acquire() {
+            Some(permit) => Ok(MeshReservation {
+                resource: snapshot,
+                affinity: Some(AffinityReservation {
+                    key,
+                    observed: Some(pin.target()),
+                }),
+                _permit: permit,
+            }),
+            None => Err(MeshReservationError::PinnedCapacityExhausted),
+        })
+    }
+
+    pub(crate) fn commit_affinity(&self, commit: MeshAffinityCommit) {
+        self.commit_affinity_at(commit, Instant::now());
+    }
+
+    fn commit_affinity_at(&self, commit: MeshAffinityCommit, now: Instant) {
+        let endpoint_id = commit.endpoint_id;
+        let resource_id = &commit.resource_id;
+        let mut state = self.inner.lock().expect("mesh registry lock poisoned");
+        prune_affinity_pins(&mut state, now);
+        if let Some(existing) = state.affinity_pins.get(&commit.key) {
+            let existing_target = existing.target();
+            if existing_target.endpoint_id == endpoint_id
+                && existing_target.resource_id == *resource_id
+            {
+                if let Some(existing) = state.affinity_pins.get_mut(&commit.key) {
+                    existing.last_seen = now;
+                }
+                return;
+            }
+            if commit.observed.as_ref() != Some(&existing_target) {
+                return;
+            }
+        }
+        state.affinity_pins.insert(
+            commit.key,
+            AffinityPin {
+                endpoint_id,
+                resource_id: resource_id.clone(),
+                last_seen: now,
+            },
+        );
+        enforce_affinity_pin_limit(&mut state);
     }
 
     pub(crate) fn has_candidate_where<F>(&self, model: &str, allows: F) -> bool
@@ -309,7 +504,26 @@ impl MeshRegistry {
         endpoint_id: EndpointId,
         model_id: String,
     ) -> crate::error::AppResult<SwitchModelResponse> {
-        self.set_model_state(endpoint_id, model_id, ModelLifecycleAction::Load)
+        self.switch_model_instances(endpoint_id, model_id, None)
+            .await
+    }
+
+    pub(crate) async fn switch_model_instances(
+        &self,
+        endpoint_id: EndpointId,
+        model_id: String,
+        instances: Option<u32>,
+    ) -> crate::error::AppResult<SwitchModelResponse> {
+        if let Some(instances) = instances {
+            crate::mesh::protocol::validate_switch_model_request(&SwitchModelRequest {
+                protocol_version: crate::mesh::protocol::REQUEST_PROTOCOL_VERSION,
+                request_id: uuid::Uuid::nil(),
+                model_id: model_id.clone(),
+                instances: Some(instances),
+            })
+            .map_err(|err| crate::error::AppError::bad_request(err.to_string()))?;
+        }
+        self.set_model_state(endpoint_id, model_id, ModelLifecycleAction::Load, instances)
             .await
     }
 
@@ -318,7 +532,7 @@ impl MeshRegistry {
         endpoint_id: EndpointId,
         model_id: String,
     ) -> crate::error::AppResult<SwitchModelResponse> {
-        self.set_model_state(endpoint_id, model_id, ModelLifecycleAction::Unload)
+        self.set_model_state(endpoint_id, model_id, ModelLifecycleAction::Unload, None)
             .await
     }
 
@@ -327,6 +541,7 @@ impl MeshRegistry {
         endpoint_id: EndpointId,
         model_id: String,
         action: ModelLifecycleAction,
+        instances: Option<u32>,
     ) -> crate::error::AppResult<SwitchModelResponse> {
         let session = self
             .current_session_any_generation(endpoint_id)
@@ -353,6 +568,7 @@ impl MeshRegistry {
             protocol_version: crate::mesh::protocol::REQUEST_PROTOCOL_VERSION,
             request_id: uuid::Uuid::new_v4(),
             model_id,
+            instances,
         };
         let connection = session.connection.as_ref().ok_or_else(|| {
             crate::error::AppError::upstream("mesh worker connection is unavailable")
@@ -536,7 +752,10 @@ impl MeshRegistry {
     }
 
     fn candidates(&self, model: &str) -> Vec<ResourceSnapshot> {
-        let now = Instant::now();
+        self.candidates_at(model, Instant::now())
+    }
+
+    fn candidates_at(&self, model: &str, now: Instant) -> Vec<ResourceSnapshot> {
         let sessions: Vec<_> = self
             .inner
             .lock()
@@ -592,6 +811,63 @@ impl MeshRegistry {
         out
     }
 
+    fn pinned_candidate(
+        &self,
+        model: &str,
+        pin: &AffinityPin,
+        now: Instant,
+    ) -> Option<ResourceSnapshot> {
+        let state = self.inner.lock().expect("mesh registry lock poisoned");
+        self.pinned_candidate_with_state(&state, model, pin, now)
+    }
+
+    fn pinned_candidate_with_state(
+        &self,
+        state: &RegistryState,
+        model: &str,
+        pin: &AffinityPin,
+        now: Instant,
+    ) -> Option<ResourceSnapshot> {
+        let session = state.workers.get(&pin.endpoint_id)?;
+        if session.is_stale(now, self.heartbeat_timeout) {
+            return None;
+        }
+        let resources = session
+            .resources
+            .lock()
+            .expect("mesh worker resources lock poisoned");
+        let resource = resources.get(&pin.resource_id)?;
+        if !resource.healthy || !resource.accepting_requests {
+            return None;
+        }
+        if state.disabled_models.contains(&(
+            session.endpoint_id,
+            resource.resource_id.clone(),
+            model.to_ascii_lowercase(),
+        )) {
+            return None;
+        }
+        if !resource
+            .models
+            .iter()
+            .any(|advertised| advertised.id.eq_ignore_ascii_case(model))
+        {
+            return None;
+        }
+        let snapshot = resource.gate.snapshot();
+        if snapshot.limit == 0 {
+            return None;
+        }
+        Some(ResourceSnapshot {
+            endpoint_id: session.endpoint_id,
+            generation: session.generation,
+            resource_id: resource.resource_id.clone(),
+            connection: session.connection.clone(),
+            effective_capacity: snapshot.limit,
+            active: snapshot.active,
+        })
+    }
+
     fn current_session(
         &self,
         endpoint_id: EndpointId,
@@ -624,6 +900,47 @@ impl MeshRegistry {
             .expect("mesh registry lock poisoned")
             .disabled_models
             .clone()
+    }
+}
+
+impl MeshReservation {
+    pub(crate) fn affinity_commit(&self) -> Option<MeshAffinityCommit> {
+        self.affinity.as_ref().map(|affinity| MeshAffinityCommit {
+            key: affinity.key.clone(),
+            observed: affinity.observed.clone(),
+            endpoint_id: self.resource.endpoint_id,
+            resource_id: self.resource.resource_id.clone(),
+        })
+    }
+}
+
+fn affinity_pin_key(model: &str, affinity: &RequestAffinity) -> AffinityPinKey {
+    AffinityPinKey {
+        model: canonical_model_key(model),
+        affinity_hash: Sha256::digest(affinity.0.as_bytes()).into(),
+    }
+}
+
+fn prune_affinity_pins(state: &mut RegistryState, now: Instant) {
+    state
+        .affinity_pins
+        .retain(|_, pin| now.duration_since(pin.last_seen) <= AFFINITY_PIN_IDLE_TTL);
+    enforce_affinity_pin_limit(state);
+}
+
+fn enforce_affinity_pin_limit(state: &mut RegistryState) {
+    if state.affinity_pins.len() <= AFFINITY_PIN_LIMIT {
+        return;
+    }
+    let excess = state.affinity_pins.len() - AFFINITY_PIN_LIMIT;
+    let mut keys_by_age: Vec<_> = state
+        .affinity_pins
+        .iter()
+        .map(|(key, pin)| (key.clone(), pin.last_seen))
+        .collect();
+    keys_by_age.sort_by_key(|(_, last_seen)| *last_seen);
+    for (key, _) in keys_by_age.into_iter().take(excess) {
+        state.affinity_pins.remove(&key);
     }
 }
 
@@ -761,6 +1078,49 @@ mod tests {
     use crate::mesh::protocol::{PROTOCOL_VERSION, SwitchableModelAdvertisement};
     use iroh::SecretKey;
 
+    fn test_advertisement(resources: Vec<(&str, u32)>) -> WorkerAdvertisement {
+        WorkerAdvertisement {
+            protocol_version: PROTOCOL_VERSION,
+            node_name: None,
+            agent_version: "test".into(),
+            resources: resources
+                .into_iter()
+                .map(|(resource_id, capacity)| ResourceAdvertisement {
+                    resource_id: resource_id.into(),
+                    models: vec![ModelAdvertisement {
+                        id: "mesh-model".into(),
+                        context_limit: None,
+                    }],
+                    availability: AvailabilitySchedule::default(),
+                    effective_capacity: capacity,
+                    accepting_requests: true,
+                    healthy: true,
+                    revision: 1,
+                })
+                .collect(),
+            model_switching: None,
+        }
+    }
+
+    fn commit_new_affinity(
+        registry: &MeshRegistry,
+        model: &str,
+        affinity: &RequestAffinity,
+        resource_id: &str,
+    ) {
+        let reservation = registry
+            .reserve_excluding_where_with_affinity(
+                model,
+                &HashSet::new(),
+                Some(affinity),
+                |_, id| id == resource_id,
+            )
+            .expect("reservation check")
+            .expect("resource available");
+        registry.commit_affinity(reservation.affinity_commit().expect("affinity commit"));
+        drop(reservation);
+    }
+
     #[test]
     fn authorization_predicate_runs_before_mesh_capacity_reservation() {
         let registry = MeshRegistry::new(Duration::from_secs(30));
@@ -809,6 +1169,317 @@ mod tests {
             .reserve("mesh-model")
             .expect("denial did not consume the only capacity permit");
         assert_eq!(reservation.resource.endpoint_id, endpoint);
+    }
+
+    #[test]
+    fn affinity_commit_pins_same_resource_and_refuses_capacity_migration() {
+        let registry = MeshRegistry::new(
+            AFFINITY_PIN_IDLE_TTL + Duration::from_secs(AFFINITY_PIN_LIMIT as u64 + 60),
+        );
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            test_advertisement(vec![("primary", 1), ("spare", 1)]),
+        );
+        let affinity = RequestAffinity("session-a".to_string());
+
+        let first = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+            )
+            .expect("reservation check")
+            .expect("first reservation");
+        let pinned_resource = first.resource.resource_id.clone();
+        registry.commit_affinity(first.affinity_commit().expect("affinity commit"));
+        drop(first);
+
+        let pinned = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+            )
+            .expect("sticky reservation")
+            .expect("pinned resource still available");
+        assert_eq!(pinned.resource.resource_id, pinned_resource);
+
+        let error = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+            )
+            .expect_err("a full pinned resource must not migrate to spare capacity");
+        assert!(matches!(
+            error,
+            MeshReservationError::PinnedCapacityExhausted
+        ));
+
+        let unpinned = registry
+            .reserve_excluding_where_with_affinity("mesh-model", &HashSet::new(), None, |_, _| true)
+            .expect("unpinned reservation")
+            .expect("spare capacity is still available to unpinned sessions");
+        assert_ne!(unpinned.resource.resource_id, pinned_resource);
+    }
+
+    #[test]
+    fn affinity_authorization_denial_does_not_consume_capacity() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(endpoint, test_advertisement(vec![("primary", 1)]));
+        let affinity = RequestAffinity("session-a".to_string());
+        commit_new_affinity(&registry, "mesh-model", &affinity, "primary");
+
+        let denied = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |candidate_endpoint, resource_id| {
+                    let candidate = registry
+                        .candidates("mesh-model")
+                        .into_iter()
+                        .find(|candidate| {
+                            candidate.endpoint_id == candidate_endpoint
+                                && candidate.resource_id == resource_id
+                        })
+                        .expect("authorization sees the pinned candidate");
+                    assert_eq!(candidate.active, 0, "capacity was reserved before authz");
+                    false
+                },
+            )
+            .expect("denied sticky resource is skipped");
+        assert!(denied.is_none());
+
+        assert!(
+            registry
+                .reserve("mesh-model")
+                .is_some_and(|reservation| reservation.resource.resource_id == "primary")
+        );
+    }
+
+    #[test]
+    fn affinity_rebinds_after_pinned_resource_is_disabled() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            test_advertisement(vec![("primary", 1), ("spare", 1)]),
+        );
+        let affinity = RequestAffinity("session-a".to_string());
+        commit_new_affinity(&registry, "mesh-model", &affinity, "primary");
+        registry.set_model_disabled(endpoint, "primary", "mesh-model", true);
+
+        let rebound = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+            )
+            .expect("sticky reservation can rebind")
+            .expect("spare resource available");
+        assert_eq!(rebound.resource.resource_id, "spare");
+        registry.commit_affinity(rebound.affinity_commit().expect("affinity commit"));
+        drop(rebound);
+        registry.set_model_disabled(endpoint, "primary", "mesh-model", false);
+
+        let pinned = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+            )
+            .expect("sticky reservation")
+            .expect("rebound resource remains pinned");
+        assert_eq!(pinned.resource.resource_id, "spare");
+    }
+
+    #[test]
+    fn affinity_rebinds_after_excluded_or_unauthorized_pinned_resource_succeeds_elsewhere() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            test_advertisement(vec![("primary", 1), ("spare", 1)]),
+        );
+        let affinity = RequestAffinity("session-a".to_string());
+        commit_new_affinity(&registry, "mesh-model", &affinity, "primary");
+
+        let excluded = HashSet::from([(endpoint, "primary".to_string())]);
+        let rebound = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &excluded,
+                Some(&affinity),
+                |_, _| true,
+            )
+            .expect("excluded pin falls back")
+            .expect("spare is available");
+        assert_eq!(rebound.resource.resource_id, "spare");
+        registry.commit_affinity(rebound.affinity_commit().expect("affinity commit"));
+        drop(rebound);
+
+        let pinned = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+            )
+            .expect("sticky reservation")
+            .expect("rebound resource remains pinned");
+        assert_eq!(pinned.resource.resource_id, "spare");
+        drop(pinned);
+
+        commit_new_affinity(&registry, "mesh-model", &affinity, "primary");
+        let auth_rebound = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, resource_id| resource_id != "primary",
+            )
+            .expect("unauthorized pin falls back")
+            .expect("authorized spare is available");
+        assert_eq!(auth_rebound.resource.resource_id, "spare");
+        registry.commit_affinity(auth_rebound.affinity_commit().expect("affinity commit"));
+        drop(auth_rebound);
+
+        let pinned = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+            )
+            .expect("sticky reservation")
+            .expect("authorized rebound resource remains pinned");
+        assert_eq!(pinned.resource.resource_id, "spare");
+    }
+
+    #[test]
+    fn absent_affinity_keeps_existing_round_robin_selection() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(endpoint, test_advertisement(vec![("a", 1), ("b", 1)]));
+
+        let first = registry
+            .reserve_excluding_where_with_affinity("mesh-model", &HashSet::new(), None, |_, _| true)
+            .expect("first reservation")
+            .expect("first resource");
+        let first_resource = first.resource.resource_id.clone();
+        drop(first);
+        let second = registry
+            .reserve_excluding_where_with_affinity("mesh-model", &HashSet::new(), None, |_, _| true)
+            .expect("second reservation")
+            .expect("second resource");
+        assert_ne!(second.resource.resource_id, first_resource);
+    }
+
+    #[test]
+    fn affinity_pins_are_bounded_ttl_pruned_and_first_writer_wins() {
+        let registry = MeshRegistry::new(
+            AFFINITY_PIN_IDLE_TTL + Duration::from_secs(AFFINITY_PIN_LIMIT as u64 + 60),
+        );
+        let endpoint = SecretKey::generate().public();
+        registry.register_test(
+            endpoint,
+            test_advertisement(vec![("primary", 1), ("spare", 1)]),
+        );
+        let now = Instant::now();
+        let affinity = RequestAffinity("session-a".to_string());
+
+        let first = registry
+            .reserve_excluding_where_with_affinity_at(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, resource_id| resource_id == "primary",
+                now,
+            )
+            .expect("first reservation")
+            .expect("primary reservation");
+        let stale_later = registry
+            .reserve_excluding_where_with_affinity_at(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, resource_id| resource_id == "spare",
+                now + Duration::from_secs(1),
+            )
+            .expect("stale reservation")
+            .expect("spare reservation");
+        registry.commit_affinity_at(first.affinity_commit().expect("affinity commit"), now);
+        drop(first);
+        registry.commit_affinity_at(
+            stale_later.affinity_commit().expect("affinity commit"),
+            now + Duration::from_secs(1),
+        );
+        drop(stale_later);
+        let pinned = registry
+            .reserve_excluding_where_with_affinity_at(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+                now + Duration::from_secs(2),
+            )
+            .expect("sticky reservation")
+            .expect("pin exists");
+        assert_eq!(pinned.resource.resource_id, "primary");
+        drop(pinned);
+
+        let after_ttl = now + AFFINITY_PIN_IDLE_TTL + Duration::from_secs(3);
+        let _ = registry.reserve_excluding_where_with_affinity_at(
+            "mesh-model",
+            &HashSet::new(),
+            Some(&affinity),
+            |_, _| true,
+            after_ttl,
+        );
+        assert!(
+            !registry
+                .inner
+                .lock()
+                .expect("mesh registry lock poisoned")
+                .affinity_pins
+                .contains_key(&affinity_pin_key("mesh-model", &affinity))
+        );
+
+        for index in 0..(AFFINITY_PIN_LIMIT + 1) {
+            let loop_affinity = RequestAffinity(format!("session-{index}"));
+            let reservation = registry
+                .reserve_excluding_where_with_affinity_at(
+                    "mesh-model",
+                    &HashSet::new(),
+                    Some(&loop_affinity),
+                    |_, resource_id| resource_id == "primary",
+                    after_ttl + Duration::from_secs(index as u64),
+                )
+                .expect("loop reservation")
+                .unwrap_or_else(|| panic!("primary reservation at index {index}"));
+            registry.commit_affinity_at(
+                reservation.affinity_commit().expect("affinity commit"),
+                after_ttl + Duration::from_secs(index as u64),
+            );
+            drop(reservation);
+        }
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .expect("mesh registry lock poisoned")
+                .affinity_pins
+                .len(),
+            AFFINITY_PIN_LIMIT
+        );
     }
 
     #[test]
@@ -1118,28 +1789,28 @@ mod tests {
                 resources: Vec::new(),
                 model_switching: Some(ModelSwitchingAdvertisement {
                     provider: "lil-fleet".into(),
-                    models: vec![SwitchableModelAdvertisement {
-                        id: "qwen3-flash".into(),
-                        description: None,
-                        phase: "ready".into(),
-                        desired_state: "loaded".into(),
-                        gpu_count: 1,
-                        assigned_gpus: vec![0],
-                    }],
+                    models: vec![SwitchableModelAdvertisement::legacy(
+                        "qwen3-flash",
+                        None,
+                        "ready",
+                        "loaded",
+                        1,
+                        vec![0],
+                    )],
                     revision: 5,
                 }),
             },
         );
         session.update_model_switching(ModelSwitchingAdvertisement {
             provider: "lil-fleet".into(),
-            models: vec![SwitchableModelAdvertisement {
-                id: "stale-model".into(),
-                description: None,
-                phase: "unloaded".into(),
-                desired_state: "unloaded".into(),
-                gpu_count: 1,
-                assigned_gpus: Vec::new(),
-            }],
+            models: vec![SwitchableModelAdvertisement::legacy(
+                "stale-model",
+                None,
+                "unloaded",
+                "unloaded",
+                1,
+                Vec::new(),
+            )],
             revision: 4,
         });
         let advertised = registry

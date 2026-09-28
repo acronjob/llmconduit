@@ -25,6 +25,7 @@ import type {
   ConfiguredProvider,
   ConfiguredProvidersResponse,
   CreateConfiguredProviderRequest,
+  UpdateConfiguredProviderRequest,
   CreateAuthApiKeyRequest,
   CreateAuthGroupRequest,
   CreateAuthPolicyRequest,
@@ -101,6 +102,7 @@ export interface DashboardChatRequest {
   top_p?: number;
   max_tokens?: number;
   reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  prompt_cache_key?: string;
 }
 
 export interface DashboardChatDelta {
@@ -328,6 +330,13 @@ export class DashboardClient {
     });
   }
 
+  updateConfiguredProvider(id: string, body: UpdateConfiguredProviderRequest): Promise<ConfiguredProvider> {
+    return this.mutate(`/configured-providers/${encodeURIComponent(id)}`, 'PATCH', body).then((value) => {
+      if (!isConfiguredProviderResponse(value)) throw new Error('/configured-providers/:id returned an invalid response');
+      return value;
+    });
+  }
+
   deleteConfiguredProvider(id: string): Promise<void> {
     return this.mutate(`/configured-providers/${encodeURIComponent(id)}`, 'DELETE');
   }
@@ -340,8 +349,8 @@ export class DashboardClient {
     return this.request('/fleet', undefined, isFleetModelsResponse);
   }
 
-  loadFleetModel(id: string): Promise<FleetOperationResponse> {
-    return this.mutate(`/fleet/models/${encodeURIComponent(id)}/load`, 'POST').then((value) => {
+  loadFleetModel(id: string, instances?: number): Promise<FleetOperationResponse> {
+    return this.mutate(`/fleet/models/${encodeURIComponent(id)}/load`, 'POST', instances === undefined ? undefined : { instances }).then((value) => {
       if (!isFleetOperationResponse(value)) throw new Error('/fleet/models/:id/load returned an invalid response');
       return value;
     });
@@ -395,8 +404,8 @@ export class DashboardClient {
     });
   }
 
-  loadMeshModel(endpointId: string, modelId: string): Promise<SwitchMeshModelResponse> {
-    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/load`, 'POST').then((value) => {
+  loadMeshModel(endpointId: string, modelId: string, instances?: number): Promise<SwitchMeshModelResponse> {
+    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/load`, 'POST', instances === undefined ? undefined : { instances }).then((value) => {
       if (!isSwitchMeshModelResponse(value)) throw new Error('/mesh/nodes/:endpoint_id/models/:model_id/load returned an invalid response');
       return value;
     });

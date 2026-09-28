@@ -33,6 +33,7 @@ export function ChatView() {
   const abortRef = useRef<AbortController | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const nextId = useRef(1);
+  const promptCacheKeyRef = useRef(newPromptCacheKey());
 
   const models = useMemo(() => catalog.data?.map((entry) => entry.id) ?? [], [catalog.data]);
   const advertisedContextLimit = catalog.data?.find((entry) => entry.id === model)?.context_limit ?? null;
@@ -84,6 +85,7 @@ export function ChatView() {
           top_p: parseOptionalNumber(topP),
           max_tokens: parseOptionalInteger(maxContextLength),
           reasoning_effort: thinkingLevel,
+          prompt_cache_key: promptCacheKeyRef.current,
         },
         (delta) => {
           if (delta.text && firstTokenAt === null) firstTokenAt = performance.now();
@@ -126,6 +128,7 @@ export function ChatView() {
     setElapsedMs(null);
     setRates({ tgPerSecond: null, ppPerSecond: null });
     setRunState('idle');
+    promptCacheKeyRef.current = newPromptCacheKey();
   }
 
   function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -329,6 +332,10 @@ function parseOptionalNumber(value: string): number | undefined {
 function parseOptionalInteger(value: string): number | undefined {
   const parsed = Number.parseInt(value, 10);
   return value.trim() && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function newPromptCacheKey(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `dashboard-chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function statusColor(state: RunState): string {

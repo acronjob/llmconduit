@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { getConnection, queryKeys } from '../../api/connection';
-import type { FleetModelsResponse, ProviderInventoryEntry } from '../../api/types';
+import type { ConfiguredProvider, ConfiguredProvidersResponse, FleetModelsResponse, ProviderInventoryEntry } from '../../api/types';
 import { renderWithQuery, resetWorld } from '../../components/testHarness';
+import { authStore } from '../../store/authStore';
 import { ProvidersView } from './ProvidersView';
 
 beforeEach(() => resetWorld({ mock: true }));
@@ -32,6 +33,16 @@ function mockProviderSlots() {
     slot('mesh:north', 'North lab', 'gpu-a'),
     slot('mesh:north', 'North lab', 'gpu-b', false),
   ] });
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 const fleetStatusCases: FleetModelsResponse = {
@@ -305,6 +316,8 @@ describe('ProvidersView', () => {
 
     const panel = await screen.findByTestId('configured-providers-panel');
     expect(panel).toHaveTextContent('Local lab');
+    expect(panel).toHaveTextContent('auto-discover');
+    expect(panel).toHaveTextContent('Refreshes about every 5 min');
     expect(panel).not.toHaveTextContent('secret-value');
 
     fireEvent.change(within(panel).getByLabelText('Provider name'), { target: { value: 'Remote lab' } });
@@ -314,6 +327,78 @@ describe('ProvidersView', () => {
 
     await waitFor(() => expect(panel).toHaveTextContent('Remote lab'));
     expect(panel).not.toHaveTextContent('secret-value');
+  });
+
+  it('toggles configured-provider autodiscovery and individual model availability', async () => {
+    const client = getConnection().client;
+    const updateProvider = vi.spyOn(client, 'updateConfiguredProvider');
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('configured-providers-panel');
+    const card = within(panel).getByText('Local lab').closest('[data-testid="configured-provider-card"]') as HTMLElement;
+
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'auto-discover' }));
+    await waitFor(() => expect(updateProvider).toHaveBeenCalledWith('managed-local-lab', { auto_discover: false }));
+    await waitFor(() => expect(card).toHaveTextContent('Automatic catalog refresh is paused'));
+
+    fireEvent.change(within(card).getByLabelText('Search models for Local lab'), { target: { value: '32b' } });
+    expect(within(card).getByText('qwen3-32b')).toBeVisible();
+    expect(within(card).queryByText('qwen3-8b-flash')).toBeNull();
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Disable' }));
+    await waitFor(() => expect(updateProvider).toHaveBeenCalledWith('managed-local-lab', { disabled_models: ['qwen3-32b'] }));
+    await waitFor(() => expect(within(card).getByRole('button', { name: 'Enable' })).toBeVisible());
+    expect(card).toHaveTextContent('1 enabled');
+  });
+
+  it('keeps configured-provider controls busy and uses returned state before delayed refetch completes', async () => {
+    const client = getConnection().client;
+    const provider: ConfiguredProvider = {
+      id: 'managed-race',
+      name: 'Race lab',
+      base_url: 'https://race.example/v1',
+      api_key_present: true,
+      auto_discover: true,
+      disabled_models: [],
+      models: [{ id: 'model-a', context_limit: 8192 }, { id: 'model-b', context_limit: 8192 }],
+    };
+    let serverProvider = provider;
+    const refetchGate = deferred<ConfiguredProvidersResponse>();
+    const configuredProviders = vi.spyOn(client, 'configuredProviders')
+      .mockResolvedValueOnce({ providers: [serverProvider] })
+      .mockImplementation(() => refetchGate.promise);
+    const updateProvider = vi.spyOn(client, 'updateConfiguredProvider').mockImplementation(async (_id, body) => {
+      serverProvider = { ...serverProvider, ...body };
+      return serverProvider;
+    });
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('configured-providers-panel');
+    const card = within(panel).getByText('Race lab').closest('[data-testid="configured-provider-card"]') as HTMLElement;
+
+    fireEvent.click(within(card).getAllByRole('button', { name: 'Disable' })[0]!);
+    await waitFor(() => expect(updateProvider).toHaveBeenCalledWith('managed-race', { disabled_models: ['model-a'] }));
+    await waitFor(() => expect(within(card).getByRole('button', { name: 'Enable' })).toBeDisabled());
+    expect(configuredProviders).toHaveBeenCalledTimes(2);
+
+    refetchGate.resolve({ providers: [serverProvider] });
+    await waitFor(() => expect(within(card).getByRole('button', { name: 'Enable' })).toBeEnabled());
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Enable' }));
+    await waitFor(() => expect(updateProvider).toHaveBeenLastCalledWith('managed-race', { disabled_models: [] }));
+  });
+
+  it('renders configured-provider controls read-only when mutations are disabled', async () => {
+    renderWithQuery(<ProvidersView />);
+    act(() => authStore.getState().setMutationsEnabled(false));
+
+    const panel = await screen.findByTestId('configured-providers-panel');
+    const card = within(panel).getByText('Local lab').closest('[data-testid="configured-provider-card"]') as HTMLElement;
+
+    expect(within(panel).getByText('mutations disabled')).toBeVisible();
+    expect(within(card).getByRole('checkbox', { name: 'auto-discover' })).toBeDisabled();
+    expect(within(card).getByRole('button', { name: 'Remove' })).toBeDisabled();
+    expect(within(card).getAllByRole('button', { name: 'Disable' })[0]).toBeDisabled();
   });
 
   it('confirms and invokes model loading advertised by a downstream mesh worker', async () => {
@@ -336,7 +421,121 @@ describe('ProvidersView', () => {
 
     await waitFor(() => expect(model).toHaveTextContent('loading'));
     expect(unloadModel).toHaveBeenCalledWith(endpoint, 'qwen3-8b-flash');
-    expect(loadModel).toHaveBeenCalledWith(endpoint, 'qwen3-32b');
+    expect(loadModel).toHaveBeenCalledWith(endpoint, 'qwen3-32b', 1);
+  });
+
+  it('lets a loaded local Fleet profile scale by sending the selected desired count', async () => {
+    const client = getConnection().client;
+    const loadModel = vi.spyOn(client, 'loadFleetModel');
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('fleet-panel');
+    const model = within(panel).getByText('qwen3-8b-flash').closest('[data-testid="fleet-model-card"]') as HTMLElement;
+    expect(within(model).getByRole('button', { name: 'Scale' })).toBeDisabled();
+
+    fireEvent.change(within(model).getByLabelText('Instances'), { target: { value: '2' } });
+    fireEvent.click(within(model).getByRole('button', { name: 'Scale' }));
+    expect(screen.getByRole('dialog')).toHaveTextContent('desired Fleet instance count to 2');
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm load' }));
+
+    await waitFor(() => expect(loadModel).toHaveBeenCalledWith('qwen3-8b-flash', 2));
+  });
+
+  it('blocks invalid local instance counts before mutation', async () => {
+    const client = getConnection().client;
+    const loadModel = vi.spyOn(client, 'loadFleetModel');
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('fleet-panel');
+    const model = within(panel).getByText('qwen3-32b').closest('[data-testid="fleet-model-card"]') as HTMLElement;
+    fireEvent.change(within(model).getByLabelText('Instances'), { target: { value: '0' } });
+
+    expect(within(model).getByText('min 1')).toBeVisible();
+    expect(within(model).getByRole('button', { name: 'Load' })).toBeDisabled();
+    expect(loadModel).not.toHaveBeenCalled();
+  });
+
+  it('shows concrete Fleet instance ports and GPU assignments when reported', async () => {
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('fleet-panel');
+    const model = within(panel).getByText('qwen3-8b-flash').closest('[data-testid="fleet-model-card"]') as HTMLElement;
+    const instances = within(model).getByTestId('instance-list');
+    expect(instances).toHaveTextContent('#0');
+    expect(instances).toHaveTextContent(':8101');
+    expect(instances).toHaveTextContent('GPU 0');
+    expect(model).toHaveTextContent('1/1');
+  });
+
+  it('scales a remote TP4 profile to two instances and reports the 2x GPU total', async () => {
+    const client = getConnection().client;
+    const mesh = await client.mesh();
+    const endpoint = mesh.nodes.find((node) => node.model_switching)!.endpoint_id;
+    vi.spyOn(client, 'providers').mockResolvedValue({ providers: [slot(`mesh:${endpoint}`, 'North lab', 'gpu-a')] });
+    const loadModel = vi.spyOn(client, 'loadMeshModel');
+    renderWithQuery(<ProvidersView />);
+
+    const switcher = await screen.findByTestId('remote-model-switcher');
+    const model = within(switcher).getByText('qwen3-8b-flash').closest('[data-testid="remote-switch-model"]') as HTMLElement;
+    fireEvent.change(within(model).getByLabelText('Instances'), { target: { value: '2' } });
+    fireEvent.click(within(model).getByRole('button', { name: 'Scale' }));
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('2 instances needs 8 GPUs total and 4 additional');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm load' }));
+
+    await waitFor(() => expect(loadModel).toHaveBeenCalledWith(endpoint, 'qwen3-8b-flash', 2));
+  });
+
+  it('can unload and account for GPUs when a remote profile has one ready replica and one failed replica', async () => {
+    const client = getConnection().client;
+    const mesh = await client.mesh();
+    const endpoint = mesh.nodes.find((node) => node.model_switching)!.endpoint_id;
+    vi.spyOn(client, 'mesh').mockResolvedValue({
+      ...mesh,
+      nodes: mesh.nodes.map((node) => node.endpoint_id === endpoint && node.model_switching ? {
+        ...node,
+        model_switching: {
+          ...node.model_switching,
+          models: [
+            {
+              id: 'qwen3-8b-flash',
+              description: 'partial replica profile',
+              phase: 'failed',
+              desired_state: 'ready',
+              gpu_count: 4,
+              max_instances: 3,
+              desired_instances: 2,
+              ready_instances: 1,
+              assigned_gpus: [0, 1, 2, 3, 4, 5, 6, 7],
+              instances: [
+                { instance_id: 'qwen3-8b-flash-0', index: 0, port: 8101, phase: 'ready', container_status: 'running', assigned_gpus: [0, 1, 2, 3] },
+                { instance_id: 'qwen3-8b-flash-1', index: 1, port: 8102, phase: 'failed', container_status: 'exited', assigned_gpus: [4, 5, 6, 7], last_error: 'replica failed' },
+              ],
+              last_error: 'replica failed',
+            },
+            { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 8, max_instances: 1, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] },
+          ],
+        },
+      } : node),
+    });
+    vi.spyOn(client, 'providers').mockResolvedValue({ providers: [slot(`mesh:${endpoint}`, 'North lab', 'gpu-a')] });
+    const unloadModel = vi.spyOn(client, 'unloadMeshModel');
+    renderWithQuery(<ProvidersView />);
+
+    const switcher = await screen.findByTestId('remote-model-switcher');
+    const partial = within(switcher).getByText('qwen3-8b-flash').closest('[data-testid="remote-switch-model"]') as HTMLElement;
+    expect(within(partial).getByRole('status', { name: 'model status: failed (failed)' })).toHaveAttribute('data-status', 'failed');
+    expect(partial).toHaveTextContent('1/2');
+    expect(within(partial).getByRole('button', { name: 'Unload' })).toBeEnabled();
+    fireEvent.click(within(partial).getByRole('button', { name: 'Unload' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm unload' }));
+    await waitFor(() => expect(unloadModel).toHaveBeenCalledWith(endpoint, 'qwen3-8b-flash'));
+
+    const large = within(switcher).getByText('qwen3-32b').closest('[data-testid="remote-switch-model"]') as HTMLElement;
+    fireEvent.click(within(large).getByRole('button', { name: 'Load' }));
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('Every currently loaded model');
+    expect(dialog).toHaveTextContent('qwen3-8b-flash');
   });
 
   it('confirms remote model unloads before sending the mutation', async () => {
