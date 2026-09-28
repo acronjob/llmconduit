@@ -318,6 +318,7 @@ describe('ProvidersView', () => {
     expect(panel).toHaveTextContent('Local lab');
     expect(panel).toHaveTextContent('auto-discover');
     expect(panel).toHaveTextContent('Refreshes about every 5 min');
+    expect(panel).toHaveTextContent('Newly discovered models are enabled unless individually disabled');
     expect(panel).not.toHaveTextContent('secret-value');
 
     fireEvent.change(within(panel).getByLabelText('Provider name'), { target: { value: 'Remote lab' } });
@@ -345,10 +346,90 @@ describe('ProvidersView', () => {
     expect(within(card).getByText('qwen3-32b')).toBeVisible();
     expect(within(card).queryByText('qwen3-8b-flash')).toBeNull();
 
-    fireEvent.click(within(card).getByRole('button', { name: 'Disable' }));
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Enable qwen3-32b' }));
     await waitFor(() => expect(updateProvider).toHaveBeenCalledWith('managed-local-lab', { disabled_models: ['qwen3-32b'] }));
-    await waitFor(() => expect(within(card).getByRole('button', { name: 'Enable' })).toBeVisible());
+    await waitFor(() => expect(within(card).getByRole('checkbox', { name: 'Enable qwen3-32b' })).not.toBeChecked());
     expect(card).toHaveTextContent('1 enabled');
+
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Only allow selected models' }));
+    await waitFor(() => expect(updateProvider).toHaveBeenCalledWith('managed-local-lab', { allowed_models: ['qwen3-8b-flash'] }));
+    await waitFor(() => expect(card).toHaveTextContent('Newly discovered models stay visible but disabled until selected'));
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Only allow selected models' }));
+    await waitFor(() => expect(updateProvider).toHaveBeenCalledWith('managed-local-lab', { allowed_models: null }));
+  });
+
+  it('keeps newly discovered models disabled in strict provider allowlist mode', async () => {
+    const client = getConnection().client;
+    vi.spyOn(client, 'configuredProviders').mockResolvedValue({
+      providers: [{
+        id: 'managed-strict',
+        name: 'Strict lab',
+        base_url: 'https://strict.example/v1',
+        api_key_present: true,
+        auto_discover: true,
+        allowed_models: ['model-a'],
+        disabled_models: [],
+        models: [{ id: 'model-a', context_limit: 8192 }, { id: 'model-b', context_limit: 8192 }],
+      }],
+    });
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('configured-providers-panel');
+    const card = within(panel).getByText('Strict lab').closest('[data-testid="configured-provider-card"]') as HTMLElement;
+
+    expect(within(card).getByRole('checkbox', { name: 'Only allow selected models' })).toBeChecked();
+    expect(within(card).getByRole('checkbox', { name: 'Enable model-a' })).toBeChecked();
+    expect(within(card).getByRole('checkbox', { name: 'Enable model-b' })).not.toBeChecked();
+    expect(card).toHaveTextContent('Newly discovered models stay visible but disabled until selected');
+  });
+
+  it('handles legacy configured providers that omit allowed_models', async () => {
+    const client = getConnection().client;
+    vi.spyOn(client, 'configuredProviders').mockResolvedValue({
+      providers: [{
+        id: 'managed-legacy',
+        name: 'Legacy lab',
+        base_url: 'https://legacy.example/v1',
+        api_key_present: true,
+        auto_discover: true,
+        disabled_models: [],
+        models: [{ id: 'model-a', context_limit: 8192 }],
+      }],
+    });
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('configured-providers-panel');
+    const card = within(panel).getByText('Legacy lab').closest('[data-testid="configured-provider-card"]') as HTMLElement;
+
+    expect(within(card).getByRole('checkbox', { name: 'Only allow selected models' })).not.toBeChecked();
+    expect(within(card).getByRole('checkbox', { name: 'Enable model-a' })).toBeChecked();
+  });
+
+  it('selecting a blacklisted model in strict mode removes it from disabled models', async () => {
+    const client = getConnection().client;
+    vi.spyOn(client, 'configuredProviders').mockResolvedValue({
+      providers: [{
+        id: 'managed-strict-blacklist',
+        name: 'Strict blacklist lab',
+        base_url: 'https://strict-blacklist.example/v1',
+        api_key_present: true,
+        auto_discover: true,
+        allowed_models: ['model-a'],
+        disabled_models: ['model-b'],
+        models: [{ id: 'model-a', context_limit: 8192 }, { id: 'model-b', context_limit: 8192 }],
+      }],
+    });
+    const updateProvider = vi.spyOn(client, 'updateConfiguredProvider');
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('configured-providers-panel');
+    const card = within(panel).getByText('Strict blacklist lab').closest('[data-testid="configured-provider-card"]') as HTMLElement;
+
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Enable model-b' }));
+    await waitFor(() => expect(updateProvider).toHaveBeenCalledWith('managed-strict-blacklist', {
+      allowed_models: ['model-a', 'model-b'],
+      disabled_models: [],
+    }));
   });
 
   it('keeps configured-provider controls busy and uses returned state before delayed refetch completes', async () => {
@@ -359,6 +440,7 @@ describe('ProvidersView', () => {
       base_url: 'https://race.example/v1',
       api_key_present: true,
       auto_discover: true,
+      allowed_models: null,
       disabled_models: [],
       models: [{ id: 'model-a', context_limit: 8192 }, { id: 'model-b', context_limit: 8192 }],
     };
@@ -376,15 +458,15 @@ describe('ProvidersView', () => {
     const panel = await screen.findByTestId('configured-providers-panel');
     const card = within(panel).getByText('Race lab').closest('[data-testid="configured-provider-card"]') as HTMLElement;
 
-    fireEvent.click(within(card).getAllByRole('button', { name: 'Disable' })[0]!);
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Enable model-a' }));
     await waitFor(() => expect(updateProvider).toHaveBeenCalledWith('managed-race', { disabled_models: ['model-a'] }));
-    await waitFor(() => expect(within(card).getByRole('button', { name: 'Enable' })).toBeDisabled());
+    await waitFor(() => expect(within(card).getByRole('checkbox', { name: 'Enable model-a' })).toBeDisabled());
     expect(configuredProviders).toHaveBeenCalledTimes(2);
 
     refetchGate.resolve({ providers: [serverProvider] });
-    await waitFor(() => expect(within(card).getByRole('button', { name: 'Enable' })).toBeEnabled());
+    await waitFor(() => expect(within(card).getByRole('checkbox', { name: 'Enable model-a' })).toBeEnabled());
 
-    fireEvent.click(within(card).getByRole('button', { name: 'Enable' }));
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Enable model-a' }));
     await waitFor(() => expect(updateProvider).toHaveBeenLastCalledWith('managed-race', { disabled_models: [] }));
   });
 
@@ -397,8 +479,9 @@ describe('ProvidersView', () => {
 
     expect(within(panel).getByText('mutations disabled')).toBeVisible();
     expect(within(card).getByRole('checkbox', { name: 'auto-discover' })).toBeDisabled();
+    expect(within(card).getByRole('checkbox', { name: 'Only allow selected models' })).toBeDisabled();
     expect(within(card).getByRole('button', { name: 'Remove' })).toBeDisabled();
-    expect(within(card).getAllByRole('button', { name: 'Disable' })[0]).toBeDisabled();
+    expect(within(card).getByRole('checkbox', { name: 'Enable qwen3-8b-flash' })).toBeDisabled();
   });
 
   it('confirms and invokes model loading advertised by a downstream mesh worker', async () => {

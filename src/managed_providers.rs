@@ -50,6 +50,7 @@ pub struct ConfiguredProviderView {
     pub api_key_present: bool,
     pub models: Vec<UpstreamModelEntry>,
     pub auto_discover: bool,
+    pub allowed_models: Option<Vec<String>>,
     pub disabled_models: Vec<String>,
 }
 
@@ -63,7 +64,30 @@ pub struct CreateConfiguredProviderRequest {
 #[derive(Clone, Deserialize, ToSchema)]
 pub struct UpdateConfiguredProviderRequest {
     pub auto_discover: Option<bool>,
+    #[serde(default)]
+    #[schema(value_type = Option<Vec<String>>, nullable = true)]
+    pub allowed_models: ModelListUpdate,
     pub disabled_models: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ModelListUpdate {
+    #[default]
+    Omitted,
+    Clear,
+    Replace(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for ModelListUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<Vec<String>>::deserialize(deserializer).map(|value| match value {
+            Some(models) => Self::Replace(models),
+            None => Self::Clear,
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -80,6 +104,8 @@ struct StoredProvider {
     models: Vec<UpstreamModelEntry>,
     #[serde(default = "default_auto_discover")]
     auto_discover: bool,
+    #[serde(default)]
+    allowed_models: Option<Vec<String>>,
     #[serde(default)]
     disabled_models: Vec<String>,
 }
@@ -181,6 +207,7 @@ impl ManagedProviderRegistry {
             api_key,
             models,
             auto_discover: true,
+            allowed_models: None,
             disabled_models: Vec::new(),
         };
         state.providers.push(ManagedProvider {
@@ -219,15 +246,28 @@ impl ManagedProviderRegistry {
             return Ok(None);
         };
         let original = state.providers[index].clone();
+        let allowed_models = match request.allowed_models {
+            ModelListUpdate::Replace(allowed_models) => Some(Some(validate_model_list(
+                &state.providers[index].stored.models,
+                allowed_models,
+                "allowed",
+            )?)),
+            ModelListUpdate::Clear => Some(None),
+            ModelListUpdate::Omitted => None,
+        };
         let disabled_models = match request.disabled_models {
-            Some(disabled_models) => Some(validate_disabled_models(
+            Some(disabled_models) => Some(validate_model_list(
                 &state.providers[index].stored.models,
                 disabled_models,
+                "disabled",
             )?),
             None => None,
         };
         if let Some(auto_discover) = request.auto_discover {
             state.providers[index].stored.auto_discover = auto_discover;
+        }
+        if let Some(allowed_models) = allowed_models {
+            state.providers[index].stored.allowed_models = allowed_models;
         }
         if let Some(disabled_models) = disabled_models {
             state.providers[index].stored.disabled_models = disabled_models;
@@ -385,32 +425,31 @@ impl ManagedProviderRegistry {
         if provider.revision != snapshot.revision || !provider.stored.auto_discover {
             return Ok(());
         }
-        let original = provider.clone();
         let mut seen = provider
             .stored
             .models
             .iter()
             .map(|entry| entry.id.to_ascii_lowercase())
             .collect::<HashSet<_>>();
+        let mut merged_models = provider.stored.models.clone();
         let mut changed = false;
         for model in models {
             if seen.insert(model.id.to_ascii_lowercase()) {
-                if provider.stored.models.len() >= MAX_PROVIDER_MODELS {
+                if merged_models.len() >= MAX_PROVIDER_MODELS {
                     return Err(AppError::bad_request(format!(
                         "provider returned too many models; maximum is {MAX_PROVIDER_MODELS}"
                     )));
                 }
-                provider.stored.models.push(model);
+                merged_models.push(model);
                 changed = true;
             }
         }
         if !changed {
             return Ok(());
         }
-        provider
-            .stored
-            .models
-            .sort_by_key(|a| a.id.to_ascii_lowercase());
+        merged_models.sort_by_key(|a| a.id.to_ascii_lowercase());
+        let original = provider.clone();
+        provider.stored.models = merged_models;
         provider.revision = provider.revision.saturating_add(1);
         match self.persist_locked(&state).await {
             Ok(()) => Ok(()),
@@ -441,14 +480,33 @@ impl ManagedProviderRegistry {
         base_models: &[UpstreamModelEntry],
     ) -> Option<ManagedProvider> {
         self.ensure_loaded().await.ok()?;
-        let mut base_ids = HashSet::new();
-        for entry in base_models {
-            base_ids.insert(entry.id.to_ascii_lowercase());
-        }
-        if base_ids.contains(&model.to_ascii_lowercase()) {
+        if base_models
+            .iter()
+            .any(|entry| entry.id.eq_ignore_ascii_case(model))
+        {
             return None;
         }
         let state = self.state.read().await;
+        let mut exact_matches = state
+            .providers
+            .iter()
+            .filter(|provider| {
+                provider.stored.models.iter().any(|entry| {
+                    entry.id.eq_ignore_ascii_case(model)
+                        && model_enabled(&provider.stored, &entry.id)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if exact_matches.len() == 1 {
+            return exact_matches.pop();
+        }
+        if !exact_matches.is_empty() {
+            return None;
+        }
+        if resolve_model_entry_in_catalog(base_models, model).is_some() {
+            return None;
+        }
         let mut matches = state
             .providers
             .iter()
@@ -458,16 +516,15 @@ impl ManagedProviderRegistry {
         (matches.len() == 1).then(|| matches.remove(0))
     }
 
-    async fn disabled_configured_model(
+    async fn blocked_configured_model(
         &self,
         model: &str,
         base_models: &[UpstreamModelEntry],
     ) -> bool {
-        if model.trim().is_empty()
-            || base_models
-                .iter()
-                .any(|entry| entry.id.eq_ignore_ascii_case(model))
-        {
+        if model.trim().is_empty() {
+            return false;
+        }
+        if resolve_model_entry_in_catalog(base_models, model).is_some() {
             return false;
         }
         self.ensure_loaded().await.ok();
@@ -475,7 +532,7 @@ impl ManagedProviderRegistry {
         if enabled_configured_model_matches(&state.providers, model) {
             return false;
         }
-        disabled_configured_model_matches(&state.providers, model)
+        blocked_configured_model_matches(&state.providers, model)
     }
 
     pub(crate) async fn disabled_model_blocks_default(&self, model: &str) -> bool {
@@ -485,7 +542,7 @@ impl ManagedProviderRegistry {
         self.ensure_loaded().await.ok();
         let state = self.state.read().await;
         !enabled_configured_model_matches(&state.providers, model)
-            && disabled_configured_model_matches(&state.providers, model)
+            && blocked_configured_model_matches(&state.providers, model)
     }
 
     async fn inventory(&self) -> AppResult<Vec<ProviderInventoryEntry>> {
@@ -565,12 +622,7 @@ impl ManagedProviderUpstream {
         provider: &ManagedProvider,
     ) -> BackendChatRequest {
         let mut request = backend.request.clone();
-        let resolved = provider
-            .stored
-            .models
-            .iter()
-            .find(|entry| entry.id.eq_ignore_ascii_case(&request.model))
-            .map(|entry| entry.id.clone())
+        let resolved = resolve_provider_model(&provider.stored, &request.model)
             .unwrap_or_else(|| request.model.clone());
         request.model = resolved;
         if let Some(serving) = &backend.serving {
@@ -630,11 +682,11 @@ impl UpstreamClient for ManagedProviderUpstream {
         }
         if self
             .registry
-            .disabled_configured_model(&request.request.model, &base_catalog)
+            .blocked_configured_model(&request.request.model, &base_catalog)
             .await
         {
             return Err(AppError::bad_request(
-                "configured provider model is disabled",
+                "configured provider model is not enabled",
             ));
         }
         self.base
@@ -664,18 +716,20 @@ impl UpstreamClient for ManagedProviderUpstream {
                 &requested_model,
                 InferenceEndpoint::Completions,
             )?;
-            request.body = proxy_body_with_model(request.body, &requested_model)?;
+            let resolved_model = resolve_provider_model(&provider.stored, &requested_model)
+                .unwrap_or_else(|| requested_model.clone());
+            request.body = proxy_body_with_model(request.body, &resolved_model)?;
             request.authorization_route = Some("configured".to_string());
             request.authorization_provider = Some(provider.stored.name.clone());
             return provider.client.proxy_completions(request).await;
         }
         if self
             .registry
-            .disabled_configured_model(&requested_model, &base_catalog)
+            .blocked_configured_model(&requested_model, &base_catalog)
             .await
         {
             return Err(AppError::bad_request(
-                "configured provider model is disabled",
+                "configured provider model is not enabled",
             ));
         }
         self.base.proxy_completions(request).await
@@ -699,11 +753,11 @@ impl UpstreamClient for ManagedProviderUpstream {
         }
         if self
             .registry
-            .disabled_configured_model(&request.request.model, &base_catalog)
+            .blocked_configured_model(&request.request.model, &base_catalog)
             .await
         {
             return Err(AppError::bad_request(
-                "configured provider model is disabled",
+                "configured provider model is not enabled",
             ));
         }
         self.base.count_tokens(request).await
@@ -747,10 +801,8 @@ impl UpstreamClient for ManagedProviderUpstream {
             .registry
             .route_for_model(requested_model, &base_catalog)
             .await
-            && let Some(model) = provider.stored.models.iter().find(|entry| {
-                entry.id.eq_ignore_ascii_case(requested_model)
-                    && !model_disabled(&provider.stored, &entry.id)
-            })
+            && let Some(model) = resolve_provider_model_entry(&provider.stored, requested_model)
+                .filter(|entry| model_enabled(&provider.stored, &entry.id))
         {
             return BackendCandidatePlan {
                 candidates: vec![BackendCandidate {
@@ -761,7 +813,7 @@ impl UpstreamClient for ManagedProviderUpstream {
         }
         if self
             .registry
-            .disabled_configured_model(requested_model, &base_catalog)
+            .blocked_configured_model(requested_model, &base_catalog)
             .await
         {
             return BackendCandidatePlan {
@@ -807,6 +859,7 @@ fn provider_view(provider: &ManagedProvider) -> ConfiguredProviderView {
         api_key_present: !provider.stored.api_key.is_empty(),
         models: provider.stored.models.clone(),
         auto_discover: provider.stored.auto_discover,
+        allowed_models: provider.stored.allowed_models.clone(),
         disabled_models: provider.stored.disabled_models.clone(),
     }
 }
@@ -816,32 +869,28 @@ fn default_auto_discover() -> bool {
 }
 
 fn provider_model_enabled(provider: &StoredProvider, model: &str) -> bool {
-    provider
-        .models
-        .iter()
-        .any(|entry| entry.id.eq_ignore_ascii_case(model) && !model_disabled(provider, &entry.id))
+    resolve_provider_model_entry(provider, model)
+        .is_some_and(|entry| model_enabled(provider, &entry.id))
 }
 
 fn enabled_configured_model_matches(providers: &[ManagedProvider], model: &str) -> bool {
     providers.iter().any(|provider| {
-        provider.stored.models.iter().any(|entry| {
-            !model_disabled(&provider.stored, &entry.id) && model_ids_match(&entry.id, model)
-        })
+        resolve_provider_model_entry(&provider.stored, model)
+            .is_some_and(|entry| model_enabled(&provider.stored, &entry.id))
     })
 }
 
-fn disabled_configured_model_matches(providers: &[ManagedProvider], model: &str) -> bool {
+fn blocked_configured_model_matches(providers: &[ManagedProvider], model: &str) -> bool {
     providers.iter().any(|provider| {
+        if let Some(entry) = resolve_provider_model_entry(&provider.stored, model) {
+            return !model_enabled(&provider.stored, &entry.id);
+        }
         provider
             .stored
-            .disabled_models
+            .models
             .iter()
-            .any(|disabled| model_ids_match(disabled, model))
+            .any(|entry| canonical_model_key(&entry.id) == canonical_model_key(model))
     })
-}
-
-fn model_ids_match(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right) || canonical_model_key(left) == canonical_model_key(right)
 }
 
 fn model_disabled(provider: &StoredProvider, model: &str) -> bool {
@@ -851,40 +900,105 @@ fn model_disabled(provider: &StoredProvider, model: &str) -> bool {
         .any(|disabled| disabled.eq_ignore_ascii_case(model))
 }
 
+fn model_allowed(provider: &StoredProvider, model: &str) -> bool {
+    match &provider.allowed_models {
+        Some(allowed) => allowed
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(model)),
+        None => true,
+    }
+}
+
+fn model_enabled(provider: &StoredProvider, model: &str) -> bool {
+    model_allowed(provider, model) && !model_disabled(provider, model)
+}
+
+fn resolve_provider_model(provider: &StoredProvider, requested_model: &str) -> Option<String> {
+    resolve_provider_model_entry(provider, requested_model)
+        .filter(|entry| model_enabled(provider, &entry.id))
+        .map(|entry| entry.id.clone())
+}
+
+fn resolve_provider_model_entry<'a>(
+    provider: &'a StoredProvider,
+    requested_model: &str,
+) -> Option<&'a UpstreamModelEntry> {
+    resolve_model_entry_in_catalog(&provider.models, requested_model)
+}
+
+fn resolve_model_entry_in_catalog<'a>(
+    models: &'a [UpstreamModelEntry],
+    requested_model: &str,
+) -> Option<&'a UpstreamModelEntry> {
+    if let Some(entry) = models
+        .iter()
+        .find(|entry| entry.id.eq_ignore_ascii_case(requested_model))
+    {
+        return Some(entry);
+    }
+    let key = canonical_model_key(requested_model);
+    let mut matches = models
+        .iter()
+        .filter(|entry| canonical_model_key(&entry.id) == key);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
 fn enabled_provider_models(provider: &StoredProvider) -> Vec<UpstreamModelEntry> {
     provider
         .models
         .iter()
-        .filter(|entry| !model_disabled(provider, &entry.id))
+        .filter(|entry| model_enabled(provider, &entry.id))
         .cloned()
         .collect()
 }
 
-fn validate_disabled_models(
+fn validate_model_list(
     models: &[UpstreamModelEntry],
-    disabled_models: Vec<String>,
+    requested_models: Vec<String>,
+    kind: &str,
 ) -> AppResult<Vec<String>> {
-    let mut disabled = Vec::new();
+    let mut normalized = Vec::new();
     let mut seen = HashSet::new();
-    for raw in disabled_models {
+    for raw in requested_models {
         let model = raw.trim();
         if model.is_empty() || model.chars().any(char::is_control) {
-            return Err(AppError::bad_request("disabled model id is invalid"));
+            return Err(AppError::bad_request(format!("{kind} model id is invalid")));
         }
-        let Some(canonical) = models
-            .iter()
-            .find(|entry| entry.id.eq_ignore_ascii_case(model))
-            .map(|entry| entry.id.clone())
-        else {
-            return Err(AppError::bad_request(format!(
-                "disabled model {model:?} is not in the configured provider catalog"
-            )));
-        };
+        let canonical = canonical_model_in_catalog(models, model, kind)?;
         if seen.insert(canonical.to_ascii_lowercase()) {
-            disabled.push(canonical);
+            normalized.push(canonical);
         }
     }
-    Ok(disabled)
+    Ok(normalized)
+}
+
+fn canonical_model_in_catalog(
+    models: &[UpstreamModelEntry],
+    model: &str,
+    kind: &str,
+) -> AppResult<String> {
+    if let Some(entry) = models
+        .iter()
+        .find(|entry| entry.id.eq_ignore_ascii_case(model))
+    {
+        return Ok(entry.id.clone());
+    }
+    let key = canonical_model_key(model);
+    let mut matches = models
+        .iter()
+        .filter(|entry| canonical_model_key(&entry.id) == key);
+    let Some(first) = matches.next() else {
+        return Err(AppError::bad_request(format!(
+            "{kind} model {model:?} is not in the configured provider catalog"
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(AppError::bad_request(format!(
+            "{kind} model {model:?} matches multiple configured provider catalog ids"
+        )));
+    }
+    Ok(first.id.clone())
 }
 
 async fn discover_provider_models(
@@ -1214,6 +1328,7 @@ mod tests {
                     context_limit: Some(4096),
                 }],
                 auto_discover: true,
+                allowed_models: None,
                 disabled_models: Vec::new(),
             },
             client: Arc::new(ReqwestUpstreamClient::with_options(
@@ -1235,6 +1350,34 @@ mod tests {
     }
 
     #[test]
+    fn old_stored_providers_default_to_no_allowlist() {
+        let stored: StoredProviders = serde_json::from_str(
+            r#"{"providers":[{"id":"cfg_old","name":"old","base_url":"https://old.example/v1/","api_key":"secret","models":[{"id":"model-a"}],"auto_discover":true,"disabled_models":[]}]}"#,
+        )
+        .expect("old stored provider JSON");
+        assert_eq!(stored.providers.len(), 1);
+        assert_eq!(stored.providers[0].allowed_models, None);
+    }
+
+    #[test]
+    fn update_provider_allowlist_distinguishes_omitted_null_and_array() {
+        let omitted: UpdateConfiguredProviderRequest =
+            serde_json::from_str("{}").expect("omitted allowlist");
+        assert_eq!(omitted.allowed_models, ModelListUpdate::Omitted);
+
+        let clear: UpdateConfiguredProviderRequest =
+            serde_json::from_str(r#"{"allowed_models":null}"#).expect("null allowlist");
+        assert_eq!(clear.allowed_models, ModelListUpdate::Clear);
+
+        let replace: UpdateConfiguredProviderRequest =
+            serde_json::from_str(r#"{"allowed_models":["Model-A"]}"#).expect("array allowlist");
+        assert_eq!(
+            replace.allowed_models,
+            ModelListUpdate::Replace(vec!["Model-A".to_string()])
+        );
+    }
+
+    #[test]
     fn configured_provider_routing_honors_authorization_scope() {
         let provider = ManagedProvider {
             stored: StoredProvider {
@@ -1247,6 +1390,7 @@ mod tests {
                     context_limit: None,
                 }],
                 auto_discover: true,
+                allowed_models: None,
                 disabled_models: Vec::new(),
             },
             client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
@@ -1281,6 +1425,55 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn provider_model_resolution_prefers_exact_ids_and_rejects_ambiguous_aliases() {
+        let mut provider = StoredProvider {
+            id: "cfg_collision".to_string(),
+            name: "collision".to_string(),
+            base_url: "https://collision.example/v1/".to_string(),
+            api_key: "secret".to_string(),
+            models: model_entries(vec!["foo-bar", "foo_bar", "unique-model"]),
+            auto_discover: true,
+            allowed_models: None,
+            disabled_models: Vec::new(),
+        };
+
+        assert_eq!(
+            resolve_provider_model(&provider, "FOO_BAR").as_deref(),
+            Some("foo_bar"),
+            "exact case-insensitive ids win before normalized aliases"
+        );
+        assert_eq!(
+            resolve_provider_model(&provider, "unique.model").as_deref(),
+            Some("unique-model"),
+            "unique normalized aliases remain accepted"
+        );
+        assert_eq!(
+            resolve_provider_model(&provider, "foobar"),
+            None,
+            "ambiguous normalized aliases are not routed to an arbitrary id"
+        );
+        provider.allowed_models = Some(vec!["foo-bar".to_string()]);
+        assert!(
+            !provider_model_enabled(&provider, "foo_bar"),
+            "persisted allowlist membership is exact and does not enable a colliding id"
+        );
+        provider.allowed_models = None;
+        provider.disabled_models = vec!["foo-bar".to_string()];
+        assert!(
+            provider_model_enabled(&provider, "foo_bar"),
+            "persisted disabled-model membership is exact and does not disable a colliding id"
+        );
+        assert!(blocked_configured_model_matches(
+            &[ManagedProvider {
+                stored: provider,
+                client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
+                revision: 0,
+            }],
+            "foobar",
+        ));
     }
 
     #[tokio::test]
@@ -1336,6 +1529,7 @@ mod tests {
                     },
                 ],
                 auto_discover: true,
+                allowed_models: None,
                 disabled_models: Vec::new(),
             };
             registry.state.write().await.providers = vec![ManagedProvider {
@@ -1395,6 +1589,7 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: model_entries(vec!["model-a", "stale-model"]),
                     auto_discover: true,
+                    allowed_models: None,
                     disabled_models: vec!["stale-model".to_string()],
                 },
                 client: Arc::new(upstream.clone()),
@@ -1435,6 +1630,7 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: model_entries(vec!["model-a"]),
                     auto_discover: true,
+                    allowed_models: None,
                     disabled_models: Vec::new(),
                 },
                 client: Arc::new(upstream.clone()),
@@ -1465,7 +1661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_models_survive_refresh_and_restart_and_are_excluded_from_serving() {
+    async fn model_selection_survives_refresh_and_restart_and_is_excluded_from_serving() {
         let store = Arc::new(
             SqlStore::connect_sqlite("sqlite::memory:")
                 .await
@@ -1482,6 +1678,7 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: model_entries(vec!["model-a", "model-b"]),
                     auto_discover: true,
+                    allowed_models: None,
                     disabled_models: Vec::new(),
                 },
                 client: Arc::new(upstream.clone()),
@@ -1494,6 +1691,7 @@ mod tests {
                 "cfg_disabled",
                 UpdateConfiguredProviderRequest {
                     auto_discover: None,
+                    allowed_models: ModelListUpdate::Replace(vec!["MODEL-A".to_string()]),
                     disabled_models: Some(vec!["MODEL-B".to_string()]),
                 },
             )
@@ -1511,6 +1709,7 @@ mod tests {
         let restarted = test_registry_with_store(store).await;
         restarted.ensure_loaded().await.expect("loaded");
         let provider = restarted.list().await.expect("list").remove(0);
+        assert_eq!(provider.allowed_models, Some(vec!["model-a".to_string()]));
         assert_eq!(provider.disabled_models, vec!["model-b"]);
         assert!(
             provider.models.iter().any(|entry| entry.id == "model-b"),
@@ -1527,6 +1726,10 @@ mod tests {
             "serving catalog excludes disabled ids"
         );
         assert!(
+            catalog.iter().all(|entry| entry.id != "model-c"),
+            "serving catalog excludes ids outside the allowlist"
+        );
+        assert!(
             managed
                 .backend_candidate_plan("model-b")
                 .await
@@ -1534,6 +1737,67 @@ mod tests {
                 .is_empty(),
             "candidate inventory excludes disabled ids"
         );
+        assert!(
+            managed
+                .backend_candidate_plan("model-c")
+                .await
+                .candidates
+                .is_empty(),
+            "candidate inventory excludes non-allowlisted ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_allowlist_clears_but_omitted_allowlist_preserves_previous_value() {
+        let registry = test_registry().await;
+        {
+            registry.state.write().await.providers = vec![ManagedProvider {
+                stored: StoredProvider {
+                    id: "cfg_allow".to_string(),
+                    name: "allow".to_string(),
+                    base_url: "https://allow.example/v1/".to_string(),
+                    api_key: "secret".to_string(),
+                    models: model_entries(vec!["model-a", "model-b"]),
+                    auto_discover: true,
+                    allowed_models: Some(vec!["model-a".to_string()]),
+                    disabled_models: Vec::new(),
+                },
+                client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
+                revision: 0,
+            }];
+            registry.state.write().await.loaded = true;
+        }
+
+        registry
+            .update(
+                "cfg_allow",
+                UpdateConfiguredProviderRequest {
+                    auto_discover: Some(false),
+                    allowed_models: ModelListUpdate::Omitted,
+                    disabled_models: None,
+                },
+            )
+            .await
+            .expect("omitted update")
+            .expect("found");
+        assert_eq!(
+            registry.list().await.expect("list")[0].allowed_models,
+            Some(vec!["model-a".to_string()])
+        );
+
+        registry
+            .update(
+                "cfg_allow",
+                UpdateConfiguredProviderRequest {
+                    auto_discover: None,
+                    allowed_models: ModelListUpdate::Clear,
+                    disabled_models: None,
+                },
+            )
+            .await
+            .expect("clear update")
+            .expect("found");
+        assert_eq!(registry.list().await.expect("list")[0].allowed_models, None);
     }
 
     #[tokio::test]
@@ -1548,6 +1812,7 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: model_entries(vec!["disabled-model"]),
                     auto_discover: true,
+                    allowed_models: None,
                     disabled_models: vec!["disabled-model".to_string()],
                 },
                 client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
@@ -1592,6 +1857,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_configured_model_does_not_block_real_base_catalog_match() {
+        let registry = test_registry().await;
+        {
+            registry.state.write().await.providers = vec![ManagedProvider {
+                stored: StoredProvider {
+                    id: "cfg_disabled_base".to_string(),
+                    name: "disabled-base".to_string(),
+                    base_url: "https://disabled-base.example/v1/".to_string(),
+                    api_key: "secret".to_string(),
+                    models: model_entries(vec!["model-a", "configured-only"]),
+                    auto_discover: true,
+                    allowed_models: None,
+                    disabled_models: vec!["model-a".to_string(), "configured-only".to_string()],
+                },
+                client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
+                revision: 0,
+            }];
+            registry.state.write().await.loaded = true;
+        }
+
+        assert!(
+            !registry
+                .blocked_configured_model("model-a", &model_entries(vec!["model-a"]))
+                .await,
+            "a concrete base catalog match remains routable"
+        );
+        assert!(
+            registry
+                .blocked_configured_model("configured-only", &model_entries(vec!["model-a"]))
+                .await,
+            "configured-only disabled ids still cannot fall through"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_configured_id_is_not_stolen_by_canonical_base_collision() {
+        let registry = test_registry().await;
+        {
+            registry.state.write().await.providers = vec![ManagedProvider {
+                stored: StoredProvider {
+                    id: "cfg_collision_route".to_string(),
+                    name: "collision-route".to_string(),
+                    base_url: "https://collision-route.example/v1/".to_string(),
+                    api_key: "secret".to_string(),
+                    models: model_entries(vec!["foo-bar"]),
+                    auto_discover: true,
+                    allowed_models: None,
+                    disabled_models: Vec::new(),
+                },
+                client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
+                revision: 0,
+            }];
+            registry.state.write().await.loaded = true;
+        }
+
+        assert!(
+            registry
+                .route_for_model("foo-bar", &model_entries(vec!["foo_bar"]))
+                .await
+                .is_some(),
+            "exact configured id wins over a base model that only collides canonically"
+        );
+        assert!(
+            registry
+                .route_for_model("foo_bar", &model_entries(vec!["foo_bar"]))
+                .await
+                .is_none(),
+            "exact base id still keeps base precedence"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_discover_toggle_racing_refresh_prevents_stale_merge() {
         let registry = test_registry().await;
         {
@@ -1603,6 +1940,7 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: model_entries(vec!["model-a"]),
                     auto_discover: false,
+                    allowed_models: None,
                     disabled_models: Vec::new(),
                 },
                 client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
@@ -1642,6 +1980,7 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: model_entries(vec!["known-model"]),
                     auto_discover: true,
+                    allowed_models: None,
                     disabled_models: Vec::new(),
                 },
                 client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
@@ -1655,6 +1994,7 @@ mod tests {
                 "cfg_update",
                 UpdateConfiguredProviderRequest {
                     auto_discover: Some(false),
+                    allowed_models: ModelListUpdate::Omitted,
                     disabled_models: Some(vec!["unknown-model".to_string()]),
                 },
             )
@@ -1672,7 +2012,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_capacity_failure_rolls_back_in_memory_catalog_additions() {
         let registry = test_registry().await;
-        let full_catalog = (0..MAX_PROVIDER_MODELS)
+        let near_full_catalog = (0..MAX_PROVIDER_MODELS - 1)
             .map(|index| UpstreamModelEntry {
                 id: format!("model-{index}"),
                 context_limit: None,
@@ -1685,8 +2025,9 @@ mod tests {
                     name: "full".to_string(),
                     base_url: "https://full.example/v1/".to_string(),
                     api_key: "secret".to_string(),
-                    models: full_catalog,
+                    models: near_full_catalog,
                     auto_discover: true,
+                    allowed_models: None,
                     disabled_models: Vec::new(),
                 },
                 client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
@@ -1703,16 +2044,20 @@ mod tests {
         let err = registry
             .merge_refreshed_models(
                 &snapshot,
-                vec![UpstreamModelEntry {
-                    id: "overflow".to_string(),
-                    context_limit: None,
-                }],
+                model_entries(vec!["fits-before-overflow", "overflow"]),
             )
             .await
             .expect_err("aggregate catalog cap rejected");
         assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
         let provider = registry.list().await.expect("list").remove(0);
-        assert_eq!(provider.models.len(), MAX_PROVIDER_MODELS);
+        assert_eq!(provider.models.len(), MAX_PROVIDER_MODELS - 1);
+        assert!(
+            provider
+                .models
+                .iter()
+                .all(|entry| entry.id != "fits-before-overflow"),
+            "near-capacity refresh is staged atomically"
+        );
         assert!(provider.models.iter().all(|entry| entry.id != "overflow"));
     }
 
@@ -1734,6 +2079,7 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: model_entries(vec!["model-a"]),
                     auto_discover: true,
+                    allowed_models: None,
                     disabled_models: Vec::new(),
                 },
                 client: Arc::new(CatalogOnlyUpstream { models: Vec::new() }),
@@ -1800,6 +2146,7 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: model_entries(vec!["model-a"]),
                     auto_discover: true,
+                    allowed_models: None,
                     disabled_models: Vec::new(),
                 },
                 client: Arc::new(upstream.clone()),
@@ -1830,11 +2177,22 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(upstream.queries(), 1, "one refresh runs after the interval");
+        for _ in 0..10 {
+            if registry.list().await.expect("list")[0]
+                .models
+                .iter()
+                .any(|entry| entry.id == "model-b")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(
             registry.list().await.expect("list")[0]
                 .models
                 .iter()
-                .any(|entry| entry.id == "model-b")
+                .any(|entry| entry.id == "model-b"),
+            "refresh commit is visible after the interval tick"
         );
 
         drop(registry);
