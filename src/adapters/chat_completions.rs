@@ -919,6 +919,12 @@ fn response_value_usage(response: &Value) -> Option<ChatUsage> {
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        cost: usage.get("cost").and_then(Value::as_f64),
+        cost_source: usage
+            .get("cost_source")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        cost_details: usage.get("cost_details").cloned(),
         prompt_tokens_details: usage
             .get("input_tokens_details")
             .and_then(|details| details.get("cached_tokens"))
@@ -1027,6 +1033,12 @@ struct ChatUsage {
     prompt_tokens: i64,
     completion_tokens: i64,
     total_tokens: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_details: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_tokens_details: Option<ChatPromptTokensDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1165,6 +1177,43 @@ mod tests {
     #[test]
     fn collected_preserves_reasoning() {
         assert_eq!(collected_reasoning(), Some("hidden".to_string()));
+    }
+
+    #[test]
+    fn stream_usage_preserves_openrouter_cost_fields() {
+        let mut converter = ChatCompletionStreamConverter::new("model".to_string(), true);
+        let events = converter.convert(&SseEvent {
+            event: "response.completed".to_string(),
+            data: json!({
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 3,
+                        "total_tokens": 15,
+                        "cost": 0.0042,
+                        "cost_source": "openrouter",
+                        "cost_details": {
+                            "upstream_inference_cost": 0.0031
+                        }
+                    }
+                }
+            }),
+        });
+
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                ChatSseEvent::Data(value) => value.get("usage"),
+                ChatSseEvent::Done => None,
+            })
+            .expect("usage chunk");
+        assert_eq!(usage["cost"], json!(0.0042));
+        assert_eq!(usage["cost_source"], json!("openrouter"));
+        assert_eq!(
+            usage["cost_details"]["upstream_inference_cost"],
+            json!(0.0031)
+        );
     }
 
     fn function_arguments_delta(call_id: &str, name: Option<&str>, delta: &str) -> SseEvent {
