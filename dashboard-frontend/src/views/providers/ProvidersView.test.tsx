@@ -393,6 +393,28 @@ describe('ProvidersView', () => {
     expect(card).toHaveTextContent('Newly discovered models stay visible but disabled until selected');
   });
 
+  it('handles legacy configured providers that omit allowed_models', async () => {
+    const client = getConnection().client;
+    vi.spyOn(client, 'configuredProviders').mockResolvedValue({
+      providers: [{
+        id: 'managed-legacy',
+        name: 'Legacy lab',
+        base_url: 'https://legacy.example/v1',
+        api_key_present: true,
+        auto_discover: true,
+        disabled_models: [],
+        models: [{ id: 'model-a', context_limit: 8192 }],
+      }],
+    });
+    renderWithQuery(<ProvidersView />);
+
+    const panel = await screen.findByTestId('configured-providers-panel');
+    const card = within(panel).getByText('Legacy lab').closest('[data-testid="configured-provider-card"]') as HTMLElement;
+
+    expect(within(card).getByRole('checkbox', { name: 'Only allow selected models' })).not.toBeChecked();
+    expect(within(card).getByRole('checkbox', { name: 'Enable model-a' })).toBeChecked();
+  });
+
   it('selecting a blacklisted model in strict mode removes it from disabled models', async () => {
     const client = getConnection().client;
     vi.spyOn(client, 'configuredProviders').mockResolvedValue({
