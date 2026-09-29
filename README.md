@@ -225,6 +225,30 @@ covers `/v1` data routes, including models, token counting, and raw completions
 key verification so requests can be attributed; leave `keys: []` with
 `require: false` for an open development gateway.
 
+### Configured provider model discovery
+
+Providers added through the dashboard discover new models automatically at startup
+and every five minutes. Discovery is additive: models missing from a later provider
+response remain in the saved catalog, and a failed refresh leaves the catalog intact.
+Existing providers also default to automatic discovery after upgrading.
+
+Admins can turn off automatic discovery for a provider or disable individual models
+in the Providers page. Disabling discovery freezes the saved catalog; it does not
+turn off inference for enabled models. Disabled models remain visible in the admin
+list but are excluded from the public model catalog and that provider's routing.
+Refreshes and gateway restarts preserve these settings.
+
+The same controls are available through the authenticated, CSRF-protected
+`PATCH /dashboard/api/configured-providers/{id}` endpoint:
+
+```json
+{"auto_discover": false, "disabled_models": ["vendor/model-id"]}
+```
+
+Both fields are optional. `disabled_models` replaces that provider's disabled-model
+list; pass an empty array to enable all saved models again. Disabling a model on one
+provider does not disable another provider that serves the same model.
+
 ### Harness and session detection
 
 Every persisted request records which harness sent it and the session
@@ -359,6 +383,15 @@ and its bearer token never leaves that machine. Set `LLMCONDUIT_FLEET_URL` and
 either `LLMCONDUIT_FLEET_TOKEN_FILE` or `LLMCONDUIT_FLEET_TOKEN` in the
 `llmconduit mesh-worker` environment to enable this capability. The controller
 and worker must both use mesh protocol v2.
+
+For a vLLM resource, set `mesh.worker.resources[].capacity_source: vllm` to
+derive its slots from `/server_info?config_format=json` (`max_num_seqs`). The
+worker refreshes this limit alongside the model catalog, so a port reused by
+another model adopts that engine's limit. Explicit availability windows and
+exceptions can reduce capacity, including to zero; they cannot exceed the
+engine limit. Failed capacity discovery makes the resource unavailable until
+discovery succeeds. Other resources retain `capacity_source: configured`
+(the default) and their existing availability schedules.
 
 Set `mesh.worker.node_name` to a short friendly worker label when one physical
 provider exposes multiple resource slots. The worker sends that label during

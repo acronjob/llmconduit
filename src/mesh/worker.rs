@@ -1,5 +1,6 @@
 use crate::config::{
-    AvailabilitySchedule, MeshWeekday, MeshWorkerConfig, MeshWorkerResourceConfig,
+    AvailabilitySchedule, MeshWeekday, MeshWorkerCapacitySource, MeshWorkerConfig,
+    MeshWorkerResourceConfig,
 };
 use crate::error::{AppError, AppResult};
 use crate::mesh::capacity::CapacityGate;
@@ -7,10 +8,11 @@ use crate::mesh::identity::load_or_create;
 use crate::mesh::io::{Admission, read_stream_open, write_admission, write_switch_response};
 use crate::mesh::protocol::{
     AdmissionRejectCode, ENROLL_ALPN, EnrollRequest, EnrollResponse, Heartbeat, HubToWorker,
-    ModelAdvertisement, ModelLifecycleAction, ModelSwitchingAdvertisement, PROTOCOL_VERSION,
-    ResourceAdvertisement, ResourceRuntimeState, StreamOpen, SwitchModelRequest,
-    SwitchModelResponse, SwitchableModelAdvertisement, WORKER_ALPN, WorkerAdvertisement,
-    WorkerToHub, read_control, write_control,
+    MAX_CAPACITY_PER_RESOURCE, ModelAdvertisement, ModelLifecycleAction,
+    ModelSwitchingAdvertisement, PROTOCOL_VERSION, ResourceAdvertisement, ResourceRuntimeState,
+    StreamOpen, SwitchModelRequest, SwitchModelResponse, SwitchableModelAdvertisement,
+    SwitchableModelInstanceAdvertisement, WORKER_ALPN, WorkerAdvertisement, WorkerToHub,
+    read_control, write_control,
 };
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -40,6 +42,7 @@ struct LocalResource {
     models: Mutex<Vec<ModelAdvertisement>>,
     healthy: Mutex<bool>,
     revision: Mutex<u64>,
+    detected_capacity: Mutex<Option<u32>>,
 }
 
 pub async fn run_worker(config: MeshWorkerConfig, join_key: Option<String>) -> AppResult<()> {
@@ -67,18 +70,10 @@ pub async fn run_worker(config: MeshWorkerConfig, join_key: Option<String>) -> A
 impl WorkerRuntime {
     pub(super) async fn new(config: MeshWorkerConfig) -> Self {
         let mut resources = HashMap::new();
-        let now = Utc::now();
         for resource in &config.resources {
-            let limit = effective_capacity_at(&resource.availability, now);
             resources.insert(
                 resource.id.clone(),
-                Arc::new(LocalResource {
-                    config: resource.clone(),
-                    gate: CapacityGate::new(limit),
-                    models: Mutex::new(Vec::new()),
-                    healthy: Mutex::new(true),
-                    revision: Mutex::new(0),
-                }),
+                Arc::new(LocalResource::new(resource.clone())),
             );
         }
         let fleet = match crate::dashboard_fleet::FleetClient::from_env(reqwest::Client::new()) {
@@ -124,6 +119,15 @@ impl WorkerRuntime {
                     phase: entry.status.phase,
                     desired_state: entry.status.desired_state,
                     gpu_count: entry.model.gpu_count.unwrap_or(0),
+                    max_instances: entry.model.max_instances,
+                    desired_instances: entry.status.desired_instances,
+                    ready_instances: entry.status.ready_instances,
+                    instances: entry
+                        .status
+                        .instances
+                        .into_iter()
+                        .map(SwitchableModelInstanceAdvertisement::from_fleet)
+                        .collect(),
                     assigned_gpus: entry
                         .status
                         .assigned_gpus
@@ -197,6 +201,35 @@ impl WorkerRuntime {
 }
 
 impl LocalResource {
+    fn new(config: MeshWorkerResourceConfig) -> Self {
+        let configured = config.capacity_source == MeshWorkerCapacitySource::Configured;
+        let limit = if configured {
+            effective_capacity_at(&config.availability, Utc::now())
+        } else {
+            0
+        };
+        Self {
+            config,
+            gate: CapacityGate::new(limit),
+            models: Mutex::new(Vec::new()),
+            healthy: Mutex::new(configured),
+            revision: Mutex::new(0),
+            detected_capacity: Mutex::new(None),
+        }
+    }
+
+    fn capacity_at(&self, now: DateTime<Utc>, detected: Option<u32>) -> u32 {
+        match self.config.capacity_source {
+            MeshWorkerCapacitySource::Configured => {
+                effective_capacity_at(&self.config.availability, now)
+            }
+            MeshWorkerCapacitySource::Vllm => detected.map_or(0, |capacity| {
+                effective_capacity_with_default(&self.config.availability, now, capacity)
+                    .min(capacity)
+            }),
+        }
+    }
+
     async fn advertisement(&self) -> ResourceAdvertisement {
         let snapshot = self.gate.snapshot();
         let (limit, active) = (snapshot.limit, snapshot.active);
@@ -213,8 +246,14 @@ impl LocalResource {
     }
 
     async fn apply_schedule(&self, now: DateTime<Utc>) -> Option<ResourceAdvertisement> {
-        let limit = effective_capacity_at(&self.config.availability, now);
-        if self.gate.set_limit_if_changed(limit) {
+        // Share this lock with discovery so a schedule tick cannot restore a
+        // previous engine's capacity after the port has been reused.
+        let detected = self.detected_capacity.lock().await;
+        let changed = self
+            .gate
+            .set_limit_if_changed(self.capacity_at(now, *detected));
+        drop(detected);
+        if changed {
             *self.revision.lock().await += 1;
             Some(self.advertisement().await)
         } else {
@@ -511,16 +550,42 @@ pub(super) async fn handle_request(
         .await?;
         return Ok(());
     }
-    let Some(_permit) = resource.gate.try_acquire() else {
+    // The hub can release its permit before the preceding worker stream has
+    // finished teardown. Keep that brief overlap on the selected runner.
+    let _permit = tokio::select! {
+        biased;
+        _ = send.stopped() => return Ok(()),
+        permit = tokio::time::timeout(Duration::from_secs(30), resource.gate.acquire()) => {
+            match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    write_admission(
+                        &mut send,
+                        &Admission::Rejected {
+                            code: AdmissionRejectCode::CapacityExhausted,
+                        },
+                    ).await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+    if !*resource.healthy.lock().await {
         write_admission(
             &mut send,
             &Admission::Rejected {
-                code: AdmissionRejectCode::CapacityExhausted,
+                code: AdmissionRejectCode::ResourceUnhealthy,
             },
         )
         .await?;
         return Ok(());
-    };
+    }
+    tracing::debug!(
+        request_id = %open.request_id,
+        resource_id = %open.resource_id,
+        active = resource.gate.snapshot().active,
+        "mesh worker capacity acquired"
+    );
     let local = match TcpStream::connect(resource.config.target).await {
         Ok(local) => local,
         Err(err) => {
@@ -562,8 +627,16 @@ pub(super) async fn handle_request(
         let _ = response_done_tx.send(());
         result
     };
-    tokio::try_join!(forward_request, forward_response)
-        .map_err(|err| AppError::upstream(format!("mesh request forwarding failed: {err}")))?;
+    let result = tokio::try_join!(forward_request, forward_response)
+        .map_err(|err| AppError::upstream(format!("mesh request forwarding failed: {err}")));
+    drop(_permit);
+    tracing::debug!(
+        request_id = %open.request_id,
+        resource_id = %open.resource_id,
+        active = resource.gate.snapshot().active,
+        "mesh worker capacity released"
+    );
+    result?;
     Ok(())
 }
 
@@ -600,7 +673,11 @@ async fn handle_switch_model(
         return Ok(());
     }
     let operation = match action {
-        ModelLifecycleAction::Load => fleet.load_model(&request.model_id).await,
+        ModelLifecycleAction::Load => {
+            fleet
+                .load_model_instances(&request.model_id, request.instances)
+                .await
+        }
         ModelLifecycleAction::Unload => fleet.unload_model(&request.model_id).await,
     };
     match operation {
@@ -618,10 +695,21 @@ async fn handle_switch_model(
 async fn refresh_models(runtime: &WorkerRuntime) -> Vec<ResourceAdvertisement> {
     let mut updates = Vec::new();
     for resource in runtime.resources.values() {
-        let (models, healthy) = match fetch_models(resource.config.target).await {
-            Ok(models) => (
+        let discovery = match resource.config.capacity_source {
+            MeshWorkerCapacitySource::Configured => fetch_models(resource.config.target)
+                .await
+                .map(|models| (models, None)),
+            MeshWorkerCapacitySource::Vllm => tokio::try_join!(
+                fetch_models(resource.config.target),
+                fetch_vllm_capacity(resource.config.target)
+            )
+            .map(|(models, capacity)| (models, Some(capacity))),
+        };
+        let (models, healthy, detected_capacity) = match discovery {
+            Ok((models, capacity)) => (
                 filter_advertised_models(models, &resource.config.models),
                 true,
+                capacity,
             ),
             Err(err) => {
                 tracing::warn!(
@@ -629,7 +717,7 @@ async fn refresh_models(runtime: &WorkerRuntime) -> Vec<ResourceAdvertisement> {
                     error = %err,
                     "mesh worker local model discovery failed"
                 );
-                (Vec::new(), false)
+                (Vec::new(), false, None)
             }
         };
         let models_changed = {
@@ -644,7 +732,14 @@ async fn refresh_models(runtime: &WorkerRuntime) -> Vec<ResourceAdvertisement> {
             *current = healthy;
             changed
         };
-        if models_changed || health_changed {
+        let capacity_changed = {
+            let mut detected = resource.detected_capacity.lock().await;
+            *detected = detected_capacity;
+            resource
+                .gate
+                .set_limit_if_changed(resource.capacity_at(Utc::now(), *detected))
+        };
+        if models_changed || health_changed || capacity_changed {
             *resource.revision.lock().await += 1;
             updates.push(resource.advertisement().await);
         }
@@ -723,6 +818,39 @@ async fn fetch_models(target: SocketAddr) -> AppResult<Vec<ModelAdvertisement>> 
         .collect())
 }
 
+async fn fetch_vllm_capacity(target: SocketAddr) -> AppResult<u32> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|err| {
+            AppError::internal(format!("failed to build capacity discovery client: {err}"))
+        })?
+        .get(format!("http://{target}/server_info?config_format=json"))
+        .send()
+        .await
+        .map_err(|err| AppError::upstream(format!("local vLLM capacity discovery failed: {err}")))?
+        .error_for_status()
+        .map_err(|err| {
+            AppError::upstream(format!("local vLLM capacity discovery failed: {err}"))
+        })?;
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|err| AppError::upstream(format!("invalid local vLLM server info: {err}")))?;
+    vllm_capacity(&value)
+}
+
+fn vllm_capacity(value: &serde_json::Value) -> AppResult<u32> {
+    value
+        .pointer("/vllm_config/scheduler_config/max_num_seqs")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|capacity| *capacity > 0 && *capacity <= u64::from(MAX_CAPACITY_PER_RESOURCE))
+        .map(|capacity| capacity as u32)
+        .ok_or_else(|| {
+            AppError::upstream("local vLLM server info has no valid scheduler max_num_seqs")
+        })
+}
+
 async fn controller_addr(config: &MeshWorkerConfig) -> AppResult<EndpointAddr> {
     let endpoint_id = config
         .controller_endpoint_id
@@ -748,6 +876,14 @@ async fn controller_addr(config: &MeshWorkerConfig) -> AppResult<EndpointAddr> {
 }
 
 fn effective_capacity_at(schedule: &AvailabilitySchedule, now: DateTime<Utc>) -> u32 {
+    effective_capacity_with_default(schedule, now, schedule.default_capacity)
+}
+
+fn effective_capacity_with_default(
+    schedule: &AvailabilitySchedule,
+    now: DateTime<Utc>,
+    default_capacity: u32,
+) -> u32 {
     for exception in schedule.exceptions.iter().rev() {
         let start = exception.start.with_timezone(&Utc);
         let end = exception.end.with_timezone(&Utc);
@@ -785,7 +921,7 @@ fn effective_capacity_at(schedule: &AvailabilitySchedule, now: DateTime<Utc>) ->
         }
     }
 
-    schedule.default_capacity
+    default_capacity
 }
 
 fn next_schedule_boundary(
@@ -895,6 +1031,198 @@ fn previous_weekday(day: MeshWeekday) -> MeshWeekday {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_resource(
+        target: SocketAddr,
+        source: MeshWorkerCapacitySource,
+    ) -> MeshWorkerResourceConfig {
+        MeshWorkerResourceConfig {
+            id: "shared-port".to_string(),
+            target,
+            models: Vec::new(),
+            model_refresh_secs: 60,
+            capacity_source: source,
+            availability: AvailabilitySchedule {
+                default_capacity: 6,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn test_runtime(config: MeshWorkerResourceConfig) -> WorkerRuntime {
+        WorkerRuntime {
+            config: MeshWorkerConfig {
+                resources: vec![config.clone()],
+                ..Default::default()
+            },
+            resources: HashMap::from([(config.id.clone(), Arc::new(LocalResource::new(config)))]),
+            fleet: None,
+            model_switching: Mutex::new(None),
+        }
+    }
+
+    async fn mount_discovery(server: &MockServer, model: &str, info: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": model, "max_model_len": 16384}]
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/server_info"))
+            .and(query_param("config_format", "json"))
+            .respond_with(info)
+            .mount(server)
+            .await;
+    }
+
+    fn capacity_response(capacity: u32) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "vllm_config": {"scheduler_config": {"max_num_seqs": capacity}}
+        }))
+    }
+
+    #[test]
+    fn vllm_capacity_rejects_missing_invalid_and_unbounded_values() {
+        assert_eq!(
+            vllm_capacity(&serde_json::json!({
+                "vllm_config": {"scheduler_config": {"max_num_seqs": 64}}
+            }))
+            .unwrap(),
+            64
+        );
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("64"),
+            serde_json::json!(65_536),
+        ] {
+            assert!(
+                vllm_capacity(&serde_json::json!({
+                    "vllm_config": {"scheduler_config": {"max_num_seqs": invalid}}
+                }))
+                .is_err()
+            );
+        }
+        assert!(vllm_capacity(&serde_json::json!({})).is_err());
+        assert!(vllm_capacity(&serde_json::json!({"vllm_config": "text config"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn vllm_discovery_tracks_shared_port_and_same_model_capacity_changes() {
+        let server = MockServer::start().await;
+        let runtime = test_runtime(test_resource(
+            *server.address(),
+            MeshWorkerCapacitySource::Vllm,
+        ));
+        let resource = &runtime.resources["shared-port"];
+        assert_eq!(resource.gate.snapshot().limit, 0);
+        assert!(!resource.advertisement().await.healthy);
+        for (model, capacity) in [
+            ("DeepSeek-V4.1-Flash", 32),
+            ("Qwen-27B", 64),
+            ("DeepSeek-V4.1-Flash", 32),
+            ("DeepSeek-V4.1-Flash", 64),
+        ] {
+            server.reset().await;
+            mount_discovery(&server, model, capacity_response(capacity)).await;
+            let updates = refresh_models(&runtime).await;
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].effective_capacity, capacity);
+            assert_eq!(updates[0].models[0].id, model);
+            assert_eq!(updates[0].models[0].context_limit, Some(16384));
+            assert!(updates[0].healthy);
+            assert!(resource.apply_schedule(Utc::now()).await.is_none());
+            assert_eq!(
+                runtime.heartbeat(1).await.resources[0].effective_capacity,
+                capacity
+            );
+        }
+        assert!(refresh_models(&runtime).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_vllm_discovery_clears_capacity_until_valid_recovery() {
+        let server = MockServer::start().await;
+        let runtime = test_runtime(test_resource(
+            *server.address(),
+            MeshWorkerCapacitySource::Vllm,
+        ));
+        mount_discovery(&server, "Qwen-27B", capacity_response(64)).await;
+        refresh_models(&runtime).await;
+        for info in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"vllm_config": {"scheduler_config": {}}})),
+        ] {
+            server.reset().await;
+            mount_discovery(&server, "DeepSeek-V4.1-Flash", info).await;
+            refresh_models(&runtime).await;
+            let resource = &runtime.resources["shared-port"];
+            let advertisement = resource.advertisement().await;
+            assert!(!advertisement.healthy);
+            assert!(!advertisement.accepting_requests);
+            assert!(advertisement.models.is_empty());
+            assert_eq!(advertisement.effective_capacity, 0);
+            assert!(resource.apply_schedule(Utc::now()).await.is_none());
+            assert_eq!(resource.gate.snapshot().limit, 0);
+        }
+        server.reset().await;
+        mount_discovery(&server, "DeepSeek-V4.1-Flash", capacity_response(32)).await;
+        let updates = refresh_models(&runtime).await;
+        assert_eq!(updates[0].effective_capacity, 32);
+        assert!(updates[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn vllm_capacity_preserves_explicit_schedule_limits() {
+        let mut config = test_resource(
+            "127.0.0.1:8115".parse().unwrap(),
+            MeshWorkerCapacitySource::Vllm,
+        );
+        config.availability = schedule(serde_json::json!({
+            "timezone": "UTC", "default_capacity": 6,
+            "weekly": [{"days": ["mon"], "start_local": "12:00", "end_local": "15:00", "capacity": 4}],
+            "exceptions": [{"start": "2026-09-28T13:00:00Z", "end": "2026-09-28T14:00:00Z", "capacity": 0}]
+        }));
+        let resource = LocalResource::new(config);
+        *resource.detected_capacity.lock().await = Some(64);
+        for (time, expected) in [
+            ("2026-09-29T12:00:00Z", 64),
+            ("2026-09-28T12:30:00Z", 4),
+            ("2026-09-28T13:30:00Z", 0),
+            ("2026-09-29T12:00:00Z", 64),
+        ] {
+            resource.apply_schedule(time.parse().unwrap()).await;
+            assert_eq!(resource.gate.snapshot().limit, expected);
+        }
+        *resource.detected_capacity.lock().await = Some(2);
+        resource
+            .apply_schedule("2026-09-28T12:30:00Z".parse().unwrap())
+            .await;
+        assert_eq!(resource.gate.snapshot().limit, 2);
+    }
+
+    #[tokio::test]
+    async fn configured_capacity_does_not_query_vllm_server_info() {
+        let server = MockServer::start().await;
+        mount_discovery(&server, "generic-model", ResponseTemplate::new(404)).await;
+        let runtime = test_runtime(test_resource(
+            *server.address(),
+            MeshWorkerCapacitySource::Configured,
+        ));
+        let updates = refresh_models(&runtime).await;
+        assert_eq!(updates[0].effective_capacity, 6);
+        assert!(updates[0].healthy);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/v1/models");
+    }
 
     #[test]
     fn worker_capacity_gate_drains_after_shrink() {

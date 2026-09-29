@@ -97,4 +97,38 @@ describe('ChatView', () => {
     expect(screen.queryByTestId('chat-message-user')).toBeNull();
     expect(screen.getByTestId('chat-empty')).toBeInTheDocument();
   });
+
+  it('keeps one prompt cache key across turns and resets it when the chat is cleared', async () => {
+    vi.spyOn(getConnection().client, 'catalog').mockResolvedValue([{ id: 'gpt-4o', context_limit: 128000 }]);
+    const sent: string[] = [];
+    vi.spyOn(getConnection().client, 'streamChat').mockImplementation(async (request, onDelta) => {
+      sent.push(request.prompt_cache_key ?? '');
+      onDelta({ kind: 'content', text: 'ok' });
+      return {
+        model: request.model,
+        requestedModel: request.model,
+        finishReason: 'stop',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    });
+    renderWithQuery(<ChatView />);
+
+    await waitFor(() => expect(screen.getByLabelText('Model')).toHaveValue('gpt-4o'));
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'one' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => expect(sent).toHaveLength(1));
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'two' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => expect(sent).toHaveLength(2));
+
+    expect(sent[0]).toBeTruthy();
+    expect(sent[1]).toBe(sent[0]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'three' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => expect(sent).toHaveLength(3));
+    expect(sent[2]).toBeTruthy();
+    expect(sent[2]).not.toBe(sent[0]);
+  });
 });

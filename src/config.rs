@@ -743,7 +743,22 @@ pub struct MeshWorkerResourceConfig {
     pub target: SocketAddr,
     pub models: Vec<String>,
     pub model_refresh_secs: u64,
+    pub capacity_source: MeshWorkerCapacitySource,
     pub availability: AvailabilitySchedule,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshWorkerCapacitySource {
+    #[default]
+    Configured,
+    Vllm,
+}
+
+impl MeshWorkerCapacitySource {
+    fn is_configured(&self) -> bool {
+        *self == Self::Configured
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1591,6 +1606,11 @@ pub struct PersistedMeshWorkerResourceConfig {
     pub models: Vec<String>,
     #[serde(default = "default_mesh_model_refresh_secs")]
     pub model_refresh_secs: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "MeshWorkerCapacitySource::is_configured"
+    )]
+    pub capacity_source: MeshWorkerCapacitySource,
     #[serde(default)]
     pub availability: PersistedAvailabilitySchedule,
 }
@@ -2620,6 +2640,7 @@ fn parse_mesh_worker_resource(
         target,
         models,
         model_refresh_secs: resource.model_refresh_secs,
+        capacity_source: resource.capacity_source,
         availability,
     })
 }
@@ -3428,6 +3449,7 @@ mod tests {
     use super::Config;
     use super::JsonMap;
     use super::JsonValue;
+    use super::MeshWorkerCapacitySource;
     use super::ModelPrice;
     use super::OrderedModelRoutes;
     use super::PersistedConfig;
@@ -5882,9 +5904,42 @@ mesh:
         assert_eq!(resource.id, "primary");
         assert_eq!(resource.models, ["qwen3", "llama-vision"]);
         assert_eq!(resource.model_refresh_secs, 60);
+        assert_eq!(
+            resource.capacity_source,
+            MeshWorkerCapacitySource::Configured
+        );
         assert_eq!(resource.availability.timezone, "America/Chicago");
         assert_eq!(resource.availability.weekly.len(), 2);
         assert_eq!(resource.availability.exceptions.len(), 1);
+    }
+
+    #[test]
+    fn mesh_worker_vllm_capacity_source_loads_and_round_trips() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+mesh:
+  worker:
+    controller_addr: "mesh.example.com:4433"
+    controller_endpoint_id: "controller-id"
+    identity_path: "/var/lib/llmconduit/worker.key"
+    resources:
+      - id: "replica"
+        target: "127.0.0.1:8115"
+        capacity_source: vllm
+        availability:
+          default_capacity: 6
+"#,
+        )
+        .expect("yaml");
+        let yaml = serde_yaml::to_string(&persisted).expect("serialize");
+        assert!(yaml.contains("capacity_source: vllm"));
+        let reparsed: PersistedConfig = serde_yaml::from_str(&yaml).expect("reparse");
+        assert_eq!(persisted.mesh, reparsed.mesh);
+        let config = Config::from_persisted(&reparsed).expect("config");
+        assert_eq!(
+            config.mesh.worker.resources[0].capacity_source,
+            MeshWorkerCapacitySource::Vllm
+        );
     }
 
     #[test]

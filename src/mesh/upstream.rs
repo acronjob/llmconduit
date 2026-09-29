@@ -5,7 +5,7 @@ use crate::mesh::io::{
     split_http_response_head, write_request_open,
 };
 use crate::mesh::protocol::{AdmissionRejectCode, ModelAdvertisement, REQUEST_PROTOCOL_VERSION};
-use crate::mesh::registry::MeshRegistry;
+use crate::mesh::registry::{MeshRegistry, MeshReservationError};
 use crate::models::chat::{ChatCompletionChunk, ChatCompletionRequest};
 use crate::upstream::{
     BackendCandidate, BackendCandidatePlan, BackendChatRequest, BackendFinalizationPolicies,
@@ -20,9 +20,9 @@ use futures::StreamExt;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio_util::bytes::BytesMut;
-use uuid::Uuid;
 
 const MESH_ERROR_BODY_READ_LIMIT: usize = 16 * 1024;
 const MESH_ERROR_BODY_DISPLAY_LIMIT: usize = 500;
@@ -34,6 +34,7 @@ pub struct MeshUpstreamClient {
     flatten_content: bool,
     max_sse_frame_bytes: usize,
     flow_store: crate::dashboard_flow::DashboardFlowStore,
+    capacity_wait_timeout: Duration,
 }
 
 impl MeshUpstreamClient {
@@ -50,7 +51,13 @@ impl MeshUpstreamClient {
             flatten_content,
             max_sse_frame_bytes,
             flow_store,
+            capacity_wait_timeout: Duration::from_secs(60),
         }
+    }
+
+    pub(crate) fn with_capacity_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.capacity_wait_timeout = timeout;
+        self
     }
 }
 
@@ -83,52 +90,81 @@ impl UpstreamClient for MeshUpstreamClient {
         let request = build_chat_http_request(&request)?;
         let mut excluded = HashSet::new();
         let mut last_error = None;
+        let capacity_deadline = tokio::time::Instant::now() + self.capacity_wait_timeout;
         loop {
             let authorization = backend.authorization.clone();
             let route = backend.authorization_route.clone();
-            let Some(reservation) = self.registry.reserve_excluding_where(
-                &model,
-                &excluded,
-                |endpoint_id, resource_id| {
-                    authorization.allows_candidate(
-                        &format!("mesh:{endpoint_id}"),
-                        route.as_deref().or(Some(resource_id)),
-                        &model,
-                        backend.endpoint,
-                    )
-                },
-            ) else {
-                let any_authorized =
-                    self.registry
-                        .has_candidate_where(&model, |endpoint_id, resource_id| {
-                            authorization.allows_candidate(
-                                &format!("mesh:{endpoint_id}"),
-                                route.as_deref().or(Some(resource_id)),
-                                &model,
-                                backend.endpoint,
-                            )
-                        });
-                if !any_authorized && self.registry.has_candidate_where(&model, |_, _| true) {
-                    return Err(AppError::forbidden(
-                        "no authorized mesh resource is available for this request",
+            let reservation = match self
+                .registry
+                .reserve_excluding_where_with_affinity_wait(
+                    &model,
+                    &excluded,
+                    backend.affinity.as_ref(),
+                    |endpoint_id, resource_id| {
+                        authorization.allows_candidate(
+                            &format!("mesh:{endpoint_id}"),
+                            route.as_deref().or(Some(resource_id)),
+                            &model,
+                            backend.endpoint,
+                        )
+                    },
+                    capacity_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await
+            {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    let any_authorized =
+                        self.registry
+                            .has_candidate_where(&model, |endpoint_id, resource_id| {
+                                authorization.allows_candidate(
+                                    &format!("mesh:{endpoint_id}"),
+                                    route.as_deref().or(Some(resource_id)),
+                                    &model,
+                                    backend.endpoint,
+                                )
+                            });
+                    if !any_authorized && self.registry.has_candidate_where(&model, |_, _| true) {
+                        return Err(AppError::forbidden(
+                            "no authorized mesh resource is available for this request",
+                        ));
+                    }
+                    return Err(last_error.unwrap_or_else(|| {
+                        AppError::upstream_with_disposition(
+                            "mesh capacity exhausted",
+                            FailoverDisposition::FailoverNoCooldown,
+                        )
+                    }));
+                }
+                Err(MeshReservationError::CapacityWaitTimedOut { pinned }) => {
+                    return Err(AppError::upstream_with_disposition(
+                        if pinned {
+                            "mesh session capacity wait timed out"
+                        } else {
+                            "mesh capacity wait timed out"
+                        },
+                        FailoverDisposition::FailoverNoCooldown,
                     ));
                 }
-                return Err(last_error.unwrap_or_else(|| {
-                    AppError::upstream_with_disposition(
-                        "mesh capacity exhausted",
-                        FailoverDisposition::FailoverNoCooldown,
-                    )
-                }));
+                Err(MeshReservationError::PinnedCapacityExhausted) => {
+                    unreachable!("async mesh admission waits for occupied session capacity")
+                }
             };
             let candidate = (
                 reservation.resource.endpoint_id,
                 reservation.resource.resource_id.clone(),
             );
+            let affinity_commit = reservation.affinity_commit();
             if let Some(capture) = backend.capture.as_ref() {
                 capture.reset_upstream_response();
             }
-            match open_mesh_http_stream(reservation, request.clone(), self.max_sse_frame_bytes)
-                .await
+            match open_mesh_http_stream(
+                reservation,
+                request.clone(),
+                self.max_sse_frame_bytes,
+                capacity_deadline,
+            )
+            .await
             {
                 Ok(stream) => {
                     stamp_header_byte(backend.serving.as_ref());
@@ -136,6 +172,9 @@ impl UpstreamClient for MeshUpstreamClient {
                         parse_sse_stream(stream, self.max_sse_frame_bytes, backend.capture.clone());
                     match stream.next().await {
                         Some(Ok(first)) => {
+                            if let Some(commit) = affinity_commit {
+                                self.registry.commit_affinity(commit);
+                            }
                             if let Some(serving) = &backend.serving {
                                 serving.set_provider(format!("mesh:{}", candidate.0));
                                 serving.set_model_served_final(model.clone());
@@ -165,7 +204,35 @@ impl UpstreamClient for MeshUpstreamClient {
                         }
                     }
                 }
-                Err(err) if err.failover_disposition() != FailoverDisposition::Terminal => {
+                Err(MeshOpenError::CapacityWaitTimedOut) => {
+                    return Err(AppError::upstream_with_disposition(
+                        "mesh worker capacity wait timed out",
+                        FailoverDisposition::FailoverNoCooldown,
+                    ));
+                }
+                Err(MeshOpenError::CapacityExhausted) => {
+                    // Worker teardown can lag the hub permit release. Busy is
+                    // not a failed runner, so preserve an existing session pin.
+                    if tokio::time::Instant::now() >= capacity_deadline {
+                        return Err(AppError::upstream_with_disposition(
+                            "mesh worker capacity wait timed out",
+                            FailoverDisposition::FailoverNoCooldown,
+                        ));
+                    }
+                    tracing::debug!(
+                        endpoint_id = %candidate.0,
+                        resource_id = %candidate.1,
+                        "mesh worker capacity still occupied; retaining session affinity"
+                    );
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(100))
+                            .min(capacity_deadline),
+                    )
+                    .await;
+                }
+                Err(MeshOpenError::Other(err))
+                    if err.failover_disposition() != FailoverDisposition::Terminal =>
+                {
                     tracing::warn!(
                         endpoint_id = %candidate.0,
                         resource_id = %candidate.1,
@@ -175,7 +242,7 @@ impl UpstreamClient for MeshUpstreamClient {
                     excluded.insert(candidate);
                     last_error = Some(err);
                 }
-                Err(err) => return Err(err),
+                Err(MeshOpenError::Other(err)) => return Err(err),
             }
         }
     }
@@ -279,52 +346,94 @@ struct MeshHttpStream {
     max_chunk_bytes: usize,
 }
 
+enum MeshOpenError {
+    CapacityExhausted,
+    CapacityWaitTimedOut,
+    Other(AppError),
+}
+
+impl From<AppError> for MeshOpenError {
+    fn from(error: AppError) -> Self {
+        Self::Other(error)
+    }
+}
+
 async fn open_mesh_http_stream(
     reservation: crate::mesh::registry::MeshReservation,
     http_request: Vec<u8>,
     max_chunk_bytes: usize,
-) -> AppResult<MeshHttpStream> {
+    capacity_deadline: tokio::time::Instant,
+) -> Result<MeshHttpStream, MeshOpenError> {
     let connection = reservation
         .resource
         .connection
         .clone()
         .ok_or_else(|| AppError::upstream("mesh reservation has no live worker connection"))?;
-    let (mut send, mut recv) = connection
+    let (mut send, recv) = connection
         .open_bi()
         .await
         .map_err(|err| AppError::upstream(format!("failed to open mesh request stream: {err}")))?;
     let open = RequestOpen {
         protocol_version: REQUEST_PROTOCOL_VERSION,
-        request_id: Uuid::new_v4(),
+        request_id: reservation.request_id,
         resource_id: reservation.resource.resource_id.clone(),
     };
     write_request_open(&mut send, &open).await?;
 
+    let request_id = open.request_id;
+    let resource_id = open.resource_id.clone();
     let write_task = tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let request_bytes = http_request.len();
         send.write_all(&http_request).await.map_err(|err| {
             AppError::upstream(format!("failed to write mesh HTTP request: {err}"))
         })?;
-        send.shutdown()
-            .await
-            .map_err(|err| AppError::upstream(format!("failed to finish mesh HTTP request: {err}")))
+        let write_ms = started.elapsed().as_millis();
+        send.shutdown().await.map_err(|err| {
+            AppError::upstream(format!("failed to finish mesh HTTP request: {err}"))
+        })?;
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms >= 1000 {
+            tracing::warn!(
+                %request_id,
+                %resource_id,
+                request_bytes,
+                write_ms,
+                elapsed_ms,
+                "slow mesh request upload"
+            );
+        }
+        Ok(())
     });
 
-    match read_admission(&mut recv).await? {
-        Admission::Accepted => {}
-        Admission::Rejected { code } => return Err(admission_error(code)),
-    }
-
-    let head = read_http_response_head(&mut recv, 64 * 1024).await?;
-    let (status, headers) = split_http_response_head(&head)?;
+    // Own the writer before awaiting admission so cancellation/rejection
+    // aborts it together with the reservation instead of detaching the task.
     let mut stream = MeshHttpStream {
         _reservation: reservation,
         recv,
         write_task: Some(write_task),
-        remaining_content_length: content_length(&headers),
-        chunked: is_chunked(&headers),
+        remaining_content_length: None,
+        chunked: false,
         chunk_buf: BytesMut::new(),
         max_chunk_bytes,
     };
+    let admission = tokio::time::timeout_at(capacity_deadline, read_admission(&mut stream.recv))
+        .await
+        .map_err(|_| MeshOpenError::CapacityWaitTimedOut)??;
+    match admission {
+        Admission::Accepted => {}
+        Admission::Rejected {
+            code: AdmissionRejectCode::CapacityExhausted,
+        } => {
+            return Err(MeshOpenError::CapacityExhausted);
+        }
+        Admission::Rejected { code } => return Err(admission_error(code).into()),
+    }
+
+    let head = read_http_response_head(&mut stream.recv, 64 * 1024).await?;
+    let (status, headers) = split_http_response_head(&head)?;
+    stream.remaining_content_length = content_length(&headers);
+    stream.chunked = is_chunked(&headers);
     if !status.is_success() {
         let body = stream.read_body_prefix(MESH_ERROR_BODY_READ_LIMIT).await?;
         stream.finish_writer().await?;
@@ -339,9 +448,10 @@ async fn open_mesh_http_stream(
             return Err(AppError::upstream_with_disposition(
                 message,
                 FailoverDisposition::Terminal,
-            ));
+            )
+            .into());
         }
-        return Err(AppError::upstream(message));
+        return Err(AppError::upstream(message).into());
     }
 
     Ok(stream)
@@ -689,12 +799,17 @@ mod tests {
         PROTOCOL_VERSION, ResourceAdvertisement, WORKER_ALPN, WorkerAdvertisement,
     };
     use crate::mesh::worker::{WorkerRuntime, handle_stream};
+    use crate::upstream::{AuthorizationScope, InferenceEndpoint, RequestAffinity};
+    use futures::poll;
+    use iroh::endpoint::Connection;
     use iroh::endpoint::presets;
     use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::task::Poll;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::{JoinHandle, JoinSet};
 
     async fn read_test_request(socket: &mut TcpStream, buf: &mut [u8]) {
         let mut request = Vec::new();
@@ -722,6 +837,178 @@ mod tests {
             let read = socket.read(buf).await.unwrap();
             assert!(read > 0);
             request.extend_from_slice(&buf[..read]);
+        }
+    }
+
+    fn chat_request(prompt: &str) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "mesh-model",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": true
+        }))
+        .unwrap()
+    }
+
+    fn resource_advertisement(resource_id: &str, capacity: u32) -> ResourceAdvertisement {
+        ResourceAdvertisement {
+            resource_id: resource_id.to_string(),
+            models: vec![ModelAdvertisement {
+                id: "mesh-model".to_string(),
+                context_limit: Some(4096),
+            }],
+            availability: AvailabilitySchedule {
+                default_capacity: capacity,
+                ..Default::default()
+            },
+            effective_capacity: capacity,
+            accepting_requests: true,
+            healthy: true,
+            revision: 1,
+        }
+    }
+
+    fn worker_advertisement(resources: Vec<ResourceAdvertisement>) -> WorkerAdvertisement {
+        WorkerAdvertisement {
+            protocol_version: PROTOCOL_VERSION,
+            node_name: None,
+            agent_version: "test".to_string(),
+            resources,
+            model_switching: None,
+        }
+    }
+
+    fn mesh_client(registry: Arc<MeshRegistry>) -> MeshUpstreamClient {
+        MeshUpstreamClient::new(
+            registry,
+            BackendFinalizationPolicies::default(),
+            true,
+            1024 * 1024,
+            crate::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+    }
+
+    struct MeshHarness {
+        client: MeshUpstreamClient,
+        worker_task: JoinHandle<()>,
+        _worker_connection_keepalive: Connection,
+        _controller: Endpoint,
+        _worker: Endpoint,
+    }
+
+    async fn start_mesh_harness(
+        resources: Vec<(&str, SocketAddr, u32)>,
+        accept_count: usize,
+    ) -> MeshHarness {
+        start_mesh_harness_with_worker_capacity(
+            resources
+                .into_iter()
+                .map(|(id, target, capacity)| (id, target, capacity, capacity))
+                .collect(),
+            accept_count,
+        )
+        .await
+    }
+
+    async fn start_mesh_harness_with_worker_capacity(
+        resources: Vec<(&str, SocketAddr, u32, u32)>,
+        accept_count: usize,
+    ) -> MeshHarness {
+        let controller_key = SecretKey::generate();
+        let controller_id = controller_key.public();
+        let controller = Endpoint::builder(presets::Minimal)
+            .secret_key(controller_key)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![WORKER_ALPN.to_vec()])
+            .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let controller_addr = EndpointAddr::from_parts(
+            controller_id,
+            controller
+                .bound_sockets()
+                .into_iter()
+                .map(TransportAddr::Ip),
+        );
+        let worker_key = SecretKey::generate();
+        let worker_id = worker_key.public();
+        let worker = Endpoint::builder(presets::Minimal)
+            .secret_key(worker_key)
+            .relay_mode(RelayMode::Disabled)
+            .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let worker_connect = worker.connect(controller_addr, WORKER_ALPN);
+        let controller_accept = async {
+            controller
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap()
+        };
+        let (worker_connection, controller_connection) =
+            tokio::join!(worker_connect, controller_accept);
+        let worker_connection = worker_connection.unwrap();
+        let worker_connection_keepalive = worker_connection.clone();
+
+        let resource_configs = resources
+            .iter()
+            .map(
+                |(id, target, _, worker_capacity)| MeshWorkerResourceConfig {
+                    id: (*id).to_string(),
+                    target: *target,
+                    models: Vec::new(),
+                    model_refresh_secs: 60,
+                    capacity_source: crate::config::MeshWorkerCapacitySource::Configured,
+                    availability: AvailabilitySchedule {
+                        default_capacity: *worker_capacity,
+                        ..Default::default()
+                    },
+                },
+            )
+            .collect();
+        let resource_ads = resources
+            .iter()
+            .map(|(id, _, advertised_capacity, _)| resource_advertisement(id, *advertised_capacity))
+            .collect();
+        let runtime = Arc::new(
+            WorkerRuntime::new(MeshWorkerConfig {
+                resources: resource_configs,
+                ..Default::default()
+            })
+            .await,
+        );
+        let worker_task = tokio::spawn(async move {
+            let mut streams = JoinSet::new();
+            for _ in 0..accept_count {
+                let (send, recv) = worker_connection.accept_bi().await.unwrap();
+                let runtime = Arc::clone(&runtime);
+                streams.spawn(async move {
+                    let _ = handle_stream(send, recv, runtime).await;
+                });
+            }
+            while streams.join_next().await.is_some() {}
+        });
+
+        let registry = Arc::new(MeshRegistry::new(Duration::from_secs(30)));
+        registry.register(
+            worker_id,
+            controller_connection,
+            worker_advertisement(resource_ads),
+        );
+
+        MeshHarness {
+            client: mesh_client(registry),
+            worker_task,
+            _worker_connection_keepalive: worker_connection_keepalive,
+            _controller: controller,
+            _worker: worker,
         }
     }
 
@@ -828,6 +1115,279 @@ mod tests {
             inventory[0].availability.as_ref().unwrap().default_capacity,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_session_waits_for_original_resource_even_when_spare_capacity_exists() {
+        let primary_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let primary_target = primary_listener.local_addr().unwrap();
+        let spare_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let spare_target = spare_listener.local_addr().unwrap();
+        let (first_request_tx, first_request_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let (second_request_tx, second_request_rx) = tokio::sync::oneshot::channel();
+        let primary_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            let (mut socket, _) = primary_listener.accept().await.unwrap();
+            read_test_request(&mut socket, &mut buf).await;
+            first_request_tx.send(()).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"id\":\"first\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"held\"}}]}\n\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            release_first_rx.await.unwrap();
+            socket
+                .write_all(b"data: {\"id\":\"first\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                .await
+                .unwrap();
+            drop(socket);
+
+            let (mut socket, _) = primary_listener.accept().await.unwrap();
+            read_test_request(&mut socket, &mut buf).await;
+            second_request_tx.send(()).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"id\":\"second\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"same primary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                .await
+                .unwrap();
+        });
+        let (spare_hit_tx, mut spare_hit_rx) = tokio::sync::oneshot::channel();
+        let spare_server = tokio::spawn(async move {
+            let _ = spare_listener.accept().await;
+            let _ = spare_hit_tx.send(());
+        });
+        let harness = start_mesh_harness(
+            vec![("primary", primary_target, 1), ("spare", spare_target, 1)],
+            4,
+        )
+        .await;
+        let affinity = RequestAffinity("session-a".to_string());
+        let primary_only =
+            AuthorizationScope::restricted(|_, route, _, _| route == Some("primary"));
+        let first_backend = BackendChatRequest::new(chat_request("first"), None, None, None)
+            .with_authorization(primary_only, InferenceEndpoint::ChatCompletions)
+            .with_affinity(Some(affinity.clone()));
+        let mut first_stream = harness
+            .client
+            .stream_chat_completion(&first_backend)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_stream.next().await.unwrap().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("held")
+        );
+        first_request_rx.await.unwrap();
+
+        let second_backend = BackendChatRequest::new(chat_request("second"), None, None, None)
+            .with_affinity(Some(affinity));
+        let mut second = Box::pin(harness.client.stream_chat_completion(&second_backend));
+        assert!(
+            matches!(poll!(&mut second), Poll::Pending),
+            "same-session request must wait for its pinned resource instead of migrating"
+        );
+        assert!(
+            spare_hit_rx.try_recv().is_err(),
+            "spare resource should remain unused while the pinned resource is busy"
+        );
+
+        release_first_tx.send(()).unwrap();
+        assert_eq!(
+            first_stream.next().await.unwrap().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some(" done")
+        );
+        assert!(first_stream.next().await.is_none());
+        drop(first_stream);
+
+        let mut second_stream = second.await.unwrap();
+        assert_eq!(
+            second_stream.next().await.unwrap().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("same primary")
+        );
+        assert!(second_stream.next().await.is_none());
+        drop(second_stream);
+        second_request_rx.await.unwrap();
+        primary_server.await.unwrap();
+        harness.worker_task.abort();
+        spare_server.abort();
+    }
+
+    #[tokio::test]
+    async fn denied_busy_mesh_resource_returns_forbidden_without_waiting() {
+        let registry = Arc::new(MeshRegistry::new(Duration::from_secs(30)));
+        registry.register_test(
+            SecretKey::generate().public(),
+            worker_advertisement(vec![resource_advertisement("denied", 1)]),
+        );
+        let held = registry.reserve("mesh-model").expect("initial reservation");
+        let client =
+            mesh_client(Arc::clone(&registry)).with_capacity_wait_timeout(Duration::from_secs(30));
+        let backend = BackendChatRequest::new(chat_request("denied"), None, None, None)
+            .with_authorization(
+                AuthorizationScope::restricted(|_, _, _, _| false),
+                InferenceEndpoint::ChatCompletions,
+            );
+        let mut attempt = Box::pin(client.stream_chat_completion(&backend));
+
+        let error = match poll!(&mut attempt) {
+            Poll::Ready(Err(error)) => error,
+            Poll::Ready(Ok(_)) => panic!("denied mesh resource should not be served"),
+            Poll::Pending => panic!("authorization denial must not wait for busy capacity"),
+        };
+        assert_eq!(error.status_code(), http::StatusCode::FORBIDDEN);
+        assert_eq!(error.failover_disposition(), FailoverDisposition::Terminal);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn pinned_capacity_deadline_reports_session_wait_without_cooldown() {
+        let registry = Arc::new(MeshRegistry::new(Duration::from_secs(30)));
+        registry.register_test(
+            SecretKey::generate().public(),
+            worker_advertisement(vec![
+                resource_advertisement("primary", 1),
+                resource_advertisement("spare", 1),
+            ]),
+        );
+        let affinity = RequestAffinity("session-a".to_string());
+        let first = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, resource_id| resource_id == "primary",
+            )
+            .unwrap()
+            .expect("primary reservation");
+        registry.commit_affinity(first.affinity_commit().expect("affinity commit"));
+        drop(first);
+        let held = registry
+            .reserve_excluding_where_with_affinity(
+                "mesh-model",
+                &HashSet::new(),
+                Some(&affinity),
+                |_, _| true,
+            )
+            .unwrap()
+            .expect("pinned reservation");
+        let client = mesh_client(Arc::clone(&registry)).with_capacity_wait_timeout(Duration::ZERO);
+        let backend = BackendChatRequest::new(chat_request("pinned timeout"), None, None, None)
+            .with_affinity(Some(affinity));
+
+        let error = match client.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("pinned capacity wait should time out"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.failover_disposition(),
+            FailoverDisposition::FailoverNoCooldown
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("mesh session capacity wait timed out")
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn unpinned_capacity_wait_resumes_after_busy_resource_releases() {
+        let registry = Arc::new(MeshRegistry::new(Duration::from_secs(30)));
+        registry.register_test(
+            SecretKey::generate().public(),
+            worker_advertisement(vec![resource_advertisement("primary", 1)]),
+        );
+        let held = registry.reserve("mesh-model").expect("initial reservation");
+        let excluded = HashSet::new();
+        let mut waiting = Box::pin(registry.reserve_excluding_where_with_affinity_wait(
+            "mesh-model",
+            &excluded,
+            None,
+            |_, _| true,
+            Duration::from_secs(30),
+        ));
+        assert!(
+            matches!(poll!(&mut waiting), Poll::Pending),
+            "global capacity exhaustion should wait while an authorized resource is busy"
+        );
+
+        drop(held);
+        let reservation = waiting
+            .await
+            .unwrap()
+            .expect("released resource should be reserved");
+        assert_eq!(reservation.resource.resource_id, "primary");
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_worker_admission_releases_hub_reservation() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let harness =
+            start_mesh_harness_with_worker_capacity(vec![("primary", target, 1, 0)], 1).await;
+        let backend = BackendChatRequest::new(chat_request("wait at worker"), None, None, None);
+        let mut pending = Box::pin(harness.client.stream_chat_completion(&backend));
+        assert!(
+            matches!(poll!(&mut pending), Poll::Pending),
+            "worker-side capacity exhaustion should leave admission pending"
+        );
+        assert!(
+            harness.client.registry.reserve("mesh-model").is_none(),
+            "pending worker admission should hold the hub reservation while alive"
+        );
+
+        drop(pending);
+        let reservation = harness
+            .client
+            .registry
+            .reserve("mesh-model")
+            .expect("dropping pending admission should release the hub reservation");
+        assert_eq!(reservation.resource.resource_id, "primary");
+        drop(reservation);
+        harness.worker_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_worker_capacity_deadline_times_out_and_releases_hub_reservation() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let harness =
+            start_mesh_harness_with_worker_capacity(vec![("primary", target, 1, 0)], 1).await;
+        let client = harness
+            .client
+            .clone()
+            .with_capacity_wait_timeout(Duration::ZERO);
+        let backend = BackendChatRequest::new(chat_request("worker timeout"), None, None, None);
+
+        let error = match client.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("worker-side capacity wait should time out"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.failover_disposition(),
+            FailoverDisposition::FailoverNoCooldown
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("mesh worker capacity wait timed out")
+        );
+        let reservation = harness
+            .client
+            .registry
+            .reserve("mesh-model")
+            .expect("worker admission timeout should release the hub reservation");
+        assert_eq!(reservation.resource.resource_id, "primary");
+        drop(reservation);
+        harness.worker_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -1058,6 +1618,7 @@ mod tests {
             target,
             models: Vec::new(),
             model_refresh_secs: 60,
+            capacity_source: crate::config::MeshWorkerCapacitySource::Configured,
             availability: availability.clone(),
         };
         let runtime = Arc::new(

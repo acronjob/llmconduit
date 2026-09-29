@@ -1,7 +1,7 @@
-import { useMemo, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { getConnection, queryKeys } from '../../api/connection';
-import type { ConfiguredProvider, CreateConfiguredProviderRequest, FleetDeploymentStatus, FleetModelEntry, FleetModelsResponse, MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, MeshSwitchableModel, ProviderHealth } from '../../api/types';
+import type { ConfiguredProvider, ConfiguredProvidersResponse, CreateConfiguredProviderRequest, FleetDeploymentStatus, FleetModelEntry, FleetModelsResponse, MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, MeshSwitchableModel, ProviderHealth, UpdateConfiguredProviderRequest } from '../../api/types';
 import { EMPTY_FILTERS } from '../../components/FlowTable/filterTypes';
 import { useFlowRows } from '../../components/FlowTable/useFlowRows';
 import { fmtCost, fmtElapsed, fmtTokens } from '../../components/FlowTable/format';
@@ -23,6 +23,8 @@ import {
 const authPoliciesKey = ['auth', 'policies', 'providers-view'] as const;
 const DASH = '—';
 const INPUT = 'rounded-md border border-line bg-bg px-2 py-1.5 font-mono text-xs text-text outline-none focus:border-accent';
+const INSTANCE_LIMIT = 64;
+const CONFIGURED_PROVIDER_MODEL_LIMIT = 80;
 
 export function ProvidersView() {
   const [createdToken, setCreatedToken] = useState<{ label: string | null; token: string } | null>(null);
@@ -60,14 +62,14 @@ export function ProvidersView() {
     onSuccess: invalidateMesh,
   });
   const changeMeshModel = useMutation({
-    mutationFn: async ({ endpointId, modelId, unloadIds, unloadOnly }: { endpointId: string; modelId: string; unloadIds: string[]; unloadOnly?: boolean }) => {
+    mutationFn: async ({ endpointId, modelId, unloadIds, unloadOnly, instances }: { endpointId: string; modelId: string; unloadIds: string[]; unloadOnly?: boolean; instances?: number }) => {
       for (const unloadId of unloadIds) {
         await client.unloadMeshModel(endpointId, unloadId);
         if (!unloadOnly || unloadId !== unloadIds.at(-1)) {
           await waitForRemoteModelUnloaded(() => client.mesh(), endpointId, unloadId);
         }
       }
-      if (!unloadOnly) return client.loadMeshModel(endpointId, modelId);
+      if (!unloadOnly) return client.loadMeshModel(endpointId, modelId, instances);
       return null;
     },
     onSuccess: invalidateMesh,
@@ -77,13 +79,15 @@ export function ProvidersView() {
     void queryClient.invalidateQueries({ queryKey: queryKeys.providers });
     void queryClient.invalidateQueries({ queryKey: queryKeys.topology });
   };
-  const loadFleetModel = useMutation({ mutationFn: (id: string) => client.loadFleetModel(id), onSuccess: invalidateFleet });
+  const loadFleetModel = useMutation({ mutationFn: ({ id, instances }: { id: string; instances?: number }) => client.loadFleetModel(id, instances), onSuccess: invalidateFleet });
   const unloadFleetModel = useMutation({ mutationFn: (id: string) => client.unloadFleetModel(id), onSuccess: invalidateFleet });
   const invalidateConfiguredProviders = () => {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.configuredProviders });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.providers });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.catalog });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.topology });
+    return Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.configuredProviders }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.providers }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.catalog }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.topology }),
+    ]);
   };
   const createConfiguredProvider = useMutation({
     mutationFn: (body: CreateConfiguredProviderRequest) => client.createConfiguredProvider(body),
@@ -92,6 +96,15 @@ export function ProvidersView() {
   const deleteConfiguredProvider = useMutation({
     mutationFn: (id: string) => client.deleteConfiguredProvider(id),
     onSuccess: invalidateConfiguredProviders,
+  });
+  const updateConfiguredProvider = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: UpdateConfiguredProviderRequest }) => client.updateConfiguredProvider(id, body),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<ConfiguredProvidersResponse>(queryKeys.configuredProviders, (current) => ({
+        providers: current?.providers.map((provider) => provider.id === updated.id ? updated : provider) ?? [updated],
+      }));
+      return invalidateConfiguredProviders();
+    },
   });
 
   const inventory = useMemo(() => buildProviderInventory({
@@ -140,10 +153,11 @@ export function ProvidersView() {
           loading={configuredProvidersQuery.isLoading}
           error={configuredProvidersQuery.error ? String(configuredProvidersQuery.error) : null}
           mutationsEnabled={mutationsEnabled}
-          busy={createConfiguredProvider.isPending || deleteConfiguredProvider.isPending}
-          mutationError={String(createConfiguredProvider.error ?? deleteConfiguredProvider.error ?? '') || null}
+          busy={createConfiguredProvider.isPending || deleteConfiguredProvider.isPending || updateConfiguredProvider.isPending}
+          mutationError={String(createConfiguredProvider.error ?? deleteConfiguredProvider.error ?? updateConfiguredProvider.error ?? '') || null}
           onCreate={(body) => createConfiguredProvider.mutate(body)}
           onDelete={(id) => deleteConfiguredProvider.mutate(id)}
+          onPatch={(id, body) => updateConfiguredProvider.mutate({ id, body })}
         />
         <MeshAdminPanel
           mesh={meshQuery.data ?? null}
@@ -159,7 +173,7 @@ export function ProvidersView() {
           onRevoke={(id) => revokeJoinKey.mutate(id)}
           onSetNode={(endpointId, enabled) => setNodeEnabled.mutate({ endpointId, enabled })}
           onSetModel={(endpointId, resourceId, model, disabled) => setModelDisabled.mutate({ endpointId, resourceId, model, disabled })}
-          onLoadModel={(endpointId, modelId, unloadIds) => changeMeshModel.mutate({ endpointId, modelId, unloadIds })}
+          onLoadModel={(endpointId, modelId, unloadIds, instances) => changeMeshModel.mutate({ endpointId, modelId, unloadIds, instances })}
           onUnloadModel={(endpointId, modelId) => changeMeshModel.mutate({ endpointId, modelId, unloadIds: [modelId], unloadOnly: true })}
         />
         <FleetPanel
@@ -169,7 +183,7 @@ export function ProvidersView() {
           mutationsEnabled={mutationsEnabled}
           busy={loadFleetModel.isPending || unloadFleetModel.isPending}
           mutationError={String(loadFleetModel.error ?? unloadFleetModel.error ?? '') || null}
-          onLoad={(id) => loadFleetModel.mutate(id)}
+          onLoad={(id, instances) => loadFleetModel.mutate({ id, instances })}
           onUnload={(id) => unloadFleetModel.mutate(id)}
         />
         <ProviderTable allRows={inventory.rows} />
@@ -188,6 +202,7 @@ function ConfiguredProvidersPanel({
   mutationError,
   onCreate,
   onDelete,
+  onPatch,
 }: {
   providers: ConfiguredProvider[];
   loading: boolean;
@@ -197,6 +212,7 @@ function ConfiguredProvidersPanel({
   mutationError: string | null;
   onCreate: (body: CreateConfiguredProviderRequest) => void;
   onDelete: (id: string) => void;
+  onPatch: (id: string, body: UpdateConfiguredProviderRequest) => void;
 }) {
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
@@ -239,25 +255,152 @@ function ConfiguredProvidersPanel({
       {providers.length > 0 && (
         <div className="mt-3 grid gap-2 lg:grid-cols-2">
           {providers.map((provider) => (
-            <div key={provider.id} className="min-w-0 rounded border border-line/70 bg-bg p-3" data-testid="configured-provider-card">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="truncate text-xs font-medium text-text">{provider.name}</div>
-                  <div className="mt-1 truncate font-mono text-[10px] text-text-muted" title={provider.base_url}>{provider.base_url}</div>
-                </div>
-                <Button type="button" variant="danger" className="px-2 py-1 text-[10px]" disabled={!mutationsEnabled || busy} onClick={() => onDelete(provider.id)}>Remove</Button>
-              </div>
-              <div className="mt-2 text-[10px] text-text-muted">
-                {provider.models.length} model{provider.models.length === 1 ? '' : 's'} discovered · key {provider.api_key_present ? 'configured' : 'missing'}
-              </div>
-              <div className="mt-2 flex flex-wrap gap-1">
-                {provider.models.map((model) => <code key={model.id} className="rounded bg-panel px-1.5 py-0.5 text-[10px] text-text">{model.id}</code>)}
-              </div>
-            </div>
+            <ConfiguredProviderCard
+              key={provider.id}
+              provider={provider}
+              mutationsEnabled={mutationsEnabled}
+              busy={busy}
+              onDelete={onDelete}
+              onPatch={onPatch}
+            />
           ))}
         </div>
       )}
     </Panel>
+  );
+}
+
+function ConfiguredProviderCard({
+  provider,
+  mutationsEnabled,
+  busy,
+  onDelete,
+  onPatch,
+}: {
+  provider: ConfiguredProvider;
+  mutationsEnabled: boolean;
+  busy: boolean;
+  onDelete: (id: string) => void;
+  onPatch: (id: string, body: UpdateConfiguredProviderRequest) => void;
+}) {
+  const [modelQuery, setModelQuery] = useState('');
+  const normalizedQuery = modelQuery.trim().toLowerCase();
+  const allowedModels = Array.isArray(provider.allowed_models) ? provider.allowed_models : null;
+  const allowlistMode = allowedModels !== null;
+  const allowed = new Set(allowedModels ?? []);
+  const disabled = new Set(provider.disabled_models);
+  const models = provider.models
+    .filter((model) => !normalizedQuery || model.id.toLowerCase().includes(normalizedQuery))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const visibleModels = models.slice(0, CONFIGURED_PROVIDER_MODEL_LIMIT);
+  const modelIsEnabled = (modelId: string) => (!allowlistMode || allowed.has(modelId)) && !disabled.has(modelId);
+  const enabledCount = provider.models.filter((model) => modelIsEnabled(model.id)).length;
+  const setAllowlistMode = (enabled: boolean) => {
+    if (!enabled) {
+      onPatch(provider.id, { allowed_models: null });
+      return;
+    }
+    onPatch(provider.id, {
+      allowed_models: provider.models.filter((model) => !disabled.has(model.id)).map((model) => model.id).sort(),
+    });
+  };
+  const setModelEnabled = (modelId: string, enabled: boolean) => {
+    if (allowlistMode) {
+      const nextAllowed = new Set(allowed);
+      const nextDisabled = new Set(disabled);
+      if (enabled) {
+        nextAllowed.add(modelId);
+        nextDisabled.delete(modelId);
+      } else {
+        nextAllowed.delete(modelId);
+      }
+      onPatch(provider.id, {
+        allowed_models: [...nextAllowed].sort(),
+        disabled_models: [...nextDisabled].sort(),
+      });
+      return;
+    }
+    const nextDisabled = new Set(disabled);
+    if (enabled) nextDisabled.delete(modelId);
+    else nextDisabled.add(modelId);
+    onPatch(provider.id, { disabled_models: [...nextDisabled].sort() });
+  };
+  return (
+    <div className="min-w-0 rounded border border-line/70 bg-bg p-3" data-testid="configured-provider-card">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="truncate text-xs font-medium text-text">{provider.name}</div>
+          <div className="mt-1 truncate font-mono text-[10px] text-text-muted" title={provider.base_url}>{provider.base_url}</div>
+        </div>
+        <Button type="button" variant="danger" className="px-2 py-1 text-[10px]" disabled={!mutationsEnabled || busy} onClick={() => onDelete(provider.id)}>Remove</Button>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-text-muted">
+        <span>{provider.models.length} discovered · {enabledCount} enabled · key {provider.api_key_present ? 'configured' : 'missing'}</span>
+        <label className={cn('ml-auto inline-flex items-center gap-1.5 rounded border border-line/70 px-2 py-1', !mutationsEnabled && 'opacity-70')} data-testid="configured-provider-autodiscover">
+          <input
+            type="checkbox"
+            checked={provider.auto_discover}
+            disabled={!mutationsEnabled || busy}
+            onChange={(event) => onPatch(provider.id, { auto_discover: event.target.checked })}
+          />
+          <span>auto-discover</span>
+        </label>
+      </div>
+      <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+        {provider.auto_discover ? 'Refreshes about every 5 min and adds newly advertised models.' : 'Automatic catalog refresh is paused; existing model choices remain.'}
+      </p>
+      <label className={cn('mt-2 inline-flex items-center gap-1.5 rounded border border-line/70 px-2 py-1 text-[10px] text-text-muted', !mutationsEnabled && 'opacity-70')} data-testid="configured-provider-allowlist">
+        <input
+          type="checkbox"
+          checked={allowlistMode}
+          disabled={!mutationsEnabled || busy}
+          onChange={(event) => setAllowlistMode(event.target.checked)}
+        />
+        <span>Only allow selected models</span>
+      </label>
+      <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+        {allowlistMode ? 'Newly discovered models stay visible but disabled until selected.' : 'Newly discovered models are enabled unless individually disabled.'}
+      </p>
+      <div className="mt-2 flex items-center gap-2">
+        <input
+          aria-label={`Search models for ${provider.name}`}
+          value={modelQuery}
+          onChange={(event) => setModelQuery(event.target.value)}
+          placeholder="search models"
+          className={cn(INPUT, 'min-w-0 flex-1')}
+        />
+        <span className="shrink-0 text-[10px] text-text-muted">{models.length}/{provider.models.length}</span>
+      </div>
+      <div className="mt-2 max-h-56 overflow-auto rounded border border-line/60">
+        {visibleModels.map((model) => {
+          const isEnabled = modelIsEnabled(model.id);
+          const isBlacklisted = disabled.has(model.id);
+          return (
+            <div key={model.id} className="flex min-w-0 items-center gap-2 border-b border-line/50 px-2 py-1.5 last:border-b-0" data-testid="configured-provider-model">
+              <input
+                aria-label={`Enable ${model.id}`}
+                type="checkbox"
+                checked={isEnabled}
+                disabled={!mutationsEnabled || busy}
+                onChange={(event) => setModelEnabled(model.id, event.target.checked)}
+              />
+              <div className="min-w-0 flex-1">
+                <div className={cn('truncate font-mono text-[10px]', isEnabled ? 'text-text' : 'text-text-muted line-through')} title={model.id}>{model.id}</div>
+                <div className="text-[9px] text-text-muted">
+                  context {model.context_limit == null ? DASH : fmtTokens(model.context_limit)}
+                  {!isEnabled && allowlistMode && !allowed.has(model.id) ? ' · not selected' : ''}
+                  {isBlacklisted ? ' · disabled' : ''}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {models.length === 0 && <div className="px-2 py-3 text-xs italic text-text-muted" data-quality="unavailable">No models match this search.</div>}
+      </div>
+      {models.length > visibleModels.length && (
+        <p className="mt-1 text-[10px] text-text-muted">Showing first {CONFIGURED_PROVIDER_MODEL_LIMIT}; narrow the search to edit more.</p>
+      )}
+    </div>
   );
 }
 
@@ -277,7 +420,7 @@ function FleetPanel({
   mutationsEnabled: boolean;
   busy: boolean;
   mutationError: string | null;
-  onLoad: (id: string) => void;
+  onLoad: (id: string, instances?: number) => void;
   onUnload: (id: string) => void;
 }) {
   const unavailable = error && error.includes('404');
@@ -332,15 +475,21 @@ function FleetModelCard({
   entry: FleetModelEntry;
   busy: boolean;
   mutationsEnabled: boolean;
-  onLoad: (id: string) => void;
+  onLoad: (id: string, instances?: number) => void;
   onUnload: (id: string) => void;
 }) {
   const [confirming, setConfirming] = useState<'load' | 'unload' | null>(null);
+  const desiredInstanceCount = modelDesiredInstances(entry);
+  const [instanceText, setInstanceText] = useState(String(desiredInstanceCount));
+  useEffect(() => setInstanceText(String(desiredInstanceCount)), [desiredInstanceCount]);
   const status = modelRuntimeStatus(entry.status);
   const active = status.state === 'loaded';
   const transitioning = status.state === 'loading';
   const phase = entry.status.phase.toLowerCase();
   const canUnload = !transitioning && (active || phase === 'failed' || phase === 'unhealthy' || Boolean(entry.status.container_status));
+  const instanceValidation = validateInstanceText(instanceText, entry.model.max_instances);
+  const requestedInstances = instanceValidation.value ?? desiredInstanceCount;
+  const scaling = active && requestedInstances !== desiredInstanceCount;
   const gpus = entry.status.assigned_gpus.length ? entry.status.assigned_gpus.map((gpu) => `GPU ${gpu}`).join(', ') : DASH;
   return (
     <div className="min-w-0 rounded border border-line/70 bg-bg p-3" data-testid="fleet-model-card">
@@ -359,28 +508,40 @@ function FleetModelCard({
       {entry.model.description && <p className="mt-2 text-[10px] leading-relaxed text-text-muted">{entry.model.description}</p>}
       <div className="mt-3 grid grid-cols-2 gap-2 text-[10px]">
         <FleetFact label="desired" value={entry.status.desired_state} />
+        <FleetFact label="instances" value={formatInstanceSummary(entry.status.ready_instances, entry.status.desired_instances, entry.status.instances?.length)} />
         <FleetFact label="gpus" value={gpus} />
         <FleetFact label="health" value={entry.status.health ?? entry.status.container_status ?? DASH} />
         <FleetFact label="checked" value={entry.status.last_checked ? fmtFleetTime(entry.status.last_checked) : DASH} />
       </div>
+      <InstanceList instances={entry.status.instances} />
       {entry.status.last_error && (
         <p className={cn('mt-2 text-[10px]', transitioning ? 'text-status-cooling' : 'text-status-down')}>
           {transitioning ? 'Waiting for readiness: ' : ''}{entry.status.last_error}
         </p>
       )}
-      <div className="mt-3 flex justify-end gap-2">
-        <Button type="button" disabled={!mutationsEnabled || busy || active || transitioning} onClick={() => setConfirming('load')} className="px-2 py-1 text-[10px]">Load</Button>
-        <Button type="button" variant="danger" disabled={!mutationsEnabled || busy || !canUnload} onClick={() => setConfirming('unload')} className="px-2 py-1 text-[10px]">Unload</Button>
+      <div className="mt-3 flex flex-wrap items-end justify-between gap-2">
+        <InstanceCountField
+          label="Instances"
+          value={instanceText}
+          onChange={setInstanceText}
+          disabled={!mutationsEnabled || busy || transitioning}
+          max={entry.model.max_instances}
+          error={instanceValidation.error}
+        />
+        <div className="flex justify-end gap-2">
+          <Button type="button" disabled={!mutationsEnabled || busy || transitioning || Boolean(instanceValidation.error) || (active && !scaling)} onClick={() => setConfirming('load')} className="px-2 py-1 text-[10px]">{active ? 'Scale' : 'Load'}</Button>
+          <Button type="button" variant="danger" disabled={!mutationsEnabled || busy || !canUnload} onClick={() => setConfirming('unload')} className="px-2 py-1 text-[10px]">Unload</Button>
+        </div>
       </div>
       {confirming && (
         <SimpleConfirmationDialog
-          title={`Confirm ${confirming}: ${entry.model.id}`}
-          message={confirming === 'load' ? 'This will start the model on available Fleet GPU capacity.' : 'This will stop the model and remove it from routing until it is loaded again.'}
+          title={`Confirm ${confirming === 'load' && active ? 'scale' : confirming}: ${entry.model.id}`}
+          message={confirming === 'load' ? `This will set the desired Fleet instance count to ${requestedInstances}.` : 'This will stop every instance and remove the model from routing until it is loaded again.'}
           confirmLabel={`Confirm ${confirming}`}
           danger={confirming === 'unload'}
           onCancel={() => setConfirming(null)}
           onConfirm={() => {
-            if (confirming === 'load') onLoad(entry.model.id);
+            if (confirming === 'load') onLoad(entry.model.id, requestedInstances);
             else onUnload(entry.model.id);
             setConfirming(null);
           }}
@@ -419,6 +580,76 @@ function FleetFact({ label, value }: { label: string; value: string }) {
       <div className="mt-1 truncate font-mono text-text" title={value} data-quality={value === DASH ? 'unavailable' : 'measured'}>{value}</div>
     </div>
   );
+}
+
+function InstanceCountField({ label, value, onChange, disabled, max, error }: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  disabled: boolean;
+  max?: number;
+  error?: string;
+}) {
+  return (
+    <label className="min-w-24 text-[10px] uppercase tracking-wide text-text-muted">
+      {label}
+      <input
+        aria-label={label}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        disabled={disabled}
+        inputMode="numeric"
+        className={cn(INPUT, 'mt-1 w-24')}
+      />
+      <span className={cn('mt-1 block normal-case tracking-normal', error ? 'text-status-down' : 'text-text-muted')}>
+        {error ?? `1-${Math.min(max ?? INSTANCE_LIMIT, INSTANCE_LIMIT)}`}
+      </span>
+    </label>
+  );
+}
+
+function InstanceList({ instances }: { instances?: Array<{ instance_id?: string; index: number; port?: number; phase: string; container_status?: string; assigned_gpus?: number[]; last_error?: string }> }) {
+  if (!instances?.length) return null;
+  return (
+    <div className="mt-2 space-y-1" data-testid="instance-list">
+      {instances.map((instance) => (
+        <div key={instance.instance_id ?? instance.index} className="grid grid-cols-[2.5rem_minmax(0,1fr)_minmax(0,1fr)] gap-2 rounded border border-line/60 bg-panel px-2 py-1 text-[10px]">
+          <span className="font-mono text-text">#{instance.index}</span>
+          <span className="truncate text-text-muted" title={instance.assigned_gpus?.map((gpu) => `GPU ${gpu}`).join(', ')}>
+            {instance.assigned_gpus?.length ? instance.assigned_gpus.map((gpu) => `GPU ${gpu}`).join(', ') : DASH}
+          </span>
+          <span className="truncate text-text-muted" title={instance.last_error ?? instance.container_status ?? instance.phase}>
+            {instance.port ? `:${instance.port} · ` : ''}{instance.phase}{instance.container_status ? ` · ${instance.container_status}` : ''}{instance.last_error ? ` · ${instance.last_error}` : ''}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function validateInstanceText(value: string, max?: number): { value?: number; error?: string } {
+  const trimmed = value.trim();
+  const limit = Math.min(max ?? INSTANCE_LIMIT, INSTANCE_LIMIT);
+  if (!/^\d+$/.test(trimmed)) return { error: 'whole number' };
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return { error: 'min 1' };
+  if (parsed > limit) return { error: `max ${limit}` };
+  return { value: parsed };
+}
+
+function formatInstanceSummary(ready?: number, desired?: number, fallback?: number): string {
+  const actualReady = ready ?? fallback;
+  if (actualReady === undefined && desired === undefined) return DASH;
+  if (desired === undefined) return String(actualReady ?? 0);
+  return `${actualReady ?? 0}/${desired}`;
+}
+
+function modelDesiredInstances(entry: FleetModelEntry): number {
+  return Math.max(1, entry.status.desired_instances ?? entry.status.ready_instances ?? entry.status.instances?.length ?? 1);
+}
+
+function meshDesiredInstances(model: MeshSwitchableModel): number {
+  return Math.max(1, model.desired_instances ?? model.ready_instances ?? model.instances?.length ?? 1);
 }
 
 function isFleetActive(entry: FleetModelEntry): boolean {
@@ -503,7 +734,7 @@ function MeshAdminPanel({
   onRevoke: (id: string) => void;
   onSetNode: (endpointId: string, enabled: boolean) => void;
   onSetModel: (endpointId: string, resourceId: string, model: string, disabled: boolean) => void;
-  onLoadModel: (endpointId: string, modelId: string, unloadIds: string[]) => void;
+  onLoadModel: (endpointId: string, modelId: string, unloadIds: string[], instances?: number) => void;
   onUnloadModel: (endpointId: string, modelId: string) => void;
 }) {
   const [label, setLabel] = useState('');
@@ -664,12 +895,25 @@ function SwitchableModelList({
   nodes: MeshNode[];
   busy: boolean;
   mutationsEnabled: boolean;
-  onLoadModel: (endpointId: string, modelId: string, unloadIds: string[]) => void;
+  onLoadModel: (endpointId: string, modelId: string, unloadIds: string[], instances?: number) => void;
   onUnloadModel: (endpointId: string, modelId: string) => void;
 }) {
   const [pending, setPending] = useState<PendingRemoteAction | null>(null);
-  const providers = nodes.filter((node) => node.model_switching);
+  const [instanceCounts, setInstanceCounts] = useState<Record<string, string>>({});
+  const providers = useMemo(() => nodes.filter((node) => node.model_switching), [nodes]);
   const count = providers.reduce((total, node) => total + (node.model_switching?.models.length ?? 0), 0);
+  useEffect(() => {
+    setInstanceCounts((current) => {
+      const next = { ...current };
+      for (const node of providers) {
+        for (const model of node.model_switching?.models ?? []) {
+          const key = remoteModelKey(node.endpoint_id, model.id);
+          if (next[key] === undefined) next[key] = String(meshDesiredInstances(model));
+        }
+      }
+      return next;
+    });
+  }, [providers]);
   return (
     <div className="mt-3 overflow-hidden rounded border border-line/70 bg-bg" data-testid="remote-model-switcher">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/70 bg-panel/60 px-3 py-2">
@@ -694,40 +938,60 @@ function SwitchableModelList({
                 const status = modelRuntimeStatus(model);
                 const loaded = status.state === 'loaded';
                 const transitioning = status.state === 'loading';
+                const canUnload = !transitioning && meshModelHasResidentCapacity(model);
+                const countKey = remoteModelKey(node.endpoint_id, model.id);
+                const instanceText = instanceCounts[countKey] ?? String(meshDesiredInstances(model));
+                const instanceValidation = validateInstanceText(instanceText, model.max_instances);
+                const requestedInstances = instanceValidation.value ?? meshDesiredInstances(model);
+                const scaling = loaded && requestedInstances !== meshDesiredInstances(model);
                 return (
                   <div
                     key={model.id}
-                    className="flex min-w-0 items-center gap-3 rounded border border-line/60 bg-bg/70 px-3 py-2"
+                    className="min-w-0 rounded border border-line/60 bg-bg/70 px-3 py-2"
                     data-testid="remote-switch-model"
                   >
-                    <ModelStatusLight status={status} testId="remote-model-status" />
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate font-mono text-[11px] text-text" title={model.id}>{model.id}</div>
-                      <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[9px] text-text-muted">
-                        <span className={cn(
-                          'shrink-0 uppercase tracking-wide',
-                          status.state === 'loaded' ? 'text-status-healthy' : status.state === 'loading' ? 'text-status-cooling' : status.state === 'failed' ? 'text-status-down' : 'text-text-muted',
-                        )}>{model.phase}</span>
-                        {model.description && <span className="truncate" title={model.description}>· {model.description}</span>}
+                    <div className="flex min-w-0 items-center gap-3">
+                      <ModelStatusLight status={status} testId="remote-model-status" />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate font-mono text-[11px] text-text" title={model.id}>{model.id}</div>
+                        <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[9px] text-text-muted">
+                          <span className={cn(
+                            'shrink-0 uppercase tracking-wide',
+                            status.state === 'loaded' ? 'text-status-healthy' : status.state === 'loading' ? 'text-status-cooling' : status.state === 'failed' ? 'text-status-down' : 'text-text-muted',
+                          )}>{model.phase}</span>
+                          <span className="shrink-0">· {formatInstanceSummary(model.ready_instances, model.desired_instances, model.instances?.length)}</span>
+                          {model.description && <span className="truncate" title={model.description}>· {model.description}</span>}
+                        </div>
                       </div>
+                      <Button
+                        type="button"
+                        disabled={!mutationsEnabled || busy || transitioning || Boolean(instanceValidation.error) || (loaded && !scaling)}
+                        onClick={() => setPending({ kind: 'load', endpointId: node.endpoint_id, model, models: node.model_switching?.models ?? [], instances: requestedInstances })}
+                        className="shrink-0 px-2.5 py-1 text-[10px]"
+                      >
+                        {loaded ? 'Scale' : transitioning ? model.phase : 'Load'}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="danger"
+                        disabled={!mutationsEnabled || busy || !canUnload}
+                        onClick={() => setPending({ kind: 'unload', endpointId: node.endpoint_id, model, models: node.model_switching?.models ?? [] })}
+                        className="shrink-0 px-2.5 py-1 text-[10px]"
+                      >
+                        Unload
+                      </Button>
                     </div>
-                    <Button
-                      type="button"
-                      disabled={!mutationsEnabled || busy || loaded || transitioning}
-                      onClick={() => setPending({ kind: 'load', endpointId: node.endpoint_id, model, models: node.model_switching?.models ?? [] })}
-                      className="shrink-0 px-2.5 py-1 text-[10px]"
-                    >
-                      {loaded ? 'Loaded' : transitioning ? model.phase : 'Load'}
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="danger"
-                      disabled={!mutationsEnabled || busy || !loaded || transitioning}
-                      onClick={() => setPending({ kind: 'unload', endpointId: node.endpoint_id, model, models: node.model_switching?.models ?? [] })}
-                      className="shrink-0 px-2.5 py-1 text-[10px]"
-                    >
-                      Unload
-                    </Button>
+                    <div className="mt-2">
+                      <InstanceCountField
+                        label="Instances"
+                        value={instanceText}
+                        onChange={(value) => setInstanceCounts((current) => ({ ...current, [countKey]: value }))}
+                        disabled={!mutationsEnabled || busy || transitioning}
+                        max={model.max_instances}
+                        error={instanceValidation.error}
+                      />
+                    </div>
+                    <InstanceList instances={model.instances} />
                   </div>
                 );
               })}
@@ -742,7 +1006,7 @@ function SwitchableModelList({
           busy={busy}
           onCancel={() => setPending(null)}
           onConfirm={(unloadIds) => {
-            if (pending.kind === 'load') onLoadModel(pending.endpointId, pending.model.id, unloadIds);
+            if (pending.kind === 'load') onLoadModel(pending.endpointId, pending.model.id, unloadIds, pending.instances);
             else onUnloadModel(pending.endpointId, pending.model.id);
             setPending(null);
           }}
@@ -757,6 +1021,7 @@ interface PendingRemoteAction {
   endpointId: string;
   model: MeshSwitchableModel;
   models: MeshSwitchableModel[];
+  instances?: number;
 }
 
 function ModelLifecycleDialog({ action, busy, onCancel, onConfirm }: {
@@ -765,7 +1030,7 @@ function ModelLifecycleDialog({ action, busy, onCancel, onConfirm }: {
   onCancel: () => void;
   onConfirm: (unloadIds: string[]) => void;
 }) {
-  const plan = useMemo(() => capacityPlan(action.models, action.model), [action.models, action.model]);
+  const plan = useMemo(() => capacityPlan(action.models, action.model, action.instances ?? 1), [action.models, action.model, action.instances]);
   const [selected, setSelected] = useState<string[]>(plan.defaultUnloadIds);
   const freed = plan.candidates.filter((model) => selected.includes(model.id)).reduce((sum, model) => sum + modelGPUCount(model), 0);
   const enoughCapacity = action.kind === 'unload' || freed >= plan.shortfall;
@@ -774,7 +1039,7 @@ function ModelLifecycleDialog({ action, busy, onCancel, onConfirm }: {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
       <div className="w-full max-w-lg rounded-lg border border-line bg-panel p-4 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="model-action-title" data-testid="model-lifecycle-dialog">
         <h3 id="model-action-title" className="text-sm font-semibold text-text">
-          Confirm {action.kind}: <span className="font-mono">{action.model.id}</span>
+          Confirm {action.kind === 'load' && modelRuntimeStatus(action.model).state === 'loaded' ? 'scale' : action.kind}: <span className="font-mono">{action.model.id}</span>
         </h3>
         {action.kind === 'unload' ? (
           <p className="mt-2 text-xs leading-relaxed text-text-muted">This will stop the model and remove it from routing until it is loaded again.</p>
@@ -785,7 +1050,7 @@ function ModelLifecycleDialog({ action, busy, onCancel, onConfirm }: {
         ) : plan.shortfall > 0 ? (
           <>
             <p className="mt-2 text-xs leading-relaxed text-text-muted">
-              Loading needs {plan.requiredGPUs} GPUs; choose models that free at least {plan.shortfall} more GPU slot{plan.shortfall === 1 ? '' : 's'}.
+              Loading {action.instances ?? 1} instance{(action.instances ?? 1) === 1 ? '' : 's'} needs {plan.requiredGPUs} GPUs total and {plan.additionalGPUs} additional; choose models that free at least {plan.shortfall} more GPU slot{plan.shortfall === 1 ? '' : 's'}.
             </p>
             <div className="mt-3 space-y-2" data-testid="capacity-eviction-choices">
               {plan.candidates.map((model) => (
@@ -800,7 +1065,9 @@ function ModelLifecycleDialog({ action, busy, onCancel, onConfirm }: {
             </div>
           </>
         ) : (
-          <p className="mt-2 text-xs leading-relaxed text-text-muted">The model will be loaded on the available GPU capacity.</p>
+          <p className="mt-2 text-xs leading-relaxed text-text-muted">
+            Loading {action.instances ?? 1} instance{(action.instances ?? 1) === 1 ? '' : 's'} needs {plan.requiredGPUs} GPUs total and {plan.additionalGPUs} additional. The desired instance count will be set to {action.instances ?? 1}.
+          </p>
         )}
         {action.kind === 'load' && unloadIds.length > 0 && (
           <p className="mt-3 text-[10px] text-text-muted">Unload first: {unloadIds.join(', ')}</p>
@@ -820,12 +1087,15 @@ function modelGPUCount(model: MeshSwitchableModel): number {
   return model.gpu_count ?? model.assigned_gpus?.length ?? 0;
 }
 
-function capacityPlan(models: MeshSwitchableModel[], target: MeshSwitchableModel) {
-  const candidates = models.filter((model) => model.id !== target.id && modelRuntimeStatus(model).state === 'loaded');
-  const assigned = new Set(candidates.flatMap((model) => model.assigned_gpus ?? []));
+function capacityPlan(models: MeshSwitchableModel[], target: MeshSwitchableModel, instances: number) {
+  const residentModels = models.filter(meshModelHasResidentCapacity);
+  const candidates = residentModels.filter((model) => model.id !== target.id);
+  const assigned = new Set(residentModels.flatMap((model) => model.assigned_gpus ?? model.instances?.flatMap((instance) => instance.assigned_gpus ?? []) ?? []));
   const totalGPUs = Math.max(0, ...models.map(modelGPUCount), ...Array.from(assigned, (gpu) => gpu + 1));
-  const requiredGPUs = modelGPUCount(target);
-  const shortfall = Math.max(0, requiredGPUs - Math.max(0, totalGPUs - assigned.size));
+  const requiredGPUs = modelGPUCount(target) * instances;
+  const currentTargetGPUs = meshModelHasResidentCapacity(target) ? liveModelGPUCount(target) : 0;
+  const additionalGPUs = Math.max(0, requiredGPUs - currentTargetGPUs);
+  const shortfall = Math.max(0, additionalGPUs - Math.max(0, totalGPUs - assigned.size));
   const unloadEverything = requiredGPUs > 0 && totalGPUs > 0 && requiredGPUs >= totalGPUs && candidates.length > 0;
   const defaultUnloadIds: string[] = [];
   let freed = 0;
@@ -834,7 +1104,28 @@ function capacityPlan(models: MeshSwitchableModel[], target: MeshSwitchableModel
     defaultUnloadIds.push(model.id);
     freed += modelGPUCount(model);
   }
-  return { candidates, totalGPUs, requiredGPUs, shortfall, unloadEverything, defaultUnloadIds };
+  return { candidates, totalGPUs, requiredGPUs, additionalGPUs, shortfall, unloadEverything, defaultUnloadIds };
+}
+
+function remoteModelKey(endpointId: string, modelId: string): string {
+  return `${endpointId}\n${modelId}`;
+}
+
+function meshModelHasResidentCapacity(model: MeshSwitchableModel): boolean {
+  const phase = model.phase.toLowerCase();
+  return modelRuntimeStatus(model).state === 'loaded'
+    || (model.ready_instances ?? 0) > 0
+    || Boolean(model.instances?.some((instance) => instance.phase.toLowerCase() !== 'unloaded' || (instance.assigned_gpus?.length ?? 0) > 0))
+    || (model.assigned_gpus?.length ?? 0) > 0
+    || phase === 'failed'
+    || phase === 'unhealthy'
+    || Boolean(model.container_status)
+    || Boolean(model.last_error);
+}
+
+function liveModelGPUCount(model: MeshSwitchableModel): number {
+  const fromInstances = model.instances?.reduce((sum, instance) => sum + (instance.assigned_gpus?.length ?? 0), 0) ?? 0;
+  return Math.max(model.assigned_gpus?.length ?? 0, fromInstances);
 }
 
 async function waitForRemoteModelUnloaded(fetchMesh: () => Promise<MeshAdminState>, endpointId: string, modelId: string): Promise<void> {

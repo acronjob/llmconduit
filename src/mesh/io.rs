@@ -299,16 +299,16 @@ mod tests {
             model_switching: Some(crate::mesh::protocol::ModelSwitchingAdvertisement {
                 provider: "lil-fleet".to_string(),
                 models: (0..32)
-                    .map(
-                        |index| crate::mesh::protocol::SwitchableModelAdvertisement {
-                            id: format!("model-{index}"),
-                            description: Some("x".repeat(256)),
-                            phase: "unloaded".to_string(),
-                            desired_state: "unloaded".to_string(),
-                            gpu_count: 1,
-                            assigned_gpus: Vec::new(),
-                        },
-                    )
+                    .map(|index| {
+                        crate::mesh::protocol::SwitchableModelAdvertisement::legacy(
+                            format!("model-{index}"),
+                            Some("x".repeat(256)),
+                            "unloaded",
+                            "unloaded",
+                            1,
+                            Vec::new(),
+                        )
+                    })
                     .collect(),
                 revision: 2,
             }),

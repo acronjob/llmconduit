@@ -1,9 +1,12 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone)]
 pub struct CapacityGate {
     inner: Arc<Mutex<CapacityGateState>>,
+    notify: Arc<Notify>,
+    shared_notify: Option<Arc<Notify>>,
 }
 
 #[derive(Debug)]
@@ -15,20 +18,29 @@ struct CapacityGateState {
 #[derive(Debug)]
 pub struct CapacityPermit {
     inner: Arc<Mutex<CapacityGateState>>,
+    notify: Arc<Notify>,
+    shared_notify: Option<Arc<Notify>>,
 }
 
 impl CapacityGate {
     pub fn new(limit: u32) -> Self {
         Self {
             inner: Arc::new(Mutex::new(CapacityGateState { limit, active: 0 })),
+            notify: Arc::new(Notify::new()),
+            shared_notify: None,
+        }
+    }
+
+    pub(crate) fn with_shared_notify(limit: u32, shared_notify: Arc<Notify>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CapacityGateState { limit, active: 0 })),
+            notify: Arc::new(Notify::new()),
+            shared_notify: Some(shared_notify),
         }
     }
 
     pub fn set_limit(&self, limit: u32) {
-        self.inner
-            .lock()
-            .expect("mesh capacity lock poisoned")
-            .limit = limit;
+        self.set_limit_if_changed(limit);
     }
 
     pub fn set_limit_if_changed(&self, limit: u32) -> bool {
@@ -37,6 +49,8 @@ impl CapacityGate {
             return false;
         }
         state.limit = limit;
+        drop(state);
+        self.notify_waiters();
         true
     }
 
@@ -57,7 +71,27 @@ impl CapacityGate {
         state.active += 1;
         Some(CapacityPermit {
             inner: Arc::clone(&self.inner),
+            notify: Arc::clone(&self.notify),
+            shared_notify: self.shared_notify.clone(),
         })
+    }
+
+    pub async fn acquire(&self) -> CapacityPermit {
+        loop {
+            let mut notified = Box::pin(self.notify.notified());
+            notified.as_mut().enable();
+            if let Some(permit) = self.try_acquire() {
+                return permit;
+            }
+            notified.await;
+        }
+    }
+
+    fn notify_waiters(&self) {
+        self.notify.notify_waiters();
+        if let Some(shared_notify) = &self.shared_notify {
+            shared_notify.notify_waiters();
+        }
     }
 }
 
@@ -72,6 +106,11 @@ impl Drop for CapacityPermit {
     fn drop(&mut self) {
         let mut state = self.inner.lock().expect("mesh capacity lock poisoned");
         state.active = state.active.saturating_sub(1);
+        drop(state);
+        self.notify.notify_waiters();
+        if let Some(shared_notify) = &self.shared_notify {
+            shared_notify.notify_waiters();
+        }
     }
 }
 
@@ -137,6 +176,39 @@ mod tests {
                 limit: 8,
                 active: 0,
                 available: 8,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_acquire_waits_until_permit_is_released() {
+        let gate = CapacityGate::new(1);
+        let first = gate.try_acquire().expect("first permit");
+        let waiting = gate.acquire();
+        tokio::pin!(waiting);
+
+        tokio::select! {
+            _ = &mut waiting => panic!("acquired while full"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        drop(first);
+        let second = waiting.await;
+        assert_eq!(
+            gate.snapshot(),
+            CapacitySnapshot {
+                limit: 1,
+                active: 1,
+                available: 0,
+            }
+        );
+        drop(second);
+        assert_eq!(
+            gate.snapshot(),
+            CapacitySnapshot {
+                limit: 1,
+                active: 0,
+                available: 1,
             }
         );
     }

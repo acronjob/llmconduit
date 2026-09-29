@@ -2340,6 +2340,7 @@ impl FailoverUpstreamClient {
             persistence_capture: backend.persistence_capture.clone(),
             capture_payloads: backend.capture_payloads,
             authorization: backend.authorization.clone(),
+            affinity: backend.affinity.clone(),
             endpoint: backend.endpoint,
             authorization_route: backend.authorization_route.clone(),
             authorization_provider: Some(provider.name.clone()),
@@ -2937,6 +2938,7 @@ impl RoutingUpstreamClient {
             persistence_capture: backend.persistence_capture.clone(),
             capture_payloads: backend.capture_payloads,
             authorization: backend.authorization.clone(),
+            affinity: backend.affinity.clone(),
             endpoint: backend.endpoint,
             authorization_route: Some(provider_name.to_string()),
             authorization_provider: Some(provider_name.to_string()),
@@ -4286,6 +4288,11 @@ impl ServingToken {
     }
 }
 
+/// Opaque, caller-scoped conversation identity used for inference-instance affinity.
+/// Ingress hashes the identity so neither credentials nor raw session IDs are retained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequestAffinity(pub String);
+
 /// Leaf-boundary wrapper carrying finalization metadata that does NOT belong on
 /// the wire DTO `ChatCompletionRequest`. Built at the leaf boundary (in the
 /// engine, before dispatch) from per-model policies keyed by the FINAL
@@ -4356,6 +4363,7 @@ pub struct BackendChatRequest {
     /// Request-local provider/route authorization. Unrestricted unless inference
     /// auth is enforced. Rebuilds must clone this exact immutable scope.
     pub authorization: AuthorizationScope,
+    pub affinity: Option<RequestAffinity>,
     /// The ingress surface whose policy is being enforced.
     pub endpoint: InferenceEndpoint,
     /// Routing writes the selected route here so nested failover/leaf checks can
@@ -4392,6 +4400,7 @@ impl BackendChatRequest {
             persistence_capture: None,
             capture_payloads: true,
             authorization: AuthorizationScope::unrestricted(),
+            affinity: None,
             endpoint: InferenceEndpoint::Responses,
             authorization_route: None,
             authorization_provider: None,
@@ -4405,6 +4414,11 @@ impl BackendChatRequest {
     ) -> Self {
         self.authorization = authorization;
         self.endpoint = endpoint;
+        self
+    }
+
+    pub fn with_affinity(mut self, affinity: Option<RequestAffinity>) -> Self {
+        self.affinity = affinity;
         self
     }
 
@@ -7372,8 +7386,9 @@ mod tests {
         // `request_for_provider` is the failover production rebuild. It must carry
         // `response_id` forward AND clone the SAME `Arc<ServingToken>` (so a tag set
         // on the rebuilt request is visible on the original — they share the token).
-        let backend =
-            d2_backend_with_identity("glm-x", "resp_failover").with_payload_capture(false);
+        let backend = d2_backend_with_identity("glm-x", "resp_failover")
+            .with_payload_capture(false)
+            .with_affinity(Some(super::RequestAffinity("opaque-session".to_owned())));
         let provider = FailoverUpstreamProvider::new(
             "p0",
             d2_leaf_client(),
@@ -7384,6 +7399,7 @@ mod tests {
         let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
         assert_eq!(rebuilt.response_id.as_deref(), Some("resp_failover"));
         assert!(!rebuilt.capture_payloads);
+        assert_eq!(rebuilt.affinity, backend.affinity);
         let orig = backend.serving.as_ref().expect("original token");
         let reb = rebuilt.serving.as_ref().expect("rebuilt token");
         assert!(
@@ -7400,8 +7416,9 @@ mod tests {
     fn routing_rebuild_preserves_response_id_and_shares_serving_arc() {
         // `routed_request` is the routing production rebuild. Same contract.
         let routing = super::RoutingUpstreamClient::new(Vec::new());
-        let backend =
-            d2_backend_with_identity("requested", "resp_routing").with_payload_capture(false);
+        let backend = d2_backend_with_identity("requested", "resp_routing")
+            .with_payload_capture(false)
+            .with_affinity(Some(super::RequestAffinity("opaque-session".to_owned())));
         let rebuilt = routing.routed_request(
             &backend,
             "served-model",
@@ -7410,6 +7427,7 @@ mod tests {
         );
         assert_eq!(rebuilt.response_id.as_deref(), Some("resp_routing"));
         assert!(!rebuilt.capture_payloads);
+        assert_eq!(rebuilt.affinity, backend.affinity);
         assert_eq!(rebuilt.request.model, "served-model");
         let orig = backend.serving.as_ref().expect("original token");
         let reb = rebuilt.serving.as_ref().expect("rebuilt token");

@@ -376,7 +376,8 @@ pub fn build_app_with_gateway_control_plane_runtime(
                     flatten_content,
                     max_sse_frame_bytes,
                     flow_store.clone(),
-                ),
+                )
+                .with_capacity_wait_timeout(config.request_timeout),
                 None,
                 serde_json::Map::new(),
                 Vec::new(),

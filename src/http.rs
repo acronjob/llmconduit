@@ -17,6 +17,7 @@ use crate::dashboard_api::dashboard_providers;
 use crate::dashboard_api::dashboard_snapshot;
 use crate::dashboard_api::dashboard_topology;
 use crate::dashboard_api::delete_configured_provider;
+use crate::dashboard_api::update_configured_provider;
 use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationDenied;
@@ -49,6 +50,7 @@ use crate::persistent_history_api::history_usage;
 use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
 use crate::upstream::BackendChatRequest;
+use crate::upstream::RequestAffinity;
 use crate::upstream::collect_models_response;
 use axum::Extension;
 use axum::Json;
@@ -236,7 +238,7 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
         )
         .route(
             "/dashboard/api/configured-providers/{id}",
-            delete(delete_configured_provider),
+            delete(delete_configured_provider).patch(update_configured_provider),
         )
         .route(
             "/dashboard/api/mesh/join-keys",
@@ -1510,9 +1512,22 @@ async fn log_api_call(
         let client_source = attribution
             .source
             .map(crate::flow_persistence::client_source_name);
-        let virtual_key_id = client_identity
+        let virtual_key_id = auth_context
             .as_ref()
-            .map(|identity| identity.key_id.as_str());
+            .map(|context| context.key_id.as_str())
+            .or_else(|| {
+                client_identity
+                    .as_ref()
+                    .map(|identity| identity.key_id.as_str())
+            });
+        let user_id = auth_context
+            .as_ref()
+            .map(|context| context.principal_id.as_str())
+            .or_else(|| {
+                client_identity
+                    .as_ref()
+                    .and_then(|identity| identity.owner_id.as_deref())
+            });
         let now_ms = epoch_millis();
         // Session-tree linkage: warm the in-memory index from durable rows
         // for a session we have not seen since startup, then link.
@@ -1525,19 +1540,15 @@ async fn log_api_call(
                         .iter()
                         .map(crate::sessions::ItemFingerprint::from)
                         .collect::<Vec<_>>();
-                    Some(
-                        gateway.session_linker().link(crate::sessions::LinkInput {
-                            api_call_id: &api_call_id,
-                            identity,
-                            client_label: attribution.label.as_deref(),
-                            virtual_key_id,
-                            user_id: client_identity
-                                .as_ref()
-                                .and_then(|identity| identity.owner_id.as_deref()),
-                            items: &items,
-                            now_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
-                        }),
-                    )
+                    Some(gateway.session_linker().link(crate::sessions::LinkInput {
+                        api_call_id: &api_call_id,
+                        identity,
+                        client_label: attribution.label.as_deref(),
+                        virtual_key_id,
+                        user_id,
+                        items: &items,
+                        now_ms: i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    }))
                 }
                 _ => None,
             },
@@ -1588,9 +1599,7 @@ async fn log_api_call(
                 link: link.as_ref(),
                 client_label: attribution.label.as_deref(),
                 client_source,
-                user_id: client_identity
-                    .as_ref()
-                    .and_then(|identity| identity.owner_id.as_deref()),
+                user_id,
             },
         );
         let _ = queue.try_begin(row);
@@ -1635,6 +1644,22 @@ async fn log_api_call(
     } else {
         None
     };
+    // Scheduling identity must work with observability disabled. Never retain
+    // the raw credential or depend on persistence having linked a session.
+    if instrument && body_is_json {
+        let namespace =
+            affinity_namespace(&headers, auth_context.as_ref(), client_identity.as_ref());
+        if let Some(affinity) = detect_request_affinity(
+            Arc::clone(gateway.harness_detector()),
+            headers.clone(),
+            body_bytes.clone(),
+            namespace,
+        )
+        .await
+        {
+            parts.extensions.insert(affinity);
+        }
+    }
     if let Some(identity) = client_identity {
         parts.extensions.insert(identity);
     }
@@ -2149,6 +2174,98 @@ async fn warm_session_index(
             tracing::warn!(harness = %identity.harness, "session warm-up timed out; linking cold");
         }
     }
+}
+
+fn affinity_namespace(
+    headers: &HeaderMap,
+    auth: Option<&crate::authz::AuthContext>,
+    client: Option<&ClientIdentity>,
+) -> String {
+    if let Some(auth) = auth {
+        return format!("auth:{}:{}", auth.principal_id, auth.key_id);
+    }
+    if let Some(client) = client {
+        return format!("client:{}", client.key_id);
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty());
+    let key = bearer.or_else(|| {
+        headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    key.map(|key| format!("credential:{:x}", Sha256::digest(key.as_bytes())))
+        .unwrap_or_else(|| "anonymous".to_owned())
+}
+
+fn affinity_from_value(
+    detector: &crate::harness::HarnessDetector,
+    mut headers: HeaderMap,
+    mut body: Value,
+    namespace: &str,
+) -> Option<RequestAffinity> {
+    // Explicit thread metadata is more specific than a per-turn request id.
+    // Keep the configured harness fallback when no thread metadata is present.
+    if body.get("type").and_then(Value::as_str) == Some("response.create")
+        && let Some(response) = body.get_mut("response")
+        && response.is_object()
+    {
+        body = response.take();
+    }
+    if body
+        .pointer("/client_metadata/thread_id")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        headers.remove("x-client-request-id");
+    }
+    // The generic `user` field identifies a caller, rather than a conversation.
+    if let Some(object) = body.as_object_mut() {
+        object.remove("user");
+    }
+    let identity = detector.detect(&headers, Some(&body));
+    let session = identity
+        .session_id
+        .as_deref()
+        .or_else(|| body.get("prompt_cache_key").and_then(Value::as_str))?
+        .trim();
+    if session.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    for value in [
+        namespace,
+        identity.harness.as_str(),
+        session,
+        identity.sub_session_id.as_deref().unwrap_or_default(),
+    ] {
+        let bytes = value.as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    Some(RequestAffinity(format!("{:x}", digest.finalize())))
+}
+
+async fn detect_request_affinity(
+    detector: Arc<crate::harness::HarnessDetector>,
+    headers: HeaderMap,
+    body: Bytes,
+    namespace: String,
+) -> Option<RequestAffinity> {
+    tokio::task::spawn_blocking(move || {
+        let body = serde_json::from_slice(&body).ok()?;
+        affinity_from_value(&detector, headers, body, &namespace)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The inbound capture handed from the middleware to the persistence seam.
@@ -2720,6 +2837,7 @@ async fn post_responses(
     auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
+    affinity: Option<Extension<RequestAffinity>>,
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
@@ -2741,6 +2859,7 @@ async fn post_responses(
             authorization,
             crate::upstream::InferenceEndpoint::Responses,
             auth,
+            affinity.map(|value| value.0),
         )
         .await?;
     let response = if wants_stream {
@@ -2788,6 +2907,8 @@ async fn post_responses(
 async fn get_responses(
     State(gateway): State<Arc<Gateway>>,
     auth: Option<Extension<crate::authz::AuthContext>>,
+    client: Option<Extension<ClientIdentity>>,
+    headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     match upgrade {
@@ -2795,7 +2916,13 @@ async fn get_responses(
             .max_frame_size(gateway.config().max_request_body_bytes)
             .max_message_size(gateway.config().max_request_body_bytes)
             .on_upgrade(move |socket| {
-                responses_ws_serve(socket, gateway, auth.map(|value| value.0))
+                responses_ws_serve(
+                    socket,
+                    gateway,
+                    auth.map(|value| value.0),
+                    client.map(|value| value.0),
+                    headers,
+                )
             })
             .into_response(),
         Err(_) => {
@@ -2820,6 +2947,8 @@ async fn responses_ws_serve(
     socket: WebSocket,
     gateway: Arc<Gateway>,
     auth: Option<crate::authz::AuthContext>,
+    client: Option<ClientIdentity>,
+    headers: HeaderMap,
 ) {
     let max_request_body_bytes = gateway.config().max_request_body_bytes;
     // `split` so the inbound `recv` and outbound `send` can be raced in the same
@@ -2923,15 +3052,26 @@ async fn responses_ws_serve(
         }
     };
 
+    let namespace = affinity_namespace(&headers, auth.as_ref(), client.as_ref());
+    let affinity = detect_request_affinity(
+        Arc::clone(gateway.harness_detector()),
+        headers,
+        request_bytes,
+        namespace,
+    )
+    .await;
+
     // 3. Run the turn through the SAME engine path as the HTTP POST.
     let event_stream = match gateway
         .clone()
-        .stream_responses_authorized_with_context(
+        .stream_responses_with_capture_authorized_context(
             request,
+            None,
             None,
             authorization,
             crate::upstream::InferenceEndpoint::Responses,
             auth,
+            affinity,
         )
         .await
     {
@@ -3073,6 +3213,7 @@ async fn post_messages(
     auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
+    affinity: Option<Extension<RequestAffinity>>,
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
     let api_call_id = api_call_id.map(|extension| extension.0.0);
@@ -3082,6 +3223,7 @@ async fn post_messages(
         api_call_id,
         persistence.map(|extension| extension.0),
         auth.map(|value| value.0),
+        affinity.map(|value| value.0),
     )
     .await
     {
@@ -3235,6 +3377,7 @@ async fn post_chat_completions(
     auth: Option<Extension<crate::authz::AuthContext>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     persistence: Option<axum::Extension<Arc<crate::flow_persistence::PersistenceCapture>>>,
+    affinity: Option<Extension<RequestAffinity>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     handle_chat_completions(
@@ -3243,6 +3386,7 @@ async fn post_chat_completions(
         api_call_id.map(|extension| extension.0.0),
         persistence.map(|extension| extension.0),
         request,
+        affinity.map(|value| value.0),
     )
     .await
 }
@@ -3280,12 +3424,26 @@ async fn dashboard_chat_completions(
             "the account is not authorized for the requested model",
         ));
     }
+    let namespace = session
+        .user
+        .as_ref()
+        .map(|user| format!("dashboard-user:{}", user.id))
+        .unwrap_or_else(|| affinity_namespace(&headers, access.auth_context(), None));
+    let body = Value::Object(
+        request
+            .extra_body
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let affinity = affinity_from_value(gateway.harness_detector(), headers, body, &namespace);
     handle_chat_completions(
         gateway,
         access.auth_context().cloned(),
         api_call_id.map(|extension| extension.0.0),
         persistence.map(|extension| extension.0),
         request,
+        affinity,
     )
     .await
 }
@@ -3387,6 +3545,7 @@ async fn handle_chat_completions(
     api_call_id: Option<String>,
     persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
     request: ChatCompletionRequest,
+    affinity: Option<RequestAffinity>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
@@ -3411,6 +3570,7 @@ async fn handle_chat_completions(
             authorization,
             crate::upstream::InferenceEndpoint::ChatCompletions,
             auth,
+            affinity,
         )
         .await?;
 
@@ -3497,6 +3657,7 @@ async fn handle_post_messages(
     api_call_id: Option<String>,
     persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
     auth: Option<crate::authz::AuthContext>,
+    affinity: Option<RequestAffinity>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
@@ -3521,6 +3682,7 @@ async fn handle_post_messages(
             authorization,
             crate::upstream::InferenceEndpoint::Messages,
             auth,
+            affinity,
         )
         .await?;
 
@@ -4607,6 +4769,41 @@ fn model_id_from_value(model: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn affinity_uses_conversations_and_threads_not_per_turn_request_ids() {
+        let detector = crate::harness::HarnessDetector::builtin();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("originator", "codex_cli_rs".parse().unwrap());
+        headers.insert("session-id", "root-session".parse().unwrap());
+        headers.insert("x-client-request-id", "request-1".parse().unwrap());
+        let body = serde_json::json!({"client_metadata":{"thread_id":"thread-a"}});
+        let first =
+            super::affinity_from_value(&detector, headers.clone(), body.clone(), "caller-a");
+        headers.insert("x-client-request-id", "request-2".parse().unwrap());
+        assert_eq!(
+            first,
+            super::affinity_from_value(&detector, headers.clone(), body, "caller-a")
+        );
+        assert_ne!(
+            first,
+            super::affinity_from_value(
+                &detector,
+                headers,
+                serde_json::json!({"client_metadata":{"thread_id":"thread-b"}}),
+                "caller-a"
+            )
+        );
+        assert_eq!(
+            None,
+            super::affinity_from_value(
+                &detector,
+                axum::http::HeaderMap::new(),
+                serde_json::json!({"user":"user-a"}),
+                "caller-a"
+            )
+        );
+    }
+
     use super::body_log_fields;
     use super::responses_wire_event_data;
     use super::should_proxy_response_header;

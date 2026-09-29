@@ -1063,6 +1063,9 @@ export interface ConfiguredProvider {
   name: string;
   base_url: string;
   api_key_present: boolean;
+  auto_discover: boolean;
+  allowed_models?: string[] | null;
+  disabled_models: string[];
   models: ProviderInventoryModel[];
 }
 
@@ -1076,22 +1079,42 @@ export interface CreateConfiguredProviderRequest {
   api_key: string;
 }
 
+export interface UpdateConfiguredProviderRequest {
+  auto_discover?: boolean;
+  allowed_models?: string[] | null;
+  disabled_models?: string[];
+}
+
 export interface FleetModel {
   id: string;
   description?: string;
   image: string;
   gpu_count?: number;
+  max_instances?: number;
+}
+
+export interface FleetInstanceStatus {
+  instance_id?: string;
+  index: number;
+  port?: number;
+  phase: string;
+  container_status?: string;
+  assigned_gpus?: number[];
+  last_error?: string;
 }
 
 export interface FleetDeploymentStatus {
   model_id: string;
   phase: string;
   desired_state: string;
+  desired_instances?: number;
+  ready_instances?: number;
   container_status?: string;
   health?: string;
   exit_code?: number;
   oom_killed?: boolean;
   assigned_gpus: number[];
+  instances?: FleetInstanceStatus[];
   last_error?: string;
   last_checked?: string;
 }
@@ -1153,7 +1176,13 @@ export interface MeshSwitchableModel {
   phase: string;
   desired_state: string;
   gpu_count?: number;
+  max_instances?: number;
+  desired_instances?: number;
+  ready_instances?: number;
   assigned_gpus?: number[];
+  instances?: FleetInstanceStatus[];
+  container_status?: string;
+  last_error?: string;
 }
 
 export interface MeshDisabledModel {
@@ -1698,7 +1727,9 @@ function isProviderCacheMetrics(v: unknown): v is ProviderCacheMetrics {
 export const isProvidersResponse = (v: unknown): v is ProvidersResponse => isArrayEnvelope(v, 'providers', isProviderInventoryEntry);
 function isConfiguredProvider(v: unknown): v is ConfiguredProvider {
   return isObj(v) && isStr(v.id) && isStr(v.name) && isStr(v.base_url)
-    && typeof v.api_key_present === 'boolean'
+    && typeof v.api_key_present === 'boolean' && typeof v.auto_discover === 'boolean'
+    && (v.allowed_models === undefined || v.allowed_models === null || isStringArray(v.allowed_models))
+    && isStringArray(v.disabled_models)
     && Array.isArray(v.models) && v.models.every(isProviderInventoryModel);
 }
 export const isConfiguredProvidersResponse = (v: unknown): v is ConfiguredProvidersResponse =>
@@ -1709,14 +1740,25 @@ export const isProviderMetricsResponse = (v: unknown): v is ProviderMetricsRespo
 
 function isFleetModel(v: unknown): v is FleetModel {
   return isObj(v) && isStr(v.id) && isOptStr(v.description) && isStr(v.image)
-    && (v.gpu_count === undefined || isUint(v.gpu_count));
+    && (v.gpu_count === undefined || isUint(v.gpu_count))
+    && (v.max_instances === undefined || isUint(v.max_instances));
+}
+
+function isFleetInstanceStatus(v: unknown): v is FleetInstanceStatus {
+  return isObj(v) && isOptStr(v.instance_id) && isUint(v.index) && isOptUint(v.port)
+    && isStr(v.phase) && isOptStr(v.container_status)
+    && (v.assigned_gpus === undefined || (Array.isArray(v.assigned_gpus) && v.assigned_gpus.every(isUint)))
+    && isOptStr(v.last_error);
 }
 
 function isFleetDeploymentStatus(v: unknown): v is FleetDeploymentStatus {
   return isObj(v) && isStr(v.model_id) && isStr(v.phase) && isStr(v.desired_state)
+    && (v.desired_instances === undefined || isUint(v.desired_instances))
+    && (v.ready_instances === undefined || isUint(v.ready_instances))
     && isOptStr(v.container_status) && isOptStr(v.health) && isOptNum(v.exit_code)
     && (v.oom_killed === undefined || typeof v.oom_killed === 'boolean')
     && Array.isArray(v.assigned_gpus) && v.assigned_gpus.every(isUint)
+    && (v.instances === undefined || (Array.isArray(v.instances) && v.instances.every(isFleetInstanceStatus)))
     && isOptStr(v.last_error) && isOptStr(v.last_checked);
 }
 
@@ -1752,7 +1794,12 @@ function isMeshModelSwitching(v: unknown): v is MeshModelSwitching {
     && Array.isArray(v.models) && v.models.every((model) => isObj(model) && isStr(model.id)
       && isOptStr(model.description) && isStr(model.phase) && isStr(model.desired_state)
       && (model.gpu_count === undefined || isUint(model.gpu_count))
-      && (model.assigned_gpus === undefined || (Array.isArray(model.assigned_gpus) && model.assigned_gpus.every(isUint))));
+      && (model.max_instances === undefined || isUint(model.max_instances))
+      && (model.desired_instances === undefined || isUint(model.desired_instances))
+      && (model.ready_instances === undefined || isUint(model.ready_instances))
+      && (model.assigned_gpus === undefined || (Array.isArray(model.assigned_gpus) && model.assigned_gpus.every(isUint)))
+      && (model.instances === undefined || (Array.isArray(model.instances) && model.instances.every(isFleetInstanceStatus)))
+      && isOptStr(model.container_status) && isOptStr(model.last_error));
 }
 
 function isMeshDisabledModel(v: unknown): v is MeshDisabledModel {
