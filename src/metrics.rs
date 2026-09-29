@@ -1222,10 +1222,12 @@ impl std::fmt::Debug for MetricsLayer {
 impl MetricsLayer {
     /// Enabled layer (debug UI on). Uses the default 400 MiB snapshot-ring quota.
     pub fn new() -> Self {
-        Self {
-            enabled: true,
-            state: Arc::new(Mutex::new(MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES))),
-        }
+        let quota = std::env::var("LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|quota| *quota > 0)
+            .unwrap_or(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+        Self::with_snapshot_quota(quota)
     }
 
     /// No-op layer (debug UI off). Every method early-returns and takes NO lock, so
@@ -1238,9 +1240,7 @@ impl MetricsLayer {
         }
     }
 
-    /// Test-only constructor with an explicit snapshot-ring byte quota, so the
-    /// memory-quota test can drive eviction without allocating 400 MiB.
-    #[cfg(test)]
+    /// Explicit quota also lets tests drive eviction without allocating 400 MiB.
     fn with_snapshot_quota(quota_bytes: usize) -> Self {
         Self {
             enabled: true,

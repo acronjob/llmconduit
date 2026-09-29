@@ -32,6 +32,8 @@ pub type StoreResult<T> = Result<T, String>;
 /// Shared wire/storage form used by `client_auth`: SHA-256 is appropriate for
 /// high-entropy generated API keys and lets authentication remain deterministic.
 const API_KEY_HASH_PREFIX: &str = "sha256:";
+const DEFAULT_PERSISTENCE_QUEUE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const PERSISTENCE_QUEUE_MAX_BYTES_ENV: &str = "LLMCONDUIT_PERSISTENCE_QUEUE_MAX_BYTES";
 
 /// Lifecycle row created at the HTTP ingress seam. `id` is the stable
 /// `api_call_id`; the response id and actual winning backend are unknown here.
@@ -2997,6 +2999,197 @@ enum WriteCommand {
     Flush(oneshot::Sender<()>),
 }
 
+impl WriteCommand {
+    fn estimated_bytes(&self) -> u64 {
+        match self {
+            Self::Begin(row) => request_row_bytes(row),
+            Self::Event(event) => event_row_bytes(event),
+            Self::Body(body) => body_write_bytes(body),
+            Self::Session(row) => session_row_bytes(row),
+            Self::Finish { request_id, finish } => {
+                string_bytes(request_id) + request_finish_bytes(finish)
+            }
+            Self::Flush(_) => 0,
+        }
+    }
+}
+
+struct QueuedCommand {
+    command: WriteCommand,
+    _reservation: BudgetReservation,
+}
+
+#[derive(Debug)]
+struct QueueBudget {
+    max_bytes: u64,
+    reserved_bytes: AtomicU64,
+}
+
+impl QueueBudget {
+    fn new(max_bytes: NonZeroU64) -> Self {
+        Self {
+            max_bytes: max_bytes.get(),
+            reserved_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, bytes: u64) -> Result<BudgetReservation, EnqueueError> {
+        if bytes == 0 {
+            return Ok(BudgetReservation {
+                budget: Arc::clone(self),
+                bytes,
+            });
+        }
+        if bytes > self.max_bytes {
+            return Err(EnqueueError::Full);
+        }
+        let mut current = self.reserved_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return Err(EnqueueError::Full);
+            };
+            if next > self.max_bytes {
+                return Err(EnqueueError::Full);
+            }
+            match self.reserved_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(BudgetReservation {
+                        budget: Arc::clone(self),
+                        bytes,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BudgetReservation {
+    budget: Arc<QueueBudget>,
+    bytes: u64,
+}
+
+impl Drop for BudgetReservation {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.budget
+                .reserved_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+fn string_bytes(value: &String) -> u64 {
+    value.capacity() as u64
+}
+
+fn optional_string_bytes(value: &Option<String>) -> u64 {
+    value.as_ref().map_or(0, string_bytes)
+}
+
+fn request_row_bytes(row: &RequestRow) -> u64 {
+    std::mem::size_of::<RequestRow>() as u64
+        + string_bytes(&row.id)
+        + optional_string_bytes(&row.response_id)
+        + optional_string_bytes(&row.conversation_id)
+        + optional_string_bytes(&row.virtual_key_id)
+        + string_bytes(&row.client_protocol)
+        + string_bytes(&row.client_model)
+        + optional_string_bytes(&row.alias)
+        + optional_string_bytes(&row.backend)
+        + optional_string_bytes(&row.resolved_model)
+        + string_bytes(&row.status)
+        + optional_string_bytes(&row.harness)
+        + optional_string_bytes(&row.harness_version)
+        + optional_string_bytes(&row.harness_session_id)
+        + optional_string_bytes(&row.harness_sub_session_id)
+        + optional_string_bytes(&row.harness_parent_session_id)
+        + optional_string_bytes(&row.session_kind)
+        + optional_string_bytes(&row.session_id)
+        + optional_string_bytes(&row.chain_parent_request_id)
+        + optional_string_bytes(&row.divergence_kind)
+        + optional_string_bytes(&row.client_label)
+        + optional_string_bytes(&row.client_source)
+        + optional_string_bytes(&row.user_id)
+}
+
+fn event_row_bytes(event: &EventRow) -> u64 {
+    std::mem::size_of::<EventRow>() as u64 + event_row_dynamic_bytes(event)
+}
+
+fn event_row_dynamic_bytes(event: &EventRow) -> u64 {
+    string_bytes(&event.request_id)
+        + string_bytes(&event.hop)
+        + string_bytes(&event.kind)
+        + optional_string_bytes(&event.payload)
+}
+
+fn blob_row_dynamic_bytes(row: &BlobRow) -> u64 {
+    string_bytes(&row.hash) + string_bytes(&row.media) + string_bytes(&row.content)
+}
+
+fn item_row_dynamic_bytes(row: &ItemRow) -> u64 {
+    string_bytes(&row.request_id)
+        + string_bytes(&row.hop)
+        + string_bytes(&row.section)
+        + optional_string_bytes(&row.kind)
+        + string_bytes(&row.blob_hash)
+        + optional_string_bytes(&row.identity_hash)
+}
+
+fn body_write_bytes(body: &BodyWrite) -> u64 {
+    std::mem::size_of::<BodyWrite>() as u64
+        + event_row_dynamic_bytes(&body.event)
+        + (body.items.capacity() * std::mem::size_of::<ItemRow>()) as u64
+        + body.items.iter().map(item_row_dynamic_bytes).sum::<u64>()
+        + (body.blobs.capacity() * std::mem::size_of::<BlobRow>()) as u64
+        + body.blobs.iter().map(blob_row_dynamic_bytes).sum::<u64>()
+}
+
+fn request_finish_bytes(finish: &RequestFinish) -> u64 {
+    std::mem::size_of::<RequestFinish>() as u64
+        + optional_string_bytes(&finish.response_id)
+        + string_bytes(&finish.status)
+        + optional_string_bytes(&finish.error)
+        + optional_string_bytes(&finish.terminal_reason)
+        + optional_string_bytes(&finish.backend)
+        + optional_string_bytes(&finish.resolved_model)
+        + optional_string_bytes(&finish.attempts_json)
+        + optional_string_bytes(&finish.timings_json)
+        + optional_string_bytes(&finish.client_label)
+        + optional_string_bytes(&finish.client_source)
+}
+
+fn session_row_bytes(row: &crate::sessions::SessionRow) -> u64 {
+    std::mem::size_of::<crate::sessions::SessionRow>() as u64
+        + string_bytes(&row.id)
+        + optional_string_bytes(&row.parent_id)
+        + string_bytes(&row.kind)
+        + string_bytes(&row.harness)
+        + optional_string_bytes(&row.harness_version)
+        + optional_string_bytes(&row.external_id)
+        + optional_string_bytes(&row.session_kind)
+        + optional_string_bytes(&row.client_label)
+        + optional_string_bytes(&row.virtual_key_id)
+        + optional_string_bytes(&row.user_id)
+        + optional_string_bytes(&row.root_request_id)
+        + optional_string_bytes(&row.spawned_by_request_id)
+}
+
+fn persistence_queue_max_bytes_from_env() -> NonZeroU64 {
+    let parsed = std::env::var(PERSISTENCE_QUEUE_MAX_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(NonZeroU64::new);
+    parsed.unwrap_or_else(|| NonZeroU64::new(DEFAULT_PERSISTENCE_QUEUE_MAX_BYTES).unwrap())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueError {
     Full,
@@ -3020,6 +3213,8 @@ pub struct PersistenceQueueStats {
     pub dropped_full: u64,
     pub dropped_closed: u64,
     pub write_failures: u64,
+    pub reserved_bytes: u64,
+    pub max_bytes: u64,
 }
 
 #[derive(Default)]
@@ -3035,20 +3230,34 @@ struct QueueCounters {
 /// backpressure to an SSE/body stream.
 #[derive(Clone)]
 pub struct PersistenceQueue {
-    sender: mpsc::Sender<WriteCommand>,
+    sender: mpsc::Sender<QueuedCommand>,
     counters: Arc<QueueCounters>,
+    budget: Arc<QueueBudget>,
 }
 
 impl PersistenceQueue {
     pub fn spawn(store: Arc<dyn PersistenceWriter>, capacity: NonZeroUsize) -> Self {
+        Self::spawn_with_max_bytes(store, capacity, persistence_queue_max_bytes_from_env())
+    }
+
+    pub(crate) fn spawn_with_max_bytes(
+        store: Arc<dyn PersistenceWriter>,
+        capacity: NonZeroUsize,
+        max_bytes: NonZeroU64,
+    ) -> Self {
         let (sender, mut receiver) = mpsc::channel(capacity.get());
         let counters = Arc::new(QueueCounters::default());
+        let budget = Arc::new(QueueBudget::new(max_bytes));
         let worker_counters = Arc::clone(&counters);
         tokio::spawn(async move {
             const FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(30);
             let mut last_failure_warning: Option<std::time::Instant> = None;
             let mut suppressed_failures = 0_u64;
-            while let Some(command) = receiver.recv().await {
+            while let Some(queued) = receiver.recv().await {
+                let QueuedCommand {
+                    command,
+                    _reservation,
+                } = queued;
                 let result = match command {
                     WriteCommand::Begin(row) => store.begin_request(*row).await,
                     WriteCommand::Event(event) => store.append_event(event).await,
@@ -3088,7 +3297,11 @@ impl PersistenceQueue {
                 );
             }
         });
-        Self { sender, counters }
+        Self {
+            sender,
+            counters,
+            budget,
+        }
     }
 
     pub fn try_begin(&self, row: RequestRow) -> Result<(), EnqueueError> {
@@ -3119,7 +3332,18 @@ impl PersistenceQueue {
     }
 
     fn try_enqueue(&self, command: WriteCommand) -> Result<(), EnqueueError> {
-        match self.sender.try_send(command) {
+        let reservation = match self.budget.reserve(command.estimated_bytes()) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.counters.dropped_full.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        let queued = QueuedCommand {
+            command,
+            _reservation: reservation,
+        };
+        match self.sender.try_send(queued) {
             Ok(()) => {
                 self.counters.accepted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -3139,8 +3363,15 @@ impl PersistenceQueue {
     /// This is a shutdown/test seam and must not be used on a streaming path.
     pub async fn flush(&self) -> StoreResult<()> {
         let (done_tx, done_rx) = oneshot::channel();
+        let reservation = self
+            .budget
+            .reserve(0)
+            .map_err(|_| "persistence queue memory budget is exhausted".to_string())?;
         self.sender
-            .send(WriteCommand::Flush(done_tx))
+            .send(QueuedCommand {
+                command: WriteCommand::Flush(done_tx),
+                _reservation: reservation,
+            })
             .await
             .map_err(|_| "persistence queue is closed".to_string())?;
         done_rx
@@ -3154,6 +3385,8 @@ impl PersistenceQueue {
             dropped_full: self.counters.dropped_full.load(Ordering::Relaxed),
             dropped_closed: self.counters.dropped_closed.load(Ordering::Relaxed),
             write_failures: self.counters.write_failures.load(Ordering::Relaxed),
+            reserved_bytes: self.budget.reserved_bytes.load(Ordering::Relaxed),
+            max_bytes: self.budget.max_bytes,
         }
     }
 }
@@ -3199,6 +3432,18 @@ mod tests {
             client_label: Some("key-abcd".to_string()),
             client_source: Some("key_hash".to_string()),
             ..RequestFinish::default()
+        }
+    }
+
+    fn event_with_payload(request_id: &str, payload_len: usize) -> EventRow {
+        EventRow {
+            request_id: request_id.to_string(),
+            seq: 1,
+            ts_ms: 1,
+            hop: "client_in".to_string(),
+            kind: "body".to_string(),
+            payload: Some("x".repeat(payload_len)),
+            bytes: Some(payload_len as i64),
         }
     }
 
@@ -5005,9 +5250,10 @@ mod tests {
     #[tokio::test]
     async fn bounded_queue_reports_overflow_without_waiting() {
         let writer = Arc::new(BlockingWriter::default());
-        let queue = PersistenceQueue::spawn(
+        let queue = PersistenceQueue::spawn_with_max_bytes(
             Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
             NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(64 * 1024).unwrap(),
         );
         queue.try_begin(request("one")).expect("first accepted");
         writer.entered.notified().await;
@@ -5032,5 +5278,143 @@ mod tests {
         writer.release.notify_waiters();
         queue.flush().await.expect("flush");
         assert_eq!(*writer.writes.lock().unwrap(), vec!["begin", "event"]);
+    }
+
+    #[tokio::test]
+    async fn persistence_queue_rejects_oversized_command_by_byte_budget() {
+        let writer = Arc::new(BlockingWriter::default());
+        let queue = PersistenceQueue::spawn_with_max_bytes(
+            Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+            NonZeroUsize::new(8).unwrap(),
+            NonZeroU64::new(512).unwrap(),
+        );
+
+        assert_eq!(
+            queue.try_event(event_with_payload("one", 2048)),
+            Err(EnqueueError::Full)
+        );
+        assert_eq!(queue.stats().accepted, 0);
+        assert_eq!(queue.stats().dropped_full, 1);
+        assert_eq!(queue.stats().reserved_bytes, 0);
+        assert_eq!(queue.stats().max_bytes, 512);
+    }
+
+    #[tokio::test]
+    async fn persistence_queue_byte_budget_rejects_even_with_queue_space() {
+        let writer = Arc::new(BlockingWriter::default());
+        let queue = PersistenceQueue::spawn_with_max_bytes(
+            Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+            NonZeroUsize::new(8).unwrap(),
+            NonZeroU64::new(4096).unwrap(),
+        );
+        let mut large_request = request("one");
+        large_request.id = "one".repeat(1000);
+
+        queue
+            .try_begin(large_request)
+            .expect("first request accepted");
+        writer.entered.notified().await;
+        assert_eq!(
+            queue.try_event(event_with_payload("two", 1000)),
+            Err(EnqueueError::Full)
+        );
+        assert_eq!(queue.stats().accepted, 1);
+        assert_eq!(queue.stats().dropped_full, 1);
+        assert!(queue.stats().reserved_bytes > 0);
+
+        writer.release.notify_waiters();
+        queue.flush().await.expect("flush");
+        assert_eq!(queue.stats().reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn persistence_queue_releases_budget_after_completed_write() {
+        let writer = Arc::new(BlockingWriter::default());
+        let queue = PersistenceQueue::spawn_with_max_bytes(
+            Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(64 * 1024).unwrap(),
+        );
+
+        queue.try_begin(request("one")).expect("accepted");
+        writer.entered.notified().await;
+        assert!(queue.stats().reserved_bytes > 0);
+
+        writer.release.notify_waiters();
+        queue.flush().await.expect("flush");
+        assert_eq!(queue.stats().reserved_bytes, 0);
+    }
+
+    #[derive(Default)]
+    struct FailingWriter {
+        writes: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl PersistenceWriter for FailingWriter {
+        async fn begin_request(&self, _row: RequestRow) -> StoreResult<()> {
+            self.writes.lock().unwrap().push("begin");
+            Err("boom".to_string())
+        }
+
+        async fn append_event(&self, _event: EventRow) -> StoreResult<()> {
+            self.writes.lock().unwrap().push("event");
+            Err("boom".to_string())
+        }
+
+        async fn finish_request(&self, _id: &str, _finish: RequestFinish) -> StoreResult<()> {
+            self.writes.lock().unwrap().push("finish");
+            Err("boom".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_queue_releases_budget_after_failed_write() {
+        let writer = Arc::new(FailingWriter::default());
+        let queue = PersistenceQueue::spawn_with_max_bytes(
+            Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(64 * 1024).unwrap(),
+        );
+
+        queue
+            .try_event(event_with_payload("one", 4096))
+            .expect("accepted");
+        assert!(queue.stats().reserved_bytes > 0);
+
+        queue.flush().await.expect("flush");
+        assert_eq!(queue.stats().write_failures, 1);
+        assert_eq!(queue.stats().reserved_bytes, 0);
+        assert_eq!(*writer.writes.lock().unwrap(), vec!["event"]);
+    }
+
+    #[tokio::test]
+    async fn persistence_queue_count_limit_rejected_enqueue_releases_budget() {
+        let writer = Arc::new(BlockingWriter::default());
+        let queue = PersistenceQueue::spawn_with_max_bytes(
+            Arc::clone(&writer) as Arc<dyn PersistenceWriter>,
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(64 * 1024).unwrap(),
+        );
+        queue.try_begin(request("one")).expect("first accepted");
+        writer.entered.notified().await;
+        queue
+            .try_event(event_with_payload("one", 2048))
+            .expect("queued event accepted");
+        let reserved_before_rejected_enqueue = queue.stats().reserved_bytes;
+
+        assert_eq!(
+            queue.try_finish("one".to_string(), finish()),
+            Err(EnqueueError::Full)
+        );
+        assert_eq!(
+            queue.stats().reserved_bytes,
+            reserved_before_rejected_enqueue
+        );
+        assert_eq!(queue.stats().dropped_full, 1);
+
+        writer.release.notify_waiters();
+        queue.flush().await.expect("flush");
+        assert_eq!(queue.stats().reserved_bytes, 0);
     }
 }

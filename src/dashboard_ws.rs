@@ -1144,6 +1144,7 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // sends, so the select arm is inert in production).
     let mut sessions_rx = gateway.session_hub().subscribe();
     let snapshot = gateway.debug_snapshot();
+    let snapshot_sequence = snapshot.last_sequence;
 
     // Split the socket so the loop can READ inbound alongside writing (D7b R2 finding
     // 4): without an inbound read, a browser-side close / peer disconnect is invisible
@@ -1227,7 +1228,7 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     let initial = snapshot_message(
         flow_summaries,
         // Flow dedup baseline = the monitor's atomically-captured sequence (finding 1).
-        snapshot.last_sequence,
+        snapshot_sequence,
         metrics,
         topology,
         // monitor baseline 0 — the transcript rides the replay frame below.
@@ -1239,10 +1240,13 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // client dedups them (the snapshot already carries those flows) — only the
     // monitor-domain transcript frame advances the (snapshot-0) monitor cursor.
     let snapshot_update = DebugUpdate {
-        sequence: snapshot.last_sequence,
-        messages: snapshot.messages.clone(),
+        sequence: snapshot_sequence,
+        messages: snapshot.messages,
     };
     let snapshot_frames = frames_for_update(&snapshot_update, &flow_store);
+    // The live connection needs only the replay watermark; retaining transcript
+    // copies here multiplies the history budget for every open dashboard tab.
+    drop(snapshot_update);
     // Send the snapshot FIRST, then the replay frames, racing expiry throughout
     // (finding 1: snapshot strictly precedes every frame).
     match send_initial(&initial, &snapshot_frames, expiry.as_mut(), &mut sink).await {
@@ -1253,6 +1257,8 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
         }
         SendOutcome::Failed => return,
     }
+    drop(snapshot_frames);
+    drop(initial);
 
     let mut metric_ticker = tokio::time::interval(METRIC_TICK_INTERVAL);
     metric_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1290,7 +1296,7 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                     // Dedup at the source against the replayed snapshot: an update
                     // already covered by the snapshot's last_sequence is skipped
                     // (the client would whole-frame-dedup it anyway).
-                    Ok(update) if update.sequence <= snapshot.last_sequence => {}
+                    Ok(update) if update.sequence <= snapshot_sequence => {}
                     Ok(update) => {
                         let frames = frames_for_update(&update, &flow_store);
                         match send_frames(&frames, expiry.as_mut(), &mut sink).await {

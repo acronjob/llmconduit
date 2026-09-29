@@ -23,7 +23,7 @@ const REQUEST_PAYLOAD_PREVIEW_CHAR_LIMIT: usize = 24 * 1024 * 1024;
 /// Global retained-preview budget across all monitor records. Per-request caps
 /// alone still permit hundreds of large inactive requests to dominate snapshot
 /// cloning and WebSocket replay.
-const MONITOR_PAYLOAD_PREVIEW_CHAR_LIMIT: usize = 128 * 1024 * 1024;
+const MONITOR_PAYLOAD_PREVIEW_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum MonitorEventKind {
@@ -298,6 +298,7 @@ pub struct DebugEventImage {
 #[derive(Clone)]
 pub struct MonitorHub {
     enabled: bool,
+    payload_preview_byte_limit: usize,
     tx: broadcast::Sender<DebugUpdate>,
     state: Arc<Mutex<MonitorState>>,
 }
@@ -329,9 +330,19 @@ struct DebugPayloadMetadata {
 
 impl MonitorHub {
     pub fn new(capacity: usize) -> Self {
+        let limit = std::env::var("LLMCONDUIT_MONITOR_PAYLOAD_PREVIEW_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(MONITOR_PAYLOAD_PREVIEW_BYTE_LIMIT);
+        Self::with_payload_preview_budget(capacity, limit)
+    }
+
+    fn with_payload_preview_budget(capacity: usize, payload_preview_byte_limit: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         Self {
             enabled: true,
+            payload_preview_byte_limit,
             tx,
             state: Arc::new(Mutex::new(MonitorState {
                 history_limit: capacity.max(1),
@@ -345,6 +356,7 @@ impl MonitorHub {
         let (tx, _) = broadcast::channel(1);
         Self {
             enabled: false,
+            payload_preview_byte_limit: 0,
             tx,
             state: Arc::new(Mutex::new(MonitorState {
                 history_limit: 1,
@@ -410,7 +422,7 @@ impl MonitorHub {
         );
         let mut messages = state.apply_event(&event);
         if carries_payload {
-            state.trim_total_payload_previews(MONITOR_PAYLOAD_PREVIEW_CHAR_LIMIT);
+            state.trim_total_payload_previews(self.payload_preview_byte_limit);
         }
         messages.extend(state.prune_expired(event.timestamp_ms));
         drop(state);
@@ -929,27 +941,29 @@ impl MonitorState {
     }
 
     fn trim_total_payload_previews(&mut self, limit: usize) {
-        let mut retained_chars: usize = self
+        // Charge allocations in O(event count), rather than scanning every
+        // retained character on the inference runtime for each payload event.
+        let mut retained_bytes: usize = self
             .records
             .iter()
             .flat_map(|record| record.events.iter())
             .filter_map(|event| event.payload_preview.as_ref())
-            .map(|preview| preview.chars().count())
+            .map(|preview| preview.capacity())
             .sum();
-        if retained_chars <= limit {
+        if retained_bytes <= limit {
             return;
         }
 
         for record in self.records.iter_mut().rev() {
             for event in &mut record.events {
-                if retained_chars <= limit {
+                if retained_bytes <= limit {
                     return;
                 }
                 let Some(preview) = event.payload_preview.take() else {
                     continue;
                 };
                 let chars = preview.chars().count();
-                retained_chars = retained_chars.saturating_sub(chars);
+                retained_bytes = retained_bytes.saturating_sub(preview.capacity());
                 event.payload_original_chars.get_or_insert(chars);
                 event.payload_retention_omitted = true;
                 record.request.payload_previews_omitted =
@@ -1978,6 +1992,37 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn configured_preview_budget_charges_allocations_and_preserves_char_metadata() {
+        let hub = MonitorHub::with_payload_preview_budget(8, 16);
+        hub.emit("resp_budget", started("model-a"));
+        let preview = "é".repeat(12);
+        hub.emit(
+            "resp_budget",
+            MonitorEventKind::RequestPayload {
+                payload_preview: preview,
+                payload_truncated: false,
+                payload_original_chars: 12,
+                payload_entry_count: 0,
+                images: Vec::new(),
+            },
+        );
+        let snapshot = hub.snapshot();
+        let event = snapshot
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                DebugWsMessage::EventAppend { event, .. } if event.kind == "request_payload" => {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("payload event remains available without its body");
+        assert!(event.payload_preview.is_none());
+        assert!(event.payload_retention_omitted);
+        assert_eq!(event.payload_original_chars, Some(12));
     }
 
     #[test]

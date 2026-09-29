@@ -178,6 +178,9 @@ async fn debug_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp:
         }
         ReplayOutcome::SendFailed => return,
     }
+    // Replay is complete; the live socket needs only last_sequence, not a
+    // private copy of every retained transcript payload.
+    drop(snapshot);
 
     loop {
         tokio::select! {

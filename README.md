@@ -404,6 +404,9 @@ uses daily gateway-owned files and attempts to remove expired files on the first
 subsequent append each process-day. Request-path writes use non-blocking enqueue:
 saturation drops persistence records instead of delaying inference, and
 accepted/drop/failure counters are logged during graceful shutdown.
+Queued and in-flight commands also share a 64 MiB allocation budget, configurable
+with `LLMCONDUIT_PERSISTENCE_QUEUE_MAX_BYTES`. Exhausting either limit drops the
+write immediately; the byte budget is released after the writer finishes it.
 
 The SQL migration set is compiled into the binary and is applied when a SQLite or
 Postgres store is opened; migration files do not need to be mounted into the
@@ -908,6 +911,14 @@ may be selected with `LLMCONDUIT_DASHBOARD_CLIENT_HEADER` for dashboard
 attribution; values from credential-bearing header names are retained only as a
 one-way short hash, never verbatim.
 
+For small hosts, tune retained dashboard data with
+`LLMCONDUIT_MONITOR_PAYLOAD_PREVIEW_BYTES` (default 128 MiB) and
+`LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES` (default 400 MiB). Both take positive byte
+counts. Exceeding the preview budget omits older bodies while keeping flow
+summaries; exceeding the snapshot budget evicts older time-travel cuts. Completed
+WebSocket replays release their temporary transcript copies before serving live
+updates.
+
 The Providers view can also control a local [lil-fleet](https://github.com/local-inference-lab/lil-fleet)
 instance. Set `LLMCONDUIT_FLEET_URL` to its loopback origin and provide either
 `LLMCONDUIT_FLEET_TOKEN_FILE` (preferred, so the bearer token can remain in a
@@ -976,6 +987,7 @@ LLMCONDUIT_STORAGE_BACKEND
 LLMCONDUIT_DATABASE_URL
 LLMCONDUIT_STORAGE_JSONL_DIR
 LLMCONDUIT_PERSISTENCE_QUEUE_CAPACITY
+LLMCONDUIT_PERSISTENCE_QUEUE_MAX_BYTES
 LLMCONDUIT_PERSISTENCE_RETENTION_DAYS
 LLMCONDUIT_REQUIRE_AUTH
 LLMCONDUIT_CONVERSATION_ID_HEADER
@@ -992,6 +1004,8 @@ LLMCONDUIT_GITHUB_ALLOWED_USERS
 LLMCONDUIT_GITHUB_ADMIN_USERS
 LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE
 LLMCONDUIT_DASHBOARD_CLIENT_HEADER
+LLMCONDUIT_MONITOR_PAYLOAD_PREVIEW_BYTES
+LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES
 LLMCONDUIT_FLEET_URL
 LLMCONDUIT_FLEET_TOKEN_FILE
 LLMCONDUIT_FLEET_TOKEN
