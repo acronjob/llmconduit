@@ -1521,7 +1521,7 @@ pub async fn create_configured_provider(
     }
 }
 
-/// `PATCH /dashboard/api/configured-providers/{id}` — update discovery and filters.
+/// `PATCH /dashboard/api/configured-providers/{id}` — update discovery and model selection.
 #[utoipa::path(
     patch,
     path = "/dashboard/api/configured-providers/{id}",
@@ -1560,7 +1560,7 @@ pub async fn update_configured_provider(
             return dashboard_error(
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "invalid JSON body, expected optional {{auto_discover, disabled_models}}: {rejection}"
+                    "invalid JSON body, expected optional {{auto_discover, allowed_models, disabled_models}}: {rejection}"
                 ),
             );
         }

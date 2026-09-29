@@ -232,22 +232,27 @@ and every five minutes. Discovery is additive: models missing from a later provi
 response remain in the saved catalog, and a failed refresh leaves the catalog intact.
 Existing providers also default to automatic discovery after upgrading.
 
-Admins can turn off automatic discovery for a provider or disable individual models
-in the Providers page. Disabling discovery freezes the saved catalog; it does not
-turn off inference for enabled models. Disabled models remain visible in the admin
-list but are excluded from the public model catalog and that provider's routing.
-Refreshes and gateway restarts preserve these settings.
+Admins can turn off automatic discovery for a provider, allow only selected saved
+models, or disable individual models in the Providers page. Disabling discovery
+freezes the saved catalog; it does not turn off inference for enabled models.
+`allowed_models: null` means all saved models are allowed, `allowed_models: []`
+means none are allowed, and a non-empty list permits only those model ids.
+`disabled_models` wins over the allowlist. Models remain visible in the admin list
+but non-enabled models are excluded from the public model catalog and that
+provider's routing. Refreshes and gateway restarts preserve these settings.
 
 The same controls are available through the authenticated, CSRF-protected
 `PATCH /dashboard/api/configured-providers/{id}` endpoint:
 
 ```json
-{"auto_discover": false, "disabled_models": ["vendor/model-id"]}
+{"auto_discover": false, "allowed_models": ["vendor/model-id"], "disabled_models": []}
 ```
 
-Both fields are optional. `disabled_models` replaces that provider's disabled-model
-list; pass an empty array to enable all saved models again. Disabling a model on one
-provider does not disable another provider that serves the same model.
+All fields are optional. Omit `allowed_models` to leave the current allowlist
+unchanged, pass `null` to allow all saved models, or pass an array to replace the
+allowlist. `disabled_models` replaces that provider's disabled-model list; pass an
+empty array to enable all allowlisted saved models again. Disabling or omitting a
+model on one provider does not disable another provider that serves the same model.
 
 ### Harness and session detection
 
