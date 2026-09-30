@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::fmt;
+use std::{fmt, io};
 
 /// Client protocol labels, shared with `flow_persistence::client_protocol_for_path`.
 pub const PROTOCOL_RESPONSES: &str = "responses";
@@ -229,8 +229,23 @@ pub fn split_body(protocol: &str, raw: &[u8], keep_media: bool) -> Result<SplitB
 /// Split an already-parsed body. See [`split_body`].
 pub fn split_value(
     protocol: &str,
+    value: Value,
+    keep_media: bool,
+) -> Result<SplitBody, SplitError> {
+    split_value_with_retention(protocol, value, keep_media, true)
+}
+
+/// Split an already-parsed body, optionally omitting retained item payloads.
+///
+/// When `retain_payloads` is false, item hashes and identities are still computed
+/// from the same canonical JSON bytes, but [`SplitItem::canonical`] is left empty.
+/// Use that mode only for metadata/lineage paths that will never persist or
+/// reassemble blobs.
+pub fn split_value_with_retention(
+    protocol: &str,
     mut value: Value,
     keep_media: bool,
+    retain_payloads: bool,
 ) -> Result<SplitBody, SplitError> {
     let layout =
         layout(protocol).ok_or_else(|| SplitError::UnknownProtocol(protocol.to_string()))?;
@@ -249,7 +264,13 @@ pub fn split_value(
         && !slot.is_null()
     {
         let item = std::mem::take(slot);
-        *slot = push_item(&mut items, ItemSection::Instructions, None, item);
+        *slot = push_item(
+            &mut items,
+            ItemSection::Instructions,
+            None,
+            item,
+            retain_payloads,
+        );
     }
     if let Some(key) = layout.tools
         && let Some(Value::Array(tools)) = object.get_mut(key)
@@ -257,7 +278,7 @@ pub fn split_value(
         for slot in tools.iter_mut() {
             let item = std::mem::take(slot);
             let kind = tool_kind(&item);
-            *slot = push_item(&mut items, ItemSection::Tool, kind, item);
+            *slot = push_item(&mut items, ItemSection::Tool, kind, item, retain_payloads);
         }
     }
     match object.get_mut(layout.messages) {
@@ -265,13 +286,25 @@ pub fn split_value(
             for slot in messages.iter_mut() {
                 let item = std::mem::take(slot);
                 let kind = message_kind(&item);
-                *slot = push_item(&mut items, ItemSection::Message, kind, item);
+                *slot = push_item(
+                    &mut items,
+                    ItemSection::Message,
+                    kind,
+                    item,
+                    retain_payloads,
+                );
             }
         }
         // The Responses API accepts a bare string as `input`; store it as one item.
         Some(slot @ Value::String(_)) => {
             let item = std::mem::take(slot);
-            *slot = push_item(&mut items, ItemSection::Message, None, item);
+            *slot = push_item(
+                &mut items,
+                ItemSection::Message,
+                None,
+                item,
+                retain_payloads,
+            );
         }
         _ => {}
     }
@@ -285,15 +318,24 @@ fn push_item(
     section: ItemSection,
     kind: Option<String>,
     item: Value,
+    retain_payloads: bool,
 ) -> Value {
     // `serde_json::Value` objects are `BTreeMap`-backed (no `preserve_order`
     // feature), so `to_string` already yields sorted keys without whitespace.
-    let canonical = serde_json::to_string(&item).unwrap_or_else(|_| "null".to_string());
-    let hash = hash_canonical(&canonical);
+    let (hash, canonical) = if retain_payloads {
+        let canonical = serde_json::to_string(&item).unwrap_or_else(|_| "null".to_string());
+        (hash_canonical(&canonical), canonical)
+    } else {
+        (hash_value(&item), String::new())
+    };
     let mut stripped = item;
     let stripped_keys = strip_identity_ignored_keys(&mut stripped);
     let identity = if normalize_identity_forms(&mut stripped) | stripped_keys {
-        hash_canonical(&serde_json::to_string(&stripped).unwrap_or_else(|_| "null".to_string()))
+        if retain_payloads {
+            hash_canonical(&serde_json::to_string(&stripped).unwrap_or_else(|_| "null".to_string()))
+        } else {
+            hash_value(&stripped)
+        }
     } else {
         hash.clone()
     };
@@ -312,6 +354,31 @@ fn push_item(
 /// Lowercase hex SHA-256 of canonical item bytes.
 pub fn hash_canonical(canonical: &str) -> String {
     let digest = Sha256::digest(canonical.as_bytes());
+    hex_digest(digest)
+}
+
+fn hash_value(value: &Value) -> String {
+    struct HashWriter(Sha256);
+
+    impl io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = HashWriter(Sha256::new());
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return hash_canonical("null");
+    }
+    hex_digest(writer.0.finalize())
+}
+
+fn hex_digest(digest: impl IntoIterator<Item = u8>) -> String {
     let mut hex = String::with_capacity(64);
     for byte in digest {
         use std::fmt::Write as _;
@@ -677,6 +744,77 @@ mod tests {
         let stripped = split_body(PROTOCOL_CHAT_COMPLETIONS, &raw, false).unwrap();
         assert!(!stripped.items[0].canonical.contains("base64,AAAA"));
         assert_ne!(kept.items[0].hash, stripped.items[0].hash);
+    }
+
+    #[test]
+    fn split_value_with_retention_true_matches_existing_split_value() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"content": [{"text": "hi", "type": "text"}], "role": "user"},
+                {"role": "assistant", "content": "hello"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+        });
+
+        let existing = split_value(PROTOCOL_CHAT_COMPLETIONS, body.clone(), true).unwrap();
+        let retained =
+            split_value_with_retention(PROTOCOL_CHAT_COMPLETIONS, body, true, true).unwrap();
+
+        assert_eq!(retained, existing);
+    }
+
+    #[test]
+    fn split_value_without_retention_hashes_large_image_without_canonical_buffer() {
+        let image = format!("data:image/png;base64,{}", "A".repeat(1024 * 1024));
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image_url", "image_url": {"url": image}},
+                        {"type": "text", "text": "done", "cache_control": {"type": "ephemeral"}}
+                    ],
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+        });
+
+        let retained = split_value(PROTOCOL_CHAT_COMPLETIONS, body.clone(), true).unwrap();
+        let metadata_only =
+            split_value_with_retention(PROTOCOL_CHAT_COMPLETIONS, body, true, false).unwrap();
+
+        assert_eq!(metadata_only.skeleton, retained.skeleton);
+        assert_eq!(metadata_only.items.len(), retained.items.len());
+        assert_eq!(metadata_only.item_bytes(), 0);
+        for (metadata, full) in metadata_only.items.iter().zip(&retained.items) {
+            assert_eq!(metadata.section, full.section);
+            assert_eq!(metadata.kind, full.kind);
+            assert_eq!(metadata.hash, full.hash);
+            assert_eq!(metadata.identity, full.identity);
+            assert!(metadata.canonical.is_empty());
+            assert!(full.canonical.len() > 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn split_value_without_retention_keeps_identity_fingerprints() {
+        let block = json!({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}
+        ]});
+        let plain = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+
+        let block =
+            split_value_with_retention(PROTOCOL_ANTHROPIC_MESSAGES, block, true, false).unwrap();
+        let plain =
+            split_value_with_retention(PROTOCOL_ANTHROPIC_MESSAGES, plain, true, false).unwrap();
+
+        assert_ne!(block.items[0].hash, plain.items[0].hash);
+        assert_eq!(block.items[0].identity, plain.items[0].identity);
+        assert!(block.items[0].canonical.is_empty());
+        assert!(plain.items[0].canonical.is_empty());
     }
 
     #[test]

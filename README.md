@@ -978,6 +978,20 @@ It is separate from the per-request `max_request_body_bytes` limit, so a
 decoded size. Smaller requests consume proportionally less of the budget.
 Dashboard chat uploads use the same budget.
 
+On small glibc hosts, large temporary image strings can leave allocator arenas
+resident after requests finish. Set these service environment variables to keep
+large allocations outside those arenas and limit arena count:
+
+```ini
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
+```
+
+These are [glibc allocator settings](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html).
+The fixed mmap threshold disables glibc's automatic threshold increases; the
+arena cap trades allocation concurrency for lower memory retention.
+
 The Providers view can also control a local [lil-fleet](https://github.com/local-inference-lab/lil-fleet)
 instance. Set `LLMCONDUIT_FLEET_URL` to its loopback origin and provide either
 `LLMCONDUIT_FLEET_TOKEN_FILE` (preferred, so the bearer token can remain in a
