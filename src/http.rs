@@ -100,6 +100,7 @@ use std::sync::OnceLock;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Instant;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -117,6 +118,8 @@ const ZSTD_WINDOW_LOG_MAX: u32 = 24;
 /// 16 KiB as the journal dump gate ([`API_LOG_PAYLOAD_DUMP_LIMIT_BYTES`]).
 const TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES: usize = API_LOG_PAYLOAD_DUMP_LIMIT_BYTES;
 const UNKNOWN_MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+const DEFAULT_INFLIGHT_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
+const INFLIGHT_BODY_PERMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RouterOptions {
@@ -129,12 +132,123 @@ pub struct RouterOptions {
     pub register_protected_routes: bool,
 }
 
+#[derive(Clone)]
+struct ApiLogMiddlewareState {
+    gateway: Arc<Gateway>,
+    body_budget: Arc<InflightRequestBodyBudget>,
+}
+
+struct InflightRequestBodyBudget {
+    semaphore: Arc<Semaphore>,
+    budget_bytes: usize,
+    max_request_body_bytes: usize,
+}
+
+impl InflightRequestBodyBudget {
+    fn from_env(max_request_body_bytes: usize) -> Self {
+        let configured = match std::env::var("LLMCONDUIT_INFLIGHT_REQUEST_BODY_BYTES") {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(value) => value.max(max_request_body_bytes),
+                Err(err) => {
+                    tracing::warn!(
+                        value = %raw,
+                        error = %err,
+                        "ignoring invalid LLMCONDUIT_INFLIGHT_REQUEST_BODY_BYTES"
+                    );
+                    DEFAULT_INFLIGHT_REQUEST_BODY_BYTES.max(max_request_body_bytes)
+                }
+            },
+            Err(_) => DEFAULT_INFLIGHT_REQUEST_BODY_BYTES.max(max_request_body_bytes),
+        };
+        let budget_bytes = configured.max(INFLIGHT_BODY_PERMIT_BYTES);
+        let permits = request_units_for_bytes(budget_bytes) as usize;
+        Self {
+            semaphore: Arc::new(Semaphore::new(permits)),
+            budget_bytes,
+            max_request_body_bytes,
+        }
+    }
+
+    fn units_for_request(&self, headers: &HeaderMap) -> u32 {
+        let content_encoding = headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("identity"));
+        let charged_bytes = if content_encoding.is_some() {
+            self.max_request_body_bytes
+        } else {
+            content_length(headers)
+                .and_then(|len| usize::try_from(len).ok())
+                .filter(|len| *len > 0)
+                .unwrap_or(self.max_request_body_bytes)
+        };
+        request_units_for_bytes(charged_bytes)
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        headers: &HeaderMap,
+    ) -> Result<InflightRequestBodyPermit, tokio::sync::AcquireError> {
+        let units = self.units_for_request(headers);
+        let permit = Arc::clone(&self.semaphore)
+            .acquire_many_owned(units)
+            .await?;
+        Ok(InflightRequestBodyPermit {
+            permit: Some(permit),
+            units,
+        })
+    }
+
+    async fn acquire_for_bytes(
+        self: &Arc<Self>,
+        charged_bytes: usize,
+    ) -> Result<InflightRequestBodyPermit, tokio::sync::AcquireError> {
+        let units = request_units_for_bytes(charged_bytes);
+        let permit = Arc::clone(&self.semaphore)
+            .acquire_many_owned(units)
+            .await?;
+        Ok(InflightRequestBodyPermit {
+            permit: Some(permit),
+            units,
+        })
+    }
+}
+
+fn bytes_to_budget_units(bytes: usize) -> usize {
+    bytes.saturating_add(INFLIGHT_BODY_PERMIT_BYTES - 1) / INFLIGHT_BODY_PERMIT_BYTES
+}
+
+fn request_units_for_bytes(bytes: usize) -> u32 {
+    let units = bytes_to_budget_units(bytes).max(1);
+    u32::try_from(units).unwrap_or(u32::MAX)
+}
+
+struct InflightRequestBodyPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    units: u32,
+}
+
+impl InflightRequestBodyPermit {
+    fn units(&self) -> u32 {
+        self.units
+    }
+
+    fn release(&mut self) {
+        self.permit.take();
+    }
+}
+
 pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
     // Read before `gateway` is moved into `.with_state(...)` below. Replaces
     // axum's stock 2 MiB `DefaultBodyLimit` with the configured cap (default
     // 10 MiB) so oversized inbound bodies are the operator's choice, not a
     // silent framework default.
     let max_request_body_bytes = gateway.config().max_request_body_bytes;
+    let log_state = Arc::new(ApiLogMiddlewareState {
+        gateway: Arc::clone(&gateway),
+        body_budget: Arc::new(InflightRequestBodyBudget::from_env(max_request_body_bytes)),
+    });
     let inference_routes = Router::new()
         .route("/v1/responses", post(post_responses).get(get_responses))
         .route("/v1/messages", post(post_messages))
@@ -179,12 +293,10 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         // on that same ceiling instead of axum's stock 2 MiB default. Both read
         // the single configured value (`max_request_body_bytes`, which the
         // middleware re-reads from the same gateway config) — there is no second,
-        // larger hidden limit. The middleware state stays `Arc<Gateway>` because
-        // `log_api_call` also opens the dashboard flow record from it.
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&gateway),
-            log_api_call,
-        ))
+        // larger hidden limit. The middleware state also carries the aggregate
+        // in-flight body memory budget so buffering remains bounded across
+        // concurrent image-heavy requests.
+        .layer(middleware::from_fn_with_state(log_state, log_api_call))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(gateway)
 }
@@ -1232,10 +1344,11 @@ fn is_length_limit_error(err: &axum::Error) -> bool {
 }
 
 async fn log_api_call(
-    State(gateway): State<Arc<Gateway>>,
+    State(state): State<Arc<ApiLogMiddlewareState>>,
     request: Request,
     next: Next,
 ) -> Response {
+    let gateway = Arc::clone(&state.gateway);
     let api_call_id = format!("api_{}", Uuid::new_v4().simple());
     let method = request.method().clone();
     let uri = request.uri().clone();
@@ -1317,6 +1430,38 @@ async fn log_api_call(
         );
         return payload_too_large(max_request_body_bytes);
     }
+
+    let inflight_body_permit = if should_gate_inflight_request_body(&method, uri.path()) {
+        match state.body_budget.acquire(&headers).await {
+            Ok(permit) => {
+                tracing::debug!(
+                    api_call_id = %api_call_id,
+                    method = %method,
+                    path = %uri.path(),
+                    permit_units = permit.units(),
+                    budget_bytes = state.body_budget.budget_bytes,
+                    "acquired inbound API body memory budget"
+                );
+                Some(permit)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    api_call_id = %api_call_id,
+                    method = %method,
+                    path = %uri.path(),
+                    error = %err,
+                    "inbound API body memory budget unavailable"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "request body memory budget unavailable",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
 
     let (mut parts, body) = request.into_parts();
     // Cap the buffered read at the CONFIGURED limit (not a fixed ceiling) so a
@@ -1741,6 +1886,9 @@ async fn log_api_call(
             .extensions
             .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
     }
+    if method == axum::http::Method::GET && uri.path() == "/v1/responses" {
+        parts.extensions.insert(Arc::clone(&state.body_budget));
+    }
 
     // D1 (incl. R1 #1/#6): capture the inbound body + headers and open the record.
     // Secrets (auth headers, `api_key`, image URIs) are redacted INLINE by the
@@ -1848,6 +1996,7 @@ async fn log_api_call(
     } else {
         response
     };
+    let response = hold_inflight_body_permit(response, inflight_body_permit);
     // Per-request model-resolution audit: the handler tags the response with the
     // served model (and the requested model when it differs) via
     // `with_model_headers`; echo both here so every response record shows whether
@@ -1877,6 +2026,14 @@ fn is_client_api_path_with_model(path: &str) -> bool {
             | "/v1/chat/completions"
             | "/v1/completions"
     )
+}
+
+fn should_gate_inflight_request_body(method: &axum::http::Method, path: &str) -> bool {
+    *method == axum::http::Method::POST
+        && matches!(
+            path,
+            "/v1/responses" | "/v1/messages" | "/v1/chat/completions" | "/v1/completions"
+        )
 }
 
 async fn api_not_found() -> Response {
@@ -2906,6 +3063,7 @@ async fn post_responses(
 )]
 async fn get_responses(
     State(gateway): State<Arc<Gateway>>,
+    budget: Option<Extension<Arc<InflightRequestBodyBudget>>>,
     auth: Option<Extension<crate::authz::AuthContext>>,
     client: Option<Extension<ClientIdentity>>,
     headers: HeaderMap,
@@ -2922,6 +3080,7 @@ async fn get_responses(
                     auth.map(|value| value.0),
                     client.map(|value| value.0),
                     headers,
+                    budget.map(|value| value.0),
                 )
             })
             .into_response(),
@@ -2942,6 +3101,11 @@ async fn get_responses(
 /// JSON or raw JSON bytes.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
+enum ResponsesWsRequestFrame {
+    Text(Bytes),
+    Binary(Bytes),
+}
+
 /// The Responses-WS socket loop. See [`get_responses`] for the protocol rationale.
 async fn responses_ws_serve(
     socket: WebSocket,
@@ -2949,6 +3113,7 @@ async fn responses_ws_serve(
     auth: Option<crate::authz::AuthContext>,
     client: Option<ClientIdentity>,
     headers: HeaderMap,
+    body_budget: Option<Arc<InflightRequestBodyBudget>>,
 ) {
     let max_request_body_bytes = gateway.config().max_request_body_bytes;
     // `split` so the inbound `recv` and outbound `send` can be raced in the same
@@ -2958,7 +3123,7 @@ async fn responses_ws_serve(
 
     // 1. Read the request frame. Respond to Ping; ignore Pong; bail on
     //    Close/EOF. codex sends a single Text (JSON) or Binary (zstd JSON).
-    let request_bytes: Bytes = loop {
+    let request_frame = loop {
         match ws_rx.next().await {
             Some(Ok(Message::Text(t))) => {
                 if t.len() > max_request_body_bytes {
@@ -2971,38 +3136,72 @@ async fn responses_ws_serve(
                     let _ = sink.send(Message::Close(None)).await;
                     return;
                 }
-                break Bytes::copy_from_slice(t.as_bytes());
+                break ResponsesWsRequestFrame::Text(Bytes::copy_from_slice(t.as_bytes()));
             }
             Some(Ok(Message::Binary(b))) => {
-                match responses_ws_decode_binary_request(b, max_request_body_bytes).await {
-                    Ok(bytes) => break bytes,
-                    Err(DecodeContentError::TooLarge) => {
-                        let _ = send_responses_ws_error(
-                            &mut sink,
-                            "payload_too_large",
-                            "request body exceeds the configured limit",
-                        )
-                        .await;
-                        let _ = sink.send(Message::Close(None)).await;
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = send_responses_ws_error(
-                            &mut sink,
-                            "invalid_request",
-                            &format!("invalid request body: {}", err.message()),
-                        )
-                        .await;
-                        let _ = sink.send(Message::Close(None)).await;
-                        return;
-                    }
-                }
+                break ResponsesWsRequestFrame::Binary(b);
             }
             Some(Ok(Message::Ping(p))) => {
                 let _ = sink.send(Message::Pong(p)).await;
             }
             Some(Ok(Message::Pong(_))) => {}
             Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+        }
+    };
+
+    let mut inflight_body_permit = if let Some(budget) = &body_budget {
+        let charged_bytes = match &request_frame {
+            ResponsesWsRequestFrame::Text(bytes) => bytes.len(),
+            ResponsesWsRequestFrame::Binary(_) => max_request_body_bytes,
+        };
+        match budget.acquire_for_bytes(charged_bytes).await {
+            Ok(permit) => Some(permit),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    charged_bytes,
+                    "responses WebSocket body memory budget unavailable"
+                );
+                let _ = send_responses_ws_error(
+                    &mut sink,
+                    "server_overloaded",
+                    "request body memory budget unavailable",
+                )
+                .await;
+                let _ = sink.send(Message::Close(None)).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let request_bytes = match request_frame {
+        ResponsesWsRequestFrame::Text(bytes) => bytes,
+        ResponsesWsRequestFrame::Binary(bytes) => {
+            match responses_ws_decode_binary_request(bytes, max_request_body_bytes).await {
+                Ok(bytes) => bytes,
+                Err(DecodeContentError::TooLarge) => {
+                    let _ = send_responses_ws_error(
+                        &mut sink,
+                        "payload_too_large",
+                        "request body exceeds the configured limit",
+                    )
+                    .await;
+                    let _ = sink.send(Message::Close(None)).await;
+                    return;
+                }
+                Err(err) => {
+                    let _ = send_responses_ws_error(
+                        &mut sink,
+                        "invalid_request",
+                        &format!("invalid request body: {}", err.message()),
+                    )
+                    .await;
+                    let _ = sink.send(Message::Close(None)).await;
+                    return;
+                }
+            }
         }
     };
 
@@ -3105,6 +3304,9 @@ async fn responses_ws_serve(
                             break;
                         }
                         if terminal {
+                            if let Some(permit) = inflight_body_permit.as_mut() {
+                                permit.release();
+                            }
                             let _ = sink.send(Message::Close(None)).await;
                             break;
                         }
@@ -3112,6 +3314,9 @@ async fn responses_ws_serve(
                     None => {
                         // Engine stream ended without a terminal event (shouldn't
                         // happen for a well-formed turn, but don't hang).
+                        if let Some(permit) = inflight_body_permit.as_mut() {
+                            permit.release();
+                        }
                         let _ = sink.send(Message::Close(None)).await;
                         break;
                     }
@@ -3853,6 +4058,63 @@ impl Drop for TeeBody {
             persistence.finish_served_response(!clean);
         }
     }
+}
+
+struct InflightBodyPermitBody {
+    inner: Body,
+    permit: Option<InflightRequestBodyPermit>,
+}
+
+impl http_body::Body for InflightBodyPermitBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                if let Some(permit) = this.permit.as_mut() {
+                    permit.release();
+                }
+                this.permit = None;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(err))) => {
+                if let Some(permit) = this.permit.as_mut() {
+                    permit.release();
+                }
+                this.permit = None;
+                Poll::Ready(Some(Err(err)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn hold_inflight_body_permit(
+    response: Response,
+    permit: Option<InflightRequestBodyPermit>,
+) -> Response {
+    let Some(permit) = permit else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let body = InflightBodyPermitBody {
+        inner: body,
+        permit: Some(permit),
+    };
+    Response::from_parts(parts, Body::new(body))
 }
 
 /// Wrap `response`'s body in a [`TeeBody`] so its served bytes are captured to the
@@ -4808,8 +5070,135 @@ mod tests {
     use super::responses_wire_event_data;
     use super::should_proxy_response_header;
     use axum::body::Bytes;
+    use axum::http::HeaderMap;
     use axum::http::HeaderName;
+    use axum::http::header;
+    use http_body::Body as _;
     use sha2::Digest as _;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    fn budget_for_tests(
+        budget_bytes: usize,
+        max_request_body_bytes: usize,
+    ) -> Arc<super::InflightRequestBodyBudget> {
+        Arc::new(super::InflightRequestBodyBudget {
+            semaphore: Arc::new(Semaphore::new(super::bytes_to_budget_units(budget_bytes))),
+            budget_bytes,
+            max_request_body_bytes,
+        })
+    }
+
+    fn headers_with_len(len: usize) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn inflight_body_budget_units_clamp_instead_of_wrapping() {
+        assert_eq!(super::request_units_for_bytes(usize::MAX), u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn inflight_body_budget_is_held_until_response_body_drops() {
+        let budget = budget_for_tests(2 * 1024 * 1024, 2 * 1024 * 1024);
+        let permit = budget
+            .acquire(&headers_with_len(2 * 1024 * 1024))
+            .await
+            .expect("first large request acquires whole budget");
+
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let response = axum::response::Response::builder()
+            .body(axum::body::Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+            .expect("response builds");
+        let response = super::hold_inflight_body_permit(response, Some(permit));
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                budget.acquire(&headers_with_len(1))
+            )
+            .await
+            .is_err(),
+            "permit remains held while the streaming response body is alive"
+        );
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_secs(1), budget.acquire(&headers_with_len(1)))
+            .await
+            .expect("released after response body drop")
+            .expect("semaphore remains open");
+    }
+
+    #[tokio::test]
+    async fn inflight_body_budget_releases_when_response_body_completes_before_drop() {
+        let budget = budget_for_tests(1024 * 1024, 1024 * 1024);
+        let permit = budget
+            .acquire(&headers_with_len(1024 * 1024))
+            .await
+            .expect("request acquires full budget");
+        let mut body = super::InflightBodyPermitBody {
+            inner: axum::body::Body::from("done"),
+            permit: Some(permit),
+        };
+
+        let first = futures::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("first frame exists")
+            .expect("first frame ok");
+        assert_eq!(first.data_ref().map(Bytes::len), Some(4));
+
+        let end = futures::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(end.is_none(), "body reached clean end");
+
+        tokio::time::timeout(Duration::from_secs(1), budget.acquire(&headers_with_len(1)))
+            .await
+            .expect("permit released at clean end even while wrapper is still alive")
+            .expect("semaphore remains open");
+
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn inflight_body_budget_weights_large_and_tiny_requests_independently() {
+        let budget = budget_for_tests(3 * 1024 * 1024, 2 * 1024 * 1024);
+        let large = budget
+            .acquire(&headers_with_len(2 * 1024 * 1024))
+            .await
+            .expect("large request acquires two MiB units");
+        let tiny = budget
+            .acquire(&headers_with_len(1))
+            .await
+            .expect("tiny request coexists with one large request");
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                budget.acquire(&headers_with_len(2 * 1024 * 1024))
+            )
+            .await
+            .is_err(),
+            "second large request waits until enough weighted budget is available"
+        );
+
+        drop(large);
+
+        let second_large = tokio::time::timeout(
+            Duration::from_secs(1),
+            budget.acquire(&headers_with_len(2 * 1024 * 1024)),
+        )
+        .await
+        .expect("second large admitted after first large releases")
+        .expect("semaphore remains open");
+
+        drop(tiny);
+        drop(second_large);
+    }
 
     /// Finding 1: the inbound redaction produces IDENTICAL redacted output on the
     /// inline (small) and `spawn_blocking` (large) paths — a secret-bearing field and

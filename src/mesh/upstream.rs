@@ -482,16 +482,19 @@ fn admission_error(code: AdmissionRejectCode) -> AppError {
 }
 
 fn build_chat_http_request(request: &ChatCompletionRequest) -> AppResult<Vec<u8>> {
-    let body = serde_json::to_vec(request)
+    let body_len = crate::replay::serialized_len(request)
         .map_err(|err| AppError::internal(format!("failed to encode mesh chat request: {err}")))?;
-    let mut bytes = Vec::with_capacity(body.len() + 256);
+    let mut bytes = Vec::with_capacity(body_len + 256);
     bytes.extend_from_slice(b"POST /v1/chat/completions HTTP/1.1\r\n");
     bytes.extend_from_slice(b"host: llmconduit-mesh-worker\r\n");
     bytes.extend_from_slice(b"content-type: application/json\r\n");
-    bytes.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
+    bytes.extend_from_slice(format!("content-length: {body_len}\r\n").as_bytes());
     bytes.extend_from_slice(b"accept: text/event-stream\r\n");
     bytes.extend_from_slice(b"connection: close\r\n\r\n");
-    bytes.extend_from_slice(&body);
+    // Encode into the wire buffer directly: a native-vision request may carry
+    // tens of MiB of image data, so a separate JSON buffer doubles peak memory.
+    serde_json::to_writer(&mut bytes, request)
+        .map_err(|err| AppError::internal(format!("failed to encode mesh chat request: {err}")))?;
     Ok(bytes)
 }
 
@@ -810,6 +813,28 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::{JoinHandle, JoinSet};
+
+    #[test]
+    fn mesh_wire_request_preserves_json_and_content_length_for_large_images() {
+        let mut request = chat_request("describe π and \"quotes\"");
+        request.messages[0].content = Some(serde_json::json!([
+            {"type": "text", "text": "describe π and \"quotes\""},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", "A".repeat(2 * 1024 * 1024))}}
+        ]));
+        let wire = build_chat_http_request(&request).expect("wire body");
+        let header_end = wire
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let body = &wire[header_end..];
+        assert_eq!(body, serde_json::to_vec(&request).expect("reference JSON"));
+        assert!(
+            std::str::from_utf8(&wire[..header_end])
+                .unwrap()
+                .contains(&format!("content-length: {}\r\n", body.len()))
+        );
+    }
 
     async fn read_test_request(socket: &mut TcpStream, buf: &mut [u8]) {
         let mut request = Vec::new();
