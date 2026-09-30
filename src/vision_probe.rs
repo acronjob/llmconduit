@@ -2,19 +2,22 @@
 //!
 //! The gateway degrades images to a text placeholder when the resolved backend
 //! is not known to be multimodal. Knowing that from names alone is guesswork,
-//! so the gateway *asks the engine*: each configured (backend, model) pair is
-//! probed at startup and then periodically with a one-pixel PNG and
-//! `max_tokens: 1`. A 2xx means images are accepted; a 4xx whose error text
-//! blames the image means text-only; anything else leaves the answer unknown
-//! (an explicit profile `native_vision` override still wins, and an unknown
-//! model keeps the name-based default).
+//! so the gateway first reads provider model metadata, then asks the engine only
+//! when metadata is missing or inconclusive. Static routes and dashboard-managed
+//! providers are checked at startup, periodically, and whenever the managed
+//! provider registry changes. The fallback probe sends a one-pixel PNG with
+//! `max_tokens: 1`: a 2xx means images are accepted; a 4xx whose error text
+//! blames the image means text-only; anything else leaves the answer unknown.
+//! An explicit profile `native_vision` override still wins, and an unknown model
+//! keeps the name-based default.
 //!
 //! Results live in [`NativeVisionCache`], keyed by the exact model id the
 //! provider receives — the same string the vision gate sees on a candidate —
 //! so aliases, profiles and failover chains need no extra bookkeeping.
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -81,6 +84,16 @@ pub enum ProbeOutcome {
     Unknown(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataVision {
+    Native,
+    TextOnly,
+    Unknown,
+}
+
+const MAX_MODELS_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROBE_BODY_BYTES: usize = 64 * 1024;
+
 /// A 1×1 red PNG, the smallest image an OpenAI-compatible endpoint will decode.
 pub const PROBE_IMAGE_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
@@ -131,10 +144,7 @@ pub fn classify_response(status: u16, body: &str) -> ProbeOutcome {
             return ProbeOutcome::TextOnly;
         }
     }
-    ProbeOutcome::Unknown(format!(
-        "status {status}: {}",
-        body.chars().take(160).collect::<String>()
-    ))
+    ProbeOutcome::Unknown(format!("status {status}"))
 }
 
 /// Send one probe.
@@ -147,10 +157,14 @@ pub async fn probe_target(client: &reqwest::Client, target: &ProbeTarget) -> Pro
     match request.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_limited_body(response, MAX_PROBE_BODY_BYTES)
+                .await
+                .ok()
+                .and_then(|body| String::from_utf8(body).ok())
+                .unwrap_or_default();
             classify_response(status, &body)
         }
-        Err(error) => ProbeOutcome::Unknown(error.to_string()),
+        Err(error) => ProbeOutcome::Unknown(error.without_url().to_string()),
     }
 }
 
@@ -220,6 +234,20 @@ impl NativeVisionCache {
         Some(backends.values().all(|native| *native))
     }
 
+    /// Remove stale entries that no current probe target can serve. Static and
+    /// dynamic targets are passed together by the background prober so configured
+    /// routes survive dashboard-provider churn.
+    pub fn retain_targets(&self, targets: &HashSet<(String, String)>) {
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.retain(|model, backends| {
+            backends.retain(|backend, _| targets.contains(&(backend.clone(), model.clone())));
+            !backends.is_empty()
+        });
+    }
+
     /// Every recorded (model, backend, native) triple, sorted, for logs and the
     /// dashboard.
     pub fn snapshot(&self) -> Vec<(String, String, bool)> {
@@ -240,25 +268,155 @@ impl NativeVisionCache {
     }
 }
 
+fn parse_model_metadata(body: &[u8]) -> HashMap<String, MetadataVision> {
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    let Some(data) = root.get("data").and_then(|value| value.as_array()) else {
+        return out;
+    };
+    for item in data {
+        let Some(id) = item.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let modalities = item
+            .get("architecture")
+            .and_then(|architecture| architecture.get("input_modalities"))
+            .and_then(|modalities| modalities.as_array());
+        let Some(modalities) = modalities else {
+            out.insert(id.to_string(), MetadataVision::Unknown);
+            continue;
+        };
+        if modalities.is_empty() {
+            out.insert(id.to_string(), MetadataVision::Unknown);
+            continue;
+        }
+        let mut saw_image = false;
+        let mut valid = true;
+        for modality in modalities {
+            let Some(modality) = modality.as_str() else {
+                valid = false;
+                break;
+            };
+            if modality.eq_ignore_ascii_case("image") {
+                saw_image = true;
+            }
+        }
+        let metadata = if !valid {
+            MetadataVision::Unknown
+        } else if saw_image {
+            MetadataVision::Native
+        } else {
+            MetadataVision::TextOnly
+        };
+        out.insert(id.to_string(), metadata);
+    }
+    out
+}
+
+async fn read_limited_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, &'static str> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err("response body is too large");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "failed to read response body")?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err("response body is too large");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn fetch_model_metadata(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<HashMap<String, MetadataVision>, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut request = client.get(&url);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("catalog metadata request failed: {}", error.without_url()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("catalog metadata status {}", status.as_u16()));
+    }
+    let body = read_limited_body(response, MAX_MODELS_BODY_BYTES)
+        .await
+        .map_err(str::to_string)?;
+    Ok(parse_model_metadata(&body))
+}
+
 /// One probe round over `targets`, recording conclusive answers.
 pub async fn probe_round(
     client: &reqwest::Client,
     targets: &[ProbeTarget],
     cache: &NativeVisionCache,
 ) {
+    let mut groups: HashMap<(String, Option<String>), Vec<&ProbeTarget>> = HashMap::new();
     for target in targets {
-        match probe_target(client, target).await {
-            ProbeOutcome::Native => {
-                cache.record(&target.backend, &target.model, true);
-                tracing::info!(backend = %target.backend, model = %target.model, "vision probe: images accepted");
+        groups
+            .entry((target.base_url.clone(), target.api_key.clone()))
+            .or_default()
+            .push(target);
+    }
+    for ((base_url, api_key), targets) in groups {
+        let metadata = match fetch_model_metadata(client, &base_url, api_key.as_deref()).await {
+            Ok(metadata) => metadata,
+            Err(reason) => {
+                tracing::warn!(base_url = %base_url, reason = %reason, "vision probe: model metadata unavailable");
+                HashMap::new()
             }
-            ProbeOutcome::TextOnly => {
-                cache.record(&target.backend, &target.model, false);
-                tracing::info!(backend = %target.backend, model = %target.model, "vision probe: text-only");
+        };
+        for target in targets {
+            match metadata.get(&target.model).copied() {
+                Some(MetadataVision::Native) => {
+                    cache.record(&target.backend, &target.model, true);
+                    tracing::info!(backend = %target.backend, model = %target.model, "vision probe: metadata advertises image input");
+                    continue;
+                }
+                Some(MetadataVision::TextOnly) => {
+                    cache.record(&target.backend, &target.model, false);
+                    tracing::info!(backend = %target.backend, model = %target.model, "vision probe: metadata advertises text-only input");
+                    continue;
+                }
+                Some(MetadataVision::Unknown) | None => {}
             }
-            ProbeOutcome::Unknown(reason) => {
-                tracing::warn!(backend = %target.backend, model = %target.model, reason = %reason, "vision probe: no conclusion");
-            }
+            probe_one_target(client, target, cache).await;
+        }
+    }
+}
+
+async fn probe_one_target(
+    client: &reqwest::Client,
+    target: &ProbeTarget,
+    cache: &NativeVisionCache,
+) {
+    match probe_target(client, target).await {
+        ProbeOutcome::Native => {
+            cache.record(&target.backend, &target.model, true);
+            tracing::info!(backend = %target.backend, model = %target.model, "vision probe: images accepted");
+        }
+        ProbeOutcome::TextOnly => {
+            cache.record(&target.backend, &target.model, false);
+            tracing::info!(backend = %target.backend, model = %target.model, "vision probe: text-only");
+        }
+        ProbeOutcome::Unknown(reason) => {
+            tracing::warn!(backend = %target.backend, model = %target.model, reason = %reason, "vision probe: no conclusion");
         }
     }
 }
@@ -269,11 +427,23 @@ pub fn spawn(
     targets: Vec<ProbeTarget>,
     cache: NativeVisionCache,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_with_managed(config, targets, cache, None)
+}
+
+/// Spawn the background prober for static routes and dashboard-managed
+/// providers. Managed targets are refreshed when the dashboard provider
+/// registry changes as well as on the periodic interval.
+pub fn spawn_with_managed(
+    config: &VisionProbeBootstrap,
+    static_targets: Vec<ProbeTarget>,
+    cache: NativeVisionCache,
+    managed: Option<Arc<crate::managed_providers::ManagedProviderRegistry>>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
         tracing::info!("native-vision probing disabled by configuration");
         return None;
     }
-    if targets.is_empty() {
+    if static_targets.is_empty() && managed.is_none() {
         tracing::info!("native-vision probing: no routed backend models to probe");
         return None;
     }
@@ -289,18 +459,94 @@ pub fn spawn(
     };
     let interval_secs = config.interval_secs.max(30);
     tracing::info!(
-        targets = targets.len(),
+        static_targets = static_targets.len(),
+        managed_targets = managed.is_some(),
         interval_secs,
         "native-vision probing enabled"
     );
     Some(tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        let mut managed_changes = managed
+            .as_ref()
+            .map(|registry| registry.vision_probe_changes());
+        let mut managed_targets = Vec::new();
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(interval_secs),
+            Duration::from_secs(interval_secs),
+        );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
-            probe_round(&client, &targets, &cache).await;
+            if let Some(registry) = managed.as_ref() {
+                match registry.vision_probe_targets().await {
+                    Ok(targets) => {
+                        managed_targets = targets;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "native-vision prober could not load dashboard provider targets; preserving previous targets");
+                    }
+                }
+            }
+            let targets = merge_targets(&static_targets, &managed_targets);
+            let active: HashSet<(String, String)> = targets
+                .iter()
+                .map(|target| (target.backend.clone(), target.model.clone()))
+                .collect();
+            cache.retain_targets(&active);
+            match managed_changes.as_mut() {
+                Some(changes) => {
+                    let mut changed = false;
+                    tokio::select! {
+                        _ = probe_round(&client, &targets, &cache) => {}
+                        result = changes.changed() => {
+                            if result.is_err() {
+                                managed_changes = None;
+                            }
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        continue;
+                    }
+                }
+                None => {
+                    probe_round(&client, &targets, &cache).await;
+                }
+            }
+            match managed_changes.as_mut() {
+                Some(changes) => {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        result = changes.changed() => {
+                            if result.is_err() {
+                                managed_changes = None;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    interval.tick().await;
+                }
+            }
         }
     }))
+}
+
+fn merge_targets(
+    static_targets: &[ProbeTarget],
+    managed_targets: &[ProbeTarget],
+) -> Vec<ProbeTarget> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for target in static_targets.iter().chain(managed_targets.iter()) {
+        if seen.insert((
+            target.backend.clone(),
+            target.base_url.clone(),
+            target.api_key.clone(),
+            target.model.clone(),
+        )) {
+            out.push(target.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -383,6 +629,103 @@ mod tests {
         cache.record("litellm", "m", true);
         assert_eq!(cache.lookup("m"), Some(true));
         assert_eq!(cache.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn metadata_parser_uses_only_explicit_valid_modalities() {
+        let parsed = parse_model_metadata(
+            br#"{
+                "data": [
+                    {"id": "vision", "architecture": {"input_modalities": ["text", "image"]}},
+                    {"id": "text", "architecture": {"input_modalities": ["text"]}},
+                    {"id": "missing", "architecture": {}},
+                    {"id": "empty", "architecture": {"input_modalities": []}},
+                    {"id": "malformed", "architecture": {"input_modalities": ["text", 1]}}
+                ]
+            }"#,
+        );
+        assert_eq!(parsed.get("vision"), Some(&MetadataVision::Native));
+        assert_eq!(parsed.get("text"), Some(&MetadataVision::TextOnly));
+        assert_eq!(parsed.get("missing"), Some(&MetadataVision::Unknown));
+        assert_eq!(parsed.get("empty"), Some(&MetadataVision::Unknown));
+        assert_eq!(parsed.get("malformed"), Some(&MetadataVision::Unknown));
+        assert!(parse_model_metadata(br#"{"data":"bad"}"#).is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_round_uses_metadata_before_image_probe() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "vision", "architecture": {"input_modalities": ["text", "image"]}},
+                    {"id": "text", "architecture": {"input_modalities": ["text"]}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let targets = vec![
+            ProbeTarget {
+                backend: "openrouter".into(),
+                base_url: format!("{}/v1", server.uri()),
+                api_key: Some("k".into()),
+                model: "vision".into(),
+            },
+            ProbeTarget {
+                backend: "openrouter".into(),
+                base_url: format!("{}/v1", server.uri()),
+                api_key: Some("k".into()),
+                model: "text".into(),
+            },
+        ];
+        let cache = NativeVisionCache::default();
+        probe_round(&reqwest::Client::new(), &targets, &cache).await;
+        assert_eq!(cache.lookup("vision"), Some(true));
+        assert_eq!(cache.lookup("text"), Some(false));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "metadata avoids image probes");
+        assert_eq!(requests[0].method.as_str(), "GET");
+        assert_eq!(
+            requests[0].headers.get("authorization").unwrap(),
+            "Bearer k"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_round_falls_back_when_metadata_is_unknown() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "unknown", "architecture": {"input_modalities": []}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"choices":[]}"#))
+            .mount(&server)
+            .await;
+        let targets = vec![ProbeTarget {
+            backend: "vllm".into(),
+            base_url: format!("{}/v1", server.uri()),
+            api_key: None,
+            model: "unknown".into(),
+        }];
+        let cache = NativeVisionCache::default();
+        probe_round(&reqwest::Client::new(), &targets, &cache).await;
+        assert_eq!(cache.lookup("unknown"), Some(true));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "unknown metadata falls back to probe");
+        assert_eq!(requests[0].method.as_str(), "GET");
+        assert_eq!(requests[1].method.as_str(), "POST");
     }
 
     #[tokio::test]

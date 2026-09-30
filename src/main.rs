@@ -292,10 +292,11 @@ async fn run_server(
     )?;
     spawn_persistent_backend_metrics(Arc::clone(&gateway));
     spawn_upstream_metrics_scraper(Arc::clone(&gateway), metrics_config);
-    llmconduit::vision_probe::spawn(
+    llmconduit::vision_probe::spawn_with_managed(
         &vision_probe_config,
         probe_targets,
         gateway.native_vision_cache().clone(),
+        gateway.managed_providers(),
     );
     let listener = TcpListener::bind(bind_addr).await?;
     log_listening(bind_addr);

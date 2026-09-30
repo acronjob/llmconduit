@@ -1122,7 +1122,7 @@ impl Gateway {
         self
     }
 
-    pub(crate) fn managed_providers(
+    pub fn managed_providers(
         &self,
     ) -> Option<Arc<crate::managed_providers::ManagedProviderRegistry>> {
         self.managed_providers.clone()

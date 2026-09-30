@@ -127,6 +127,7 @@ pub struct ManagedProviderRegistry {
     store: Arc<dyn PersistenceStore>,
     options: ManagedProviderOptions,
     state: RwLock<ManagedProviderState>,
+    vision_changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl ManagedProviderRegistry {
@@ -135,6 +136,7 @@ impl ManagedProviderRegistry {
             store,
             options,
             state: RwLock::new(ManagedProviderState::default()),
+            vision_changes: tokio::sync::watch::channel(0).0,
         });
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let registry = Arc::downgrade(&registry);
@@ -163,6 +165,33 @@ impl ManagedProviderRegistry {
             .iter()
             .map(provider_view)
             .collect())
+    }
+
+    /// Only enabled catalog entries are candidates for automatic vision checks.
+    pub async fn vision_probe_targets(&self) -> AppResult<Vec<crate::vision_probe::ProbeTarget>> {
+        self.ensure_loaded().await?;
+        let state = self.state.read().await;
+        Ok(state
+            .providers
+            .iter()
+            .flat_map(|provider| {
+                provider
+                    .stored
+                    .models
+                    .iter()
+                    .filter(|model| model_enabled(&provider.stored, &model.id))
+                    .map(|model| crate::vision_probe::ProbeTarget {
+                        backend: provider.stored.id.clone(),
+                        base_url: provider.stored.base_url.clone(),
+                        api_key: Some(provider.stored.api_key.clone()),
+                        model: model.id.clone(),
+                    })
+            })
+            .collect())
+    }
+
+    pub fn vision_probe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.vision_changes.subscribe()
     }
 
     pub async fn add(
@@ -347,6 +376,8 @@ impl ManagedProviderRegistry {
             .collect();
         state.providers = providers;
         state.loaded = true;
+        self.vision_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(())
     }
 
@@ -366,7 +397,11 @@ impl ManagedProviderRegistry {
             .await
             .map_err(|err| {
                 AppError::internal(format!("failed to persist configured providers: {err}"))
-            })
+            })?;
+        // Notify only after a successful save; failed edits are rolled back.
+        self.vision_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(())
     }
 
     async fn refresh_configured_providers_once(&self) -> AppResult<()> {
@@ -1300,6 +1335,7 @@ mod tests {
             store,
             options: test_options(),
             state: RwLock::new(ManagedProviderState::default()),
+            vision_changes: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -1477,6 +1513,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_vision_detection_tracks_add_filter_and_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer secret-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "vision-a", "architecture": {"input_modalities": ["text", "image"]}},
+                    {"id": "text-b", "architecture": {"input_modalities": ["text"]}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let registry = bare_test_registry().await;
+        let cache = crate::vision_probe::NativeVisionCache::default();
+        let task = crate::vision_probe::spawn_with_managed(
+            &crate::vision_probe::VisionProbeBootstrap::default(),
+            Vec::new(),
+            cache.clone(),
+            Some(registry.clone()),
+        )
+        .expect("dynamic prober starts even with an empty registry");
+        let added = registry
+            .add(CreateConfiguredProviderRequest {
+                name: "external".into(),
+                base_url: server.uri(),
+                api_key: "secret-key".into(),
+            })
+            .await
+            .expect("add");
+        async fn wait_for(
+            cache: &crate::vision_probe::NativeVisionCache,
+            model: &str,
+            expected: Option<bool>,
+        ) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while cache.lookup(model) != expected {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("vision cache updated after provider change");
+        }
+        wait_for(&cache, "vision-a", Some(true)).await;
+        wait_for(&cache, "text-b", Some(false)).await;
+        registry
+            .update(
+                &added.id,
+                UpdateConfiguredProviderRequest {
+                    auto_discover: None,
+                    allowed_models: ModelListUpdate::Replace(vec!["vision-a".into()]),
+                    disabled_models: None,
+                },
+            )
+            .await
+            .expect("filter");
+        wait_for(&cache, "text-b", None).await;
+        assert_eq!(
+            registry
+                .vision_probe_targets()
+                .await
+                .expect("targets")
+                .len(),
+            1
+        );
+        registry
+            .update(
+                &added.id,
+                UpdateConfiguredProviderRequest {
+                    auto_discover: None,
+                    allowed_models: ModelListUpdate::Clear,
+                    disabled_models: None,
+                },
+            )
+            .await
+            .expect("clear filter");
+        wait_for(&cache, "text-b", Some(false)).await;
+        registry.delete(&added.id).await.expect("delete");
+        wait_for(&cache, "vision-a", None).await;
+        wait_for(&cache, "text-b", None).await;
+        task.abort();
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .iter()
+                .all(|request| request.method == "GET"),
+            "metadata prevents inference probes"
+        );
+    }
+
+    #[tokio::test]
     async fn add_discovers_models_persists_and_redacts_key() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1578,7 +1707,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_additively_merges_models_and_preserves_missing_disabled_models() {
-        let registry = test_registry().await;
+        let registry = bare_test_registry().await;
         let upstream = MutableCatalogUpstream::new(vec!["model-a"]);
         {
             registry.state.write().await.providers = vec![ManagedProvider {
@@ -1598,6 +1727,7 @@ mod tests {
             registry.state.write().await.loaded = true;
         }
 
+        let changes = registry.vision_probe_changes();
         upstream.set_models(vec!["model-a", "model-b"]).await;
         registry
             .refresh_configured_providers_once()
@@ -1615,6 +1745,18 @@ mod tests {
             "refresh adds new ids and retains models missing upstream"
         );
         assert_eq!(provider.disabled_models, vec!["stale-model"]);
+        assert!(changes.has_changed().expect("watch open"));
+        assert_eq!(
+            registry
+                .vision_probe_targets()
+                .await
+                .expect("targets")
+                .iter()
+                .map(|target| target.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model-a", "model-b"],
+            "newly discovered enabled models become probe targets"
+        );
     }
 
     #[tokio::test]
@@ -2157,6 +2299,7 @@ mod tests {
 
         tokio::time::pause();
         let refresh_interval = MODEL_DISCOVERY_REFRESH_INTERVAL;
+        let mut changes = registry.vision_probe_changes();
         let started = Arc::new(Notify::new());
         let task = tokio::spawn(refresh_configured_providers_loop_with_interval(
             Arc::downgrade(&registry),
@@ -2177,16 +2320,9 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(upstream.queries(), 1, "one refresh runs after the interval");
-        for _ in 0..10 {
-            if registry.list().await.expect("list")[0]
-                .models
-                .iter()
-                .any(|entry| entry.id == "model-b")
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        // Query start is not commit completion: wait for the persisted-change
+        // signal instead of racing the SQL worker with a fixed yield count.
+        changes.changed().await.expect("refresh committed");
         assert!(
             registry.list().await.expect("list")[0]
                 .models
