@@ -796,8 +796,14 @@ vision_model: "Qwen3-VL"
 ```
 
 Whether a backend has native vision support is detected, not guessed: at startup
-and every ten minutes the gateway sends each routed (backend, model) pair a
-one-pixel PNG with `max_tokens: 1`. A success marks the model multimodal; a 4xx
+and every ten minutes the gateway checks each routed (backend, model) pair.
+Dashboard-added providers are checked too, including newly discovered models;
+provider additions, removals, and model allow/block list changes trigger a new check.
+The gateway first reads `/models` metadata (`architecture.input_modalities`):
+an explicit `image` input marks the model multimodal, while an explicit non-image
+input list marks it text-only. If the metadata is absent or inconclusive, the
+gateway sends a one-pixel PNG with `max_tokens: 1`. Metadata avoids inference
+requests for providers such as OpenRouter. A success marks the model multimodal; a 4xx
 that blames the image marks it text-only; anything else (auth, 5xx, unreachable)
 leaves the answer unknown. A profile's explicit `native_vision` still overrides
 the probe, and an unknown model keeps the name-based default. Configure or
