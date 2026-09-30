@@ -963,6 +963,17 @@ summaries; exceeding the snapshot budget evicts older time-travel cuts. Complete
 WebSocket replays release their temporary transcript copies before serving live
 updates.
 
+Replay history is bounded by both `max_replay_entries` and a conservative
+64 MiB retained-memory budget. Oversized records are skipped; setting
+`max_replay_entries: 0` disables replay retention.
+
+Large inference uploads share a 128 MiB in-flight body budget, configurable
+with `LLMCONDUIT_INFLIGHT_REQUEST_BODY_BYTES`. This budget queues uploads before
+buffering and stays charged until the response stream finishes or disconnects.
+It is separate from the per-request `max_request_body_bytes` limit, so a
+100 MiB request remains supported. Compressed uploads reserve their maximum
+decoded size. Smaller requests consume proportionally less of the budget.
+
 The Providers view can also control a local [lil-fleet](https://github.com/local-inference-lab/lil-fleet)
 instance. Set `LLMCONDUIT_FLEET_URL` to its loopback origin and provide either
 `LLMCONDUIT_FLEET_TOKEN_FILE` (preferred, so the bearer token can remain in a

@@ -551,7 +551,7 @@ fn estimate_input_tokens(
     // count (and thus the estimate) is stable. The G3 test oracle (T9) builds
     // an INDEPENDENT normalization of the recorded request — it does not call
     // this fn — so estimator-vs-oracle drift surfaces as a test failure.
-    let bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+    let bytes = crate::replay::serialized_len(&request).unwrap_or(0);
     // ceil(bytes / 4): ~4 bytes per token is the standard coarse approximation.
     bytes.div_ceil(4) as i64
 }
@@ -1908,8 +1908,16 @@ impl Gateway {
             .find_replay_baseline(&request)
             .await
             .map_err(&finalize_pre_spawn_err)?;
+        let replay_prefix_len = baseline_record
+            .as_ref()
+            .map(|record| record.internal_messages.len())
+            .unwrap_or(0);
+        // Clone only the unreplayed input, rather than copying every inline
+        // image into a full request clone and immediately discarding that copy.
+        let input = std::mem::take(&mut request.input);
         let mut tail_request = request.clone();
-        tail_request.input = request.input[prefix_len..].to_vec();
+        tail_request.input = input[prefix_len..].to_vec();
+        request.input = input;
         if self.config.brave_api_key.is_none() {
             let original_tool_count = tail_request.tools.len();
             tail_request
@@ -1965,13 +1973,13 @@ impl Gateway {
         let lowered = lower_request_with_image_agent_and_roles(
             &tail_request,
             baseline_record
-                .as_ref()
-                .map(|record| record.internal_messages.clone())
+                .map(|record| record.internal_messages)
                 .unwrap_or_default(),
             vision_session.is_some(),
             roles,
         )
         .map_err(&finalize_pre_spawn_err)?;
+        drop(tail_request);
 
         // G3 pre-flight context budgeting (T9: candidate-set seam). Estimate
         // over the LOWERED upstream payload (`lowered.messages`/`tools`/scalars)
@@ -2069,13 +2077,6 @@ impl Gateway {
         if let Some(phases) = &persistence_phases {
             phases.stamp_routing_decision();
         }
-        // Chat-message length of the replayed prefix (the baseline handed to
-        // lowering above). Threaded into `run_turn` so its pre-send adjacency
-        // merge is tail-scoped and never rewrites the cache-stable prefix.
-        let replay_prefix_len = baseline_record
-            .as_ref()
-            .map(|record| record.internal_messages.len())
-            .unwrap_or(0);
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
         let accounting_context = auth_context.clone();
@@ -2454,7 +2455,7 @@ impl Gateway {
     async fn run_turn(
         &self,
         response_id: String,
-        request: ResponsesRequest,
+        mut request: ResponsesRequest,
         mut current_messages: Vec<ChatMessage>,
         // Length of the replayed prefix carried over from a prior turn. Role
         // shaping + adjacency merges apply ONLY to the tail
@@ -2806,7 +2807,7 @@ impl Gateway {
         self.send_event(&tx, in_progress_event(&response_id), &abort_token)
             .await?;
 
-        let mut public_history = request.input.clone();
+        let mut public_history = std::mem::take(&mut request.input);
         let mut response_output = Vec::new();
         let mut event_state = ResponseEventState::default();
 
