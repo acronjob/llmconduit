@@ -1571,6 +1571,7 @@ async fn log_api_call(
                 body_bytes.clone(),
                 protocol,
                 gateway.persistence_keep_media(),
+                capture_payloads,
                 Some((Arc::clone(gateway.harness_detector()), headers.clone())),
             )
             .await,
@@ -2450,12 +2451,14 @@ async fn offload_persistence_inbound(
     body: Bytes,
     protocol: &'static str,
     keep_media: bool,
+    capture_payloads: bool,
     detection: Option<(Arc<crate::harness::HarnessDetector>, HeaderMap)>,
 ) -> PersistenceInbound {
     fn split_inbound(
         raw: &[u8],
         protocol: &str,
         keep_media: bool,
+        capture_payloads: bool,
         detection: Option<&(Arc<crate::harness::HarnessDetector>, HeaderMap)>,
     ) -> PersistenceInbound {
         match serde_json::from_slice::<Value>(raw) {
@@ -2468,7 +2471,12 @@ async fn offload_persistence_inbound(
                 // moves the items out); headers are the middleware's clone.
                 let harness =
                     detection.map(|(detector, headers)| detector.detect(headers, Some(&value)));
-                match crate::content_store::split_value(protocol, value, keep_media) {
+                match crate::content_store::split_value_with_retention(
+                    protocol,
+                    value,
+                    keep_media,
+                    capture_payloads,
+                ) {
                     Ok(split) => PersistenceInbound {
                         valid_json: true,
                         model,
@@ -2505,12 +2513,22 @@ async fn offload_persistence_inbound(
     }
 
     if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
-        return split_inbound(&body, protocol, keep_media, detection.as_ref());
+        return split_inbound(
+            &body,
+            protocol,
+            keep_media,
+            capture_payloads,
+            detection.as_ref(),
+        );
     }
-    let owned = body.to_vec();
-    drop(body);
     match tokio::task::spawn_blocking(move || {
-        split_inbound(&owned, protocol, keep_media, detection.as_ref())
+        split_inbound(
+            &body,
+            protocol,
+            keep_media,
+            capture_payloads,
+            detection.as_ref(),
+        )
     })
     .await
     {
@@ -5326,9 +5344,9 @@ mod tests {
             "secret redacted on the offloaded path"
         );
 
-        // The offload converted the body to an OWNED `Vec` for the blocking task and
-        // dropped its `Bytes`, so nothing pins the shared backing: `observer` is now the
-        // SOLE owner and reclaims uniquely (no retained slice of the inbound buffer).
+        // The offload moved its `Bytes` handle into the blocking task and returned
+        // without retaining a slice of the inbound buffer, so `observer` is now
+        // the sole owner and reclaims uniquely.
         assert!(
             observer.try_into_mut().is_ok(),
             "offload retained no clone of the inbound Bytes backing"
@@ -5345,6 +5363,7 @@ mod tests {
         let capture = super::offload_persistence_inbound(
             body,
             crate::content_store::PROTOCOL_RESPONSES,
+            true,
             true,
             None,
         )
@@ -5367,12 +5386,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistence_inbound_capture_disabled_keeps_lineage_without_payloads() {
+        let body = Bytes::from_static(
+            br#"{"model":"lineage-model","input":[{"role":"user","content":"remember me"}]}"#,
+        );
+        let capture = super::offload_persistence_inbound(
+            body,
+            crate::content_store::PROTOCOL_RESPONSES,
+            true,
+            false,
+            None,
+        )
+        .await;
+        assert!(capture.valid_json);
+        assert_eq!(capture.model.as_deref(), Some("lineage-model"));
+        let split = capture.split.expect("valid body splits for lineage");
+        assert_eq!(split.items.len(), 1);
+        assert!(!split.items[0].hash.is_empty(), "storage hash remains");
+        assert!(
+            !split.items[0].identity.is_empty(),
+            "session lineage identity remains"
+        );
+        assert!(
+            split.items[0].canonical.is_empty(),
+            "payload capture disabled does not retain item bytes"
+        );
+        assert!(split.skeleton.contains(crate::content_store::REF_KEY));
+    }
+
+    #[tokio::test]
     async fn persistence_inbound_malformed_body_opens_no_row_and_keeps_no_bytes() {
         let body = Bytes::from_static(br#"{"api_key":"super-secret-without-a-close"#);
         let capture = super::offload_persistence_inbound(
             body,
             crate::content_store::PROTOCOL_RESPONSES,
             true,
+            false,
             None,
         )
         .await;
