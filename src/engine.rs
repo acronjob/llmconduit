@@ -861,6 +861,9 @@ impl Gateway {
     ) -> Self {
         self.operational_alias_profiles = aliases.into_iter().collect();
         self.operational_unknown_model_policy = unknown_model_policy;
+        self.upstream.set_reject_unknown_models(
+            unknown_model_policy == crate::control_plane::UnknownModelPolicy::Reject,
+        );
         self
     }
 
@@ -1441,6 +1444,21 @@ impl Gateway {
         self.normalize_upstream_model(&configured_model).await
     }
 
+    pub async fn checked_resolve_request_model(
+        &self,
+        request_model: &str,
+    ) -> AppResult<(String, bool)> {
+        let resolved = self.resolve_request_model(request_model).await;
+        if self.operational_unknown_model_policy == crate::control_plane::UnknownModelPolicy::Reject
+            && !resolved.1
+        {
+            return Err(AppError::not_found(
+                "requested model is not currently routable",
+            ));
+        }
+        Ok(resolved)
+    }
+
     pub fn subscribe_monitor(
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::monitor::DebugUpdate> {
@@ -1772,7 +1790,8 @@ impl Gateway {
         // model the leaf records as `model_served`. Stamped onto the record via
         // `set_normalized` below alongside the normalized canonical body.
         let model_requested = request.model.clone();
-        let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
+        let (resolved_model, request_genuine) =
+            self.checked_resolve_request_model(&request.model).await?;
         // F1c: stamp the resolved/served model onto the capture outcome metadata now
         // that resolution has settled (absent for a turn that fails before here).
         if let Some(guard) = &capture_guard {

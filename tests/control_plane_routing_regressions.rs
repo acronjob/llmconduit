@@ -8,7 +8,7 @@ use axum::body::Body;
 use http::Request;
 use llmconduit::AppOptions;
 use llmconduit::ControlPlaneRuntime;
-use llmconduit::config::{Config, ModelRoute, PersistedConfig};
+use llmconduit::config::{Config, ModelProfile, ModelRoute, PersistedConfig};
 use llmconduit::control_plane::{
     OperationalProviderPlan, OperationalRoutePlan, UnknownModelPolicy,
 };
@@ -200,6 +200,218 @@ async fn operational_routes_preserve_primary_passthrough_for_unmatched_models() 
     assert_eq!(
         body["choices"][0]["message"]["content"],
         "served by primary"
+    );
+}
+
+#[tokio::test]
+async fn reject_policy_rejects_backendless_profile_before_catalog_default_dispatch() {
+    let primary = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "wielick-large"}]
+        })))
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&primary)
+        .await;
+
+    let mut config = base_config(&format!("{}/v1/", primary.uri()));
+    config
+        .model_profiles
+        .insert("DeepSeek-V4.1-Flash".to_string(), ModelProfile::default());
+    let (app, _gateway) = llmconduit::build_app_with_gateway_control_plane(
+        config,
+        None,
+        AppOptions::default(),
+        Vec::new(),
+        UnknownModelPolicy::Reject,
+        None,
+    )
+    .expect("reject-mode app");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "deepseek-v4.1-flash",
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("gateway response");
+
+    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reject_policy_allows_case_insensitive_genuine_catalog_match() {
+    let primary = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "DeepSeek-V4.1-Flash"}]
+        })))
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"model": "DeepSeek-V4.1-Flash"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_sse_body("chat-deepseek", "served by deepseek")),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    let mut config = base_config(&format!("{}/v1/", primary.uri()));
+    config
+        .model_profiles
+        .insert("DeepSeek-V4.1-Flash".to_string(), ModelProfile::default());
+    let (app, _gateway) = llmconduit::build_app_with_gateway_control_plane(
+        config,
+        None,
+        AppOptions::default(),
+        Vec::new(),
+        UnknownModelPolicy::Reject,
+        None,
+    )
+    .expect("reject-mode app");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "deepseek-v4.1-flash",
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("gateway response");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("response body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "served by deepseek"
+    );
+}
+
+#[tokio::test]
+async fn reject_policy_allows_genuine_catalog_model_without_profile() {
+    let primary = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "wielick-large"}]
+        })))
+        .mount(&primary)
+        .await;
+
+    let config = base_config(&format!("{}/v1/", primary.uri()));
+    let (_app, gateway) = llmconduit::build_app_with_gateway_control_plane(
+        config,
+        None,
+        AppOptions::default(),
+        Vec::new(),
+        UnknownModelPolicy::Reject,
+        None,
+    )
+    .expect("reject-mode app");
+
+    let (resolved, genuine) = gateway
+        .checked_resolve_request_model("wielick-large")
+        .await
+        .expect("genuine catalog model should be accepted under reject policy");
+    assert_eq!(resolved, "wielick-large");
+    assert!(genuine);
+}
+
+#[tokio::test]
+async fn passthrough_policy_preserves_catalog_default_dispatch() {
+    let primary = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "wielick-large"}]
+        })))
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"model": "wielick-large"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_sse_body("chat-default", "served by default")),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    let config = base_config(&format!("{}/v1/", primary.uri()));
+    let (app, _gateway) = llmconduit::build_app_with_gateway_control_plane(
+        config,
+        None,
+        AppOptions::default(),
+        Vec::new(),
+        UnknownModelPolicy::Passthrough,
+        None,
+    )
+    .expect("passthrough app");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "not-loaded",
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("gateway response");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("response body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "served by default"
     );
 }
 

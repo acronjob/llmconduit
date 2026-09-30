@@ -202,7 +202,10 @@ control_plane:
 ```
 
 `unknown_model_policy: passthrough` preserves the normal catalog/default route
-for unknown names; `reject` returns 404 before contacting an upstream. Disabled
+for unknown names; `reject` returns 404 before contacting an upstream, including
+when a configured profile has no available backend and would select a different
+catalog-default model. This also applies to dashboard chat and Responses
+WebSocket turns. Disabled
 backends are omitted from operational route plans. Empty provider chains and
 dangling or duplicate UUID references fail startup rather than silently changing
 routing.
@@ -973,6 +976,7 @@ buffering and stays charged until the response stream finishes or disconnects.
 It is separate from the per-request `max_request_body_bytes` limit, so a
 100 MiB request remains supported. Compressed uploads reserve their maximum
 decoded size. Smaller requests consume proportionally less of the budget.
+Dashboard chat uploads use the same budget.
 
 The Providers view can also control a local [lil-fleet](https://github.com/local-inference-lab/lil-fleet)
 instance. Set `LLMCONDUIT_FLEET_URL` to its loopback origin and provide either
