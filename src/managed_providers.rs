@@ -866,6 +866,10 @@ impl UpstreamClient for ManagedProviderUpstream {
         self.base.provider_base_url()
     }
 
+    fn set_reject_unknown_models(&self, reject: bool) {
+        self.base.set_reject_unknown_models(reject);
+    }
+
     fn model_catalog_cache_ttl(&self) -> Duration {
         Duration::from_secs(0)
     }

@@ -2032,7 +2032,11 @@ fn should_gate_inflight_request_body(method: &axum::http::Method, path: &str) ->
     *method == axum::http::Method::POST
         && matches!(
             path,
-            "/v1/responses" | "/v1/messages" | "/v1/chat/completions" | "/v1/completions"
+            "/v1/responses"
+                | "/v1/messages"
+                | "/v1/chat/completions"
+                | "/v1/completions"
+                | "/dashboard/api/chat"
         )
 }
 
@@ -2998,7 +3002,10 @@ async fn post_responses(
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let served = gateway.resolve_request_model(&request.model).await.0;
+    let served = gateway
+        .checked_resolve_request_model(&request.model)
+        .await?
+        .0;
     let authorization = authorize_inference(
         auth.as_ref().map(|value| &value.0),
         crate::upstream::InferenceEndpoint::Responses,
@@ -3483,7 +3490,10 @@ async fn handle_count_tokens(
 
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
-    let resolved_model = gateway.resolve_request_model(&original_model).await.0;
+    let resolved_model = gateway
+        .checked_resolve_request_model(&original_model)
+        .await?
+        .0;
     let authorization = authorize_inference(
         auth.as_ref(),
         crate::upstream::InferenceEndpoint::CountTokens,
@@ -3753,7 +3763,10 @@ async fn handle_chat_completions(
     affinity: Option<RequestAffinity>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let model = gateway.resolve_request_model(&request.model).await.0;
+    let model = gateway
+        .checked_resolve_request_model(&request.model)
+        .await?
+        .0;
     let authorization = authorize_inference(
         auth.as_ref(),
         crate::upstream::InferenceEndpoint::ChatCompletions,
@@ -3865,7 +3878,10 @@ async fn handle_post_messages(
     affinity: Option<RequestAffinity>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let model = gateway.resolve_request_model(&request.model).await.0;
+    let model = gateway
+        .checked_resolve_request_model(&request.model)
+        .await?
+        .0;
     let authorization = authorize_inference(
         auth.as_ref(),
         crate::upstream::InferenceEndpoint::Messages,
@@ -5031,6 +5047,18 @@ fn model_id_from_value(model: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inflight_body_gate_includes_dashboard_chat_uploads() {
+        assert!(super::should_gate_inflight_request_body(
+            &axum::http::Method::POST,
+            "/dashboard/api/chat"
+        ));
+        assert!(!super::should_gate_inflight_request_body(
+            &axum::http::Method::GET,
+            "/dashboard/api/chat"
+        ));
+    }
+
     #[test]
     fn affinity_uses_conversations_and_threads_not_per_turn_request_ids() {
         let detector = crate::harness::HarnessDetector::builtin();

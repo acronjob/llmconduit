@@ -31,6 +31,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -676,6 +677,12 @@ pub trait UpstreamClient: Send + Sync {
     fn model_catalog_cache_ttl(&self) -> Duration {
         Duration::from_secs(ROUTING_MODEL_CATALOG_TTL_SECS)
     }
+
+    /// Tell composite upstreams whether a request that resolves only through
+    /// catalog-default fallback should be rejected before dispatch. Leaf
+    /// upstreams have no catalog-default resolution step, so the default is a
+    /// no-op and the method stays dyn-safe for `Arc<dyn UpstreamClient>`.
+    fn set_reject_unknown_models(&self, _reject: bool) {}
 }
 
 pub type DynUpstreamClient = Arc<dyn UpstreamClient>;
@@ -997,6 +1004,7 @@ pub struct RoutingUpstreamClient {
     /// always move together. Default `Arc<CatalogMeta>` (both `None`) until the
     /// first refresh.
     catalog_meta: Arc<Mutex<Arc<CatalogMeta>>>,
+    reject_unknown_models: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -2897,7 +2905,27 @@ impl RoutingUpstreamClient {
             routes,
             catalog: Arc::new(AsyncMutex::new(None)),
             catalog_meta: Arc::new(Mutex::new(Arc::new(CatalogMeta::default()))),
+            reject_unknown_models: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn ensure_default_resolution_allowed(
+        &self,
+        requested_model: &str,
+        resolved_model: &str,
+        kind: MatchKind,
+    ) -> AppResult<()> {
+        if kind == MatchKind::Default && self.reject_unknown_models.load(Ordering::Relaxed) {
+            tracing::warn!(
+                requested_model = %requested_model,
+                resolved_model = %resolved_model,
+                "rejecting catalog-default model resolution under unknown-model reject policy"
+            );
+            return Err(AppError::not_found(
+                "requested model is not currently routable",
+            ));
+        }
+        Ok(())
     }
 
     /// Look up a synthetic route provider by index, mapping an out-of-range
@@ -3492,6 +3520,12 @@ impl UpstreamClient for FailoverUpstreamClient {
     fn provider_health(&self) -> Vec<ProviderHealth> {
         self.provider_health_with_route(None, CatalogMeta::default())
     }
+
+    fn set_reject_unknown_models(&self, reject: bool) {
+        for provider in &self.providers {
+            provider.client.set_reject_unknown_models(reject);
+        }
+    }
 }
 
 #[async_trait]
@@ -3630,6 +3664,16 @@ impl UpstreamClient for RoutingUpstreamClient {
         health
     }
 
+    fn set_reject_unknown_models(&self, reject: bool) {
+        self.reject_unknown_models.store(reject, Ordering::Relaxed);
+        for provider in &self.providers {
+            provider.client.set_reject_unknown_models(reject);
+        }
+        for route_provider in &self.route_providers {
+            route_provider.client.set_reject_unknown_models(reject);
+        }
+    }
+
     async fn stream_chat_completion_with_timeout(
         &self,
         backend: &BackendChatRequest,
@@ -3676,6 +3720,11 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
+        self.ensure_default_resolution_allowed(
+            &backend.request.model,
+            &resolution.model_id,
+            match_kind,
+        )?;
         let routed_request =
             self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
         // D2: tag the `route` serving field with the selected routing provider's
@@ -3734,6 +3783,11 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
+        self.ensure_default_resolution_allowed(
+            &backend.request.model,
+            &resolution.model_id,
+            match_kind,
+        )?;
         let routed = self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
         match resolution.target {
             RoutingModelTarget::Primary => provider.client.count_tokens(&routed).await,
@@ -3787,6 +3841,7 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
+        self.ensure_default_resolution_allowed(&requested_model, &resolution.model_id, match_kind)?;
         log_model_resolution(
             &requested_model,
             &resolution.model_id,
@@ -5918,21 +5973,32 @@ mod tests {
         assert!(guarded.next().await.is_none());
     }
 
+    use super::ProxyCompletionsRequest;
     use super::ReqwestUpstreamClient;
+    use super::RoutingUpstreamClient;
+    use super::RoutingUpstreamProvider;
+    use super::UpstreamClient;
     use super::UpstreamModelEntry;
+    use super::UpstreamModelsResponse;
     use super::UpstreamRequestLogger;
+    use super::UpstreamStream;
     use super::classify_attempt_error;
     use super::extract_supported_model_catalog;
     use super::sanitize_chat_request;
     use super::should_proxy_request_header;
     use crate::error::AppError;
+    use crate::error::AppResult;
     use crate::error::FailoverDisposition;
     use crate::models::chat::ChatCompletionRequest;
     use crate::models::chat::ChatMessage;
+    use axum::body::Bytes;
+    use http::HeaderMap;
     use http::HeaderName;
     use reqwest::StatusCode;
     use serde_json::Value;
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as AtomicOrdering;
 
     /// The full RFC 7230 §6.1 hop-by-hop set; must match the canonical list and
     /// the response-direction parity test in `http.rs`.
@@ -6022,7 +6088,6 @@ mod tests {
     use super::InferenceEndpoint;
     use super::ModelFamily;
     use super::ProviderStatus;
-    use super::UpstreamClient as _;
     use super::apply_family_chat_template_kwargs;
     use super::detect_model_family;
     use super::merge_chat_kwargs_gap_fill;
@@ -6095,6 +6160,86 @@ mod tests {
         client_kwargs: Option<JsonMap<String, Value>>,
     ) -> BackendChatRequest {
         BackendChatRequest::new(family_request(model), client_kwargs, None, None)
+    }
+
+    #[derive(Clone, Default)]
+    struct CatalogDefaultDispatchProbe {
+        stream_calls: Arc<AtomicUsize>,
+        count_calls: Arc<AtomicUsize>,
+        completions_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl UpstreamClient for CatalogDefaultDispatchProbe {
+        async fn stream_chat_completion(
+            &self,
+            _request: &BackendChatRequest,
+        ) -> AppResult<UpstreamStream> {
+            self.stream_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(AppError::internal("stream dispatch should not be reached"))
+        }
+
+        async fn list_models(&self) -> AppResult<UpstreamModelsResponse> {
+            super::json_response(json!({
+                "data": [{"id": "wielick-large"}]
+            }))
+        }
+
+        async fn count_tokens(&self, _request: &BackendChatRequest) -> AppResult<Option<u64>> {
+            self.count_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(Some(1))
+        }
+
+        async fn proxy_completions(
+            &self,
+            _request: ProxyCompletionsRequest,
+        ) -> AppResult<reqwest::Response> {
+            self.completions_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(AppError::internal(
+                "completions dispatch should not be reached",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_unknown_models_blocks_catalog_default_before_dispatch() {
+        let probe = CatalogDefaultDispatchProbe::default();
+        let client = RoutingUpstreamClient::new(vec![RoutingUpstreamProvider::new(
+            "mesh",
+            probe.clone(),
+            None,
+            JsonMap::new(),
+            Vec::new(),
+            Duration::ZERO,
+        )]);
+        client.set_reject_unknown_models(true);
+
+        let backend = family_backend("DeepSeek-V4.1-Flash", None);
+        let stream_error = match client.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("catalog default must reject before stream dispatch"),
+            Err(err) => err,
+        };
+        assert_eq!(stream_error.status_code(), StatusCode::NOT_FOUND);
+
+        let count_error = match client.count_tokens(&backend).await {
+            Ok(_) => panic!("catalog default must reject before token-count dispatch"),
+            Err(err) => err,
+        };
+        assert_eq!(count_error.status_code(), StatusCode::NOT_FOUND);
+
+        let completions = ProxyCompletionsRequest::new(
+            HeaderMap::new(),
+            Bytes::from(json!({"model": "DeepSeek-V4.1-Flash", "prompt": "hello"}).to_string()),
+        );
+        let completions_error = match client.proxy_completions(completions).await {
+            Ok(_) => panic!("catalog default must reject before completions dispatch"),
+            Err(err) => err,
+        };
+        assert_eq!(completions_error.status_code(), StatusCode::NOT_FOUND);
+
+        assert_eq!(probe.stream_calls.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(probe.count_calls.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(probe.completions_calls.load(AtomicOrdering::Relaxed), 0);
     }
 
     /// Empty finalization policies (no effort map, no family override, no
