@@ -121,7 +121,17 @@ async fn restrict_existing_secret_file(path: &Path) -> io::Result<()> {
             mode = format!("{mode:o}"),
             "mesh identity key was group/world accessible; restricting it to 0600"
         );
-        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        // Read-only mounts (e.g. a container's `:ro` key bind) cannot be
+        // tightened from inside; the key is still usable, so refusing to start
+        // would turn a hardening nudge into an outage.
+        if let Err(error) = fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not restrict mesh identity key permissions; fix them on the host"
+            );
+        }
     }
     Ok(())
 }

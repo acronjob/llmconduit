@@ -458,7 +458,15 @@ fn ensure_private_db_file(path: &Path) -> Result<(), StoreError> {
             mode = format!("{mode:o}"),
             "mesh state database was group/world accessible; restricting it to 0600"
         );
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        // Best-effort like the identity key: an unchangeable mode (read-only
+        // mount, foreign owner) must not keep the controller from starting.
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not restrict mesh state database permissions; fix them on the host"
+            );
+        }
     }
     Ok(())
 }
