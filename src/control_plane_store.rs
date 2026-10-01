@@ -34,6 +34,10 @@ pub type StoreResult<T> = Result<T, String>;
 const API_KEY_HASH_PREFIX: &str = "sha256:";
 const DEFAULT_PERSISTENCE_QUEUE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const PERSISTENCE_QUEUE_MAX_BYTES_ENV: &str = "LLMCONDUIT_PERSISTENCE_QUEUE_MAX_BYTES";
+/// SQLite pool ceiling: one writer plus a few concurrent dashboard readers.
+const SQLITE_MAX_CONNECTIONS: u32 = 4;
+/// Per-connection SQLite page cache in KiB (`PRAGMA cache_size` negative form).
+const SQLITE_CACHE_SIZE_PRAGMA: &str = "-8192";
 
 /// Lifecycle row created at the HTTP ingress seam. `id` is the stable
 /// `api_call_id`; the response id and actual winning backend are unknown here.
@@ -789,19 +793,32 @@ impl SqlStore {
     /// chmodded because it may be shared or operator-owned; deployments must
     /// place the database in a private directory when pathname privacy matters.
     pub async fn connect_sqlite(url: &str) -> StoreResult<Self> {
-        let options = sqlx::sqlite::SqliteConnectOptions::from_str(url)
+        let in_memory = sqlite_url_is_memory(url);
+        let mut options = sqlx::sqlite::SqliteConnectOptions::from_str(url)
             // The connection string can carry URI parameters; never repeat it.
             .map_err(|_| "invalid SQLite connection URL".to_string())?
             .create_if_missing(true)
             .foreign_keys(true)
-            .journal_mode(if sqlite_url_is_memory(url) {
+            .journal_mode(if in_memory {
                 sqlx::sqlite::SqliteJournalMode::Memory
             } else {
                 sqlx::sqlite::SqliteJournalMode::Wal
             })
-            .busy_timeout(Duration::from_secs(5));
-        let database_path = (!sqlite_url_is_memory(url)).then(|| options.get_filename().to_owned());
+            .busy_timeout(Duration::from_secs(5))
+            // Bound the per-connection page cache (negative = KiB) so the pool's
+            // worst case stays a few tens of MiB on a small host.
+            .pragma("cache_size", SQLITE_CACHE_SIZE_PRAGMA);
+        if !in_memory {
+            // WAL + NORMAL is crash-safe (no corruption); a power loss can only
+            // drop the last few committed transactions, which is acceptable for
+            // observability/control-plane rows and saves an fsync per commit.
+            options = options.synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        }
+        let database_path = (!in_memory).then(|| options.get_filename().to_owned());
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            // SQLite serializes writers anyway; a small pool bounds the per-
+            // connection caches and file handles without costing throughput.
+            .max_connections(SQLITE_MAX_CONNECTIONS)
             .connect_with(options)
             .await
             .map_err(|_| "SQLite storage connection failed".to_string())?;
@@ -5207,6 +5224,21 @@ mod tests {
             .try_get(0)
             .expect("journal mode value");
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        let synchronous: i64 = sqlx::query("PRAGMA synchronous")
+            .fetch_one(sqlite_pool(&store))
+            .await
+            .expect("synchronous")
+            .try_get(0)
+            .expect("synchronous value");
+        assert_eq!(synchronous, 1, "WAL databases run synchronous=NORMAL");
+        let cache_size: i64 = sqlx::query("PRAGMA cache_size")
+            .fetch_one(sqlite_pool(&store))
+            .await
+            .expect("cache_size")
+            .try_get(0)
+            .expect("cache_size value");
+        assert_eq!(cache_size, -8192);
+        assert_eq!(sqlite_pool(&store).options().get_max_connections(), 4);
         store.close().await;
         std::fs::remove_file(path).expect("remove database");
         for suffix in ["-wal", "-shm"] {
