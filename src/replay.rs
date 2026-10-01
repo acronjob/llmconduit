@@ -31,10 +31,14 @@ struct ReplayEntry {
     retained_bytes: usize,
 }
 
+/// Raw SHA-256 digest. Kept binary (not hex) so each retained key is 32 bytes
+/// inline instead of a 64-byte heap `String`.
+type ReplayKey = [u8; 32];
+
 #[derive(Debug, Clone)]
 struct ReplayInner {
-    map: HashMap<String, ReplayEntry>,
-    order: VecDeque<String>,
+    map: HashMap<ReplayKey, ReplayEntry>,
+    order: VecDeque<ReplayKey>,
     max_entries: usize,
     max_bytes: usize,
     retained_bytes: usize,
@@ -69,8 +73,8 @@ impl ReplayStore {
 
     pub async fn insert(&self, record: ReplayRecord) {
         let key =
-            hash_visible_history(&record.model, &record.instructions, &record.visible_history);
-        let Ok(retained_bytes) = retained_record_bytes(&key, &record) else {
+            visible_history_digest(&record.model, &record.instructions, &record.visible_history);
+        let Ok(retained_bytes) = retained_record_bytes(&record) else {
             return;
         };
         let mut guard = self.inner.write().await;
@@ -103,7 +107,7 @@ impl ReplayStore {
                 break;
             }
         }
-        guard.order.push_back(key.clone());
+        guard.order.push_back(key);
         guard.retained_bytes = guard.retained_bytes.saturating_add(retained_bytes);
         guard.map.insert(
             key,
@@ -120,14 +124,16 @@ impl ReplayStore {
         instructions: &str,
         input: &[ResponseItem],
     ) -> Option<ReplayRecord> {
+        // Every prefix digest comes from ONE streaming pass (O(total bytes), not
+        // O(N^2) re-serialization) and is computed BEFORE the lock so hashing a
+        // long history never holds up concurrent inserts.
+        let digests = prefix_digests(model, instructions, input);
         let guard = self.inner.read().await;
-        for len in (0..=input.len()).rev() {
-            let key = hash_visible_history(model, instructions, &input[..len]);
-            if let Some(record) = guard.map.get(&key) {
-                return Some(record.record.clone());
-            }
-        }
-        None
+        digests
+            .iter()
+            .rev()
+            .find_map(|key| guard.map.get(key))
+            .map(|entry| entry.record.clone())
     }
 
     /// Number of entries currently stored. Observability/testability accessor
@@ -155,7 +161,7 @@ impl ReplayInner {
         false
     }
 
-    fn evict_oldest_except(&mut self, skipped_key: &str) -> bool {
+    fn evict_oldest_except(&mut self, skipped_key: &ReplayKey) -> bool {
         while let Some(index) = self.order.iter().position(|key| key != skipped_key) {
             let Some(oldest) = self.order.remove(index) else {
                 return false;
@@ -170,10 +176,64 @@ impl ReplayInner {
 }
 
 pub fn hash_visible_history(model: &str, instructions: &str, items: &[ResponseItem]) -> String {
+    hex::encode(visible_history_digest(model, instructions, items))
+}
+
+fn visible_history_digest(model: &str, instructions: &str, items: &[ResponseItem]) -> ReplayKey {
     let mut hasher = Sha256::new();
     let mut writer = Sha256Writer(&mut hasher);
     let _ = serialize_visible_history(&mut writer, model, instructions, items);
-    hex::encode(hasher.finalize())
+    hasher.finalize().into()
+}
+
+/// Digests of `items[..k]` for every `k` in `0..=items.len()` (index = `k`),
+/// byte-identical to [`visible_history_digest`] on each prefix.
+///
+/// The canonical payload is `{"instructions":I,"items":[i0,i1,...],"model":M}`
+/// (sorted keys, compact), so every prefix shares all bytes up to its last item
+/// and differs only by the closing `],"model":M}` suffix. Streaming the shared
+/// bytes into one hasher and finalizing a CLONE plus that suffix per prefix
+/// turns the lookup from O(N^2) serialization into O(total bytes). If an item
+/// fails to serialize, longer prefixes are omitted: the legacy path would hash
+/// a truncated payload that no successful insert could have produced.
+fn prefix_digests(model: &str, instructions: &str, items: &[ResponseItem]) -> Vec<ReplayKey> {
+    let mut suffix = Vec::with_capacity(model.len() + 16);
+    suffix.extend_from_slice(b"],\"model\":");
+    if serde_json::to_writer(&mut suffix, model).is_err() {
+        return Vec::new();
+    }
+    suffix.push(b'}');
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"{\"instructions\":");
+    if serde_json::to_writer(Sha256Writer(&mut hasher), instructions).is_err() {
+        return Vec::new();
+    }
+    hasher.update(b",\"items\":[");
+
+    let finish = |hasher: &Sha256| -> ReplayKey {
+        let mut prefix = hasher.clone();
+        prefix.update(&suffix);
+        prefix.finalize().into()
+    };
+
+    let mut digests = Vec::with_capacity(items.len() + 1);
+    digests.push(finish(&hasher));
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            hasher.update(b",");
+        }
+        // `to_value` is what sorts struct fields into the legacy (BTreeMap) key
+        // order the stored hashes were built with; it now runs once per item.
+        let Ok(value) = serde_json::to_value(item) else {
+            break;
+        };
+        if serde_json::to_writer(Sha256Writer(&mut hasher), &value).is_err() {
+            break;
+        }
+        digests.push(finish(&hasher));
+    }
+    digests
 }
 
 pub(crate) fn serialized_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
@@ -182,13 +242,14 @@ pub(crate) fn serialized_len<T: Serialize>(value: &T) -> Result<usize, serde_jso
     Ok(writer.bytes)
 }
 
-fn retained_record_bytes(key: &str, record: &ReplayRecord) -> Result<usize, serde_json::Error> {
+fn retained_record_bytes(record: &ReplayRecord) -> Result<usize, serde_json::Error> {
     // Replay records retain Rust strings, vectors, enum tags, and map buckets, so
     // serialized JSON length is a lower bound. Charge a conservative multiple of
     // the serialized payload to keep the retained heap below the nominal budget.
     Ok(serialized_len(record)?
         .saturating_mul(SERIALIZED_RETAINED_BYTE_MULTIPLIER)
-        .saturating_add(key.len())
+        // Key is held twice: map bucket + FIFO order.
+        .saturating_add(mem::size_of::<ReplayKey>().saturating_mul(2))
         .saturating_add(mem::size_of::<ReplayEntry>())
         .saturating_add(REPLAY_ENTRY_STRUCTURAL_OVERHEAD))
 }
@@ -382,12 +443,8 @@ mod tests {
             "data:image/png;base64,{}",
             "b".repeat(1024)
         ))]);
-        let first_key =
-            hash_visible_history(&first.model, &first.instructions, &first.visible_history);
-        let first_bytes = retained_record_bytes(&first_key, &first).unwrap();
-        let second_key =
-            hash_visible_history(&second.model, &second.instructions, &second.visible_history);
-        let second_bytes = retained_record_bytes(&second_key, &second).unwrap();
+        let first_bytes = retained_record_bytes(&first).unwrap();
+        let second_bytes = retained_record_bytes(&second).unwrap();
         let store = ReplayStore::with_byte_limit(10, first_bytes.max(second_bytes) + 64);
 
         store.insert(first).await;
@@ -427,12 +484,7 @@ mod tests {
     #[tokio::test]
     async fn test_replay_store_oversize_record_does_not_clear_existing() {
         let existing = record_with_history(vec![user_msg("existing")]);
-        let existing_key = hash_visible_history(
-            &existing.model,
-            &existing.instructions,
-            &existing.visible_history,
-        );
-        let existing_bytes = retained_record_bytes(&existing_key, &existing).unwrap();
+        let existing_bytes = retained_record_bytes(&existing).unwrap();
         let store = ReplayStore::with_byte_limit(10, existing_bytes + 256);
         store.insert(existing).await;
 
@@ -456,12 +508,7 @@ mod tests {
     #[tokio::test]
     async fn test_replay_store_replacement_updates_byte_accounting() {
         let original = record_with_history(vec![user_msg("same")]);
-        let key = hash_visible_history(
-            &original.model,
-            &original.instructions,
-            &original.visible_history,
-        );
-        let original_bytes = retained_record_bytes(&key, &original).unwrap();
+        let original_bytes = retained_record_bytes(&original).unwrap();
         let replacement = ReplayRecord {
             internal_messages: vec![ChatMessage {
                 role: "assistant".to_string(),
@@ -474,11 +521,9 @@ mod tests {
             }],
             ..original.clone()
         };
-        let replacement_bytes = retained_record_bytes(&key, &replacement).unwrap();
+        let replacement_bytes = retained_record_bytes(&replacement).unwrap();
         let other = record_with_history(vec![user_msg("other")]);
-        let other_key =
-            hash_visible_history(&other.model, &other.instructions, &other.visible_history);
-        let other_bytes = retained_record_bytes(&other_key, &other).unwrap();
+        let other_bytes = retained_record_bytes(&other).unwrap();
         let store = ReplayStore::with_byte_limit(
             10,
             replacement_bytes
@@ -593,6 +638,90 @@ mod tests {
         let legacy = hex::encode(hasher.finalize());
 
         assert_eq!(hash_visible_history("model", "instr", &items), legacy);
+    }
+
+    /// The pre-optimization lookup key: one `json!` payload per prefix.
+    fn legacy_hash(model: &str, instructions: &str, items: &[ResponseItem]) -> String {
+        let payload = serde_json::json!({
+            "model": model,
+            "instructions": instructions,
+            "items": items,
+        });
+        hex::encode(Sha256::digest(serde_json::to_vec(&payload).unwrap()))
+    }
+
+    fn varied_items() -> Vec<ResponseItem> {
+        let shapes = [
+            serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi \"quoted\" \u{2603}\n"}]}),
+            serde_json::json!({"type":"message","id":"m1","role":"assistant","phase":"final","content":[{"type":"output_text","text":"ok"}]}),
+            serde_json::json!({"type":"reasoning","id":"r1","summary":[{"type":"summary_text","text":"s"}],"encrypted_content":"enc"}),
+            serde_json::json!({"type":"function_call","name":"f","namespace":"ns","arguments":"{\"z\":1,\"a\":2}","call_id":"c1"}),
+            serde_json::json!({"type":"function_call_output","call_id":"c1","output":{"zeta":1,"alpha":[1,{"y":2,"b":3}]}}),
+            serde_json::json!({"type":"custom_tool_call","status":"done","call_id":"c2","name":"g","input":"x"}),
+            serde_json::json!({"type":"custom_tool_call_output","call_id":"c2","output":"plain"}),
+            serde_json::json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA","detail":"high"}]}),
+            serde_json::json!({"type":"message","role":"user","content":[]}),
+        ];
+        shapes
+            .into_iter()
+            .map(|v| serde_json::from_value(v).expect("valid response item"))
+            .collect()
+    }
+
+    #[test]
+    fn prefix_digests_match_legacy_hash_for_every_prefix() {
+        let items = varied_items();
+        for (model, instructions) in [
+            ("m", "i"),
+            ("", ""),
+            ("gpt-\"x\"", "line1\nline2 \u{1F600} \\ /"),
+        ] {
+            // Every contiguous window exercises different leading shapes.
+            for start in 0..items.len() {
+                let window = &items[start..];
+                let digests = prefix_digests(model, instructions, window);
+                assert_eq!(digests.len(), window.len() + 1);
+                for (len, digest) in digests.iter().enumerate() {
+                    let expected = legacy_hash(model, instructions, &window[..len]);
+                    assert_eq!(hex::encode(digest), expected, "prefix len {len}");
+                    assert_eq!(
+                        hash_visible_history(model, instructions, &window[..len]),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn longest_prefix_match_prefers_longest_stored_prefix() {
+        let items = varied_items();
+        let store = ReplayStore::new(100);
+        for len in [0, 2, 5] {
+            store
+                .insert(ReplayRecord {
+                    model: "m".to_string(),
+                    instructions: "i".to_string(),
+                    visible_history: items[..len].to_vec(),
+                    internal_messages: vec![],
+                })
+                .await;
+        }
+        let hit = store.longest_prefix_match("m", "i", &items).await.unwrap();
+        assert_eq!(hit.visible_history.len(), 5);
+        let hit = store
+            .longest_prefix_match("m", "i", &items[..4])
+            .await
+            .unwrap();
+        assert_eq!(hit.visible_history.len(), 2);
+        let hit = store.longest_prefix_match("m", "i", &[]).await.unwrap();
+        assert!(hit.visible_history.is_empty());
+        assert!(
+            store
+                .longest_prefix_match("m2", "i", &items)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
