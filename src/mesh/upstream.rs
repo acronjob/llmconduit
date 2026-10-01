@@ -26,6 +26,14 @@ use tokio_util::bytes::BytesMut;
 
 const MESH_ERROR_BODY_READ_LIMIT: usize = 16 * 1024;
 const MESH_ERROR_BODY_DISPLAY_LIMIT: usize = 500;
+const DEFAULT_MESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest slice taken from the QUIC receive buffer per read. Chunks are
+/// handed through without copying, so this only bounds per-read latency.
+const MESH_BODY_READ_CHUNK_BYTES: usize = 64 * 1024;
+/// Small chat bodies are not worth a compression pass on the hub's 2 vCPUs.
+const MESH_COMPRESSION_MIN_BYTES: usize = 8 * 1024;
+/// Fast levels only: the hub pays this CPU on every large mesh request.
+const MESH_ZSTD_LEVEL: i32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct MeshUpstreamClient {
@@ -35,6 +43,8 @@ pub struct MeshUpstreamClient {
     max_sse_frame_bytes: usize,
     flow_store: crate::dashboard_flow::DashboardFlowStore,
     capacity_wait_timeout: Duration,
+    first_byte_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 impl MeshUpstreamClient {
@@ -51,12 +61,27 @@ impl MeshUpstreamClient {
             flatten_content,
             max_sse_frame_bytes,
             flow_store,
-            capacity_wait_timeout: Duration::from_secs(60),
+            capacity_wait_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
+            first_byte_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
+            idle_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
         }
     }
 
+    /// The gateway passes its `request_timeout` here. It bounds the wait for
+    /// worker capacity and, once a worker admits the request, the wait for
+    /// its first response chunk and every later gap between body reads, so
+    /// a worker that accepts and then hangs cannot pin the request forever.
     pub(crate) fn with_capacity_wait_timeout(mut self, timeout: Duration) -> Self {
         self.capacity_wait_timeout = timeout;
+        self.first_byte_timeout = timeout;
+        self.idle_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_response_timeouts(mut self, first_byte: Duration, idle: Duration) -> Self {
+        self.first_byte_timeout = first_byte;
+        self.idle_timeout = idle;
         self
     }
 }
@@ -87,7 +112,7 @@ impl UpstreamClient for MeshUpstreamClient {
                 None => capture.mark_upstream_request_redaction_failed(),
             }
         }
-        let request = build_chat_http_request(&request)?;
+        let body = MeshRequestBody::encode(&request)?;
         let mut excluded = HashSet::new();
         let mut last_error = None;
         let capacity_deadline = tokio::time::Instant::now() + self.capacity_wait_timeout;
@@ -158,19 +183,41 @@ impl UpstreamClient for MeshUpstreamClient {
             if let Some(capture) = backend.capture.as_ref() {
                 capture.reset_upstream_response();
             }
+            let wire = if reservation.resource.local_model_id == request.model {
+                body.wire(reservation.resource.accepts_zstd).await?
+            } else {
+                // The catalog shows the allowlist spelling; this worker's
+                // engine matches its own spelling case-sensitively.
+                let mut local = request.clone();
+                local.model = reservation.resource.local_model_id.clone();
+                MeshRequestBody::encode(&local)?
+                    .wire(reservation.resource.accepts_zstd)
+                    .await?
+            };
             match open_mesh_http_stream(
                 reservation,
-                request.clone(),
-                self.max_sse_frame_bytes,
+                wire,
+                MeshStreamLimits {
+                    max_chunk_bytes: self.max_sse_frame_bytes,
+                    first_byte_timeout: self.first_byte_timeout,
+                    idle_timeout: self.idle_timeout,
+                },
                 capacity_deadline,
             )
             .await
             {
-                Ok(stream) => {
+                Ok((stream, first_byte_deadline)) => {
                     stamp_header_byte(backend.serving.as_ref());
                     let mut stream =
                         parse_sse_stream(stream, self.max_sse_frame_bytes, backend.capture.clone());
-                    match stream.next().await {
+                    // Still pre-first-chunk, so a stall here is safe to fail
+                    // over: nothing has reached the client yet.
+                    let first = tokio::time::timeout_at(first_byte_deadline, stream.next())
+                        .await
+                        .unwrap_or_else(|_| {
+                            Some(Err(first_byte_timeout_error(self.first_byte_timeout)))
+                        });
+                    match first {
                         Some(Ok(first)) => {
                             if let Some(commit) = affinity_commit {
                                 self.registry.commit_affinity(commit);
@@ -344,6 +391,14 @@ struct MeshHttpStream {
     chunked: bool,
     chunk_buf: BytesMut,
     max_chunk_bytes: usize,
+    idle_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MeshStreamLimits {
+    max_chunk_bytes: usize,
+    first_byte_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 enum MeshOpenError {
@@ -358,12 +413,14 @@ impl From<AppError> for MeshOpenError {
     }
 }
 
+/// On success also returns the deadline for the first SSE chunk, measured
+/// from worker admission.
 async fn open_mesh_http_stream(
     reservation: crate::mesh::registry::MeshReservation,
-    http_request: Vec<u8>,
-    max_chunk_bytes: usize,
+    http_request: MeshWireRequest,
+    limits: MeshStreamLimits,
     capacity_deadline: tokio::time::Instant,
-) -> Result<MeshHttpStream, MeshOpenError> {
+) -> Result<(MeshHttpStream, tokio::time::Instant), MeshOpenError> {
     let connection = reservation
         .resource
         .connection
@@ -384,10 +441,12 @@ async fn open_mesh_http_stream(
     let resource_id = open.resource_id.clone();
     let write_task = tokio::spawn(async move {
         let started = tokio::time::Instant::now();
-        let request_bytes = http_request.len();
-        send.write_all(&http_request).await.map_err(|err| {
-            AppError::upstream(format!("failed to write mesh HTTP request: {err}"))
-        })?;
+        let request_bytes = http_request.head.len() + http_request.body.len();
+        for part in [&http_request.head, &http_request.body] {
+            send.write_all(part).await.map_err(|err| {
+                AppError::upstream(format!("failed to write mesh HTTP request: {err}"))
+            })?;
+        }
         let write_ms = started.elapsed().as_millis();
         send.shutdown().await.map_err(|err| {
             AppError::upstream(format!("failed to finish mesh HTTP request: {err}"))
@@ -415,7 +474,8 @@ async fn open_mesh_http_stream(
         remaining_content_length: None,
         chunked: false,
         chunk_buf: BytesMut::new(),
-        max_chunk_bytes,
+        max_chunk_bytes: limits.max_chunk_bytes,
+        idle_timeout: limits.idle_timeout,
     };
     let admission = tokio::time::timeout_at(capacity_deadline, read_admission(&mut stream.recv))
         .await
@@ -430,7 +490,16 @@ async fn open_mesh_http_stream(
         Admission::Rejected { code } => return Err(admission_error(code).into()),
     }
 
-    let head = read_http_response_head(&mut stream.recv, 64 * 1024).await?;
+    // Admission only proves the worker reached its local engine. Bound the
+    // wait for the engine's answer too: an accepted-then-silent worker would
+    // otherwise hold this request (and its capacity permit) indefinitely.
+    let first_byte_deadline = tokio::time::Instant::now() + limits.first_byte_timeout;
+    let head = tokio::time::timeout_at(
+        first_byte_deadline,
+        read_http_response_head(&mut stream.recv, 64 * 1024),
+    )
+    .await
+    .map_err(|_| first_byte_timeout_error(limits.first_byte_timeout))??;
     let (status, headers) = split_http_response_head(&head)?;
     stream.remaining_content_length = content_length(&headers);
     stream.chunked = is_chunked(&headers);
@@ -454,7 +523,7 @@ async fn open_mesh_http_stream(
         return Err(AppError::upstream(message).into());
     }
 
-    Ok(stream)
+    Ok((stream, first_byte_deadline))
 }
 
 fn mesh_upstream_error_message(status: http::StatusCode, body: &[u8]) -> String {
@@ -481,21 +550,97 @@ fn admission_error(code: AdmissionRejectCode) -> AppError {
     }
 }
 
-fn build_chat_http_request(request: &ChatCompletionRequest) -> AppResult<Vec<u8>> {
-    let body_len = crate::replay::serialized_len(request)
-        .map_err(|err| AppError::internal(format!("failed to encode mesh chat request: {err}")))?;
-    let mut bytes = Vec::with_capacity(body_len + 256);
-    bytes.extend_from_slice(b"POST /v1/chat/completions HTTP/1.1\r\n");
-    bytes.extend_from_slice(b"host: llmconduit-mesh-worker\r\n");
-    bytes.extend_from_slice(b"content-type: application/json\r\n");
-    bytes.extend_from_slice(format!("content-length: {body_len}\r\n").as_bytes());
-    bytes.extend_from_slice(b"accept: text/event-stream\r\n");
-    bytes.extend_from_slice(b"connection: close\r\n\r\n");
-    // Encode into the wire buffer directly: a native-vision request may carry
-    // tens of MiB of image data, so a separate JSON buffer doubles peak memory.
-    serde_json::to_writer(&mut bytes, request)
-        .map_err(|err| AppError::internal(format!("failed to encode mesh chat request: {err}")))?;
-    Ok(bytes)
+/// The JSON chat body for one mesh request, encoded once and shared by every
+/// attempt. The zstd variant is computed at most once, and only if some
+/// attempt lands on a worker that advertised it can decode zstd.
+struct MeshRequestBody {
+    json: Bytes,
+    zstd: tokio::sync::OnceCell<Option<Bytes>>,
+}
+
+/// One attempt's request as written to the worker stream: the head and
+/// body stay separate so a multi-MiB body is never copied into a combined
+/// buffer.
+struct MeshWireRequest {
+    head: Bytes,
+    body: Bytes,
+}
+
+impl MeshRequestBody {
+    fn encode(request: &ChatCompletionRequest) -> AppResult<Self> {
+        let body_len = crate::replay::serialized_len(request).map_err(|err| {
+            AppError::internal(format!("failed to encode mesh chat request: {err}"))
+        })?;
+        // Sized exactly up front: a native-vision request may carry tens of
+        // MiB of image data, so growth reallocations would double peak memory.
+        let mut json = Vec::with_capacity(body_len);
+        serde_json::to_writer(&mut json, request).map_err(|err| {
+            AppError::internal(format!("failed to encode mesh chat request: {err}"))
+        })?;
+        Ok(Self {
+            json: Bytes::from(json),
+            zstd: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    async fn wire(&self, worker_accepts_zstd: bool) -> AppResult<MeshWireRequest> {
+        if worker_accepts_zstd && self.json.len() >= MESH_COMPRESSION_MIN_BYTES {
+            let compressed = self
+                .zstd
+                .get_or_init(|| compress_mesh_body(self.json.clone()))
+                .await;
+            if let Some(compressed) = compressed {
+                return Ok(MeshWireRequest {
+                    head: chat_http_request_head(
+                        compressed.len(),
+                        Some(crate::mesh::protocol::REQUEST_ENCODING_ZSTD),
+                    ),
+                    body: compressed.clone(),
+                });
+            }
+        }
+        Ok(MeshWireRequest {
+            head: chat_http_request_head(self.json.len(), None),
+            body: self.json.clone(),
+        })
+    }
+}
+
+/// `None` when compression fails or saves too little to be worth the
+/// worker's decode (base64 image payloads barely shrink).
+async fn compress_mesh_body(json: Bytes) -> Option<Bytes> {
+    // Multi-MiB bodies take tens of milliseconds to compress; keep that off
+    // the async workers of a 2-vCPU hub.
+    let compressed = tokio::task::spawn_blocking(move || {
+        zstd::bulk::compress(&json, MESH_ZSTD_LEVEL)
+            .ok()
+            .filter(|compressed| compressed.len() < json.len() - json.len() / 10)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    Some(Bytes::from(compressed))
+}
+
+fn chat_http_request_head(content_length: usize, content_encoding: Option<&str>) -> Bytes {
+    let mut head = Vec::with_capacity(256);
+    head.extend_from_slice(b"POST /v1/chat/completions HTTP/1.1\r\n");
+    head.extend_from_slice(b"host: llmconduit-mesh-worker\r\n");
+    head.extend_from_slice(b"content-type: application/json\r\n");
+    if let Some(encoding) = content_encoding {
+        head.extend_from_slice(format!("content-encoding: {encoding}\r\n").as_bytes());
+    }
+    head.extend_from_slice(format!("content-length: {content_length}\r\n").as_bytes());
+    head.extend_from_slice(b"accept: text/event-stream\r\n");
+    head.extend_from_slice(b"connection: close\r\n\r\n");
+    Bytes::from(head)
+}
+
+fn first_byte_timeout_error(timeout: Duration) -> AppError {
+    AppError::upstream(format!(
+        "mesh worker produced no response within {}s of admitting the request",
+        timeout.as_secs_f64()
+    ))
 }
 
 fn parse_sse_stream(
@@ -535,11 +680,15 @@ fn parse_sse_stream(
             }
             frame_guard.accept(&bytes)?;
             line_buf.extend_from_slice(&bytes);
-            while let Some(line_end) = line_buf.iter().position(|byte| *byte == b'\n') {
-                let mut line = line_buf.drain(..=line_end).collect::<Vec<_>>();
-                line.pop();
-                if line.last() == Some(&b'\r') { line.pop(); }
-                let line = std::str::from_utf8(&line)
+            // Walk complete lines in place and compact once per read instead
+            // of allocating and shifting the buffer for every line.
+            let mut consumed = 0;
+            while let Some(offset) = line_buf[consumed..].iter().position(|byte| *byte == b'\n') {
+                let line_end = consumed + offset;
+                let mut line = &line_buf[consumed..line_end];
+                consumed = line_end + 1;
+                if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
+                let line = std::str::from_utf8(line)
                     .map_err(|err| AppError::upstream(format!("invalid UTF-8 in mesh SSE event: {err}")))?;
                 if line.is_empty() {
                     if !event.is_empty() {
@@ -562,6 +711,7 @@ fn parse_sse_stream(
                     event.push_str(data.trim_start());
                 }
             }
+            line_buf.drain(..consumed);
         }
         if !line_buf.is_empty() {
             if line_buf.last() == Some(&b'\r') { line_buf.pop(); }
@@ -639,6 +789,28 @@ impl MeshHttpStream {
             .map_err(|err| AppError::internal(format!("mesh writer task failed: {err}")))?
     }
 
+    /// One zero-copy slice of the QUIC receive buffer, or `None` at EOF.
+    /// Every read is bounded by the idle timeout: once the first chunk has
+    /// gone to the client the stream cannot fail over, but a silent worker
+    /// must still surface as an error instead of a hung response.
+    async fn read_chunk(&mut self) -> AppResult<Option<Bytes>> {
+        match tokio::time::timeout(
+            self.idle_timeout,
+            self.recv.read_chunk(MESH_BODY_READ_CHUNK_BYTES),
+        )
+        .await
+        {
+            Ok(Ok(chunk)) => Ok(chunk),
+            Ok(Err(err)) => Err(AppError::upstream(format!(
+                "failed to read mesh response body: {err}"
+            ))),
+            Err(_) => Err(AppError::upstream(format!(
+                "mesh response body stalled for {}s",
+                self.idle_timeout.as_secs_f64()
+            ))),
+        }
+    }
+
     async fn next_body_bytes(&mut self) -> AppResult<Option<Bytes>> {
         if self.chunked {
             loop {
@@ -646,19 +818,14 @@ impl MeshHttpStream {
                     if chunk.is_empty() {
                         return Ok(None);
                     }
-                    return Ok(Some(Bytes::from(chunk)));
+                    return Ok(Some(chunk));
                 }
-                let mut buf = [0_u8; 8192];
-                let read = tokio::io::AsyncReadExt::read(&mut self.recv, &mut buf)
-                    .await
-                    .map_err(|err| {
-                        AppError::upstream(format!("failed to read mesh response body: {err}"))
-                    })?;
-                if read == 0 {
+                let Some(read) = self.read_chunk().await? else {
                     return Err(AppError::upstream(
                         "mesh chunked response ended before its terminator",
                     ));
-                }
+                };
+                let read_len = read.len();
                 let max_buffered = MAX_HTTP_CHUNK_LINE_BYTES
                     .checked_add(2)
                     .and_then(|value| {
@@ -666,25 +833,19 @@ impl MeshHttpStream {
                     })
                     .and_then(|value| value.checked_add(2))
                     .ok_or_else(|| AppError::upstream("mesh HTTP chunk buffer limit overflow"))?;
-                if self.chunk_buf.len().saturating_add(read) > max_buffered {
+                if self.chunk_buf.len().saturating_add(read_len) > max_buffered {
                     return Err(AppError::upstream(format!(
                         "mesh HTTP chunk buffer exceeds {max_buffered} byte limit"
                     )));
                 }
-                self.chunk_buf.extend_from_slice(&buf[..read]);
+                self.chunk_buf.extend_from_slice(&read);
             }
         }
 
         if matches!(self.remaining_content_length, Some(0)) {
             return Ok(None);
         }
-        let mut buf = [0_u8; 8192];
-        let read = tokio::io::AsyncReadExt::read(&mut self.recv, &mut buf)
-            .await
-            .map_err(|err| {
-                AppError::upstream(format!("failed to read mesh response body: {err}"))
-            })?;
-        if read == 0 {
+        let Some(read) = self.read_chunk().await? else {
             if let Some(remaining) = self.remaining_content_length
                 && remaining > 0
             {
@@ -693,17 +854,17 @@ impl MeshHttpStream {
                 )));
             }
             return Ok(None);
-        }
+        };
         if let Some(remaining) = self.remaining_content_length.as_mut() {
-            if read > *remaining {
+            if read.len() > *remaining {
                 return Err(AppError::upstream(format!(
                     "mesh response body exceeded Content-Length by {} bytes",
-                    read - *remaining
+                    read.len() - *remaining
                 )));
             }
-            *remaining -= read;
+            *remaining -= read.len();
         }
-        Ok(Some(Bytes::copy_from_slice(&buf[..read])))
+        Ok(Some(read))
     }
 
     async fn read_body_prefix(&mut self, limit: usize) -> AppResult<Vec<u8>> {
@@ -814,25 +975,63 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::{JoinHandle, JoinSet};
 
-    #[test]
-    fn mesh_wire_request_preserves_json_and_content_length_for_large_images() {
+    fn large_image_request() -> ChatCompletionRequest {
         let mut request = chat_request("describe π and \"quotes\"");
         request.messages[0].content = Some(serde_json::json!([
             {"type": "text", "text": "describe π and \"quotes\""},
             {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", "A".repeat(2 * 1024 * 1024))}}
         ]));
-        let wire = build_chat_http_request(&request).expect("wire body");
-        let header_end = wire
-            .windows(4)
-            .position(|bytes| bytes == b"\r\n\r\n")
-            .unwrap()
-            + 4;
-        let body = &wire[header_end..];
-        assert_eq!(body, serde_json::to_vec(&request).expect("reference JSON"));
+        request
+    }
+
+    #[tokio::test]
+    async fn mesh_wire_request_preserves_json_and_content_length_for_large_images() {
+        let request = large_image_request();
+        let wire = MeshRequestBody::encode(&request)
+            .expect("wire body")
+            .wire(false)
+            .await
+            .expect("wire");
+        let head = std::str::from_utf8(&wire.head).unwrap();
+        assert!(head.ends_with("\r\n\r\n"));
+        assert_eq!(
+            &wire.body[..],
+            serde_json::to_vec(&request).expect("reference JSON")
+        );
+        assert!(head.contains(&format!("content-length: {}\r\n", wire.body.len())));
+        assert!(!head.contains("content-encoding"));
+    }
+
+    #[tokio::test]
+    async fn zstd_is_used_only_for_capable_workers_and_large_bodies() {
+        let request = large_image_request();
+        let body = MeshRequestBody::encode(&request).expect("encode");
+        let wire = body.wire(true).await.expect("wire");
+        let head = std::str::from_utf8(&wire.head).unwrap();
+        assert!(head.contains("content-encoding: zstd\r\n"), "{head}");
+        assert!(head.contains(&format!("content-length: {}\r\n", wire.body.len())));
+        assert!(wire.body.len() < body.json.len());
+        let decoded = zstd::decode_all(&wire.body[..]).expect("zstd body");
+        assert_eq!(decoded, &body.json[..]);
+        // The compressed body is cached for later attempts.
+        let again = body.wire(true).await.expect("wire again");
+        assert_eq!(again.body.as_ptr(), wire.body.as_ptr());
+
+        // Legacy workers always receive identity bodies.
+        let legacy = body.wire(false).await.expect("legacy wire");
         assert!(
-            std::str::from_utf8(&wire[..header_end])
+            !std::str::from_utf8(&legacy.head)
                 .unwrap()
-                .contains(&format!("content-length: {}\r\n", body.len()))
+                .contains("content-encoding")
+        );
+
+        // Small bodies skip the compression pass.
+        let small = MeshRequestBody::encode(&chat_request("hi")).expect("encode");
+        let wire = small.wire(true).await.expect("wire");
+        assert!(
+            !std::str::from_utf8(&wire.head)
+                .unwrap()
+                .contains("content-encoding")
         );
     }
 
@@ -939,6 +1138,15 @@ mod tests {
         resources: Vec<(&str, SocketAddr, u32, u32)>,
         accept_count: usize,
     ) -> MeshHarness {
+        start_mesh_harness_with_encodings(resources, accept_count, Vec::new(), "mesh-model").await
+    }
+
+    async fn start_mesh_harness_with_encodings(
+        resources: Vec<(&str, SocketAddr, u32, u32)>,
+        accept_count: usize,
+        request_encodings: Vec<String>,
+        advertised_model: &str,
+    ) -> MeshHarness {
         let controller_key = SecretKey::generate();
         let controller_id = controller_key.public();
         let controller = Endpoint::builder(presets::Minimal)
@@ -1001,7 +1209,11 @@ mod tests {
             .collect();
         let resource_ads = resources
             .iter()
-            .map(|(id, _, advertised_capacity, _)| resource_advertisement(id, *advertised_capacity))
+            .map(|(id, _, advertised_capacity, _)| {
+                let mut ad = resource_advertisement(id, *advertised_capacity);
+                ad.models[0].id = advertised_model.to_string();
+                ad
+            })
             .collect();
         let runtime = Arc::new(
             WorkerRuntime::new(MeshWorkerConfig {
@@ -1026,7 +1238,10 @@ mod tests {
         registry.register(
             worker_id,
             controller_connection,
-            worker_advertisement(resource_ads),
+            WorkerAdvertisement {
+                request_encodings,
+                ..worker_advertisement(resource_ads)
+            },
         );
 
         MeshHarness {
@@ -1326,6 +1541,183 @@ mod tests {
                 .contains("mesh session capacity wait timed out")
         );
         drop(held);
+    }
+
+    async fn read_full_test_request(socket: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut buf = [0_u8; 64 * 1024];
+        let mut request = Vec::new();
+        let header_end = loop {
+            let read = socket.read(&mut buf).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buf[..read]);
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let head = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(str::to_owned)
+            })
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let read = socket.read(&mut buf).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buf[..read]);
+        }
+        (head, request[header_end..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn zstd_request_bodies_are_decoded_by_the_worker_before_the_local_engine() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_full_test_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"id\":\"z\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                .await
+                .unwrap();
+            request_tx.send(request).unwrap();
+        });
+        // The worker spells the model differently from the request; its
+        // engine must receive its own spelling.
+        let harness = start_mesh_harness_with_encodings(
+            vec![("primary", target, 1, 1)],
+            1,
+            vec!["zstd".to_string()],
+            "Mesh-Model",
+        )
+        .await;
+        let request = large_image_request();
+        let mut stream = harness
+            .client
+            .stream_chat_completion(&BackendChatRequest::new(request, None, None, None))
+            .await
+            .expect("stream");
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("ok")
+        );
+        let (head, body) = request_rx.await.unwrap();
+        let head = head.to_ascii_lowercase();
+        assert!(!head.contains("content-encoding"), "{head}");
+        assert!(head.contains(&format!("content-length: {}\r\n", body.len())));
+        assert!(head.contains(&format!("host: {target}\r\n")), "{head}");
+        let forwarded: Value = serde_json::from_slice(&body).expect("identity JSON body");
+        assert_eq!(forwarded["model"], "Mesh-Model");
+        assert!(
+            forwarded["messages"][0]["content"][1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 2 * 1024 * 1024
+        );
+        drop(stream);
+        server.await.unwrap();
+        harness.worker_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admitted_but_silent_worker_times_out_before_the_first_chunk() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_full_test_request(&mut socket).await;
+            // Accept the request and then say nothing.
+            let _ = release_rx.await;
+        });
+        let harness = start_mesh_harness(vec![("primary", target, 1)], 1).await;
+        let client = harness
+            .client
+            .clone()
+            .with_response_timeouts(Duration::from_millis(300), Duration::from_secs(30));
+        let started = tokio::time::Instant::now();
+        let error = match client
+            .stream_chat_completion(&BackendChatRequest::new(
+                chat_request("hang"),
+                None,
+                None,
+                None,
+            ))
+            .await
+        {
+            Ok(_) => panic!("silent worker must not produce a stream"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(error.to_string().contains("no response"), "{error}");
+        // Pre-first-chunk: the failover layer may still try another provider.
+        assert_ne!(error.failover_disposition(), FailoverDisposition::Terminal);
+        let reservation = client
+            .registry
+            .reserve("mesh-model")
+            .expect("timed-out attempt releases its reservation");
+        drop(reservation);
+        let _ = release_tx.send(());
+        server.await.unwrap();
+        harness.worker_task.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_after_the_first_chunk_surfaces_an_error() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_full_test_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"id\":\"s\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"}}]}\n\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            let _ = release_rx.await;
+        });
+        let harness = start_mesh_harness(vec![("primary", target, 1)], 1).await;
+        let client = harness
+            .client
+            .clone()
+            .with_response_timeouts(Duration::from_secs(30), Duration::from_millis(300));
+        let mut stream = client
+            .stream_chat_completion(&BackendChatRequest::new(
+                chat_request("stall"),
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("first chunk arrives");
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("first")
+        );
+        let error = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("idle timeout fires")
+            .expect("stream yields an error")
+            .expect_err("stalled body is an error");
+        assert!(error.to_string().contains("stalled"), "{error}");
+        drop(stream);
+        let _ = release_tx.send(());
+        server.await.unwrap();
+        harness.worker_task.abort();
     }
 
     #[tokio::test]
