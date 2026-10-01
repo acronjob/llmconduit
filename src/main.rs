@@ -42,8 +42,40 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+// The binary (not the library) picks the allocator: mimalloc returns freed
+// pages to the OS promptly and avoids glibc's per-thread arena growth, which
+// otherwise keeps the RSS of a bursty, multi-MiB-body workload high on a
+// small host. The lib's `#[cfg(test)]` allocator probe lives in a different
+// crate, so the two never conflict.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Default ceiling for Tokio's blocking pool (Tokio's own default is 512).
+/// Large request bodies are parsed/redacted on that pool; unbounded, a burst of
+/// concurrent 10 MiB bodies could fan out to hundreds of threads, each with its
+/// own stack and transient parse allocations.
+const DEFAULT_MAX_BLOCKING_THREADS: usize = 16;
+const MAX_BLOCKING_THREADS_ENV: &str = "LLMCONDUIT_MAX_BLOCKING_THREADS";
+
+fn max_blocking_threads() -> usize {
+    parse_max_blocking_threads(std::env::var(MAX_BLOCKING_THREADS_ENV).ok().as_deref())
+}
+
+fn parse_max_blocking_threads(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(DEFAULT_MAX_BLOCKING_THREADS)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(max_blocking_threads())
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     init_tracing(command_uses_dedicated_terminal(&cli.command));
     let app_options = AppOptions {
@@ -781,6 +813,68 @@ async fn run_user_command(
     Ok(())
 }
 
+/// Ceiling on one `/metrics` exposition body. vLLM/SGLang emit tens of KiB; a
+/// misbehaving or hostile endpoint must not be able to grow scraper memory.
+const METRICS_BODY_CAP_BYTES: usize = 2 * 1024 * 1024;
+
+/// Read a response body as UTF-8 text, failing once it exceeds `cap` bytes
+/// instead of buffering an unbounded body.
+async fn read_capped_text(mut response: reqwest::Response, cap: usize) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > cap as u64)
+    {
+        return Err(format!("metrics body exceeds {cap} bytes"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > cap {
+            return Err(format!("metrics body exceeds {cap} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| "metrics body is not UTF-8".to_string())
+}
+
+/// True when `base_url` points at a backend we could plausibly be co-located
+/// with: loopback, private/CGNAT/link-local IPs, single-label hosts (compose
+/// service names) and internal-only DNS suffixes. Public hostnames are hosted
+/// APIs, which do not expose Prometheus metrics.
+fn is_self_hosted_base_url(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                // Carrier-grade NAT range, used by Tailscale and similar overlays.
+                || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000) == 64)
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Some(url::Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            !host.contains('.')
+                || [
+                    ".localhost",
+                    ".local",
+                    ".internal",
+                    ".lan",
+                    ".home.arpa",
+                    ".ts.net",
+                ]
+                .iter()
+                .any(|suffix| host.ends_with(suffix))
+        }
+        None => false,
+    }
+}
+
 /// Scrape every backend's Prometheus `/metrics` (vLLM / SGLang) on the
 /// configured interval and persist a per-model sample per backend. Backends
 /// that do not answer are retried with backoff; the request path is never
@@ -835,6 +929,13 @@ fn spawn_upstream_metrics_scraper(
                 let url = match override_cfg.and_then(|cfg| cfg.url.clone()) {
                     Some(url) => url,
                     None => {
+                        // A derived URL is only probed on self-hosted backends;
+                        // hosted APIs have no Prometheus endpoint, so scraping them
+                        // just burns requests. `enabled: true` opts one in.
+                        let opted_in = override_cfg.and_then(|cfg| cfg.enabled) == Some(true);
+                        if !opted_in && !is_self_hosted_base_url(&provider.base_url) {
+                            continue;
+                        }
                         match llmconduit::upstream_metrics::derive_metrics_url(&provider.base_url) {
                             Some(url) => url,
                             None => continue,
@@ -847,7 +948,7 @@ fn spawn_upstream_metrics_scraper(
                     if !response.status().is_success() {
                         return Err(format!("status {}", response.status()));
                     }
-                    let text = response.text().await.map_err(|e| e.to_string())?;
+                    let text = read_capped_text(response, METRICS_BODY_CAP_BYTES).await?;
                     llmconduit::upstream_metrics::parse_exposition(
                         &provider.id,
                         &text,
@@ -1206,6 +1307,73 @@ mod tests {
                 pairs: 1,
             }
         )));
+    }
+
+    #[test]
+    fn max_blocking_threads_defaults_and_honors_override() {
+        assert_eq!(super::parse_max_blocking_threads(None), 16);
+        assert_eq!(super::parse_max_blocking_threads(Some("64")), 64);
+        assert_eq!(super::parse_max_blocking_threads(Some(" 8 ")), 8);
+        assert_eq!(super::parse_max_blocking_threads(Some("0")), 16);
+        assert_eq!(super::parse_max_blocking_threads(Some("lots")), 16);
+    }
+
+    #[test]
+    fn metrics_scraper_only_probes_self_hosted_backends_by_default() {
+        for local in [
+            "http://127.0.0.1:8000/v1",
+            "http://localhost:8000/v1",
+            "http://vllm:8000/v1",
+            "http://10.0.0.5:8000/v1",
+            "http://192.168.1.20/v1",
+            "http://100.101.2.3:8000/v1",
+            "http://[::1]:8000/v1",
+            "http://gpu.internal:8000/v1",
+            "http://gpu-box.tail1234.ts.net:8000/v1",
+        ] {
+            assert!(super::is_self_hosted_base_url(local), "{local}");
+        }
+        for remote in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            "https://8.8.8.8/v1",
+            "not a url",
+        ] {
+            assert!(!super::is_self_hosted_base_url(remote), "{remote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_body_read_is_capped() {
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::path;
+        let server = MockServer::start().await;
+        Mock::given(path("/small"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("vllm:metric 1\n"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/large"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let small = client
+            .get(format!("{}/small", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            super::read_capped_text(small, 1024).await.unwrap(),
+            "vllm:metric 1\n"
+        );
+        let large = client
+            .get(format!("{}/large", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert!(super::read_capped_text(large, 1024).await.is_err());
     }
 
     #[test]

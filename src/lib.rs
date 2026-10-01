@@ -96,7 +96,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const PROVIDER_METRICS_INTERVAL_ENV: &str = "LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS";
-const DEFAULT_PROVIDER_METRICS_INTERVAL_SECS: u64 = 30;
+/// Dashboard-only cache telemetry; two minutes keeps idle hosts quiet. The
+/// env override still allows anything in `5..=3600`.
+const DEFAULT_PROVIDER_METRICS_INTERVAL_SECS: u64 = 120;
 
 fn provider_metrics_interval_from_env() -> Duration {
     let seconds = std::env::var(PROVIDER_METRICS_INTERVAL_ENV)
