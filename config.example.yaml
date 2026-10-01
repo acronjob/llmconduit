@@ -48,10 +48,9 @@ control_plane:
   # self-hosted backends (loopback, private/Tailscale IPs, single-label or
   # .local/.internal/.lan/.ts.net hosts); public hosted APIs are skipped unless
   # given an explicit `url` or `enabled: true`. Bodies are capped at 2 MiB.
-  # Small hosts: 60 seconds is plenty for dashboard trends.
   metrics:
     enabled: true
-    scrape_interval_secs: 15
+    scrape_interval_secs: 60
     backends: {}
     #  local: { url: "http://host.docker.internal:8000/metrics" }
     #  openrouter: { enabled: false }
