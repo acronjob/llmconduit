@@ -1161,6 +1161,75 @@ impl SnapshotFlowSummary {
     }
 }
 
+/// One body-free summary SHARED between snapshot cuts. A flow that did not mutate
+/// between two 5 s cuts is the SAME allocation in both (not a deep copy per cut), so
+/// a flow resident for the whole ring costs one summary, not up to 720. Derefs to the
+/// summary; serializes exactly like it (the wire shape is unchanged).
+#[derive(Debug, Clone)]
+pub struct SharedFlowSummary(Arc<SnapshotFlowSummary>);
+
+impl SharedFlowSummary {
+    /// Address of the shared allocation — the identity the snapshot ring uses to
+    /// charge each unique summary to its memory quota exactly once.
+    pub fn alloc_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+impl std::ops::Deref for SharedFlowSummary {
+    type Target = SnapshotFlowSummary;
+    fn deref(&self) -> &SnapshotFlowSummary {
+        &self.0
+    }
+}
+
+impl Serialize for SharedFlowSummary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (*self.0).serialize(serializer)
+    }
+}
+
+/// The immutable, shareable summary list of one snapshot cut. When the FlowStore
+/// did not mutate between two cuts (an idle box) both cuts hold the SAME list
+/// allocation, so an idle cut copies nothing. Derefs to a slice (`iter()`,
+/// `len()`, `for s in &cut.summaries` all work) and serializes as a JSON array.
+#[derive(Debug, Clone)]
+pub struct SnapshotSummaries(Arc<[SharedFlowSummary]>);
+
+impl SnapshotSummaries {
+    /// Address of the shared list allocation (see [`SharedFlowSummary::alloc_id`]).
+    pub fn alloc_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
+}
+
+impl Default for SnapshotSummaries {
+    fn default() -> Self {
+        Self(Arc::from(Vec::new()))
+    }
+}
+
+impl std::ops::Deref for SnapshotSummaries {
+    type Target = [SharedFlowSummary];
+    fn deref(&self) -> &[SharedFlowSummary] {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a SnapshotSummaries {
+    type Item = &'a SharedFlowSummary;
+    type IntoIter = std::slice::Iter<'a, SharedFlowSummary>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Serialize for SnapshotSummaries {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter())
+    }
+}
+
 /// An opaque RAII hold on the FlowStore lock handed to
 /// [`DashboardFlowStore::with_summaries_under_lock`]'s closure. It exposes NOTHING of
 /// the private interior state — its only purpose is to let the closure decide WHEN the
@@ -1196,6 +1265,16 @@ struct DashboardFlowState {
     /// (AGENTS.md: per-domain `{domain, seq}` cursors). The D5 5 s snapshot reads it
     /// at the cut instant; D7/D13 frames carry it.
     seq: u64,
+    /// Snapshot-ring sharing: the last projected summary per live flow, tagged
+    /// with the `record_seq` it was projected at. Every summary-visible mutation
+    /// goes through `insert`/`update`, which stamp a fresh `record_seq`, so an
+    /// equal tag proves the summary is still exact and can be reused by the next
+    /// cut (body shedding changes no summary field and is correctly ignored).
+    summary_cache: HashMap<String, (u64, SharedFlowSummary)>,
+    /// The last cut's whole summary list, tagged with the `seq` it was built at:
+    /// an unchanged `seq` means no insert/update/remove happened, so the next cut
+    /// reuses the list allocation outright.
+    shared_list: Option<(u64, SnapshotSummaries)>,
 }
 
 /// Authoritative store of per-flow records + the capture seam. Mirrors the
@@ -1799,6 +1878,23 @@ impl DashboardFlowStore {
             .collect()
     }
 
+    /// Number of live records with `status == Open` (the dashboard's
+    /// `active_streams`). Counts in place under the lock — every viewer asks once
+    /// a second, and [`list`](Self::list) would clone every record handle into a
+    /// fresh `Vec` just to count it. `0` when disabled.
+    pub fn open_count(&self) -> u64 {
+        if !self.enabled {
+            return 0;
+        }
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        state
+            .by_id
+            .values()
+            .filter(|record| record.status == FlowStatus::Open)
+            .count() as u64
+    }
+
     /// Resolve a single record by `api_call_id` OR `response_id` (via the link
     /// index). `None` when disabled or unknown. Prunes expired records first.
     pub fn detail(&self, id: &str) -> Option<Arc<FlowRecord>> {
@@ -1910,22 +2006,24 @@ impl DashboardFlowStore {
     /// touches only Metrics + topology), so no deadlock is possible. Pruning happens
     /// once, before the summaries are built, so the seq already reflects any prune. When
     /// disabled, `f` runs with an empty guard + `(Vec::new(), 0)` and no lock is taken.
+    ///
+    /// The summaries are SHARED with earlier cuts wherever a flow did not mutate (and
+    /// the whole list is shared when nothing mutated), so a cut costs only the flows
+    /// that changed since the previous one.
     pub fn with_summaries_under_lock<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(FlowSnapshotGuard<'_>, Vec<SnapshotFlowSummary>, u64) -> R,
+        F: FnOnce(FlowSnapshotGuard<'_>, SnapshotSummaries, u64) -> R,
     {
         if !self.enabled {
-            return f(FlowSnapshotGuard { guard: None }, Vec::new(), 0);
+            return f(
+                FlowSnapshotGuard { guard: None },
+                SnapshotSummaries::default(),
+                0,
+            );
         }
         let mut state = self.lock();
         state.prune_expired(now_ms());
-        let summaries = state
-            .order
-            .iter()
-            .rev()
-            .filter_map(|id| state.by_id.get(id))
-            .map(|record| SnapshotFlowSummary::from_record(record))
-            .collect();
+        let summaries = state.shared_summaries();
         let seq = state.seq;
         // Hand the guard to `f` so it controls when the FlowStore lock is released
         // (after it has nested the metrics lock under this one).
@@ -2188,6 +2286,36 @@ impl Drop for TelemetryGuard {
 }
 
 impl DashboardFlowState {
+    /// The newest-first body-free summary list for a snapshot cut, reusing every
+    /// allocation that is still exact (see `summary_cache` / `shared_list`).
+    fn shared_summaries(&mut self) -> SnapshotSummaries {
+        if let Some((built_at, list)) = &self.shared_list
+            && *built_at == self.seq
+        {
+            return list.clone();
+        }
+        let mut list = Vec::with_capacity(self.order.len());
+        for id in self.order.iter().rev() {
+            let Some(record) = self.by_id.get(id) else {
+                continue;
+            };
+            let summary = match self.summary_cache.get(id) {
+                Some((record_seq, cached)) if *record_seq == record.record_seq => cached.clone(),
+                _ => {
+                    let fresh =
+                        SharedFlowSummary(Arc::new(SnapshotFlowSummary::from_record(record)));
+                    self.summary_cache
+                        .insert(id.clone(), (record.record_seq, fresh.clone()));
+                    fresh
+                }
+            };
+            list.push(summary);
+        }
+        let list = SnapshotSummaries(Arc::from(list));
+        self.shared_list = Some((self.seq, list.clone()));
+        list
+    }
+
     /// Insert (or replace) a record, keeping `by_id` + `order` in lockstep and the
     /// `live_summary_bytes` total correct. Bumps the global `seq` and stamps the
     /// record's own `record_seq` with the post-bump value (D7b R2 finding 1), so the
@@ -2335,6 +2463,7 @@ impl DashboardFlowState {
                 self.link_index.remove(response_id);
             }
         }
+        self.summary_cache.remove(api_call_id);
         self.order.retain(|id| id != api_call_id);
         // Drop any dangling link-index entries that pointed at this id.
         self.link_index.retain(|_, owner| owner != api_call_id);
@@ -2455,6 +2584,50 @@ mod tests {
             None,
             ClientAttribution::none(),
         );
+    }
+
+    fn shared_cut(store: &DashboardFlowStore) -> SnapshotSummaries {
+        store.with_summaries_under_lock(|_guard, summaries, _seq| summaries)
+    }
+
+    #[test]
+    fn shared_summaries_track_mutation_removal_and_body_shedding() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        open_simple(&store, "api_2");
+        let first = shared_cut(&store);
+        assert_eq!(
+            first
+                .iter()
+                .map(|s| s.api_call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["api_2", "api_1"],
+            "newest first, like snapshot_summaries"
+        );
+        // Shared projection is identical to the owned one.
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(store.snapshot_summaries()).unwrap()
+        );
+        assert_eq!(shared_cut(&store).alloc_id(), first.alloc_id());
+
+        store.set_upstream("api_1", Some("t".to_string()), None, None);
+        let second = shared_cut(&store);
+        assert_eq!(second[0].alloc_id(), first[0].alloc_id(), "api_2 reused");
+        assert_ne!(
+            second[1].alloc_id(),
+            first[1].alloc_id(),
+            "api_1 re-projected"
+        );
+        assert_eq!(second[1].upstream_target.as_deref(), Some("t"));
+
+        // TTL removal drops the flow AND its cache entry.
+        store.force_started_ms("api_2", 0);
+        store.prune_at(FLOW_TTL_MS + 100);
+        let third = shared_cut(&store);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].api_call_id, "api_1");
+        assert!(!store.lock().summary_cache.contains_key("api_2"));
     }
 
     #[test]
