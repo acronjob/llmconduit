@@ -4444,18 +4444,18 @@ fn stream_chat_completions_response(
         let mut converter = ChatCompletionStreamConverter::new(model, include_usage);
         let mut stream = std::pin::pin!(stream);
         'streaming: while let Some(event) = stream.next().await {
-            let chat_events = converter.convert(&event);
-            for chat_event in chat_events {
-                if tx.send(chat_event).await.is_err() {
+            // Rendered straight to wire JSON; same bytes as
+            // `convert(..)` + `to_sse_data()` without a per-token `Value` tree.
+            for data in converter.convert_sse_data(&event) {
+                if tx.send(data).await.is_err() {
                     break 'streaming;
                 }
             }
         }
     });
 
-    let mapped = ReceiverStream::new(rx).map(|event| {
-        Ok::<_, Infallible>(axum::response::sse::Event::default().data(event.to_sse_data()))
-    });
+    let mapped = ReceiverStream::new(rx)
+        .map(|data| Ok::<_, Infallible>(axum::response::sse::Event::default().data(data)));
 
     let mut response = Sse::new(mapped)
         .keep_alive(axum::response::sse::KeepAlive::new())
