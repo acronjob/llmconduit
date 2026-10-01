@@ -312,6 +312,20 @@ pub fn document() -> utoipa::openapi::OpenApi {
     openapi
 }
 
+/// The serialized OpenAPI document. The spec is static for the life of the
+/// process, so it is built and serialized once instead of on every
+/// `/openapi.json` hit (a few hundred KiB of allocation per request).
+pub fn document_json() -> axum::body::Bytes {
+    static DOCUMENT: std::sync::OnceLock<axum::body::Bytes> = std::sync::OnceLock::new();
+    DOCUMENT
+        .get_or_init(|| {
+            axum::body::Bytes::from(
+                serde_json::to_vec(&document()).expect("OpenAPI document serializes"),
+            )
+        })
+        .clone()
+}
+
 fn operations(
     item: &mut utoipa::openapi::path::PathItem,
 ) -> Vec<(&'static str, &mut utoipa::openapi::path::Operation)> {
