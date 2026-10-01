@@ -1179,19 +1179,408 @@ struct BodyLogFields {
 /// Compute the body-derived log fields for `path`/`body`, returning `None` for a
 /// dashboard auth endpoint so the caller emits no body-derived field (D7a R3 #1
 /// — the digest + length are a token-verification oracle).
+#[cfg(test)]
 fn body_log_fields(path: &str, body: &Bytes, summarize_payload: bool) -> Option<BodyLogFields> {
-    if is_dashboard_auth_path(path) {
-        return None;
+    analyze_inbound_body(
+        body,
+        InboundBodyPlan::log_only(path, summarize_payload, false),
+    )
+    .body_log
+}
+
+/// Everything `log_api_call` derives from the inbound body, decided BEFORE the
+/// body is examined so a single pass (one JSON parse, one digest) can serve the
+/// log line, model authorization, scheduling affinity, durable persistence and
+/// turn capture together. Each extra parse of a 10 MiB body costs tens of ms of
+/// CPU and a multi-x transient allocation spike, which a 2 vCPU host feels.
+struct InboundBodyPlan {
+    path: String,
+    /// `false` for a dashboard auth path: no body-derived field may be logged.
+    body_log: bool,
+    /// Build the redacted `body_summary` (payload capture on).
+    summarize: bool,
+    /// Build the redacted small-body `body_payload` dump.
+    dump_payload: bool,
+    persistence: Option<PersistencePlan>,
+    affinity: Option<AffinityPlan>,
+    /// Build the redacted turn-capture `inbound_request` section.
+    turn_capture: bool,
+}
+
+struct PersistencePlan {
+    protocol: &'static str,
+    keep_media: bool,
+    capture_payloads: bool,
+    detection: Option<(Arc<crate::harness::HarnessDetector>, HeaderMap)>,
+}
+
+struct AffinityPlan {
+    detector: Arc<crate::harness::HarnessDetector>,
+    headers: HeaderMap,
+    namespace: String,
+}
+
+impl InboundBodyPlan {
+    fn log_only(path: &str, capture_payloads: bool, dump_small_payload: bool) -> Self {
+        let body_log = !is_dashboard_auth_path(path);
+        Self {
+            path: path.to_owned(),
+            body_log,
+            summarize: body_log && capture_payloads,
+            dump_payload: body_log && capture_payloads && dump_small_payload,
+            persistence: None,
+            affinity: None,
+            turn_capture: false,
+        }
     }
-    Some(BodyLogFields {
-        bytes: body.len(),
-        sha256: hex::encode(Sha256::digest(body)),
-        summary: if summarize_payload {
-            summarize_api_body(path, body)
-        } else {
-            "payload_capture=disabled".to_owned()
+
+    fn needs_value(&self) -> bool {
+        self.summarize
+            || self.dump_payload
+            || self.persistence.is_some()
+            || self.affinity.is_some()
+            || self.turn_capture
+    }
+}
+
+/// Result of the single inbound-body pass.
+struct InboundBodyAnalysis {
+    valid_json: bool,
+    model: Option<String>,
+    body_log: Option<BodyLogFields>,
+    payload_dump: Option<String>,
+    persistence: Option<PersistenceInbound>,
+    affinity: Option<RequestAffinity>,
+    /// `(model_requested, redacted_section, partial)` for turn capture.
+    turn_capture: Option<(Option<String>, Vec<u8>, bool)>,
+}
+
+/// Minimal `{"model": ...}` reader for the paths that only need the requested
+/// model: it validates the JSON syntax without materializing a `Value` tree for
+/// the (possibly multi-MiB) rest of the body. Anything it cannot represent
+/// exactly like `Value::get("model")` (a non-object top level) is an error, and
+/// the caller then falls back to the full `Value` parse.
+struct ModelProbe(Option<String>);
+
+impl<'de> Deserialize<'de> for ModelProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct IsModelKey(bool);
+        impl<'de> Deserialize<'de> for IsModelKey {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct KeyVisitor;
+                impl serde::de::Visitor<'_> for KeyVisitor {
+                    type Value = IsModelKey;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("an object key")
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<IsModelKey, E> {
+                        Ok(IsModelKey(v == "model"))
+                    }
+                }
+                d.deserialize_str(KeyVisitor)
+            }
+        }
+
+        /// A string value, or `None` for any other JSON type (drained).
+        struct MaybeString(Option<String>);
+        impl<'de> Deserialize<'de> for MaybeString {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct ValueVisitor;
+                impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+                    type Value = MaybeString;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("any JSON value")
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<MaybeString, E> {
+                        Ok(MaybeString(Some(v.to_owned())))
+                    }
+                    fn visit_string<E: serde::de::Error>(
+                        self,
+                        v: String,
+                    ) -> Result<MaybeString, E> {
+                        Ok(MaybeString(Some(v)))
+                    }
+                    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<MaybeString, E> {
+                        Ok(MaybeString(None))
+                    }
+                    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<MaybeString, E> {
+                        Ok(MaybeString(None))
+                    }
+                    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<MaybeString, E> {
+                        Ok(MaybeString(None))
+                    }
+                    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<MaybeString, E> {
+                        Ok(MaybeString(None))
+                    }
+                    fn visit_unit<E: serde::de::Error>(self) -> Result<MaybeString, E> {
+                        Ok(MaybeString(None))
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<MaybeString, A::Error> {
+                        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                        Ok(MaybeString(None))
+                    }
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<MaybeString, A::Error> {
+                        while map
+                            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                            .is_some()
+                        {}
+                        Ok(MaybeString(None))
+                    }
+                }
+                d.deserialize_any(ValueVisitor)
+            }
+        }
+
+        struct ProbeVisitor;
+        impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
+            type Value = ModelProbe;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ModelProbe, A::Error> {
+                // Last duplicate wins, exactly like `Value`'s map insert.
+                let mut model = None;
+                while let Some(IsModelKey(is_model)) = map.next_key()? {
+                    if is_model {
+                        model = map.next_value::<MaybeString>()?.0;
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(ModelProbe(model))
+            }
+        }
+        deserializer.deserialize_map(ProbeVisitor)
+    }
+}
+
+/// `(valid_json, model)` with the same answers as parsing into a `Value` and
+/// reading `model`, but without building the tree for an ordinary object body.
+fn probe_model(body: &[u8]) -> (bool, Option<String>) {
+    match serde_json::from_slice::<ModelProbe>(body) {
+        Ok(ModelProbe(model)) => (true, model),
+        Err(_) => match serde_json::from_slice::<Value>(body) {
+            Ok(value) => (
+                true,
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
+            Err(_) => (false, None),
         },
-    })
+    }
+}
+
+/// The single inbound-body pass: at most ONE `Value` parse and one SHA-256,
+/// shared by every consumer in [`InboundBodyPlan`]. Redaction is unchanged:
+/// the summary, payload dump, persistence split and turn-capture section each
+/// go through the same redactors they always did.
+fn analyze_inbound_body(body: &[u8], plan: InboundBodyPlan) -> InboundBodyAnalysis {
+    let digest = plan.body_log.then(|| hex::encode(Sha256::digest(body)));
+    let body_log = |summary: Option<String>| {
+        digest.clone().map(|sha256| BodyLogFields {
+            bytes: body.len(),
+            sha256,
+            summary: summary.unwrap_or_else(|| "payload_capture=disabled".to_owned()),
+        })
+    };
+
+    if !plan.needs_value() {
+        let (valid_json, model) = probe_model(body);
+        return InboundBodyAnalysis {
+            valid_json,
+            model,
+            body_log: body_log(None),
+            payload_dump: None,
+            persistence: None,
+            affinity: None,
+            turn_capture: None,
+        };
+    }
+
+    match serde_json::from_slice::<Value>(body) {
+        Ok(mut value) => {
+            let model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let summary = plan
+                .summarize
+                .then(|| summarize_json_api_body(&plan.path, &value));
+            let payload_dump = plan.dump_payload.then(|| {
+                // Only small bodies reach here (the dump limit), so the clone is cheap.
+                let mut dump = value.clone();
+                redact_payload_secrets(&mut dump);
+                // G4 round-4 #2: strip image URIs from every remaining string via
+                // the shared redactor BEFORE serializing, so no logged surface
+                // carries request image content.
+                crate::redaction::redact_image_uris_in_value(&mut dump);
+                serde_json::to_string(&dump)
+                    .unwrap_or_else(|_| "<failed to serialize json>".to_string())
+            });
+            // Detect while the parsed body is still whole (before splitting moves
+            // the items out); headers are the middleware's clone.
+            let harness = plan.persistence.as_ref().and_then(|persistence| {
+                persistence
+                    .detection
+                    .as_ref()
+                    .map(|(detector, headers)| detector.detect(headers, Some(&value)))
+            });
+            // Affinity hides fields temporarily and restores them, so the value
+            // is intact for the consumers below.
+            let affinity = plan.affinity.and_then(|affinity| {
+                affinity_from_value_mut(
+                    &affinity.detector,
+                    affinity.headers,
+                    &mut value,
+                    &affinity.namespace,
+                )
+            });
+            let turn_capture = plan.turn_capture.then(|| {
+                let mut section = if plan.persistence.is_some() {
+                    value.clone()
+                } else {
+                    std::mem::take(&mut value)
+                };
+                redact_payload_secrets(&mut section);
+                crate::redaction::redact_image_uris_in_value(&mut section);
+                let bytes = serde_json::to_vec(&section)
+                    .unwrap_or_else(|_| b"<failed to serialize json>".to_vec());
+                (model.clone(), bytes, false)
+            });
+            let persistence = plan.persistence.map(|persistence| {
+                match crate::content_store::split_value_with_retention(
+                    persistence.protocol,
+                    value,
+                    persistence.keep_media,
+                    persistence.capture_payloads,
+                ) {
+                    Ok(split) => PersistenceInbound {
+                        split: Some(split),
+                        redacted: Vec::new(),
+                        partial: false,
+                        harness,
+                    },
+                    Err(error) => PersistenceInbound {
+                        split: None,
+                        redacted: format!("[redacted: body not splittable: {error}]").into_bytes(),
+                        partial: false,
+                        harness,
+                    },
+                }
+            });
+            InboundBodyAnalysis {
+                valid_json: true,
+                model,
+                body_log: body_log(summary),
+                payload_dump,
+                persistence,
+                affinity,
+                turn_capture,
+            }
+        }
+        Err(err) => {
+            let summary = plan.summarize.then(|| {
+                if body.is_empty() {
+                    return "empty".to_string();
+                }
+                // Redact image URIs from the raw preview before logging (round-4
+                // #2): a non-JSON body could still embed a `data:`/signed image URL.
+                let preview = crate::redaction::redact_image_uris(&String::from_utf8_lossy(body));
+                format!(
+                    "non_json parse_error={} preview={}",
+                    compact_for_log(&err.to_string()),
+                    compact_for_log(&preview)
+                )
+            });
+            // Non-JSON body: still strip image URIs from the raw text so a
+            // `data:`/signed URL in a malformed/odd payload is not logged raw.
+            let payload_dump = plan
+                .dump_payload
+                .then(|| crate::redaction::redact_image_uris(&String::from_utf8_lossy(body)));
+            // A malformed payload has no trustworthy key boundaries, so image-only
+            // redaction could retain an unterminated `api_key` value. The shared
+            // capped redactor emits a fixed marker and retains none of the source.
+            let malformed_marker = || {
+                crate::redaction::capture_capped_redacted(
+                    body,
+                    crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
+                    4 * 1024,
+                )
+            };
+            InboundBodyAnalysis {
+                valid_json: false,
+                model: None,
+                body_log: body_log(summary),
+                payload_dump,
+                persistence: plan.persistence.map(|_| PersistenceInbound {
+                    split: None,
+                    redacted: malformed_marker(),
+                    partial: false,
+                    harness: None,
+                }),
+                affinity: None,
+                turn_capture: plan.turn_capture.then(|| (None, malformed_marker(), false)),
+            }
+        }
+    }
+}
+
+/// Run [`analyze_inbound_body`] inline for small bodies and on the blocking pool
+/// for larger ones, so a multi-MiB parse never stalls a Tokio worker. The
+/// blocking task owns a cheap `Bytes` handle that it drops when it finishes;
+/// the caller awaits it, so nothing outlives the request.
+async fn analyze_inbound_body_offloaded(body: Bytes, plan: InboundBodyPlan) -> InboundBodyAnalysis {
+    if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
+        return analyze_inbound_body(&body, plan);
+    }
+    let len = body.len();
+    let failure_shape = (plan.body_log, plan.persistence.is_some(), plan.turn_capture);
+    match tokio::task::spawn_blocking(move || analyze_inbound_body(&body, plan)).await {
+        Ok(analysis) => analysis,
+        Err(err) => {
+            // Only reachable on a panic or runtime shutdown. Report honest
+            // non-empty markers flagged `partial` rather than a fabricated
+            // complete capture, and never treat the body as valid JSON (a
+            // durable row must not open for a body the extractor may reject).
+            tracing::warn!(error = %err, "inbound body analysis task failed");
+            let (body_log, persistence, turn_capture) = failure_shape;
+            InboundBodyAnalysis {
+                valid_json: false,
+                model: None,
+                body_log: body_log.then(|| BodyLogFields {
+                    bytes: len,
+                    sha256: "unavailable".to_owned(),
+                    summary: "analysis_failed".to_owned(),
+                }),
+                payload_dump: None,
+                persistence: persistence.then(|| PersistenceInbound {
+                    split: None,
+                    redacted: b"[redacted: persistence inbound task failed]".to_vec(),
+                    partial: true,
+                    harness: None,
+                }),
+                affinity: None,
+                turn_capture: turn_capture.then(|| {
+                    (
+                        None,
+                        b"<turn-capture: inbound redaction task failed>".to_vec(),
+                        true,
+                    )
+                }),
+            }
+        }
+    }
 }
 
 /// Inbound `Content-Encoding` decompression. codex-tui 0.145+ zstd-compresses
@@ -1557,45 +1946,52 @@ async fn log_api_call(
         parts.headers.insert(header::CONTENT_LENGTH, len);
     }
 
-    // Parse once for the existing authorization/logging surfaces. Large
-    // inference bodies move this CPU-bound JSON walk to the blocking pool and
-    // return a right-sized redacted copy for durable ingress, so persistence
-    // never adds another 10 MiB scan on the Tokio worker.
+    // ONE pass over the body serves every body-derived consumer below (log
+    // fields, model authorization, affinity, durable persistence, turn
+    // capture). Large bodies run it on the blocking pool; paths that only need
+    // `model` skip building a `Value` tree entirely.
     let instrument = is_flow_capture_request(&method, uri.path());
     let persistence_requested = instrument && gateway.persistence_enabled();
-    let mut persistence_inbound = if persistence_requested {
-        let protocol = crate::flow_persistence::client_protocol_for_path(uri.path())
-            .expect("instrumented paths have a protocol");
-        Some(
-            offload_persistence_inbound(
-                body_bytes.clone(),
-                protocol,
-                gateway.persistence_keep_media(),
-                capture_payloads,
-                Some((Arc::clone(gateway.harness_detector()), headers.clone())),
-            )
-            .await,
-        )
-    } else {
-        None
-    };
+    let capture_gate = instrument && capture_payloads && gateway.turn_capture().is_enabled();
+    let mut plan = InboundBodyPlan::log_only(
+        uri.path(),
+        capture_payloads,
+        body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES,
+    );
+    if persistence_requested {
+        plan.persistence = Some(PersistencePlan {
+            protocol: crate::flow_persistence::client_protocol_for_path(uri.path())
+                .expect("instrumented paths have a protocol"),
+            keep_media: gateway.persistence_keep_media(),
+            capture_payloads,
+            detection: Some((Arc::clone(gateway.harness_detector()), headers.clone())),
+        });
+    }
+    // Scheduling identity must work with observability disabled. Never retain
+    // the raw credential or depend on persistence having linked a session.
+    if instrument {
+        plan.affinity = Some(AffinityPlan {
+            detector: Arc::clone(gateway.harness_detector()),
+            headers: headers.clone(),
+            namespace: affinity_namespace(
+                &headers,
+                auth_context.as_ref(),
+                client_identity.as_ref(),
+            ),
+        });
+    }
+    plan.turn_capture = capture_gate;
+    let InboundBodyAnalysis {
+        valid_json: body_is_json,
+        model: requested_model,
+        body_log: body_log_fields,
+        payload_dump,
+        persistence: mut persistence_inbound,
+        affinity: request_affinity,
+        turn_capture: turn_capture_inbound,
+    } = analyze_inbound_body_offloaded(body_bytes.clone(), plan).await;
     // Authorize the client-facing name before any profile, alias, or backend
     // rewrite. Invalid JSON remains the protocol handler's responsibility.
-    let body_is_json = persistence_inbound.as_ref().map_or_else(
-        || serde_json::from_slice::<Value>(&body_bytes).is_ok(),
-        |body| body.valid_json,
-    );
-    let requested_model = match &persistence_inbound {
-        Some(body) => body.model.clone(),
-        None => serde_json::from_slice::<Value>(&body_bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }),
-    };
     if method == axum::http::Method::POST
         && is_client_api_path_with_model(uri.path())
         && gateway
@@ -1790,21 +2186,8 @@ async fn log_api_call(
     } else {
         None
     };
-    // Scheduling identity must work with observability disabled. Never retain
-    // the raw credential or depend on persistence having linked a session.
-    if instrument && body_is_json {
-        let namespace =
-            affinity_namespace(&headers, auth_context.as_ref(), client_identity.as_ref());
-        if let Some(affinity) = detect_request_affinity(
-            Arc::clone(gateway.harness_detector()),
-            headers.clone(),
-            body_bytes.clone(),
-            namespace,
-        )
-        .await
-        {
-            parts.extensions.insert(affinity);
-        }
+    if let Some(affinity) = request_affinity {
+        parts.extensions.insert(affinity);
     }
     if let Some(identity) = client_identity {
         parts.extensions.insert(identity);
@@ -1818,8 +2201,7 @@ async fn log_api_call(
     // body is an offline token-verification oracle. `body_log_fields` returns
     // `None` there so we emit only non-body metadata; every other path logs the
     // length, hex digest, and the redacted summary.
-    let is_auth_path = is_dashboard_auth_path(uri.path());
-    match body_log_fields(uri.path(), &body_bytes, capture_payloads) {
+    match body_log_fields {
         Some(fields) => tracing::info!(
             api_call_id = %api_call_id,
             method = %method,
@@ -1857,12 +2239,12 @@ async fn log_api_call(
     }
     // Never dump the auth-endpoint body (it carries the token, and even its
     // length/digest are an oracle — handled above).
-    if capture_payloads && !is_auth_path && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
+    if let Some(body_payload) = payload_dump {
         tracing::info!(
             api_call_id = %api_call_id,
             method = %method,
             path = %uri.path(),
-            body_payload = %payload_for_log(&body_bytes),
+            body_payload = %body_payload,
             "inbound API request payload"
         );
     }
@@ -1877,7 +2259,6 @@ async fn log_api_call(
     // keyed on `turn_capture().is_enabled()` INDEPENDENT of the flow store / debug
     // UI — so `api_call_id` reaches the engine and the artifact is written with the
     // dashboard OFF.
-    let capture_gate = instrument && capture_payloads && gateway.turn_capture().is_enabled();
 
     // The `api_call_id` extension the engine reads to link `response_id →
     // api_call_id` (D1) and to reach the per-turn capture state (F1c) is inserted
@@ -1932,34 +2313,29 @@ async fn log_api_call(
     };
 
     // F1b: start the per-turn artifact and write the redacted inbound-request
-    // section. `redacted_inbound_section` COPIES + redacts the body (secret keys +
-    // image URIs, the SAME path `payload_for_log` uses — AGENTS.md line 137/144),
-    // never retaining a slice of the 256 MiB buffer.
-    let turn_capture_state = if capture_gate {
-        // Finding 1: redact OFF the tokio worker for large bodies (spawn_blocking),
-        // AWAITED here before `write_inbound_request` so the section is written +
-        // closed before the finalize barrier can read it. `body_bytes.clone()` is a
-        // cheap Arc-backed `Bytes` clone; the offload copies it into an OWNED `Vec` for
-        // the blocking task (F1 — so nothing pins the 256 MiB backing) and this clone
-        // is dropped before `body_bytes` is moved into the rebuilt request below.
-        let (model_requested, inbound_section, inbound_partial) =
-            offload_redacted_inbound_section(body_bytes.clone()).await;
-        let state = gateway
-            .turn_capture()
-            .start(&api_call_id, model_requested, epoch_millis());
-        if let Some(state) = &state {
-            state.write_inbound_request(&inbound_section);
-            if inbound_partial {
-                // F3 (Fable-fix): the redaction offload could not capture the body (a
-                // spawn_blocking join failure); mark the section partial so it never
-                // reads as a complete inbound body (don't-lie-with-zeros).
-                state.mark_inbound_request_degraded();
+    // section. The section was built by the single inbound-body pass above: a
+    // fresh owned copy redacted through the SAME secret + image-URI redactors as
+    // the `body_payload` log (AGENTS.md line 137/144), never a slice of the
+    // middleware buffer. It is complete before `write_inbound_request`, so the
+    // section is written + closed before the finalize barrier can read it.
+    let turn_capture_state =
+        if let Some((model_requested, inbound_section, inbound_partial)) = turn_capture_inbound {
+            let state = gateway
+                .turn_capture()
+                .start(&api_call_id, model_requested, epoch_millis());
+            if let Some(state) = &state {
+                state.write_inbound_request(&inbound_section);
+                if inbound_partial {
+                    // F3 (Fable-fix): the redaction offload could not capture the body (a
+                    // spawn_blocking join failure); mark the section partial so it never
+                    // reads as a complete inbound body (don't-lie-with-zeros).
+                    state.mark_inbound_request_degraded();
+                }
             }
-        }
-        state
-    } else {
-        None
-    };
+            state
+        } else {
+            None
+        };
 
     // F1c: the turn-capture MIDDLEWARE backstop, held across `next.run`. If the
     // request NEVER reaches the engine (a `Json`/extractor rejection, a
@@ -2076,7 +2452,15 @@ async fn probe_messages() -> Response {
     responses((status = 200, body = serde_json::Value, description = "OpenAPI 3.1 document."))
 )]
 async fn get_openapi() -> Response {
-    (StatusCode::OK, Json(crate::openapi::document())).into_response()
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        crate::openapi::document_json(),
+    )
+        .into_response()
 }
 
 /// Liveness probe. Always `200 {"status":"healthy"}` once the server accepts connections.
@@ -2145,45 +2529,6 @@ fn dashboard_client_header() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn summarize_api_body(path: &str, body: &Bytes) -> String {
-    if body.is_empty() {
-        return "empty".to_string();
-    }
-    match serde_json::from_slice::<Value>(body) {
-        Ok(value) => summarize_json_api_body(path, &value),
-        Err(err) => {
-            // Redact image URIs from the raw preview before logging (round-4 #2):
-            // a non-JSON body could still embed a `data:`/signed image URL.
-            let preview = crate::redaction::redact_image_uris(&String::from_utf8_lossy(body));
-            format!(
-                "non_json parse_error={} preview={}",
-                compact_for_log(&err.to_string()),
-                compact_for_log(&preview)
-            )
-        }
-    }
-}
-
-fn payload_for_log(body: &Bytes) -> String {
-    match serde_json::from_slice::<Value>(body) {
-        Ok(mut value) => {
-            redact_payload_secrets(&mut value);
-            // G4 round-4 #2: an inbound body under the dump limit would otherwise
-            // log raw `data:` image bytes / signed `image_url`s. Strip image URIs
-            // from every remaining string via the shared redactor BEFORE
-            // serializing, so no logged surface carries request image content.
-            crate::redaction::redact_image_uris_in_value(&mut value);
-            serde_json::to_string(&value)
-                .unwrap_or_else(|_| "<failed to serialize json>".to_string())
-        }
-        Err(_) => {
-            // Non-JSON body: still strip image URIs from the raw text so a
-            // `data:`/signed URL in a malformed/odd payload is not logged raw.
-            crate::redaction::redact_image_uris(&String::from_utf8_lossy(body))
-        }
-    }
-}
-
 fn redact_payload_secrets(value: &mut Value) {
     // Single sensitive-key authority AND walker now live in `crate::redaction`
     // (D1 R1 #10; F1d extended the shared authority from just the key-list to the
@@ -2194,88 +2539,26 @@ fn redact_payload_secrets(value: &mut Value) {
     crate::redaction::redact_payload_secrets_in_value(value);
 }
 
-/// F1b: the redacted bytes for the turn-capture `inbound_request` section, plus
-/// the requested `model` (outcome metadata). Redaction MIRRORS `payload_for_log`
-/// EXACTLY — secret keys via [`redact_payload_secrets`], image/data URIs via
-/// [`crate::redaction::redact_image_uris_in_value`] — so the on-disk artifact is a
-/// NEW logged surface that does NOT bypass `redact_payload_secrets` (AGENTS.md
-/// line 137) and never carries raw image bytes. Parses/serializes a fresh owned
-/// `Value`, so it COPIES out of `body` and never retains a slice of the 256 MiB
-/// middleware buffer (AGENTS.md line 144).
+/// F1b: the redacted turn-capture `inbound_request` section for `body`, via the
+/// single inbound-body pass.
+#[cfg(test)]
 fn redacted_inbound_section(body: &[u8]) -> (Option<String>, Vec<u8>) {
-    match serde_json::from_slice::<Value>(body) {
-        Ok(mut value) => {
-            let model = value
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            redact_payload_secrets(&mut value);
-            crate::redaction::redact_image_uris_in_value(&mut value);
-            let bytes = serde_json::to_vec(&value)
-                .unwrap_or_else(|_| b"<failed to serialize json>".to_vec());
-            (model, bytes)
-        }
-        Err(_) => {
-            // A malformed payload has no trustworthy key boundaries, so image-
-            // only redaction could retain an unterminated `api_key` value. The
-            // shared capped redactor emits a fixed marker for malformed/non-UTF8
-            // input and retains none of the source bytes.
-            (
-                None,
-                crate::redaction::capture_capped_redacted(
-                    body,
-                    crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
-                    4 * 1024,
-                ),
-            )
-        }
-    }
+    let mut plan = InboundBodyPlan::log_only("/v1/responses", false, false);
+    plan.turn_capture = true;
+    let (model, bytes, _) = analyze_inbound_body(body, plan)
+        .turn_capture
+        .expect("turn capture was planned");
+    (model, bytes)
 }
 
-/// Fable review (Finding 1): produce the redacted `inbound_request` bytes, moving the
-/// CPU-bound parse+redact+re-serialize OFF the tokio worker for a LARGE body via
-/// `spawn_blocking` (mirroring `upstream::UpstreamRequestLogger`). Small bodies
-/// (`<= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES`) stay inline — the blocking-pool hop
-/// isn't worth it. Redaction is IDENTICAL on both paths (it is the SAME
-/// [`redacted_inbound_section`]). The caller AWAITS this INLINE, before
-/// `write_inbound_request` (append + close), so the section is fully written and
-/// closed before the both-`done` finalize barrier can read it (no section race, no
-/// hang). Returns `(model_requested, redacted_bytes, partial)`; `partial` is `true`
-/// ONLY on a join failure (the body could not be captured -- the caller then marks
-/// the section degraded rather than reporting a false "complete", don't-lie-with-zeros).
-///
-/// F1 (Fable-fix): the blocking task is handed an OWNED `Vec<u8>` copy of the body,
-/// NOT the Arc-backed `Bytes` — moving a `Bytes` clone into `spawn_blocking` would PIN
-/// the whole 256 MiB inbound middleware backing allocation for the task's lifetime,
-/// and a DETACHED task (outer future cancelled) would keep it pinned (AGENTS.md line
-/// 144 — no retained slice of that buffer). The owned right-sized copy is the intended
-/// cost; the redacted output is likewise a fresh owned `Vec`.
+#[cfg(test)]
 async fn offload_redacted_inbound_section(body: Bytes) -> (Option<String>, Vec<u8>, bool) {
-    if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
-        let (model, bytes) = redacted_inbound_section(&body);
-        return (model, bytes, false);
-    }
-    // Copy to an OWNED, right-sized `Vec` and DROP the Arc-backed `Bytes` BEFORE the
-    // blocking hop, so nothing pins the 256 MiB backing across the task (or after, on
-    // cancellation when the task detaches).
-    let owned: Vec<u8> = body.to_vec();
-    drop(body);
-    match tokio::task::spawn_blocking(move || redacted_inbound_section(&owned)).await {
-        Ok((model, bytes)) => (model, bytes, false),
-        // `redacted_inbound_section` is panic-free (serde failures fall back to a
-        // marker), so a `JoinError` here means the runtime is shutting down. Record an
-        // honest, NON-EMPTY marker AND signal `partial` so the section still closes
-        // (never a hang) and never reads as a fabricated empty/complete body
-        // (don't-lie-with-zeros; F3).
-        Err(err) => {
-            tracing::warn!(error = %err, "turn-capture: inbound redaction task failed");
-            (
-                None,
-                b"<turn-capture: inbound redaction task failed>".to_vec(),
-                true,
-            )
-        }
-    }
+    let mut plan = InboundBodyPlan::log_only("/v1/responses", false, false);
+    plan.turn_capture = true;
+    analyze_inbound_body_offloaded(body, plan)
+        .await
+        .turn_capture
+        .expect("turn capture was planned")
 }
 
 /// Upper bound on the time a cold-session warm-up may spend reading durable
@@ -2369,18 +2652,57 @@ fn affinity_namespace(
 
 fn affinity_from_value(
     detector: &crate::harness::HarnessDetector,
-    mut headers: HeaderMap,
+    headers: HeaderMap,
     mut body: Value,
+    namespace: &str,
+) -> Option<RequestAffinity> {
+    affinity_from_value_mut(detector, headers, &mut body, namespace)
+}
+
+/// Run `f` against `value` as if its top-level `key` were absent, then put the
+/// entry back at its original position. Entries are MOVED (never cloned), so
+/// hiding a field of a multi-MiB body costs only a walk over its top-level
+/// keys, and the restored map is identical under either `serde_json` map
+/// backend (sorted or insertion-ordered).
+fn with_object_key_hidden<R>(value: &mut Value, key: &str, f: impl FnOnce(&Value) -> R) -> R {
+    let Some(map) = value.as_object_mut().filter(|map| map.contains_key(key)) else {
+        return f(value);
+    };
+    let mut entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+    let index = entries
+        .iter()
+        .position(|(name, _)| name == key)
+        .expect("contains_key checked above");
+    let hidden = entries.remove(index);
+    let view = Value::Object(entries.into_iter().collect());
+    let result = f(&view);
+    let Value::Object(view) = view else {
+        unreachable!("view is constructed as an object");
+    };
+    let mut entries: Vec<(String, Value)> = view.into_iter().collect();
+    entries.insert(index, hidden);
+    *value = Value::Object(entries.into_iter().collect());
+    result
+}
+
+/// [`affinity_from_value`] over a borrowed body: any field it hides for
+/// detection is restored before returning, so the single inbound-body pass
+/// can hand the same parsed `Value` to persistence and turn capture next.
+fn affinity_from_value_mut(
+    detector: &crate::harness::HarnessDetector,
+    mut headers: HeaderMap,
+    body: &mut Value,
     namespace: &str,
 ) -> Option<RequestAffinity> {
     // Explicit thread metadata is more specific than a per-turn request id.
     // Keep the configured harness fallback when no thread metadata is present.
-    if body.get("type").and_then(Value::as_str) == Some("response.create")
-        && let Some(response) = body.get_mut("response")
-        && response.is_object()
-    {
-        body = response.take();
-    }
+    let is_response_create = body.get("type").and_then(Value::as_str) == Some("response.create")
+        && body.get("response").is_some_and(Value::is_object);
+    let body = if is_response_create {
+        body.get_mut("response").expect("checked above")
+    } else {
+        body
+    };
     if body
         .pointer("/client_metadata/thread_id")
         .and_then(Value::as_str)
@@ -2389,10 +2711,8 @@ fn affinity_from_value(
         headers.remove("x-client-request-id");
     }
     // The generic `user` field identifies a caller, rather than a conversation.
-    if let Some(object) = body.as_object_mut() {
-        object.remove("user");
-    }
-    let identity = detector.detect(&headers, Some(&body));
+    let identity =
+        with_object_key_hidden(body, "user", |view| detector.detect(&headers, Some(view)));
     let session = identity
         .session_id
         .as_deref()
@@ -2434,8 +2754,6 @@ async fn detect_request_affinity(
 /// `split` is the content-addressed body (present whenever the body parsed as a
 /// JSON object); `redacted` is the bounded fallback marker used otherwise.
 struct PersistenceInbound {
-    valid_json: bool,
-    model: Option<String>,
     split: Option<crate::content_store::SplitBody>,
     redacted: Vec<u8>,
     partial: bool,
@@ -2443,110 +2761,39 @@ struct PersistenceInbound {
     harness: Option<crate::harness::HarnessIdentity>,
 }
 
-/// Parse the inbound body once, extract `model`, and split it into
-/// content-addressed items. The split retains the whole body (that is the
-/// point: full bodies are stored, deduplicated per item), so large bodies do
-/// the parse + hash work on the blocking pool rather than a Tokio worker.
+#[cfg(test)]
 async fn offload_persistence_inbound(
     body: Bytes,
     protocol: &'static str,
     keep_media: bool,
     capture_payloads: bool,
     detection: Option<(Arc<crate::harness::HarnessDetector>, HeaderMap)>,
-) -> PersistenceInbound {
-    fn split_inbound(
-        raw: &[u8],
-        protocol: &str,
-        keep_media: bool,
-        capture_payloads: bool,
-        detection: Option<&(Arc<crate::harness::HarnessDetector>, HeaderMap)>,
-    ) -> PersistenceInbound {
-        match serde_json::from_slice::<Value>(raw) {
-            Ok(value) => {
-                let model = value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                // Detect while the parsed body is still whole (before splitting
-                // moves the items out); headers are the middleware's clone.
-                let harness =
-                    detection.map(|(detector, headers)| detector.detect(headers, Some(&value)));
-                match crate::content_store::split_value_with_retention(
-                    protocol,
-                    value,
-                    keep_media,
-                    capture_payloads,
-                ) {
-                    Ok(split) => PersistenceInbound {
-                        valid_json: true,
-                        model,
-                        split: Some(split),
-                        redacted: Vec::new(),
-                        partial: false,
-                        harness,
-                    },
-                    Err(error) => PersistenceInbound {
-                        valid_json: true,
-                        model,
-                        split: None,
-                        redacted: format!("[redacted: body not splittable: {error}]").into_bytes(),
-                        partial: false,
-                        harness,
-                    },
-                }
-            }
-            Err(_) => PersistenceInbound {
-                valid_json: false,
-                model: None,
-                split: None,
-                // Malformed input has no trustworthy key boundaries; the shared
-                // redactor stores a fixed marker with none of the source bytes.
-                redacted: crate::redaction::capture_capped_redacted(
-                    raw,
-                    crate::flow_persistence::EVENT_PAYLOAD_CAP_BYTES,
-                    4 * 1024,
-                ),
-                partial: false,
-                harness: None,
-            },
-        }
+) -> TestPersistenceInbound {
+    let mut plan = InboundBodyPlan::log_only("/v1/responses", false, false);
+    plan.persistence = Some(PersistencePlan {
+        protocol,
+        keep_media,
+        capture_payloads,
+        detection,
+    });
+    let analysis = analyze_inbound_body_offloaded(body, plan).await;
+    let inbound = analysis.persistence.expect("persistence was planned");
+    TestPersistenceInbound {
+        valid_json: analysis.valid_json,
+        model: analysis.model,
+        split: inbound.split,
+        redacted: inbound.redacted,
+        partial: inbound.partial,
     }
+}
 
-    if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
-        return split_inbound(
-            &body,
-            protocol,
-            keep_media,
-            capture_payloads,
-            detection.as_ref(),
-        );
-    }
-    match tokio::task::spawn_blocking(move || {
-        split_inbound(
-            &body,
-            protocol,
-            keep_media,
-            capture_payloads,
-            detection.as_ref(),
-        )
-    })
-    .await
-    {
-        Ok(capture) => capture,
-        Err(err) => {
-            tracing::warn!(error = %err, "persistence inbound split task failed");
-            PersistenceInbound {
-                // A detached/panicked parse cannot establish valid JSON. Do not
-                // open a durable row that the typed extractor may never claim.
-                valid_json: false,
-                model: None,
-                split: None,
-                redacted: b"[redacted: persistence inbound task failed]".to_vec(),
-                partial: true,
-                harness: None,
-            }
-        }
-    }
+#[cfg(test)]
+struct TestPersistenceInbound {
+    valid_json: bool,
+    model: Option<String>,
+    split: Option<crate::content_store::SplitBody>,
+    redacted: Vec<u8>,
+    partial: bool,
 }
 
 /// Current wall-clock time as epoch milliseconds (the `started_ms` clock the
@@ -5429,6 +5676,133 @@ mod tests {
         assert!(capture.split.is_none());
         let marker = String::from_utf8(capture.redacted).unwrap();
         assert!(!marker.contains("super-secret"));
+    }
+
+    /// The validation-only `model` probe must answer exactly like parsing into a
+    /// `Value` and reading `model`, for every shape a client can send.
+    #[test]
+    fn model_probe_matches_value_semantics() {
+        let cases: &[&[u8]] = &[
+            br#"{"model":"m1","input":[{"role":"user","content":"hi"}]}"#,
+            br#"{"input":{"model":"nested"},"model":"outer"}"#,
+            br#"{"model":"first","model":"last"}"#,
+            br#"{"model":5}"#,
+            br#"{"model":null}"#,
+            br#"{"model":{"id":"x"}}"#,
+            br#"{"model":["x"]}"#,
+            br#"{"mod\u0065l":"escaped-key"}"#,
+            br#"{"model":"esc\"aped\u00e9"}"#,
+            br#"{}"#,
+            br#"["model","x"]"#,
+            br#""model""#,
+            br#"42"#,
+            br#"{"model":"x"} trailing"#,
+            br#"{"model":"x""#,
+            b"",
+        ];
+        for case in cases {
+            let expected = match serde_json::from_slice::<serde_json::Value>(case) {
+                Ok(value) => (
+                    true,
+                    value
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                ),
+                Err(_) => (false, None),
+            };
+            assert_eq!(
+                super::probe_model(case),
+                expected,
+                "{}",
+                String::from_utf8_lossy(case)
+            );
+        }
+    }
+
+    /// Affinity detection hides `user` while it runs, and must hand the body
+    /// back byte-identical for the persistence/turn-capture consumers.
+    #[test]
+    fn affinity_over_borrowed_body_restores_it_and_matches_owned() {
+        let detector = crate::harness::HarnessDetector::builtin();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("originator", "codex_cli_rs".parse().unwrap());
+        headers.insert("session-id", "root-session".parse().unwrap());
+        for body in [
+            serde_json::json!({"zeta":1,"user":"u","alpha":[1,2],"prompt_cache_key":"pk"}),
+            serde_json::json!({"type":"response.create","response":{"user":"u","client_metadata":{"thread_id":"t"}}}),
+            serde_json::json!({"prompt_cache_key":"pk"}),
+            serde_json::json!(["not", "an", "object"]),
+        ] {
+            let original = serde_json::to_string(&body).unwrap();
+            let owned =
+                super::affinity_from_value(&detector, headers.clone(), body.clone(), "caller");
+            let mut borrowed = body;
+            let via_mut =
+                super::affinity_from_value_mut(&detector, headers.clone(), &mut borrowed, "caller");
+            assert_eq!(owned, via_mut);
+            assert_eq!(serde_json::to_string(&borrowed).unwrap(), original);
+        }
+    }
+
+    /// The single inbound pass produces every consumer's output from one parse,
+    /// with the same redaction each surface had on its own.
+    #[tokio::test]
+    async fn single_inbound_pass_serves_every_consumer() {
+        let body = Bytes::from_static(
+            br#"{"model":"m-one","api_key":"sk-SINGLE-PASS","user":"caller","prompt_cache_key":"pk-1","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,RAWSINGLEPASS"}]}]}"#,
+        );
+        let detector = Arc::new(crate::harness::HarnessDetector::builtin());
+        let mut plan = super::InboundBodyPlan::log_only("/v1/responses", true, true);
+        plan.persistence = Some(super::PersistencePlan {
+            protocol: crate::content_store::PROTOCOL_RESPONSES,
+            keep_media: false,
+            capture_payloads: true,
+            detection: Some((Arc::clone(&detector), HeaderMap::new())),
+        });
+        plan.affinity = Some(super::AffinityPlan {
+            detector: Arc::clone(&detector),
+            headers: HeaderMap::new(),
+            namespace: "caller-ns".to_owned(),
+        });
+        plan.turn_capture = true;
+        let analysis = super::analyze_inbound_body_offloaded(body.clone(), plan).await;
+
+        assert!(analysis.valid_json);
+        assert_eq!(analysis.model.as_deref(), Some("m-one"));
+        let log = analysis.body_log.expect("non-auth path logs body fields");
+        assert_eq!(log.bytes, body.len());
+        assert_eq!(log.sha256, hex::encode(sha2::Sha256::digest(&body)));
+        assert!(log.summary.contains("model=m-one"), "{}", log.summary);
+        assert!(!log.summary.contains("sk-SINGLE-PASS"));
+        let dump = analysis.payload_dump.expect("small body is dumped");
+        assert!(!dump.contains("sk-SINGLE-PASS") && !dump.contains("RAWSINGLEPASS"));
+        assert!(
+            dump.contains("\"user\":\"caller\""),
+            "affinity restored user"
+        );
+        let (model, section, partial) = analysis.turn_capture.expect("planned");
+        assert_eq!(model.as_deref(), Some("m-one"));
+        assert!(!partial);
+        let section = String::from_utf8(section).unwrap();
+        assert!(!section.contains("sk-SINGLE-PASS") && !section.contains("RAWSINGLEPASS"));
+        assert!(section.contains("\"user\":\"caller\""));
+        let persistence = analysis.persistence.expect("planned");
+        let split = persistence.split.expect("object body splits");
+        assert!(!split.skeleton.contains("sk-SINGLE-PASS"));
+        assert_eq!(
+            analysis.affinity,
+            super::affinity_from_value(
+                &detector,
+                HeaderMap::new(),
+                serde_json::from_slice(&body).unwrap(),
+                "caller-ns"
+            )
+        );
+        assert!(
+            analysis.affinity.is_some(),
+            "prompt_cache_key yields affinity"
+        );
     }
 
     #[test]
