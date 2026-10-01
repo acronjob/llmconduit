@@ -65,8 +65,10 @@ const fn default_true() -> bool {
     true
 }
 
+// Dashboard trends need minute-level resolution at most; a faster default
+// spends burst CPU and SQL writes on small hubs for no visible gain.
 const fn default_scrape_interval_secs() -> u64 {
-    15
+    60
 }
 
 /// Derive the Prometheus endpoint from an OpenAI-compatible base URL:
@@ -748,7 +750,7 @@ sglang:prefill_effective_tokens_total{engine_type="unified",model_name="glm",mod
     fn metrics_bootstrap_defaults_and_parses_overrides() {
         let config = MetricsBootstrap::default();
         assert!(config.enabled);
-        assert_eq!(config.scrape_interval_secs, 15);
+        assert_eq!(config.scrape_interval_secs, 60);
         assert!(MetricsBootstrap::is_default(&config));
         let parsed: MetricsBootstrap = serde_yaml::from_str(
             "scrape_interval_secs: 30\nbackends:\n  local: { url: 'http://x:9/metrics' }\n  litellm: { enabled: false }\n",

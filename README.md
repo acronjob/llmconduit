@@ -1032,8 +1032,7 @@ Without `--binary`, the helper compiles locally with
 `CARGO_PROFILE_RELEASE_LTO=false`, 16 codegen units and one build job. That
 still peaks around 2.1 GB, so it refuses on hosts with under 3 GiB of RAM+swap
 unless `--build-on-host` is passed (for example after adding swap). Also
-consider `control_plane.metrics.scrape_interval_secs: 60`,
-`control_plane.storage.keep_media: false` and a shorter `retention_days`.
+consider `control_plane.storage.keep_media: false` and a shorter `retention_days`.
 
 Streaming responses are Server-Sent Events. A reverse proxy in front of the
 gateway must not buffer or compress them, or clients see tokens in bursts and
