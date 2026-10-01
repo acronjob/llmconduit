@@ -9,10 +9,10 @@ use crate::mesh::io::{Admission, read_stream_open, write_admission, write_switch
 use crate::mesh::protocol::{
     AdmissionRejectCode, ENROLL_ALPN, EnrollRequest, EnrollResponse, Heartbeat, HubToWorker,
     MAX_CAPACITY_PER_RESOURCE, ModelAdvertisement, ModelLifecycleAction,
-    ModelSwitchingAdvertisement, PROTOCOL_VERSION, ResourceAdvertisement, ResourceRuntimeState,
-    StreamOpen, SwitchModelRequest, SwitchModelResponse, SwitchableModelAdvertisement,
-    SwitchableModelInstanceAdvertisement, WORKER_ALPN, WorkerAdvertisement, WorkerToHub,
-    read_control, write_control,
+    ModelSwitchingAdvertisement, PROTOCOL_VERSION, REQUEST_ENCODING_ZSTD, ResourceAdvertisement,
+    ResourceRuntimeState, StreamOpen, SwitchModelRequest, SwitchModelResponse,
+    SwitchableModelAdvertisement, SwitchableModelInstanceAdvertisement, WORKER_ALPN,
+    WorkerAdvertisement, WorkerToHub, read_control, write_control,
 };
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -104,6 +104,7 @@ impl WorkerRuntime {
             agent_version: crate::VERSION.to_string(),
             resources,
             model_switching: self.model_switching.lock().await.clone(),
+            request_encodings: vec![REQUEST_ENCODING_ZSTD.to_string()],
         }
     }
 
@@ -262,7 +263,7 @@ impl LocalResource {
     }
 }
 
-async fn enroll(
+pub(super) async fn enroll(
     endpoint: &Endpoint,
     controller: EndpointAddr,
     config: &MeshWorkerConfig,

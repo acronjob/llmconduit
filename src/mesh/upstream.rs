@@ -899,6 +899,7 @@ mod tests {
             agent_version: "test".to_string(),
             resources,
             model_switching: None,
+            request_encodings: Vec::new(),
         }
     }
 
@@ -1110,6 +1111,7 @@ mod tests {
                     revision: 1,
                 }],
                 model_switching: None,
+                request_encodings: Vec::new(),
             },
         );
         let mesh = MeshUpstreamClient::new(
@@ -1133,7 +1135,10 @@ mod tests {
         let inventory = wrapped.provider_inventory().await.expect("inventory");
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].provider_id, format!("mesh:{endpoint}"));
-        assert_eq!(inventory[0].provider_name, "workstation");
+        assert_eq!(
+            inventory[0].provider_name,
+            format!("workstation ({})", endpoint.fmt_short())
+        );
         assert_eq!(inventory[0].resource_id.as_deref(), Some("local-vllm"));
         assert_eq!(inventory[0].capacity_limit, Some(3));
         assert_eq!(
@@ -1681,6 +1686,7 @@ mod tests {
                     revision: 1,
                 }],
                 model_switching: None,
+                request_encodings: Vec::new(),
             },
         );
         let client = MeshUpstreamClient::new(
