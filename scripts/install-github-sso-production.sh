@@ -4,13 +4,33 @@ set -Eeuo pipefail
 # Install llmconduit as a persistent user service behind an HTTPS reverse proxy.
 # Secrets may be supplied as environment variables or entered at the prompts.
 # Refuses to run unless the caller confirms the production host.
+#
+# Small hosts (for example a 2 GB / 2 vCPU VM) should NOT compile the release
+# binary themselves: the optimized link alone can exhaust memory. Build on a
+# larger machine with the same CPU architecture and an equal-or-older glibc:
+#
+#   LLMCONDUIT_BUILD_DASHBOARD=1 cargo build --locked --release
+#   scp target/release/llmconduit prod-host:/tmp/llmconduit
+#
+# then install it here with `--binary /tmp/llmconduit` (or `--binary-url URL
+# --binary-sha256 HEX`). Without either, the script builds locally with a
+# low-memory profile (no LTO, 16 codegen units, one job).
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 CONFIG_PATH="${LLMCONDUIT_CONFIG_PATH:-${HOME}/.config/llmconduit/config.yaml}"
 ENV_FILE="${LLMCONDUIT_ENV_FILE:-${HOME}/.config/llmconduit/dashboard.env}"
+TUNING_FILE="${LLMCONDUIT_TUNING_FILE:-${HOME}/.config/llmconduit/tuning.env}"
 UNIT_FILE="${HOME}/.config/systemd/user/llmconduit.service"
+INSTALL_DIR="${LLMCONDUIT_INSTALL_DIR:-${HOME}/.local/lib/llmconduit}"
+BINARY_PATH="${LLMCONDUIT_BINARY_PATH:-}"
+BINARY_URL="${LLMCONDUIT_BINARY_URL:-}"
+BINARY_SHA256="${LLMCONDUIT_BINARY_SHA256:-}"
+# systemd memory guardrails sized for a 2 GB host: reclaim pressure starts at
+# MemoryHigh, and the kernel OOM-kills only this service at MemoryMax.
+MEMORY_HIGH="${LLMCONDUIT_MEMORY_HIGH:-1200M}"
+MEMORY_MAX="${LLMCONDUIT_MEMORY_MAX:-1536M}"
 DRY_RUN=0
 CONFIRM_PRODUCTION_HOST="${LLMCONDUIT_CONFIRM_PRODUCTION_HOST:-}"
 BIND_ADDR="${LLMCONDUIT_BIND_ADDR:-127.0.0.1:4000}"
@@ -30,9 +50,22 @@ need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 usage() {
   cat <<'EOF'
 Usage: install-github-sso-production.sh --confirm-production-host HOST [--dry-run]
+         [--binary PATH | --binary-url URL --binary-sha256 HEX]
 
 Requires an existing config with control_plane.storage and writes GitHub
 secrets only to the separate EnvironmentFile.
+
+  --binary PATH        Install a prebuilt llmconduit binary instead of compiling.
+  --binary-url URL     Download a prebuilt binary (requires --binary-sha256).
+  --binary-sha256 HEX  Expected SHA-256 of the prebuilt binary.
+
+Prebuilt binaries must be built with LLMCONDUIT_BUILD_DASHBOARD=1 on a host
+with the same architecture and an equal-or-older glibc. Without one, the
+release binary is compiled here with a low-memory profile.
+
+Memory tuning defaults live in the unit; override them in
+~/.config/llmconduit/tuning.env (LLMCONDUIT_TUNING_FILE). Unit memory limits:
+LLMCONDUIT_MEMORY_HIGH (default 1200M) and LLMCONDUIT_MEMORY_MAX (default 1536M).
 EOF
 }
 
@@ -46,6 +79,21 @@ while [[ $# -gt 0 ]]; do
     --dry-run)
       DRY_RUN=1
       shift
+      ;;
+    --binary)
+      [[ $# -ge 2 ]] || die '--binary requires a path'
+      BINARY_PATH="$2"
+      shift 2
+      ;;
+    --binary-url)
+      [[ $# -ge 2 ]] || die '--binary-url requires a URL'
+      BINARY_URL="$2"
+      shift 2
+      ;;
+    --binary-sha256)
+      [[ $# -ge 2 ]] || die '--binary-sha256 requires a hex digest'
+      BINARY_SHA256="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -86,10 +134,22 @@ write_env() {
   printf '%s="%s"\n' "$name" "$value"
 }
 
-need cargo
+[[ -z "${BINARY_PATH}" || -z "${BINARY_URL}" ]] || die 'pass either --binary or --binary-url, not both'
+if [[ -n "${BINARY_URL}" ]]; then
+  [[ "${BINARY_URL}" =~ ^https:// ]] || die '--binary-url must be an https:// URL'
+  [[ "${BINARY_SHA256}" =~ ^[0-9A-Fa-f]{64}$ ]] || die '--binary-url requires --binary-sha256 with a 64-hex-digit digest'
+fi
+if [[ -n "${BINARY_PATH}" ]]; then
+  [[ -f "${BINARY_PATH}" && -x "${BINARY_PATH}" ]] || die "prebuilt binary is not an executable file: ${BINARY_PATH}"
+  [[ -z "${BINARY_SHA256}" || "${BINARY_SHA256}" =~ ^[0-9A-Fa-f]{64}$ ]] || die '--binary-sha256 must be a 64-hex-digit digest'
+fi
+if [[ -z "${BINARY_PATH}" && -z "${BINARY_URL}" ]]; then
+  need cargo
+  need npm
+fi
 need curl
-need npm
 need openssl
+need sha256sum
 need systemctl
 [[ -f "${CONFIG_PATH}" ]] || die "config file not found: ${CONFIG_PATH}"
 if ! grep -Eq '^[[:space:]]*control_plane:[[:space:]]*($|#)' "${CONFIG_PATH}" || \
@@ -178,11 +238,77 @@ else
 fi
 unset GITHUB_CLIENT_SECRET SESSION_KEY AUTH_PEPPER AUTH_BOOTSTRAP_KEY
 
-printf 'Building the release binary with the dashboard embedded...\n'
-if [[ "${DRY_RUN}" == 1 ]]; then
-  printf '[dry-run] would run cargo build --locked --release with embedded dashboard\n'
+BINARY="${INSTALL_DIR}/llmconduit"
+
+# Install `$1` as the service binary atomically, verifying `$2` (optional).
+install_binary() {
+  local source="$1" expected_sha="${2:-}" actual_sha tmp
+  if [[ -n "${expected_sha}" ]]; then
+    actual_sha="$(sha256sum -- "${source}" | cut -d' ' -f1)"
+    [[ "${actual_sha,,}" == "${expected_sha,,}" ]] || \
+      die "binary SHA-256 mismatch: expected ${expected_sha}, got ${actual_sha}"
+  fi
+  "${source}" --help >/dev/null 2>&1 || die "binary does not run on this host: ${source}"
+  mkdir -p -- "${INSTALL_DIR}"
+  tmp="$(mktemp "${BINARY}.tmp.XXXXXX")"
+  cp -- "${source}" "${tmp}"
+  chmod 755 -- "${tmp}"
+  mv -f -- "${tmp}" "${BINARY}"
+}
+
+if [[ -n "${BINARY_URL}" ]]; then
+  printf 'Downloading the prebuilt release binary...\n'
+  if [[ "${DRY_RUN}" == 1 ]]; then
+    printf '[dry-run] would download %s, verify its SHA-256, and install %s\n' "${BINARY_URL}" "${BINARY}"
+  else
+    download="$(mktemp)"
+    trap 'rm -f -- "${download}"' EXIT
+    curl --fail --silent --show-error --location --proto '=https' --output "${download}" "${BINARY_URL}"
+    chmod 700 -- "${download}"
+    install_binary "${download}" "${BINARY_SHA256}"
+  fi
+elif [[ -n "${BINARY_PATH}" ]]; then
+  if [[ "${DRY_RUN}" == 1 ]]; then
+    printf '[dry-run] would install prebuilt binary %s as %s\n' "${BINARY_PATH}" "${BINARY}"
+  else
+    install_binary "${BINARY_PATH}" "${BINARY_SHA256}"
+  fi
 else
-  (cd -- "${REPO_DIR}" && LLMCONDUIT_BUILD_DASHBOARD=1 cargo build --locked --release)
+  printf 'Building the release binary with the dashboard embedded (low-memory profile)...\n'
+  printf 'Tip: on a small host, build elsewhere and pass --binary instead.\n'
+  if [[ "${DRY_RUN}" == 1 ]]; then
+    printf '[dry-run] would run cargo build --locked --release with embedded dashboard and install %s\n' "${BINARY}"
+  else
+    # Thin LTO + one codegen unit (the release profile) can OOM a 2 GB host at
+    # link time; trade a little runtime speed for a build that fits. Callers may
+    # still override any of these.
+    (cd -- "${REPO_DIR}" && \
+      LLMCONDUIT_BUILD_DASHBOARD=1 \
+      CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-false}" \
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}" \
+      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" \
+      cargo build --locked --release)
+    install_binary "${REPO_DIR}/target/release/llmconduit"
+  fi
+fi
+
+if [[ "${DRY_RUN}" == 1 ]]; then
+  printf '[dry-run] would create tuning EnvironmentFile if absent: %s\n' "${TUNING_FILE}"
+elif [[ ! -e "${TUNING_FILE}" ]]; then
+  mkdir -p -- "$(dirname -- "${TUNING_FILE}")"
+  cat >"${TUNING_FILE}" <<'EOF'
+# llmconduit memory/CPU tuning overrides (not secrets). The unit already sets
+# small-host defaults; uncomment a line here to override it, then run
+#   systemctl --user restart llmconduit.service
+#LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES=33554432
+#LLMCONDUIT_MONITOR_PAYLOAD_PREVIEW_BYTES=16777216
+#LLMCONDUIT_INFLIGHT_REQUEST_BODY_BYTES=67108864
+#LLMCONDUIT_PERSISTENCE_QUEUE_MAX_BYTES=16777216
+#LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=120
+#LLMCONDUIT_MAX_BLOCKING_THREADS=16
+#MALLOC_ARENA_MAX=2
+EOF
+  chmod 600 -- "${TUNING_FILE}"
 fi
 
 if [[ "${DRY_RUN}" == 1 ]]; then
@@ -198,10 +324,21 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${REPO_DIR}
+# Small-host memory defaults (2 GB VM). Values in the tuning file override them;
+# the secrets file comes last.
+Environment=MALLOC_ARENA_MAX=2
+Environment=LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES=33554432
+Environment=LLMCONDUIT_MONITOR_PAYLOAD_PREVIEW_BYTES=16777216
+Environment=LLMCONDUIT_INFLIGHT_REQUEST_BODY_BYTES=67108864
+Environment=LLMCONDUIT_PERSISTENCE_QUEUE_MAX_BYTES=16777216
+Environment=LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=120
+EnvironmentFile=-${TUNING_FILE}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${REPO_DIR}/target/release/llmconduit start --config ${CONFIG_PATH} --with-debug-ui
+ExecStart=${BINARY} start --config ${CONFIG_PATH} --with-debug-ui
 Restart=on-failure
 RestartSec=3
+MemoryHigh=${MEMORY_HIGH}
+MemoryMax=${MEMORY_MAX}
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -240,6 +377,8 @@ printf '  Service:       llmconduit.service\n'
 printf '  Local health:  %s/dashboard\n' "${HEALTH_URL}"
 printf '  Public URL:    %s/dashboard\n' "${PUBLIC_ORIGIN}"
 printf '  Secrets file:  %s (mode 0600)\n' "${ENV_FILE}"
+printf '  Tuning file:   %s\n' "${TUNING_FILE}"
+printf '  Binary:        %s\n' "${BINARY}"
 printf '  Logs:          journalctl --user -u llmconduit.service -f\n'
 if [[ "${ALLOW_MUTATIONS}" =~ ^(0|false|no)$ ]]; then
   printf '\nDashboard mutations remain disabled. Re-run with LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1 to enable Access/Fleet writes.\n'
