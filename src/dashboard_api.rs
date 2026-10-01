@@ -964,12 +964,7 @@ fn upstream_edge_rates(
 /// `pub(crate)` so the live `/dashboard/ws` tick + initial snapshot derive the SAME
 /// open-flow count as the REST `/metrics` read (gap 01 — one source, no drift).
 pub(crate) fn active_stream_count(gateway: &Gateway) -> u64 {
-    gateway
-        .flow_store()
-        .list()
-        .iter()
-        .filter(|record| record.status == FlowStatus::Open)
-        .count() as u64
+    gateway.flow_store().open_count()
 }
 
 /// Count the OPEN flows in a FROZEN snapshot cut's body-free summaries — the
