@@ -57,6 +57,37 @@ pub struct WorkerAdvertisement {
     pub agent_version: String,
     pub resources: Vec<ResourceAdvertisement>,
     pub model_switching: Option<ModelSwitchingAdvertisement>,
+    /// `Content-Encoding` values this worker can decode on inference request
+    /// bodies. Optional on the wire in both directions: an older hub ignores
+    /// the unknown field, and an older worker omits it so a newer hub keeps
+    /// sending identity-encoded bodies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_encodings: Vec<String>,
+}
+
+/// Request-body encoding negotiated through
+/// [`WorkerAdvertisement::request_encodings`].
+pub const REQUEST_ENCODING_ZSTD: &str = "zstd";
+pub const MAX_REQUEST_ENCODINGS: usize = 8;
+pub const MAX_REQUEST_ENCODING_BYTES: usize = 32;
+
+/// Largest context window a worker may advertise. Anything above this is
+/// either a bug or hostile and would overflow downstream token budgeting.
+pub const MAX_CONTEXT_LIMIT: i64 = 10_000_000;
+
+impl WorkerAdvertisement {
+    pub fn accepts_request_encoding(&self, encoding: &str) -> bool {
+        self.request_encodings
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(encoding))
+    }
+}
+
+/// Drops a context limit outside `1..=MAX_CONTEXT_LIMIT` instead of
+/// rejecting the whole advertisement: an unknown window only disables
+/// pre-flight budgeting for that model, while a bogus one corrupts it.
+pub fn sanitize_context_limit(limit: Option<i64>) -> Option<i64> {
+    limit.filter(|limit| (1..=MAX_CONTEXT_LIMIT).contains(limit))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +328,27 @@ pub fn validate_worker_advertisement(
     }
     if let Some(switching) = &advertisement.model_switching {
         validate_model_switching(switching)?;
+    }
+    if advertisement.request_encodings.len() > MAX_REQUEST_ENCODINGS {
+        return Err(ProtocolError::TooManyRequestEncodings {
+            count: advertisement.request_encodings.len(),
+            max: MAX_REQUEST_ENCODINGS,
+        });
+    }
+    for encoding in &advertisement.request_encodings {
+        validate_bounded_string(
+            encoding,
+            MAX_REQUEST_ENCODING_BYTES,
+            ProtocolError::BlankSwitchingState {
+                field: "request encoding",
+            },
+            |len, max| ProtocolError::SwitchingStateTooLong {
+                field: "request encoding",
+                len,
+                max,
+            },
+        )?;
+        reject_control_characters(encoding, "request encoding")?;
     }
     Ok(())
 }
@@ -728,6 +780,8 @@ pub enum ProtocolError {
     },
     #[error("join key must not be blank")]
     BlankJoinKey,
+    #[error("worker advertised {count} request encodings, maximum is {max}")]
+    TooManyRequestEncodings { count: usize, max: usize },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -822,6 +876,7 @@ mod tests {
                 revision: 1,
             }],
             model_switching: None,
+            request_encodings: Vec::new(),
         };
         validate_worker_advertisement(&advertisement).unwrap();
         advertisement.resources[0].models = vec![
@@ -970,6 +1025,94 @@ mod tests {
     }
 
     #[test]
+    fn request_encodings_round_trip_and_stay_backward_compatible() {
+        let advertisement = WorkerAdvertisement {
+            protocol_version: PROTOCOL_VERSION,
+            node_name: None,
+            agent_version: "test".to_string(),
+            resources: Vec::new(),
+            model_switching: None,
+            request_encodings: vec![REQUEST_ENCODING_ZSTD.to_string()],
+        };
+        let hello = WorkerToHub::Hello(advertisement.clone());
+        let value = serde_json::to_value(&hello).unwrap();
+        assert_eq!(
+            value["payload"]["request_encodings"],
+            serde_json::json!(["zstd"])
+        );
+        let decoded: WorkerToHub = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded, hello);
+        let WorkerToHub::Hello(decoded) = decoded else {
+            unreachable!()
+        };
+        assert!(decoded.accepts_request_encoding("ZSTD"));
+
+        // An older worker omits the field: a newer hub must parse it and not
+        // compress.
+        let mut legacy = value["payload"].clone();
+        legacy.as_object_mut().unwrap().remove("request_encodings");
+        let legacy: WorkerAdvertisement = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.request_encodings.is_empty());
+        assert!(!legacy.accepts_request_encoding(REQUEST_ENCODING_ZSTD));
+        // ...and it serializes without the field so an older peer sees the
+        // exact legacy shape.
+        assert!(
+            serde_json::to_value(&legacy).unwrap()["request_encodings"].is_null(),
+            "empty encodings must be omitted on the wire"
+        );
+
+        // An older hub's struct (no field) tolerates a newer worker's hello.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct LegacyAdvertisement {
+            protocol_version: u16,
+            node_name: Option<String>,
+            agent_version: String,
+            resources: Vec<ResourceAdvertisement>,
+            model_switching: Option<ModelSwitchingAdvertisement>,
+        }
+        serde_json::from_value::<LegacyAdvertisement>(value["payload"].clone())
+            .expect("older hub ignores the new field");
+    }
+
+    #[test]
+    fn request_encodings_are_bounded() {
+        let mut advertisement = WorkerAdvertisement {
+            protocol_version: PROTOCOL_VERSION,
+            node_name: None,
+            agent_version: "test".to_string(),
+            resources: Vec::new(),
+            model_switching: None,
+            request_encodings: vec!["zstd".to_string(); MAX_REQUEST_ENCODINGS + 1],
+        };
+        assert!(matches!(
+            validate_worker_advertisement(&advertisement),
+            Err(ProtocolError::TooManyRequestEncodings { .. })
+        ));
+        advertisement.request_encodings = vec!["zstd\nforged".to_string()];
+        assert!(matches!(
+            validate_worker_advertisement(&advertisement),
+            Err(ProtocolError::ControlCharacter { .. })
+        ));
+        advertisement.request_encodings = vec!["zstd".to_string()];
+        validate_worker_advertisement(&advertisement).unwrap();
+    }
+
+    #[test]
+    fn context_limits_outside_the_sane_range_are_dropped() {
+        assert_eq!(sanitize_context_limit(Some(32_768)), Some(32_768));
+        assert_eq!(sanitize_context_limit(Some(1)), Some(1));
+        assert_eq!(
+            sanitize_context_limit(Some(MAX_CONTEXT_LIMIT)),
+            Some(MAX_CONTEXT_LIMIT)
+        );
+        for invalid in [0, -1, i64::MIN, MAX_CONTEXT_LIMIT + 1, i64::MAX] {
+            assert_eq!(sanitize_context_limit(Some(invalid)), None, "{invalid}");
+        }
+        assert_eq!(sanitize_context_limit(None), None);
+    }
+
+    #[test]
     fn advertisement_validation_rejects_log_injection_and_oversized_model_ids() {
         let mut advertisement = WorkerAdvertisement {
             protocol_version: PROTOCOL_VERSION,
@@ -977,6 +1120,7 @@ mod tests {
             agent_version: "test".to_string(),
             resources: Vec::new(),
             model_switching: None,
+            request_encodings: Vec::new(),
         };
         assert!(matches!(
             validate_worker_advertisement(&advertisement),

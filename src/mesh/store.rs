@@ -8,14 +8,23 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::task;
 use uuid::Uuid;
 
+/// SQLite-backed mesh enrollment state.
+///
+/// One long-lived connection is shared by every clone (behind a blocking
+/// mutex touched only from `spawn_blocking`): reopening the database per call
+/// re-parsed the schema and re-negotiated locks on every worker control
+/// frame, which is pure overhead on the small hub VM.
 #[derive(Debug, Clone)]
 pub struct MeshStore {
     path: PathBuf,
+    conn: Arc<std::sync::Mutex<Option<Connection>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +87,7 @@ impl MeshStore {
     pub fn at_path(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            conn: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -288,16 +298,32 @@ impl MeshStore {
     }
 
     pub async fn is_node_authorized(&self, endpoint_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .node_authorization(endpoint_id)
+            .await?
+            .is_some_and(|node| node.enabled))
+    }
+
+    /// Enabled flag plus the operator-visible label recorded at enrollment,
+    /// or `None` when the endpoint never enrolled.
+    pub async fn node_authorization(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<NodeAuthorization>, StoreError> {
         let endpoint_id = endpoint_id.to_string();
         self.with_conn(move |conn| {
-            let enabled = conn
-                .query_row(
-                    "SELECT enabled FROM mesh_nodes WHERE endpoint_id = ?1",
-                    params![endpoint_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?;
-            Ok(enabled == Some(1))
+            conn.query_row(
+                "SELECT enabled, label FROM mesh_nodes WHERE endpoint_id = ?1",
+                params![endpoint_id],
+                |row| {
+                    Ok(NodeAuthorization {
+                        enabled: row.get::<_, i64>(0)? == 1,
+                        label: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
         })
         .await
     }
@@ -370,14 +396,76 @@ impl MeshStore {
         T: Send + 'static,
     {
         let path = self.path.clone();
+        let shared = Arc::clone(&self.conn);
         task::spawn_blocking(move || {
-            let mut conn = Connection::open(path)?;
-            conn.pragma_update(None, "foreign_keys", "ON")?;
-            f(&mut conn)
+            let mut guard = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_none() {
+                *guard = Some(open_connection(&path)?);
+            }
+            let conn = guard
+                .as_mut()
+                .expect("mesh store connection was just opened");
+            f(conn)
         })
         .await
         .map_err(StoreError::Join)?
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeAuthorization {
+    pub enabled: bool,
+    pub label: Option<String>,
+}
+
+fn open_connection(path: &Path) -> Result<Connection, StoreError> {
+    ensure_private_db_file(path)?;
+    let conn = Connection::open(path)?;
+    // The dashboard, the controller, and the `mesh` CLI can all touch the
+    // same file; WAL lets readers proceed during a write and busy_timeout
+    // turns a brief lock overlap into a wait instead of SQLITE_BUSY.
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(conn)
+}
+
+/// The store holds join-token hashes and the node allowlist, so it must not
+/// be world-readable. SQLite creates its `-wal`/`-shm` siblings with the main
+/// file's mode, so fixing the main file covers them too.
+#[cfg(unix)]
+fn ensure_private_db_file(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err.into()),
+    }
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{mode:o}"),
+            "mesh state database was group/world accessible; restricting it to 0600"
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_db_file(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -659,6 +747,83 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn store_uses_wal_and_reuses_one_connection() {
+        let path = temp_db("wal");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let mode = store
+            .with_conn(|conn| {
+                conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                    .map_err(StoreError::from)
+            })
+            .await
+            .expect("journal mode");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        // A connection-scoped temp table survives only if the clone reuses
+        // the very same connection.
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("CREATE TEMP TABLE reuse_probe(x INTEGER)")?;
+                Ok(())
+            })
+            .await
+            .expect("create temp table");
+        store
+            .clone()
+            .with_conn(|conn| {
+                conn.execute("INSERT INTO reuse_probe(x) VALUES (1)", [])?;
+                Ok(())
+            })
+            .await
+            .expect("temp table is visible on the shared connection");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_file_is_owner_only_and_loose_modes_are_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_db("mode");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(store);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let reopened = MeshStore::open(&path).await.expect("reopen store");
+        reopened.list_nodes().await.expect("query");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn node_authorization_returns_enrollment_label() {
+        let path = temp_db("node-label");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let created = store
+            .create_join_key(None, None, Some(1))
+            .await
+            .expect("create key");
+        store
+            .validate_join_key_for_endpoint(&created.token, "node-a", Some("gpu-box".into()), 1)
+            .await
+            .expect("enroll");
+        assert_eq!(
+            store.node_authorization("node-a").await.expect("lookup"),
+            Some(NodeAuthorization {
+                enabled: true,
+                label: Some("gpu-box".into()),
+            })
+        );
+        assert_eq!(
+            store.node_authorization("node-b").await.expect("lookup"),
+            None
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
