@@ -6,7 +6,7 @@
 //! rebuild its immutable snapshot, and revoke delegated sessions atomically.
 
 use axum::Router;
-use axum::extract::{Extension, Json, Path};
+use axum::extract::{Extension, Json, Path, Query};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -64,6 +64,23 @@ pub enum ManagementPermission {
     FleetModelsLoad,
     #[serde(rename = "fleet.models.unload")]
     FleetModelsUnload,
+    #[serde(rename = "fleet.models.hold")]
+    FleetModelsHold,
+    #[serde(rename = "auth.eval_keys.create")]
+    EvalKeysCreate,
+}
+
+/// How a management request authenticated, inserted by `http.rs` beside the
+/// [`ManagementActor`]. Lets handlers reserve break-glass options (such as a
+/// forced unload of a held model) for interactive administrator sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagementChannel {
+    /// Dashboard cookie session of an administrator or the bootstrap token.
+    AdminSession,
+    /// Delegated dashboard session created from a management API key.
+    DelegatedSession,
+    /// A bearer/x-api-key management credential.
+    ApiKey,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +95,15 @@ pub enum ManagementActor {
 }
 
 impl ManagementActor {
+    /// Stable identity used to own resources such as model holds:
+    /// `bootstrap`, or `key:<key_id>` for delegated credentials.
+    pub(crate) fn owner_id(&self) -> String {
+        match self {
+            Self::Bootstrap => "bootstrap".to_string(),
+            Self::Delegated { key_id, .. } => format!("key:{key_id}"),
+        }
+    }
+
     pub(crate) fn allows(&self, permission: ManagementPermission) -> bool {
         matches!(self, Self::Bootstrap)
             || matches!(self, Self::Delegated { permissions, .. } if permissions.contains(&permission))
@@ -184,6 +210,12 @@ pub struct AccessApiKey {
     /// Opt-in retention of request/response bodies. Flow metadata is retained
     /// independently of this setting.
     pub capture_payloads: bool,
+    /// Eval safety: requests for a model no upstream serves get 404 for this
+    /// key even under `unknown_model_policy: passthrough`.
+    pub reject_unknown_models: bool,
+    /// Eval safety: the gateway never reduces this key's `max_tokens`
+    /// (pre-flight cap or overflow retry); upstream overflow errors surface.
+    pub exact_max_tokens: bool,
 }
 
 /// Only the create/rotate response carries `raw_key`; list responses cannot recover it.
@@ -227,6 +259,143 @@ pub struct AccessUsageRow {
     pub reasoning_tokens: Option<u64>,
     pub cost: Option<f64>,
     pub cost_confidence: String,
+    /// Set for `group_by=key|key_and_served_model` windowed queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    /// Set for `group_by=served_model|key_and_served_model` windowed queries
+    /// (`null` groups requests whose served model was never reported).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
+}
+
+/// Grouping for windowed usage queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageGroupBy {
+    #[default]
+    Key,
+    ServedModel,
+    KeyAndServedModel,
+}
+
+impl UsageGroupBy {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "key" => Some(Self::Key),
+            "served_model" => Some(Self::ServedModel),
+            "key_and_served_model" => Some(Self::KeyAndServedModel),
+            _ => None,
+        }
+    }
+}
+
+pub const DEFAULT_USAGE_PAGE_LIMIT: u32 = 500;
+pub const MAX_USAGE_PAGE_LIMIT: u32 = 1000;
+const MAX_USAGE_OFFSET: u32 = 1_000_000;
+
+/// `GET /dashboard/api/auth/usage` parameters. With none of them present the
+/// handler keeps the historical lifetime-per-key response (`{usage}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageQuery {
+    pub key_id: Option<String>,
+    /// Inclusive lower bound on `created_at_ms` (terminal time, epoch ms).
+    pub since_ms: Option<i64>,
+    /// Exclusive upper bound on `created_at_ms`.
+    pub until_ms: Option<i64>,
+    pub group_by: UsageGroupBy,
+    pub limit: u32,
+    pub offset: u32,
+    /// `false` for the legacy parameterless request.
+    pub windowed: bool,
+}
+
+impl UsageQuery {
+    pub fn legacy() -> Self {
+        Self {
+            limit: DEFAULT_USAGE_PAGE_LIMIT,
+            ..Self::default()
+        }
+    }
+
+    pub fn parse(pairs: &[(String, String)]) -> Result<Self, AccessError> {
+        let mut query = Self::legacy();
+        let bad = |message: &str| AccessError::new(StatusCode::BAD_REQUEST, message.to_string());
+        for (key, value) in pairs {
+            let value = value.trim();
+            match key.as_str() {
+                "key_id" => {
+                    if value.is_empty()
+                        || value.len() > 128
+                        || !value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                        })
+                    {
+                        return Err(bad("key_id must be a key id"));
+                    }
+                    query.key_id = Some(value.to_string());
+                }
+                "since_ms" | "until_ms" => {
+                    let parsed = value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|value| *value >= 0)
+                        .ok_or_else(|| bad("since_ms/until_ms must be epoch milliseconds"))?;
+                    if key == "since_ms" {
+                        query.since_ms = Some(parsed);
+                    } else {
+                        query.until_ms = Some(parsed);
+                    }
+                }
+                "group_by" => {
+                    query.group_by = UsageGroupBy::parse(value).ok_or_else(|| {
+                        bad("group_by must be key, served_model or key_and_served_model")
+                    })?;
+                }
+                "limit" => {
+                    query.limit = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|limit| (1..=MAX_USAGE_PAGE_LIMIT).contains(limit))
+                        .ok_or_else(|| bad("limit must be between 1 and 1000"))?;
+                }
+                "offset" => {
+                    query.offset = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|offset| *offset <= MAX_USAGE_OFFSET)
+                        .ok_or_else(|| bad("offset must be between 0 and 1000000"))?;
+                }
+                _ => continue,
+            }
+            query.windowed = true;
+        }
+        if let (Some(since), Some(until)) = (query.since_ms, query.until_ms)
+            && since >= until
+        {
+            return Err(bad("since_ms must be before until_ms"));
+        }
+        Ok(query)
+    }
+}
+
+/// Windowed/grouped usage page.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccessUsagePage {
+    pub usage: Vec<AccessUsageRow>,
+    pub group_by: UsageGroupBy,
+    pub window: AccessUsageWindow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    pub limit: u32,
+    pub offset: u32,
+    /// Offset of the next page, or `null` when this page is the last.
+    pub next_offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccessUsageWindow {
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,11 +443,87 @@ pub struct CreateApiKeyRequest {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub capture_payloads: bool,
+    #[serde(default)]
+    pub reject_unknown_models: bool,
+    #[serde(default)]
+    pub exact_max_tokens: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdatePayloadCaptureRequest {
     pub capture_payloads: bool,
+}
+
+/// `POST /dashboard/api/auth/eval-keys`: one pinned inference key for an eval
+/// run. Creates exactly one key plus one allow policy bound to that key.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateEvalKeyRequest {
+    /// An enabled service account with no group, role or policy bindings, so
+    /// the key's only grant is the pinned policy created here.
+    pub principal_id: String,
+    pub name: String,
+    /// Exact served (backend) model; globs are refused.
+    pub served_model: String,
+    /// Exact client-facing model; defaults to `served_model`.
+    #[serde(default)]
+    pub requested_model: Option<String>,
+    /// 1..=256 concurrent inference sessions.
+    pub max_concurrent_sessions: u32,
+    /// RFC 3339; in the future and at most 7 days away.
+    pub expires_at: String,
+    #[serde(default)]
+    pub reject_unknown_models: bool,
+    #[serde(default)]
+    pub exact_max_tokens: bool,
+}
+
+/// Effective settings of a created eval key. `raw_key` is returned once.
+#[derive(Serialize)]
+pub struct CreatedEvalKey {
+    pub key_id: String,
+    pub policy_id: String,
+    pub raw_key: String,
+    pub prefix: String,
+    pub principal_id: String,
+    pub name: String,
+    pub requested_model: String,
+    pub served_model: String,
+    /// Always `["chat", "models"]`.
+    pub endpoints: Vec<String>,
+    pub max_concurrent_sessions: u32,
+    pub expires_at: String,
+    /// Always `false` for eval keys.
+    pub capture_payloads: bool,
+    pub reject_unknown_models: bool,
+    pub exact_max_tokens: bool,
+}
+
+impl std::fmt::Debug for CreatedEvalKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreatedEvalKey")
+            .field("key_id", &self.key_id)
+            .field("policy_id", &self.policy_id)
+            .field("raw_key", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevokedEvalKey {
+    pub key_id: String,
+    pub revoked: bool,
+}
+
+/// `PATCH /dashboard/api/auth/api-keys/{id}`: any non-empty subset of the
+/// key's flags. Omitted fields are unchanged.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateApiKeyRequest {
+    pub capture_payloads: Option<bool>,
+    pub reject_unknown_models: Option<bool>,
+    pub exact_max_tokens: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,9 +600,12 @@ pub enum AccessOperation {
     RevokeApiKey(String),
     RotateApiKey(String),
     UpdateApiKeyPayloadCapture(String, bool),
+    UpdateApiKey(String, UpdateApiKeyRequest),
+    CreateEvalKey(CreateEvalKeyRequest),
+    RevokeEvalKey(String),
     ListSessions,
     RevokeSession(String),
-    Usage,
+    Usage(UsageQuery),
     Audit,
     Pricing,
     SyncPricing(SyncPricingRequest),
@@ -373,8 +621,11 @@ pub enum AccessResult {
     Policies(Vec<AccessPolicy>),
     ApiKeys(Vec<AccessApiKey>),
     CreatedApiKey(CreatedAccessApiKey),
+    CreatedEvalKey(CreatedEvalKey),
+    RevokedEvalKey(RevokedEvalKey),
     Sessions(Vec<AccessSession>),
     Usage(Vec<AccessUsageRow>),
+    UsagePage(AccessUsagePage),
     Audit(Vec<AccessAuditEvent>),
     Pricing(Vec<AccessPricingRow>),
 }
@@ -462,6 +713,15 @@ where
         .route(
             "/dashboard/api/auth/api-keys/{id}/payload-capture",
             post(update_api_key_payload_capture),
+        )
+        .route(
+            "/dashboard/api/auth/api-keys/{id}",
+            axum::routing::patch(update_api_key),
+        )
+        .route("/dashboard/api/auth/eval-keys", post(create_eval_key))
+        .route(
+            "/dashboard/api/auth/eval-keys/{id}/revoke",
+            post(revoke_eval_key),
         )
         .route("/dashboard/api/auth/sessions", get(sessions))
         .route(
@@ -598,13 +858,24 @@ read_handler!(
     Sessions,
     "sessions"
 );
-read_handler!(
-    usage,
-    ManagementPermission::UsageRead,
-    AccessOperation::Usage,
-    Usage,
-    "usage"
-);
+async fn usage(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<Value>, AccessError> {
+    let query = UsageQuery::parse(&pairs)?;
+    match execute(
+        (backend, actor),
+        ManagementPermission::UsageRead,
+        AccessOperation::Usage(query),
+    )
+    .await?
+    {
+        AccessResult::Usage(value) => Ok(Json(json!({ "usage": value }))),
+        AccessResult::UsagePage(page) => Ok(Json(json!(page))),
+        _ => Err(AccessError::contract()),
+    }
+}
 read_handler!(
     audit,
     ManagementPermission::AuditRead,
@@ -723,6 +994,67 @@ async fn update_api_key_payload_capture(
     }
 }
 
+async fn create_eval_key(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Json(body): Json<CreateEvalKeyRequest>,
+) -> Result<(StatusCode, Json<CreatedEvalKey>), AccessError> {
+    match execute(
+        (backend, actor),
+        ManagementPermission::EvalKeysCreate,
+        AccessOperation::CreateEvalKey(body),
+    )
+    .await?
+    {
+        AccessResult::CreatedEvalKey(value) => Ok((StatusCode::CREATED, Json(value))),
+        _ => Err(AccessError::contract()),
+    }
+}
+
+async fn revoke_eval_key(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Path(id): Path<String>,
+) -> Result<Json<RevokedEvalKey>, AccessError> {
+    match execute(
+        (backend, actor),
+        ManagementPermission::EvalKeysCreate,
+        AccessOperation::RevokeEvalKey(id),
+    )
+    .await?
+    {
+        AccessResult::RevokedEvalKey(value) => Ok(Json(value)),
+        _ => Err(AccessError::contract()),
+    }
+}
+
+async fn update_api_key(
+    backend: Extension<Arc<dyn AccessBackend>>,
+    actor: Extension<ManagementActor>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateApiKeyRequest>,
+) -> Result<Json<Value>, AccessError> {
+    if body.capture_payloads.is_none()
+        && body.reject_unknown_models.is_none()
+        && body.exact_max_tokens.is_none()
+    {
+        return Err(AccessError::new(
+            StatusCode::BAD_REQUEST,
+            "set at least one of capture_payloads, reject_unknown_models, exact_max_tokens",
+        ));
+    }
+    match execute(
+        (backend, actor),
+        ManagementPermission::KeysCreate,
+        AccessOperation::UpdateApiKey(id, body),
+    )
+    .await?
+    {
+        AccessResult::ApiKeys(value) => Ok(Json(json!({ "api_keys": value }))),
+        _ => Err(AccessError::contract()),
+    }
+}
+
 async fn revoke_session(
     backend: Extension<Arc<dyn AccessBackend>>,
     actor: Extension<ManagementActor>,
@@ -825,6 +1157,8 @@ mod tests {
                                 expires_at: body.expires_at,
                                 last_used_at: None,
                                 capture_payloads: body.capture_payloads,
+                                reject_unknown_models: body.reject_unknown_models,
+                                exact_max_tokens: body.exact_max_tokens,
                             },
                             raw_key: "llmc_secret_once".into(),
                         }))
@@ -863,6 +1197,8 @@ mod tests {
                 expires_at: None,
                 last_used_at: None,
                 capture_payloads: false,
+                reject_unknown_models: false,
+                exact_max_tokens: false,
             },
             raw_key: "llmc_extremely_secret".into(),
         };
@@ -1020,6 +1356,8 @@ mod tests {
                 "expires_at": null,
                 "last_used_at": null,
                 "capture_payloads": false,
+                "reject_unknown_models": false,
+                "exact_max_tokens": false,
                 "raw_key": "llmc_secret_once"
             })
         );

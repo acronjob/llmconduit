@@ -81,7 +81,8 @@ describe('policyEditorModel', () => {
       'fleet.models.read',
       'fleet.models.load',
       'fleet.models.unload',
-    ])).toBe('View Fleet model state, Load Fleet models, Unload Fleet models');
+      'fleet.models.hold',
+    ])).toBe('View Fleet model state, Load Fleet models, Unload Fleet models, Hold Fleet models (leases)');
   });
 
   it('rejects policies that grant neither model access nor administration access', () => {

@@ -1099,6 +1099,7 @@ mod tests {
             resources,
             model_switching: None,
             request_encodings: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -1327,6 +1328,7 @@ mod tests {
                 }],
                 model_switching: None,
                 request_encodings: Vec::new(),
+                capabilities: Vec::new(),
             },
         );
         let mesh = MeshUpstreamClient::new(
@@ -2079,6 +2081,7 @@ mod tests {
                 }],
                 model_switching: None,
                 request_encodings: Vec::new(),
+                capabilities: Vec::new(),
             },
         );
         let client = MeshUpstreamClient::new(

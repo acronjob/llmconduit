@@ -95,6 +95,8 @@ pub fn charge_for_usage(usage: FlowUsage, rates: UsageRates) -> Option<UsageChar
 pub struct UsageEvent {
     pub auth_request_id: String,
     pub api_call_id: Option<String>,
+    /// Client-supplied `X-Request-ID`, validated at ingress.
+    pub client_request_id: Option<String>,
     pub key_id: String,
     pub principal_id: String,
     pub endpoint: String,
@@ -128,7 +130,8 @@ pub fn migrate_usage_schema(conn: &Connection) -> rusqlite::Result<()> {
             reasoning_tokens INTEGER,
             cost_nano_usd INTEGER,
             cost_confidence TEXT NOT NULL,
-            created_at_ms INTEGER NOT NULL
+            created_at_ms INTEGER NOT NULL,
+            client_request_id TEXT
         );",
     )?;
     // Older auth-store revisions created the table before the final accounting
@@ -144,6 +147,7 @@ pub fn migrate_usage_schema(conn: &Connection) -> rusqlite::Result<()> {
         ("cost_nano_usd", "INTEGER"),
         ("cost_confidence", "TEXT NOT NULL DEFAULT 'unavailable'"),
         ("created_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("client_request_id", "TEXT"),
     ] {
         if !columns.contains(name) {
             conn.execute(
@@ -156,7 +160,10 @@ pub fn migrate_usage_schema(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE INDEX IF NOT EXISTS auth_usage_created_idx
             ON auth_usage_events(created_at_ms);
          CREATE INDEX IF NOT EXISTS auth_usage_key_created_idx
-            ON auth_usage_events(key_id, created_at_ms);",
+            ON auth_usage_events(key_id, created_at_ms);
+         CREATE INDEX IF NOT EXISTS auth_usage_client_request_idx
+            ON auth_usage_events(client_request_id)
+            WHERE client_request_id IS NOT NULL;",
     )?;
     Ok(())
 }
@@ -177,9 +184,9 @@ pub fn record_usage_once(conn: &Connection, event: &UsageEvent) -> rusqlite::Res
                 requested_model, served_model, provider, route, status,
                 prompt_tokens, completion_tokens, total_tokens, cached_tokens,
                 reasoning_tokens, cost_nano_usd, cost_confidence, created_at_ms,
-                cost_nanos, created_at
+                client_request_id, cost_nanos, created_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                       ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?16, ?18)",
+                       ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?16, ?18)",
             true,
         )
     } else {
@@ -188,9 +195,10 @@ pub fn record_usage_once(conn: &Connection, event: &UsageEvent) -> rusqlite::Res
             auth_request_id, api_call_id, key_id, principal_id, endpoint,
             requested_model, served_model, provider, route, status,
             prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-            reasoning_tokens, cost_nano_usd, cost_confidence, created_at_ms
+            reasoning_tokens, cost_nano_usd, cost_confidence, created_at_ms,
+            client_request_id
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                  ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                  ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             false,
         )
     };
@@ -219,6 +227,7 @@ pub fn record_usage_once(conn: &Connection, event: &UsageEvent) -> rusqlite::Res
                 .unwrap_or(UsageCostConfidence::Unavailable)
                 .as_str(),
             event.created_at_ms,
+            event.client_request_id,
         ],
     )?;
     debug_assert_eq!(include_legacy, legacy_columns.contains("created_at"));
@@ -285,6 +294,7 @@ mod tests {
         UsageEvent {
             auth_request_id: id.to_string(),
             api_call_id: None,
+            client_request_id: None,
             key_id: "key_1".to_string(),
             principal_id: "usr_1".to_string(),
             endpoint: "responses".to_string(),
@@ -394,5 +404,42 @@ mod tests {
             UsageRates::from_model_price(crate::config::ModelPrice::without_cached(0.002, 0.006))
                 .unwrap();
         assert_eq!(omitted.cached_per_token, None);
+    }
+
+    #[test]
+    fn client_request_id_is_persisted_and_migrated_into_existing_stores() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A store created before client_request_id existed.
+        conn.execute_batch(
+            "CREATE TABLE auth_usage_events (
+                auth_request_id TEXT PRIMARY KEY NOT NULL, api_call_id TEXT,
+                key_id TEXT NOT NULL, principal_id TEXT NOT NULL, endpoint TEXT NOT NULL,
+                requested_model TEXT, served_model TEXT, provider TEXT, route TEXT,
+                status TEXT NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER,
+                total_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER,
+                cost_nano_usd INTEGER, cost_confidence TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        migrate_usage_schema(&conn).unwrap();
+        let mut event = event("authreq_correlated");
+        event.api_call_id = Some("api_1".into());
+        event.client_request_id = Some("harbor:trial-7".into());
+        assert!(record_usage_once(&conn, &event).unwrap());
+        let row: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT api_call_id, client_request_id FROM auth_usage_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("api_1".to_string()),
+                Some("harbor:trial-7".to_string())
+            )
+        );
     }
 }

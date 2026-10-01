@@ -232,6 +232,27 @@ impl FleetClient {
         .await
     }
 
+    /// `GET /v1/operations/{id}`: the state of one lifecycle operation.
+    pub async fn operation(&self, operation_id: &str) -> Result<FleetOperation, FleetProxyError> {
+        crate::mesh::protocol::validate_operation_id(operation_id)
+            .map_err(|_| FleetProxyError::new(StatusCode::BAD_REQUEST, "invalid operation id"))?;
+        self.request(
+            reqwest::Method::GET,
+            &format!("/v1/operations/{operation_id}"),
+        )
+        .await
+    }
+
+    /// Test seam: a client for a loopback Fleet mock with an inline token.
+    #[cfg(test)]
+    pub(crate) fn for_test(client: Client, base_url: &str, token: &str) -> Self {
+        Self {
+            client,
+            base_url: parse_loopback_url(base_url).expect("loopback Fleet URL"),
+            token: FleetTokenSource::Env(token.to_string()),
+        }
+    }
+
     async fn request<T>(&self, method: reqwest::Method, path: &str) -> Result<T, FleetProxyError>
     where
         T: DeserializeOwned,
@@ -342,6 +363,11 @@ impl FleetProxyError {
 
     pub fn status(&self) -> StatusCode {
         self.status
+    }
+
+    /// Fleet's sanitized machine-readable error code, when it sent one.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
     }
 
     fn into_response(self) -> Response {

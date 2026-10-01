@@ -74,6 +74,9 @@ pub struct RequestRow {
     pub client_source: Option<String>,
     /// Owner of the authenticating virtual key, when known.
     pub user_id: Option<String>,
+    /// Client-supplied `X-Request-ID` (validated at ingress), when sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
 }
 
 /// One bounded/redacted hop event. Callers must use the existing turn-capture
@@ -219,6 +222,8 @@ pub struct RequestSummary {
     pub divergence_index: Option<i64>,
     pub cache_bust: Option<bool>,
     pub user_id: Option<String>,
+    /// Client-supplied `X-Request-ID`, when the request carried one.
+    pub client_request_id: Option<String>,
 }
 
 /// One (bucket, user, key) cell of the activity series.
@@ -1000,7 +1005,8 @@ const REQUEST_COLUMNS: &str = "SELECT id, response_id, conversation_id, virtual_
     reasoning_tokens, error, terminal_reason, attempts_json, timings_json, client_label, \
     client_source, harness, harness_version, harness_session_id, harness_sub_session_id, \
     harness_parent_session_id, session_kind, session_id, chain_parent_request_id, item_count, \
-    shared_prefix_items, divergence_kind, divergence_index, cache_bust, user_id FROM requests";
+    shared_prefix_items, divergence_kind, divergence_index, cache_bust, user_id, \
+    client_request_id FROM requests";
 
 fn decode_request<R>(row: &R) -> StoreResult<RequestSummary>
 where
@@ -1052,6 +1058,7 @@ where
             .map_err(store_error)?
             .map(|flag| flag != 0),
         user_id: row.try_get(36).map_err(store_error)?,
+        client_request_id: row.try_get(37).map_err(store_error)?,
     })
 }
 
@@ -1664,8 +1671,8 @@ impl PersistenceWriter for SqlStore {
              harness, harness_version, harness_session_id, harness_sub_session_id, \
              harness_parent_session_id, session_kind, session_id, chain_parent_request_id, \
              item_count, shared_prefix_items, divergence_kind, divergence_index, cache_bust, \
-             client_label, client_source, user_id) VALUES ({})",
-            placeholders(self.postgres(), 27)
+             client_label, client_source, user_id, client_request_id) VALUES ({})",
+            placeholders(self.postgres(), 28)
         );
         execute!(
             self,
@@ -1697,6 +1704,7 @@ impl PersistenceWriter for SqlStore {
             row.client_label,
             row.client_source,
             row.user_id,
+            row.client_request_id,
         );
         Ok(())
     }
@@ -3134,6 +3142,7 @@ fn request_row_bytes(row: &RequestRow) -> u64 {
         + optional_string_bytes(&row.client_label)
         + optional_string_bytes(&row.client_source)
         + optional_string_bytes(&row.user_id)
+        + optional_string_bytes(&row.client_request_id)
 }
 
 fn event_row_bytes(event: &EventRow) -> u64 {
@@ -3470,7 +3479,10 @@ mod tests {
             .await
             .expect("connect");
         store
-            .begin_request(request("api-call-1"))
+            .begin_request(RequestRow {
+                client_request_id: Some("harbor:trial-1".to_string()),
+                ..request("api-call-1")
+            })
             .await
             .expect("begin");
         store
@@ -3496,6 +3508,7 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got.id, "api-call-1");
+        assert_eq!(got.client_request_id.as_deref(), Some("harbor:trial-1"));
         assert_eq!(got.response_id.as_deref(), Some("resp-1"));
         assert_eq!(got.backend.as_deref(), Some("winner"));
         assert_eq!(got.resolved_model.as_deref(), Some("served-model"));
@@ -3528,7 +3541,7 @@ mod tests {
         };
         assert_eq!(
             migration_versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
         let request_indexes: Vec<String> = match &store.pool {
             SqlPool::Sqlite(pool) => sqlx::query(

@@ -194,6 +194,8 @@ pub enum ManagementPermission {
     FleetModelsRead,
     FleetModelsLoad,
     FleetModelsUnload,
+    FleetModelsHold,
+    EvalKeysCreate,
 }
 
 impl ManagementPermission {
@@ -221,6 +223,8 @@ impl ManagementPermission {
             Self::FleetModelsRead => "fleet.models.read",
             Self::FleetModelsLoad => "fleet.models.load",
             Self::FleetModelsUnload => "fleet.models.unload",
+            Self::FleetModelsHold => "fleet.models.hold",
+            Self::EvalKeysCreate => "auth.eval_keys.create",
         }
     }
 
@@ -231,7 +235,7 @@ impl ManagementPermission {
     }
 }
 
-pub const ALL_MANAGEMENT_PERMISSIONS: [ManagementPermission; 22] = [
+pub const ALL_MANAGEMENT_PERMISSIONS: [ManagementPermission; 24] = [
     ManagementPermission::KeysRead,
     ManagementPermission::KeysCreate,
     ManagementPermission::KeysRevoke,
@@ -254,6 +258,8 @@ pub const ALL_MANAGEMENT_PERMISSIONS: [ManagementPermission; 22] = [
     ManagementPermission::FleetModelsRead,
     ManagementPermission::FleetModelsLoad,
     ManagementPermission::FleetModelsUnload,
+    ManagementPermission::FleetModelsHold,
+    ManagementPermission::EvalKeysCreate,
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -744,7 +750,7 @@ mod tests {
         let unique = ALL_MANAGEMENT_PERMISSIONS
             .into_iter()
             .collect::<HashSet<_>>();
-        assert_eq!(ALL_MANAGEMENT_PERMISSIONS.len(), 22);
+        assert_eq!(ALL_MANAGEMENT_PERMISSIONS.len(), 24);
         assert_eq!(unique.len(), ALL_MANAGEMENT_PERMISSIONS.len());
         assert!(ALL_MANAGEMENT_PERMISSIONS.into_iter().all(
             |permission| ManagementPermission::parse(permission.as_str()) == Some(permission)

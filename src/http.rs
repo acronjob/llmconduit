@@ -449,6 +449,22 @@ fn protected_routes(gateway: Arc<Gateway>, auth: Arc<DashboardAuth>) -> Router<A
             post(dashboard_mesh::unload_node_model),
         )
         .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/holds",
+            get(dashboard_mesh::list_model_holds).post(dashboard_mesh::create_model_hold),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/holds/{hold_id}",
+            delete(dashboard_mesh::release_model_hold),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/holds/{hold_id}/renew",
+            post(dashboard_mesh::renew_model_hold),
+        )
+        .route(
+            "/dashboard/api/mesh/nodes/{endpoint_id}/operations/{operation_id}",
+            get(dashboard_mesh::get_node_operation),
+        )
+        .route(
             "/dashboard/api/fleet",
             get(crate::dashboard_fleet::fleet_models),
         )
@@ -736,19 +752,27 @@ async fn require_management_access(
         return management_error(StatusCode::UNAUTHORIZED, "unauthorized");
     };
 
-    let (actor, cookie_or_dashboard_token) =
+    let (actor, cookie_or_dashboard_token, channel) =
         if let Some(session) = dashboard_auth.authenticate(request.headers()) {
             if session.user.as_ref().is_some_and(|user| !user.is_admin) {
                 return management_error(StatusCode::FORBIDDEN, "administrator role required");
             }
-            (crate::dashboard_access::ManagementActor::Bootstrap, true)
+            (
+                crate::dashboard_access::ManagementActor::Bootstrap,
+                true,
+                crate::dashboard_access::ManagementChannel::AdminSession,
+            )
         } else if let Some((session_id, _)) = dashboard_auth.delegated_session(request.headers()) {
             match gateway
                 .authz()
                 .authenticate_delegated_session(&session_id)
                 .await
             {
-                Ok(Some(actor)) => (actor, true),
+                Ok(Some(actor)) => (
+                    actor,
+                    true,
+                    crate::dashboard_access::ManagementChannel::DelegatedSession,
+                ),
                 Ok(None) => return management_error(StatusCode::UNAUTHORIZED, "unauthorized"),
                 Err(_) => {
                     return management_error(
@@ -759,7 +783,11 @@ async fn require_management_access(
             }
         } else {
             match gateway.authz().authenticate(request.headers()) {
-                Ok(Some(context)) => (context.management_actor(), false),
+                Ok(Some(context)) => (
+                    context.management_actor(),
+                    false,
+                    crate::dashboard_access::ManagementChannel::ApiKey,
+                ),
                 Ok(None)
                 | Err(crate::authz::AuthFailure::Missing)
                 | Err(crate::authz::AuthFailure::Invalid) => {
@@ -827,6 +855,7 @@ async fn require_management_access(
     }
 
     request.extensions_mut().insert(actor);
+    request.extensions_mut().insert(channel);
     next.run(request).await
 }
 
@@ -1732,13 +1761,126 @@ fn is_length_limit_error(err: &axum::Error) -> bool {
     false
 }
 
+/// Client correlation header accepted on `/v1/*` and echoed back.
+const CLIENT_REQUEST_ID_HEADER: &str = "x-request-id";
+/// The gateway's own request id (`api_call_id`), returned on every `/v1/*`
+/// response; it keys request history and usage rows.
+const GATEWAY_REQUEST_ID_HEADER: &str = "x-llmconduit-request-id";
+const MAX_CLIENT_REQUEST_ID_BYTES: usize = 128;
+
+/// `Ok(None)` when absent; `Err` for a repeated, non-ASCII, empty, overlong or
+/// otherwise malformed value (1-128 bytes of `[A-Za-z0-9._:-]`).
+fn parse_client_request_id(headers: &HeaderMap) -> Result<Option<String>, ()> {
+    let mut values = headers.get_all(CLIENT_REQUEST_ID_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?;
+    let valid = !value.is_empty()
+        && value.len() <= MAX_CLIENT_REQUEST_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'));
+    if valid {
+        Ok(Some(value.to_string()))
+    } else {
+        Err(())
+    }
+}
+
+fn invalid_client_request_id_response(path: &str, anthropic_surface: bool) -> Response {
+    const MESSAGE: &str = "X-Request-ID must be 1-128 characters of [A-Za-z0-9._:-]";
+    if anthropic_surface || matches!(path, "/v1/messages" | "/v1/messages/count_tokens") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": { "type": "invalid_request_error", "message": MESSAGE }
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "message": MESSAGE,
+                "type": "invalid_request_error",
+                "code": "invalid_request_id"
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Stamps the correlation headers on a `/v1/*` response. Streaming responses
+/// carry them on the initial response head.
+fn stamp_request_id_headers(
+    response: &mut Response,
+    api_call_id: &str,
+    client_request_id: Option<&str>,
+) {
+    if let Ok(value) = HeaderValue::from_str(api_call_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(GATEWAY_REQUEST_ID_HEADER), value);
+    }
+    if let Some(client_request_id) = client_request_id
+        && let Ok(value) = HeaderValue::from_str(client_request_id)
+    {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(CLIENT_REQUEST_ID_HEADER), value);
+    }
+}
+
 async fn log_api_call(
     State(state): State<Arc<ApiLogMiddlewareState>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let gateway = Arc::clone(&state.gateway);
     let api_call_id = format!("api_{}", Uuid::new_v4().simple());
+    let correlate = request.uri().path().starts_with("/v1/");
+    let client_request_id = if correlate {
+        match parse_client_request_id(request.headers()) {
+            Ok(client_request_id) => client_request_id,
+            Err(()) => {
+                let anthropic_surface = request.headers().contains_key("anthropic-version")
+                    || request.headers().contains_key("anthropic-beta");
+                let mut response =
+                    invalid_client_request_id_response(request.uri().path(), anthropic_surface);
+                stamp_request_id_headers(&mut response, &api_call_id, None);
+                return response;
+            }
+        }
+    } else {
+        None
+    };
+    let mut response = log_api_call_inner(
+        state,
+        request,
+        next,
+        api_call_id.clone(),
+        client_request_id.clone(),
+    )
+    .await;
+    if correlate {
+        stamp_request_id_headers(&mut response, &api_call_id, client_request_id.as_deref());
+    }
+    response
+}
+
+async fn log_api_call_inner(
+    state: Arc<ApiLogMiddlewareState>,
+    request: Request,
+    next: Next,
+    api_call_id: String,
+    client_request_id: Option<String>,
+) -> Response {
+    let gateway = Arc::clone(&state.gateway);
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
@@ -1771,7 +1913,9 @@ async fn log_api_call(
         && is_authenticated_client_api_request(&method, uri.path())
     {
         match gateway.authz().authenticate(&headers) {
-            Ok(Some(context)) => Some(context),
+            Ok(Some(context)) => Some(
+                context.with_request_correlation(api_call_id.clone(), client_request_id.clone()),
+            ),
             Ok(None) => None,
             Err(failure) => return auth_failure_response(uri.path(), failure),
         }
@@ -2142,6 +2286,7 @@ async fn log_api_call(
                 client_label: attribution.label.as_deref(),
                 client_source,
                 user_id,
+                client_request_id: client_request_id.as_deref(),
             },
         );
         let _ = queue.try_begin(row);
@@ -3268,7 +3413,10 @@ async fn post_responses(
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let served = gateway
-        .checked_resolve_request_model(&request.model)
+        .checked_resolve_request_model_for(
+            &request.model,
+            auth.as_ref().map(|Extension(context)| context),
+        )
         .await?
         .0;
     let authorization = authorize_inference(
@@ -3756,7 +3904,7 @@ async fn handle_count_tokens(
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let resolved_model = gateway
-        .checked_resolve_request_model(&original_model)
+        .checked_resolve_request_model_for(&original_model, auth.as_ref())
         .await?
         .0;
     let authorization = authorize_inference(
@@ -3933,7 +4081,7 @@ async fn dashboard_chat_completions(
 /// while SQL users receive the union of the model scopes on their active keys.
 pub(crate) enum DashboardInferenceAccess {
     Unrestricted,
-    Policy(crate::authz::AuthContext),
+    Policy(Box<crate::authz::AuthContext>),
     Models(Vec<String>),
     Denied,
 }
@@ -3972,7 +4120,7 @@ pub(crate) async fn dashboard_inference_access(
             .map_err(|error| {
                 AppError::internal(format!("dashboard authorization failed: {error}"))
             })?
-            .map(DashboardInferenceAccess::Policy)
+            .map(|context| DashboardInferenceAccess::Policy(Box::new(context)))
             .ok_or_else(|| AppError::forbidden("dashboard session is no longer authorized"));
     }
     let Some(user) = session.user.as_ref() else {
@@ -4029,7 +4177,7 @@ async fn handle_chat_completions(
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway
-        .checked_resolve_request_model(&request.model)
+        .checked_resolve_request_model_for(&request.model, auth.as_ref())
         .await?
         .0;
     let authorization = authorize_inference(
@@ -4144,7 +4292,7 @@ async fn handle_post_messages(
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway
-        .checked_resolve_request_model(&request.model)
+        .checked_resolve_request_model_for(&request.model, auth.as_ref())
         .await?
         .0;
     let authorization = authorize_inference(

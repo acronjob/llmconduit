@@ -395,6 +395,8 @@ pub struct BeginPersistenceInput<'a> {
     pub client_source: Option<&'a str>,
     /// Owner of the authenticating virtual key, when known.
     pub user_id: Option<&'a str>,
+    /// Client-supplied `X-Request-ID`, already validated at ingress.
+    pub client_request_id: Option<&'a str>,
 }
 
 pub fn begin_request(input: BeginPersistenceInput<'_>) -> RequestRow {
@@ -456,6 +458,7 @@ pub fn begin_request(input: BeginPersistenceInput<'_>) -> RequestRow {
         client_label: input.client_label.map(bounded_scalar),
         client_source: input.client_source.map(bounded_scalar),
         user_id: input.user_id.map(bounded_scalar),
+        client_request_id: input.client_request_id.map(bounded_scalar),
     }
 }
 
@@ -1589,8 +1592,10 @@ mod tests {
             client_label: Some("key-abc"),
             client_source: Some("key_hash"),
             user_id: Some("user-1"),
+            client_request_id: Some("harbor:trial-7"),
         });
         assert_eq!(row.user_id.as_deref(), Some("user-1"));
+        assert_eq!(row.client_request_id.as_deref(), Some("harbor:trial-7"));
         assert_eq!(row.session_id.as_deref(), Some("node-1"));
         assert_eq!(row.chain_parent_request_id.as_deref(), Some("api_0"));
         assert_eq!(row.divergence_kind.as_deref(), Some("tools_changed"));

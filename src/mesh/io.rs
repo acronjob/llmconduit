@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use crate::error::{AppError, AppResult};
-pub use crate::mesh::protocol::{Admission, RequestOpen, StreamOpen, SwitchModelResponse};
+pub use crate::mesh::protocol::{
+    Admission, FleetOperationResponse, RequestOpen, StreamOpen, SwitchModelResponse,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::bytes::{Buf, BytesMut};
 
@@ -33,7 +35,7 @@ where
 {
     match read_stream_open(reader).await? {
         StreamOpen::Inference(open) => Ok(open),
-        StreamOpen::SwitchModel(_) | StreamOpen::UnloadModel(_) => {
+        StreamOpen::SwitchModel(_) | StreamOpen::UnloadModel(_) | StreamOpen::FleetOperation(_) => {
             Err(AppError::bad_request("expected mesh inference stream"))
         }
     }
@@ -73,6 +75,33 @@ where
     let bytes = read_len_prefixed(reader, crate::mesh::protocol::MAX_CONTROL_FRAME_BYTES).await?;
     serde_json::from_slice(&bytes)
         .map_err(|err| AppError::bad_request(format!("invalid mesh switch response: {err}")))
+}
+
+pub async fn write_fleet_operation_response<W>(
+    writer: &mut W,
+    response: &FleetOperationResponse,
+) -> AppResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let bytes = serde_json::to_vec(response).map_err(|err| {
+        AppError::internal(format!("failed to encode mesh operation response: {err}"))
+    })?;
+    write_len_prefixed(
+        writer,
+        &bytes,
+        crate::mesh::protocol::MAX_CONTROL_FRAME_BYTES,
+    )
+    .await
+}
+
+pub async fn read_fleet_operation_response<R>(reader: &mut R) -> AppResult<FleetOperationResponse>
+where
+    R: AsyncRead + Unpin,
+{
+    let bytes = read_len_prefixed(reader, crate::mesh::protocol::MAX_CONTROL_FRAME_BYTES).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| AppError::bad_request(format!("invalid mesh operation response: {err}")))
 }
 
 pub async fn write_admission<W>(writer: &mut W, admission: &Admission) -> AppResult<()>
@@ -317,6 +346,8 @@ mod tests {
                 revision: 2,
             }),
             error_status: None,
+            error_code: None,
+            operation: None,
         };
         let write = tokio::spawn(async move { write_switch_response(&mut a, &response).await });
         let got = read_switch_response(&mut b).await.expect("read response");

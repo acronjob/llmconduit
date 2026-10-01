@@ -63,7 +63,20 @@ pub struct WorkerAdvertisement {
     /// sending identity-encoded bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_encodings: Vec<String>,
+    /// Optional worker features beyond the base v2 protocol (for example
+    /// [`CAPABILITY_FLEET_OPERATIONS`]). Additive in both directions: an older
+    /// hub ignores the field and an older worker omits it, so a newer hub never
+    /// sends that worker a stream type it cannot parse.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
+
+/// The worker answers [`StreamOpen::FleetOperation`] lookups and reports the
+/// Fleet operation in [`SwitchModelResponse::operation`].
+pub const CAPABILITY_FLEET_OPERATIONS: &str = "fleet_operations";
+pub const MAX_CAPABILITIES: usize = 16;
+pub const MAX_CAPABILITY_BYTES: usize = 64;
+pub const MAX_OPERATION_ID_BYTES: usize = 128;
 
 /// Request-body encoding negotiated through
 /// [`WorkerAdvertisement::request_encodings`].
@@ -80,6 +93,12 @@ impl WorkerAdvertisement {
         self.request_encodings
             .iter()
             .any(|value| value.eq_ignore_ascii_case(encoding))
+    }
+
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(capability))
     }
 }
 
@@ -257,6 +276,119 @@ pub enum StreamOpen {
     Inference(RequestOpen),
     SwitchModel(SwitchModelRequest),
     UnloadModel(SwitchModelRequest),
+    /// Look up a Fleet lifecycle operation. Only sent to workers advertising
+    /// [`CAPABILITY_FLEET_OPERATIONS`]; an older worker cannot parse it.
+    FleetOperation(FleetOperationRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetOperationRequest {
+    pub protocol_version: u16,
+    pub request_id: Uuid,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetOperationResponse {
+    pub request_id: Uuid,
+    pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<LifecycleOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Status Fleet (or the worker) answered with when the lookup failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_status: Option<u16>,
+}
+
+/// A Fleet lifecycle operation as relayed by a worker. `id`, `state` and
+/// `error` are the stable contract; the remaining fields are informational and
+/// optional on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LifecycleOperation {
+    pub id: String,
+    pub state: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+impl LifecycleOperation {
+    pub(crate) fn from_fleet(value: crate::dashboard_fleet::FleetOperation) -> Self {
+        Self {
+            id: value.id,
+            state: value.state,
+            error: value.error,
+            kind: Some(value.kind),
+            model_id: Some(value.model_id),
+            instances: value.instances,
+            created_at: Some(value.created_at),
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+        }
+    }
+
+    /// Bounds every worker-controlled field. Returns `None` when the id or
+    /// state is unusable; free text is truncated and stripped of control
+    /// characters rather than rejected.
+    pub fn sanitized(self) -> Option<Self> {
+        if validate_operation_id(&self.id).is_err() {
+            return None;
+        }
+        let state = bounded_text(Some(self.state), MAX_SWITCHING_STATE_BYTES)?;
+        Some(Self {
+            id: self.id,
+            state,
+            error: bounded_text(self.error, MAX_SWITCHING_DESCRIPTION_BYTES),
+            kind: bounded_text(self.kind, MAX_SWITCHING_STATE_BYTES),
+            model_id: self
+                .model_id
+                .filter(|model| validate_model_id(model).is_ok()),
+            instances: self.instances,
+            created_at: bounded_text(self.created_at, MAX_SWITCHING_STATE_BYTES),
+            started_at: bounded_text(self.started_at, MAX_SWITCHING_STATE_BYTES),
+            finished_at: bounded_text(self.finished_at, MAX_SWITCHING_STATE_BYTES),
+        })
+    }
+}
+
+/// Operation ids are opaque Fleet tokens (hex today): 1-128 bytes of
+/// `[A-Za-z0-9._:-]`, so they can travel in a URL path segment unescaped.
+pub fn validate_operation_id(operation_id: &str) -> Result<(), ProtocolError> {
+    if operation_id.is_empty()
+        || operation_id.len() > MAX_OPERATION_ID_BYTES
+        || !operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(ProtocolError::InvalidOperationId);
+    }
+    Ok(())
+}
+
+fn bounded_text(value: Option<String>, max: usize) -> Option<String> {
+    let value = value?;
+    let mut normalized = String::new();
+    for ch in value.trim().chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if normalized.len() + ch.len_utf8() > max {
+            break;
+        }
+        normalized.push(ch);
+    }
+    let normalized = normalized.trim().to_owned();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +419,15 @@ pub struct SwitchModelResponse {
     /// Optional both ways: older peers omit or ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_status: Option<u16>,
+    /// Fleet's machine-readable error code (e.g. `operation_in_progress`,
+    /// `insufficient_resources`) when it refused. Optional both ways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// The Fleet operation this request started or joined. Optional both
+    /// ways: older workers omit it and older hubs ignore it. `None` also for
+    /// an already-satisfied no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<LifecycleOperation>,
 }
 
 impl SwitchModelResponse {
@@ -351,6 +492,27 @@ pub fn validate_worker_advertisement(
             count: advertisement.request_encodings.len(),
             max: MAX_REQUEST_ENCODINGS,
         });
+    }
+    if advertisement.capabilities.len() > MAX_CAPABILITIES {
+        return Err(ProtocolError::TooManyCapabilities {
+            count: advertisement.capabilities.len(),
+            max: MAX_CAPABILITIES,
+        });
+    }
+    for capability in &advertisement.capabilities {
+        validate_bounded_string(
+            capability,
+            MAX_CAPABILITY_BYTES,
+            ProtocolError::BlankSwitchingState {
+                field: "worker capability",
+            },
+            |len, max| ProtocolError::SwitchingStateTooLong {
+                field: "worker capability",
+                len,
+                max,
+            },
+        )?;
+        reject_control_characters(capability, "worker capability")?;
     }
     for encoding in &advertisement.request_encodings {
         validate_bounded_string(
@@ -567,6 +729,13 @@ pub fn validate_switch_model_request(request: &SwitchModelRequest) -> Result<(),
         validate_instance_count("instances", instances)?;
     }
     Ok(())
+}
+
+pub fn validate_fleet_operation_request(
+    request: &FleetOperationRequest,
+) -> Result<(), ProtocolError> {
+    validate_protocol_version(request.protocol_version)?;
+    validate_operation_id(&request.operation_id)
 }
 
 pub fn validate_protocol_version(version: u16) -> Result<(), ProtocolError> {
@@ -799,6 +968,10 @@ pub enum ProtocolError {
     BlankJoinKey,
     #[error("worker advertised {count} request encodings, maximum is {max}")]
     TooManyRequestEncodings { count: usize, max: usize },
+    #[error("worker advertised {count} capabilities, maximum is {max}")]
+    TooManyCapabilities { count: usize, max: usize },
+    #[error("invalid Fleet operation id")]
+    InvalidOperationId,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -894,6 +1067,7 @@ mod tests {
             }],
             model_switching: None,
             request_encodings: Vec::new(),
+            capabilities: Vec::new(),
         };
         validate_worker_advertisement(&advertisement).unwrap();
         advertisement.resources[0].models = vec![
@@ -1050,6 +1224,7 @@ mod tests {
             resources: Vec::new(),
             model_switching: None,
             request_encodings: vec![REQUEST_ENCODING_ZSTD.to_string()],
+            capabilities: Vec::new(),
         };
         let hello = WorkerToHub::Hello(advertisement.clone());
         let value = serde_json::to_value(&hello).unwrap();
@@ -1102,6 +1277,8 @@ mod tests {
             error: Some("Fleet rejected the request (overrides_not_allowed)".to_string()),
             model_switching: None,
             error_status: Some(400),
+            error_code: None,
+            operation: None,
         };
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["error_status"], serde_json::json!(400));
@@ -1143,6 +1320,7 @@ mod tests {
             resources: Vec::new(),
             model_switching: None,
             request_encodings: vec!["zstd".to_string(); MAX_REQUEST_ENCODINGS + 1],
+            capabilities: Vec::new(),
         };
         assert!(matches!(
             validate_worker_advertisement(&advertisement),
@@ -1180,6 +1358,7 @@ mod tests {
             resources: Vec::new(),
             model_switching: None,
             request_encodings: Vec::new(),
+            capabilities: Vec::new(),
         };
         assert!(matches!(
             validate_worker_advertisement(&advertisement),
@@ -1203,5 +1382,129 @@ mod tests {
             validate_worker_advertisement(&advertisement),
             Err(ProtocolError::ModelIdTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn switch_response_operation_is_optional_in_both_directions() {
+        // An old worker's response (no `operation`) still parses.
+        let legacy: SwitchModelResponse = serde_json::from_value(serde_json::json!({
+            "request_id": Uuid::nil(),
+            "model_id": "qwen",
+            "accepted": true,
+            "changed": true,
+            "error": null,
+            "model_switching": null
+        }))
+        .expect("legacy response");
+        assert_eq!(legacy.operation, None);
+        // A new response omits the field when there is no operation, so an
+        // old hub sees exactly the legacy shape.
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("operation").is_none());
+
+        let mut current = legacy;
+        current.operation = Some(LifecycleOperation {
+            id: "0123abcd".into(),
+            state: "pending".into(),
+            error: None,
+            kind: Some("activate".into()),
+            model_id: Some("qwen".into()),
+            instances: Some(2),
+            created_at: Some("2026-10-01T00:00:00Z".into()),
+            started_at: None,
+            finished_at: None,
+        });
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["operation"]["id"], "0123abcd");
+        assert_eq!(
+            serde_json::from_value::<SwitchModelResponse>(encoded).unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn worker_capabilities_are_additive_and_bounded() {
+        let legacy: WorkerAdvertisement = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "node_name": null,
+            "agent_version": "old",
+            "resources": [],
+            "model_switching": null
+        }))
+        .expect("legacy advertisement");
+        assert!(legacy.capabilities.is_empty());
+        assert!(!legacy.has_capability(CAPABILITY_FLEET_OPERATIONS));
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("capabilities")
+                .is_none()
+        );
+        let mut advertisement = legacy;
+        advertisement.capabilities = vec![CAPABILITY_FLEET_OPERATIONS.to_string()];
+        validate_worker_advertisement(&advertisement).unwrap();
+        assert!(advertisement.has_capability(CAPABILITY_FLEET_OPERATIONS));
+        advertisement.capabilities = vec!["x".to_string(); MAX_CAPABILITIES + 1];
+        assert!(matches!(
+            validate_worker_advertisement(&advertisement),
+            Err(ProtocolError::TooManyCapabilities { .. })
+        ));
+        advertisement.capabilities = vec!["bad\ncap".to_string()];
+        assert!(validate_worker_advertisement(&advertisement).is_err());
+    }
+
+    #[test]
+    fn fleet_operation_stream_round_trips_and_validates_ids() {
+        let request = FleetOperationRequest {
+            protocol_version: REQUEST_PROTOCOL_VERSION,
+            request_id: Uuid::nil(),
+            operation_id: "0123abcd".into(),
+        };
+        let value = serde_json::to_value(StreamOpen::FleetOperation(request.clone())).unwrap();
+        assert_eq!(value["type"], "fleet_operation");
+        assert_eq!(
+            serde_json::from_value::<StreamOpen>(value).unwrap(),
+            StreamOpen::FleetOperation(request.clone())
+        );
+        validate_fleet_operation_request(&request).unwrap();
+        for bad in ["", "a/b", "a b", &"x".repeat(MAX_OPERATION_ID_BYTES + 1)] {
+            assert!(validate_operation_id(bad).is_err(), "{bad:?}");
+        }
+        validate_operation_id("op_1.2:3-4").unwrap();
+    }
+
+    #[test]
+    fn lifecycle_operation_sanitization_bounds_worker_text() {
+        let operation = LifecycleOperation {
+            id: "0123abcd".into(),
+            state: " running ".into(),
+            error: Some(format!("line1\nline2{}", "e".repeat(4096))),
+            kind: Some("unload".into()),
+            model_id: Some("bad\nmodel".into()),
+            instances: None,
+            created_at: None,
+            started_at: None,
+            finished_at: None,
+        }
+        .sanitized()
+        .expect("valid operation");
+        assert_eq!(operation.state, "running");
+        let error = operation.error.unwrap();
+        assert!(error.starts_with("line1 line2"));
+        assert!(error.len() <= MAX_SWITCHING_DESCRIPTION_BYTES);
+        assert_eq!(operation.model_id, None);
+
+        let invalid = LifecycleOperation {
+            id: "bad id".into(),
+            state: "running".into(),
+            error: None,
+            kind: None,
+            model_id: None,
+            instances: None,
+            created_at: None,
+            started_at: None,
+            finished_at: None,
+        };
+        assert_eq!(invalid.sanitized(), None);
     }
 }

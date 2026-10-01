@@ -51,6 +51,9 @@ pub(crate) struct WorkerSession {
     enrollment_label: Option<String>,
     /// The worker advertised it can decode zstd request bodies.
     accepts_zstd: bool,
+    /// The worker advertised `fleet_operations` (operation lookups and the
+    /// operation field on switch responses).
+    supports_fleet_operations: bool,
     connected_at: Instant,
     last_seen: Mutex<Instant>,
     resources: Mutex<HashMap<String, ResourceState>>,
@@ -99,6 +102,13 @@ pub(crate) struct MeshAffinityCommit {
     observed: Option<AffinityPinTarget>,
     endpoint_id: EndpointId,
     resource_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum FleetOperationLookupError {
+    /// The worker is connected but predates operation lookups.
+    Unsupported,
+    Mesh(crate::error::AppError),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -198,6 +208,8 @@ impl MeshRegistry {
         let worker_name = advertised_worker_name(advertisement.node_name.as_deref());
         let accepts_zstd =
             advertisement.accepts_request_encoding(crate::mesh::protocol::REQUEST_ENCODING_ZSTD);
+        let supports_fleet_operations =
+            advertisement.has_capability(crate::mesh::protocol::CAPABILITY_FLEET_OPERATIONS);
         Arc::new(WorkerSession {
             endpoint_id,
             connection,
@@ -205,6 +217,7 @@ impl MeshRegistry {
             worker_name,
             enrollment_label: advertised_worker_name(enrollment_label.as_deref()),
             accepts_zstd,
+            supports_fleet_operations,
             connected_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
             model_switching: Mutex::new(advertisement.model_switching.clone()),
@@ -745,6 +758,88 @@ impl MeshRegistry {
             session.update_model_switching(update.clone());
             response.model_switching = Some(update);
         }
+        // Worker-controlled: keep only a well-formed operation, bounded.
+        response.operation = response
+            .operation
+            .take()
+            .and_then(crate::mesh::protocol::LifecycleOperation::sanitized);
+        Ok(response)
+    }
+
+    /// Looks up a Fleet lifecycle operation on a connected worker. Fails with
+    /// [`FleetOperationLookupError::Unsupported`] for workers that predate the
+    /// `fleet_operations` capability (they cannot parse the stream type).
+    pub(crate) async fn fleet_operation(
+        &self,
+        endpoint_id: EndpointId,
+        operation_id: String,
+    ) -> Result<crate::mesh::protocol::FleetOperationResponse, FleetOperationLookupError> {
+        let session = self
+            .current_session_any_generation(endpoint_id)
+            .ok_or_else(|| {
+                FleetOperationLookupError::Mesh(crate::error::AppError::upstream(
+                    "mesh worker is not connected",
+                ))
+            })?;
+        if session.is_stale(Instant::now(), self.heartbeat_timeout) {
+            return Err(FleetOperationLookupError::Mesh(
+                crate::error::AppError::upstream("mesh worker is stale"),
+            ));
+        }
+        if !session.supports_fleet_operations {
+            return Err(FleetOperationLookupError::Unsupported);
+        }
+        let request = crate::mesh::protocol::FleetOperationRequest {
+            protocol_version: crate::mesh::protocol::REQUEST_PROTOCOL_VERSION,
+            request_id: uuid::Uuid::new_v4(),
+            operation_id,
+        };
+        crate::mesh::protocol::validate_fleet_operation_request(&request).map_err(|err| {
+            FleetOperationLookupError::Mesh(crate::error::AppError::bad_request(err.to_string()))
+        })?;
+        let connection = session.connection.as_ref().ok_or_else(|| {
+            FleetOperationLookupError::Mesh(crate::error::AppError::upstream(
+                "mesh worker connection is unavailable",
+            ))
+        })?;
+        let result = async {
+            let (mut send, mut recv) =
+                tokio::time::timeout(Duration::from_secs(10), connection.open_bi())
+                    .await
+                    .map_err(|_| {
+                        crate::error::AppError::upstream("mesh operation stream timed out")
+                    })?
+                    .map_err(|err| {
+                        crate::error::AppError::upstream(format!(
+                            "failed to open mesh operation stream: {err}"
+                        ))
+                    })?;
+            crate::mesh::io::write_stream_open(
+                &mut send,
+                &StreamOpen::FleetOperation(request.clone()),
+            )
+            .await?;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::mesh::io::read_fleet_operation_response(&mut recv),
+            )
+            .await
+            .map_err(|_| crate::error::AppError::upstream("mesh operation request timed out"))?
+        }
+        .await;
+        let mut response = result.map_err(FleetOperationLookupError::Mesh)?;
+        if response.request_id != request.request_id
+            || response.operation_id != request.operation_id
+        {
+            return Err(FleetOperationLookupError::Mesh(
+                crate::error::AppError::upstream("mesh operation response did not match request"),
+            ));
+        }
+        response.operation = response
+            .operation
+            .take()
+            .and_then(crate::mesh::protocol::LifecycleOperation::sanitized)
+            .filter(|operation| operation.id == request.operation_id);
         Ok(response)
     }
 
@@ -1382,6 +1477,7 @@ mod tests {
                 .collect(),
             model_switching: None,
             request_encodings: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -1433,6 +1529,7 @@ mod tests {
                 }],
                 model_switching: None,
                 request_encodings: Vec::new(),
+                capabilities: Vec::new(),
             },
         );
 
@@ -2274,6 +2371,7 @@ mod tests {
                 }],
                 model_switching: None,
                 request_encodings: Vec::new(),
+                capabilities: Vec::new(),
             },
         );
 
@@ -2329,6 +2427,7 @@ mod tests {
                 ],
                 model_switching: None,
                 request_encodings: Vec::new(),
+                capabilities: Vec::new(),
             },
         );
 
@@ -2386,6 +2485,7 @@ mod tests {
                         .collect(),
                     model_switching: None,
                     request_encodings: Vec::new(),
+                    capabilities: Vec::new(),
                 },
             );
         }
@@ -2429,6 +2529,7 @@ mod tests {
                     }],
                     model_switching: None,
                     request_encodings: Vec::new(),
+                    capabilities: Vec::new(),
                 },
             );
         }
@@ -2473,6 +2574,7 @@ mod tests {
                 }],
                 model_switching: None,
                 request_encodings: Vec::new(),
+                capabilities: Vec::new(),
             },
         );
 
@@ -2522,6 +2624,7 @@ mod tests {
                 }],
                 model_switching: None,
                 request_encodings: Vec::new(),
+                capabilities: Vec::new(),
             },
         );
 
@@ -2569,6 +2672,7 @@ mod tests {
                     revision: 5,
                 }),
                 request_encodings: Vec::new(),
+                capabilities: Vec::new(),
             },
         );
         session.update_model_switching(ModelSwitchingAdvertisement {
@@ -2617,6 +2721,7 @@ mod hardening_tests {
             }],
             model_switching: None,
             request_encodings: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 
