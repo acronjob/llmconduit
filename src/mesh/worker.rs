@@ -33,7 +33,17 @@ pub(super) struct WorkerRuntime {
     resources: HashMap<String, Arc<LocalResource>>,
     fleet: Option<Arc<crate::dashboard_fleet::FleetClient>>,
     model_switching: Mutex<Option<ModelSwitchingAdvertisement>>,
+    /// After a load/unload, poll Fleet quickly until this instant (or until
+    /// no model is mid-transition) so the hub sees the phase change promptly.
+    fast_refresh_until: std::sync::Mutex<Option<TokioInstant>>,
+    refresh_wakeup: tokio::sync::Notify,
 }
+
+/// Poll cadence while a requested model transition is in flight.
+const FAST_MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Upper bound on fast polling after one lifecycle request; large model
+/// loads that take longer fall back to the normal cadence.
+const FAST_MODEL_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
 struct LocalResource {
@@ -88,6 +98,8 @@ impl WorkerRuntime {
             resources,
             fleet,
             model_switching: Mutex::new(None),
+            fast_refresh_until: std::sync::Mutex::new(None),
+            refresh_wakeup: tokio::sync::Notify::new(),
         };
         runtime.refresh_model_switching().await;
         runtime
@@ -442,9 +454,9 @@ async fn model_refresh_task(
         .min()
         .unwrap_or(60)
         .max(1);
-    let mut refresh = tokio::time::interval(Duration::from_secs(refresh_secs));
-    refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    refresh.tick().await;
+    let normal = Duration::from_secs(refresh_secs);
+    let refresh = tokio::time::sleep(normal);
+    tokio::pin!(refresh);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -452,7 +464,10 @@ async fn model_refresh_task(
                     break;
                 }
             }
-            _ = refresh.tick() => {
+            // A lifecycle request just ran (and already refreshed): only
+            // re-plan the next poll at the fast cadence.
+            _ = runtime.refresh_wakeup.notified() => {}
+            _ = &mut refresh => {
                 for update in refresh_models(&runtime).await {
                     if updates.send(WorkerToHub::ResourceUpdate(update)).await.is_err() {
                         return Ok(());
@@ -465,8 +480,64 @@ async fn model_refresh_task(
                 }
             }
         }
+        let delay = runtime
+            .next_model_refresh_delay(normal, TokioInstant::now())
+            .await;
+        refresh.as_mut().reset(TokioInstant::now() + delay);
     }
     Ok(())
+}
+
+/// Whether Fleet still reports this model moving toward its desired state.
+/// Unknown phases count as in flight; the fast window bounds the cost.
+fn model_is_settling(model: &SwitchableModelAdvertisement) -> bool {
+    let wants_loaded = model.desired_state.eq_ignore_ascii_case("loaded")
+        || model.desired_state.eq_ignore_ascii_case("ready");
+    match model.phase.to_ascii_lowercase().as_str() {
+        "ready" | "running" | "loaded" => model.ready_instances < model.desired_instances,
+        "unloaded" | "stopped" => wants_loaded,
+        "failed" | "error" => false,
+        _ => true,
+    }
+}
+
+impl WorkerRuntime {
+    fn begin_fast_model_refresh(&self) {
+        *self
+            .fast_refresh_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(TokioInstant::now() + FAST_MODEL_REFRESH_WINDOW);
+        self.refresh_wakeup.notify_one();
+    }
+
+    async fn next_model_refresh_delay(&self, normal: Duration, now: TokioInstant) -> Duration {
+        let fast_until = *self
+            .fast_refresh_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(fast_until) = fast_until.filter(|until| now < *until) else {
+            return normal;
+        };
+        let settling = self
+            .model_switching
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|inventory| inventory.models.iter().any(model_is_settling));
+        if settling {
+            return FAST_MODEL_REFRESH_INTERVAL.min(normal).min(
+                fast_until
+                    .saturating_duration_since(now)
+                    .max(Duration::from_millis(1)),
+            );
+        }
+        *self
+            .fast_refresh_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        normal
+    }
 }
 
 async fn request_task(
@@ -928,6 +999,7 @@ async fn handle_switch_model(
         changed: false,
         error: None,
         model_switching: None,
+        error_status: None,
     };
     let Some(fleet) = runtime.fleet.as_ref() else {
         response.error = Some("model switching is not configured".to_string());
@@ -959,8 +1031,14 @@ async fn handle_switch_model(
             response.changed = operation.changed;
             runtime.refresh_model_switching().await;
             response.model_switching = runtime.model_switching.lock().await.clone();
+            if operation.changed {
+                runtime.begin_fast_model_refresh();
+            }
         }
-        Err(err) => response.error = Some(err.to_string()),
+        Err(err) => {
+            response.error = Some(err.to_string());
+            response.error_status = Some(err.status().as_u16());
+        }
     }
     write_switch_response(&mut send, &response).await
 }
@@ -1333,6 +1411,8 @@ mod tests {
             resources: HashMap::from([(config.id.clone(), Arc::new(LocalResource::new(config)))]),
             fleet: None,
             model_switching: Mutex::new(None),
+            fast_refresh_until: std::sync::Mutex::new(None),
+            refresh_wakeup: tokio::sync::Notify::new(),
         }
     }
 
@@ -1461,6 +1541,80 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn model_settling_tracks_fleet_transitions() {
+        let model = |phase: &str, desired: &str, ready: u32, wanted: u32| {
+            let mut model =
+                SwitchableModelAdvertisement::legacy("qwen", None, phase, desired, 1, Vec::new());
+            model.ready_instances = ready;
+            model.desired_instances = wanted;
+            model
+        };
+        assert!(model_is_settling(&model("loading", "loaded", 0, 1)));
+        assert!(model_is_settling(&model("starting", "loaded", 0, 1)));
+        assert!(model_is_settling(&model("unloaded", "loaded", 0, 1)));
+        assert!(model_is_settling(&model("ready", "loaded", 1, 2)));
+        assert!(!model_is_settling(&model("ready", "loaded", 1, 1)));
+        assert!(!model_is_settling(&model("unloaded", "unloaded", 0, 0)));
+        assert!(!model_is_settling(&model("failed", "loaded", 0, 1)));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_requests_poll_fast_only_while_a_model_is_settling() {
+        let runtime = test_runtime(test_resource(
+            "127.0.0.1:9".parse().unwrap(),
+            MeshWorkerCapacitySource::Configured,
+        ));
+        let normal = Duration::from_secs(60);
+        let now = TokioInstant::now();
+        assert_eq!(runtime.next_model_refresh_delay(normal, now).await, normal);
+
+        *runtime.model_switching.lock().await = Some(ModelSwitchingAdvertisement {
+            provider: "lil-fleet".into(),
+            models: vec![SwitchableModelAdvertisement::legacy(
+                "qwen",
+                None,
+                "loading",
+                "loaded",
+                1,
+                Vec::new(),
+            )],
+            revision: 1,
+        });
+        runtime.begin_fast_model_refresh();
+        let now = TokioInstant::now();
+        assert_eq!(
+            runtime.next_model_refresh_delay(normal, now).await,
+            FAST_MODEL_REFRESH_INTERVAL
+        );
+        // The fast window is bounded even if Fleet never settles.
+        assert_eq!(
+            runtime
+                .next_model_refresh_delay(normal, now + FAST_MODEL_REFRESH_WINDOW)
+                .await,
+            normal
+        );
+
+        runtime
+            .model_switching
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .models[0]
+            .phase = "ready".into();
+        assert_eq!(
+            runtime
+                .next_model_refresh_delay(normal, TokioInstant::now())
+                .await,
+            normal
+        );
+        assert!(
+            runtime.fast_refresh_until.lock().unwrap().is_none(),
+            "a settled inventory ends fast polling"
+        );
     }
 
     #[tokio::test]
@@ -1663,6 +1817,8 @@ mod tests {
             resources: HashMap::new(),
             fleet: None,
             model_switching: Mutex::new(None),
+            fast_refresh_until: std::sync::Mutex::new(None),
+            refresh_wakeup: tokio::sync::Notify::new(),
         };
 
         let advertisement = runtime.advertisement().await;

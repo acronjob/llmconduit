@@ -282,6 +282,23 @@ pub struct SwitchModelResponse {
     pub changed: bool,
     pub error: Option<String>,
     pub model_switching: Option<ModelSwitchingAdvertisement>,
+    /// HTTP status the worker's Fleet answered with when it refused the
+    /// operation, so the hub can report e.g. a 400 instead of a blanket 409.
+    /// Optional both ways: older peers omit or ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_status: Option<u16>,
+}
+
+impl SwitchModelResponse {
+    /// Status for the hub's dashboard response when the worker refused:
+    /// Fleet's request-level 4xx (and gateway 502/504) pass through,
+    /// anything else keeps the historical 409.
+    pub fn rejection_status(&self) -> http::StatusCode {
+        self.error_status
+            .filter(|status| (400..=499).contains(status) || matches!(status, 502 | 504))
+            .and_then(|status| http::StatusCode::from_u16(status).ok())
+            .unwrap_or(http::StatusCode::CONFLICT)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1073,6 +1090,48 @@ mod tests {
         }
         serde_json::from_value::<LegacyAdvertisement>(value["payload"].clone())
             .expect("older hub ignores the new field");
+    }
+
+    #[test]
+    fn switch_response_error_status_round_trips_and_is_optional() {
+        let response = SwitchModelResponse {
+            request_id: Uuid::nil(),
+            model_id: "qwen3-flash".to_string(),
+            accepted: false,
+            changed: false,
+            error: Some("Fleet rejected the request (overrides_not_allowed)".to_string()),
+            model_switching: None,
+            error_status: Some(400),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["error_status"], serde_json::json!(400));
+        assert_eq!(
+            serde_json::from_value::<SwitchModelResponse>(value.clone()).unwrap(),
+            response
+        );
+        assert_eq!(response.rejection_status(), http::StatusCode::BAD_REQUEST);
+
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("error_status");
+        let legacy: SwitchModelResponse = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.error_status, None);
+        assert_eq!(legacy.rejection_status(), http::StatusCode::CONFLICT);
+        assert!(
+            serde_json::to_value(&legacy).unwrap()["error_status"].is_null(),
+            "absent status stays off the wire"
+        );
+        for (status, expected) in [
+            (404, http::StatusCode::NOT_FOUND),
+            (502, http::StatusCode::BAD_GATEWAY),
+            (500, http::StatusCode::CONFLICT),
+            (200, http::StatusCode::CONFLICT),
+        ] {
+            let response = SwitchModelResponse {
+                error_status: Some(status),
+                ..legacy.clone()
+            };
+            assert_eq!(response.rejection_status(), expected, "{status}");
+        }
     }
 
     #[test]
