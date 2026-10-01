@@ -28,6 +28,8 @@ pub(crate) struct MeshRegistry {
     heartbeat_timeout: Duration,
     next_generation: Arc<AtomicU64>,
     notify: Arc<Notify>,
+    /// Lowercase model id -> allowlist spelling.
+    canonical_model_ids: Arc<HashMap<String, String>>,
 }
 
 #[derive(Debug, Default)]
@@ -44,6 +46,11 @@ pub(crate) struct WorkerSession {
     pub(crate) connection: Option<Connection>,
     pub(crate) generation: u64,
     worker_name: Option<String>,
+    /// Label recorded by the hub at enrollment. Preferred over the name the
+    /// worker self-reports in every hello, which it can change at will.
+    enrollment_label: Option<String>,
+    /// The worker advertised it can decode zstd request bodies.
+    accepts_zstd: bool,
     connected_at: Instant,
     last_seen: Mutex<Instant>,
     resources: Mutex<HashMap<String, ResourceState>>,
@@ -59,6 +66,11 @@ pub(crate) struct ResourceSnapshot {
     pub(crate) connection: Option<Connection>,
     pub(crate) effective_capacity: u32,
     pub(crate) active: u32,
+    pub(crate) accepts_zstd: bool,
+    /// The requested model in this worker's own spelling. The hub catalog
+    /// shows the allowlist spelling, but the worker's engine (vLLM matches
+    /// served names case-sensitively) must receive the id it advertised.
+    pub(crate) local_model_id: String,
 }
 
 #[derive(Debug)]
@@ -136,6 +148,7 @@ impl MeshRegistry {
             heartbeat_timeout,
             next_generation: Arc::new(AtomicU64::new(1)),
             notify: Arc::new(Notify::new()),
+            canonical_model_ids: Arc::new(HashMap::new()),
         }
     }
 
@@ -145,22 +158,22 @@ impl MeshRegistry {
         connection: Connection,
         advertisement: WorkerAdvertisement,
     ) -> Arc<WorkerSession> {
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let worker_name = advertised_worker_name(advertisement.node_name.as_deref());
-        let session = Arc::new(WorkerSession {
+        self.register_enrolled(endpoint_id, connection, advertisement, None)
+    }
+
+    pub(crate) fn register_enrolled(
+        &self,
+        endpoint_id: EndpointId,
+        connection: Connection,
+        advertisement: WorkerAdvertisement,
+        enrollment_label: Option<String>,
+    ) -> Arc<WorkerSession> {
+        let session = self.new_session(
             endpoint_id,
-            connection: Some(connection),
-            generation,
-            worker_name,
-            connected_at: Instant::now(),
-            last_seen: Mutex::new(Instant::now()),
-            model_switching: Mutex::new(advertisement.model_switching.clone()),
-            resources: Mutex::new(resources_from_advertisement(
-                advertisement,
-                Arc::clone(&self.notify),
-            )),
-            notify: Arc::clone(&self.notify),
-        });
+            Some(connection),
+            advertisement,
+            enrollment_label,
+        );
         let old = {
             let mut state = self.inner.lock().expect("mesh registry lock poisoned");
             state.workers.insert(endpoint_id, Arc::clone(&session))
@@ -174,19 +187,24 @@ impl MeshRegistry {
         session
     }
 
-    #[cfg(test)]
-    pub(crate) fn register_test(
+    fn new_session(
         &self,
         endpoint_id: EndpointId,
+        connection: Option<Connection>,
         advertisement: WorkerAdvertisement,
+        enrollment_label: Option<String>,
     ) -> Arc<WorkerSession> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let worker_name = advertised_worker_name(advertisement.node_name.as_deref());
-        let session = Arc::new(WorkerSession {
+        let accepts_zstd =
+            advertisement.accepts_request_encoding(crate::mesh::protocol::REQUEST_ENCODING_ZSTD);
+        Arc::new(WorkerSession {
             endpoint_id,
-            connection: None,
+            connection,
             generation,
             worker_name,
+            enrollment_label: advertised_worker_name(enrollment_label.as_deref()),
+            accepts_zstd,
             connected_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
             model_switching: Mutex::new(advertisement.model_switching.clone()),
@@ -195,7 +213,26 @@ impl MeshRegistry {
                 Arc::clone(&self.notify),
             )),
             notify: Arc::clone(&self.notify),
-        });
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_test(
+        &self,
+        endpoint_id: EndpointId,
+        advertisement: WorkerAdvertisement,
+    ) -> Arc<WorkerSession> {
+        self.register_test_with_label(endpoint_id, advertisement, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_test_with_label(
+        &self,
+        endpoint_id: EndpointId,
+        advertisement: WorkerAdvertisement,
+        enrollment_label: Option<String>,
+    ) -> Arc<WorkerSession> {
+        let session = self.new_session(endpoint_id, None, advertisement, enrollment_label);
         {
             let mut state = self.inner.lock().expect("mesh registry lock poisoned");
             state.workers.insert(endpoint_id, Arc::clone(&session));
@@ -722,7 +759,10 @@ impl MeshRegistry {
             .cloned()
             .collect();
         let disabled = self.disabled_models_snapshot();
-        let mut by_id: HashMap<String, Option<i64>> = HashMap::new();
+        // Keyed case-insensitively: routing already matches models without
+        // regard to case, so "Qwen3" and "qwen3" from two workers are one
+        // routable model and must be one catalog entry.
+        let mut by_key: HashMap<String, (String, Option<i64>)> = HashMap::new();
         for session in sessions {
             if session.is_stale(now, self.heartbeat_timeout) {
                 continue;
@@ -736,23 +776,63 @@ impl MeshRegistry {
                     continue;
                 }
                 for model in &resource.models {
+                    let key = model.id.to_ascii_lowercase();
                     if disabled.contains(&(
                         session.endpoint_id,
                         resource.resource_id.clone(),
-                        model.id.to_ascii_lowercase(),
+                        key.clone(),
                     )) {
                         continue;
                     }
-                    by_id.entry(model.id.clone()).or_insert(model.context_limit);
+                    // Workers can disagree about one model's window. Take
+                    // the smallest known value so budgeting never exceeds
+                    // the strictest serving worker; HashMap iteration order
+                    // made the old first-writer choice nondeterministic.
+                    let limit = crate::mesh::protocol::sanitize_context_limit(model.context_limit);
+                    let display = self.canonical_model_id(&model.id);
+                    by_key
+                        .entry(key)
+                        .and_modify(|(id, current)| {
+                            *current = min_known_limit(*current, limit);
+                            if display < *id {
+                                id.clone_from(&display);
+                            }
+                        })
+                        .or_insert((display, limit));
                 }
             }
         }
-        let mut models: Vec<_> = by_id
-            .into_iter()
+        let mut models: Vec<_> = by_key
+            .into_values()
             .map(|(id, context_limit)| ModelAdvertisement { id, context_limit })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
+    }
+
+    /// The operator's allowlist spelling for a model id, falling back to the
+    /// id as advertised when the allowlist does not name it.
+    fn canonical_model_id(&self, model: &str) -> String {
+        self.canonical_model_ids
+            .get(&model.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| model.to_string())
+    }
+
+    /// Present controller-allowlisted model ids in the operator's spelling
+    /// instead of whichever case each worker's engine happens to report.
+    pub(crate) fn with_canonical_model_ids<'a>(
+        mut self,
+        allowlisted: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut canonical = HashMap::new();
+        for model in allowlisted {
+            canonical
+                .entry(model.to_ascii_lowercase())
+                .or_insert_with(|| model.to_string());
+        }
+        self.canonical_model_ids = Arc::new(canonical);
+        self
     }
 
     /// Snapshot every connected mesh resource for the administrative provider
@@ -797,8 +877,10 @@ impl MeshRegistry {
                             ))
                         })
                         .map(|model| crate::upstream::UpstreamModelEntry {
-                            id: model.id.clone(),
-                            context_limit: model.context_limit,
+                            id: self.canonical_model_id(&model.id),
+                            context_limit: crate::mesh::protocol::sanitize_context_limit(
+                                model.context_limit,
+                            ),
                         })
                         .collect(),
                     availability: Some(resource.availability.clone()),
@@ -891,13 +973,13 @@ impl MeshRegistry {
                 )) {
                     continue;
                 }
-                if !resource
+                let Some(local_model) = resource
                     .models
                     .iter()
-                    .any(|advertised| advertised.id.eq_ignore_ascii_case(model))
-                {
+                    .find(|advertised| advertised.id.eq_ignore_ascii_case(model))
+                else {
                     continue;
-                }
+                };
                 let snapshot = resource.gate.snapshot();
                 let effective_capacity = snapshot.limit;
                 let active = snapshot.active;
@@ -913,6 +995,8 @@ impl MeshRegistry {
                     connection: session.connection.clone(),
                     effective_capacity,
                     active,
+                    accepts_zstd: session.accepts_zstd,
+                    local_model_id: local_model.id.clone(),
                 });
             }
         }
@@ -955,13 +1039,10 @@ impl MeshRegistry {
         )) {
             return None;
         }
-        if !resource
+        let local_model = resource
             .models
             .iter()
-            .any(|advertised| advertised.id.eq_ignore_ascii_case(model))
-        {
-            return None;
-        }
+            .find(|advertised| advertised.id.eq_ignore_ascii_case(model))?;
         let snapshot = resource.gate.snapshot();
         if snapshot.limit == 0 {
             return None;
@@ -976,6 +1057,8 @@ impl MeshRegistry {
             connection: session.connection.clone(),
             effective_capacity: snapshot.limit,
             active: snapshot.active,
+            accepts_zstd: session.accepts_zstd,
+            local_model_id: local_model.id.clone(),
         })
     }
 
@@ -1089,10 +1172,18 @@ fn enforce_affinity_pin_limit(state: &mut RegistryState) {
 }
 
 impl WorkerSession {
+    /// Display name for dashboard views. Names are not unique and the
+    /// advertised one is worker-controlled, so a named node always carries a
+    /// short endpoint-id suffix: one worker cannot render as another.
     fn provider_name(&self, fallback_provider_id: &str) -> String {
-        self.worker_name
-            .clone()
-            .unwrap_or_else(|| fallback_provider_id.to_string())
+        match self
+            .enrollment_label
+            .as_deref()
+            .or(self.worker_name.as_deref())
+        {
+            Some(name) => format!("{name} ({})", self.endpoint_id.fmt_short()),
+            None => fallback_provider_id.to_string(),
+        }
     }
 
     pub(crate) fn touch(&self) {
@@ -1193,6 +1284,13 @@ impl WorkerSession {
     }
 }
 
+fn min_known_limit(current: Option<i64>, next: Option<i64>) -> Option<i64> {
+    match (current, next) {
+        (Some(current), Some(next)) => Some(current.min(next)),
+        (known, None) | (None, known) => known,
+    }
+}
+
 fn advertised_worker_name(node_name: Option<&str>) -> Option<String> {
     node_name.and_then(|name| {
         let trimmed = name.trim();
@@ -1283,6 +1381,7 @@ mod tests {
                 })
                 .collect(),
             model_switching: None,
+            request_encodings: Vec::new(),
         }
     }
 
@@ -1333,6 +1432,7 @@ mod tests {
                     revision: 1,
                 }],
                 model_switching: None,
+                request_encodings: Vec::new(),
             },
         );
 
@@ -2173,6 +2273,7 @@ mod tests {
                     revision: 1,
                 }],
                 model_switching: None,
+                request_encodings: Vec::new(),
             },
         );
 
@@ -2227,6 +2328,7 @@ mod tests {
                     },
                 ],
                 model_switching: None,
+                request_encodings: Vec::new(),
             },
         );
 
@@ -2237,11 +2339,9 @@ mod tests {
                 .iter()
                 .all(|entry| entry.provider_id == format!("mesh:{endpoint}"))
         );
-        assert!(
-            inventory
-                .iter()
-                .all(|entry| entry.provider_name == "workstation-a")
-        );
+        assert!(inventory.iter().all(
+            |entry| entry.provider_name == format!("workstation-a ({})", endpoint.fmt_short())
+        ));
         assert_eq!(
             inventory
                 .iter()
@@ -2285,6 +2385,7 @@ mod tests {
                         })
                         .collect(),
                     model_switching: None,
+                    request_encodings: Vec::new(),
                 },
             );
         }
@@ -2327,13 +2428,17 @@ mod tests {
                         revision: 1,
                     }],
                     model_switching: None,
+                    request_encodings: Vec::new(),
                 },
             );
         }
 
         let inventory = registry.provider_inventory();
         assert_eq!(inventory.len(), 1);
-        assert_eq!(inventory[0].provider_name, "worker-new");
+        assert_eq!(
+            inventory[0].provider_name,
+            format!("worker-new ({})", endpoint.fmt_short())
+        );
         assert_eq!(inventory[0].provider_id, format!("mesh:{endpoint}"));
         assert_eq!(inventory[0].resource_id.as_deref(), Some("slot"));
     }
@@ -2367,6 +2472,7 @@ mod tests {
                     revision: 1,
                 }],
                 model_switching: None,
+                request_encodings: Vec::new(),
             },
         );
 
@@ -2415,6 +2521,7 @@ mod tests {
                     revision: 1,
                 }],
                 model_switching: None,
+                request_encodings: Vec::new(),
             },
         );
 
@@ -2461,6 +2568,7 @@ mod tests {
                     )],
                     revision: 5,
                 }),
+                request_encodings: Vec::new(),
             },
         );
         session.update_model_switching(ModelSwitchingAdvertisement {
@@ -2480,5 +2588,152 @@ mod tests {
             .expect("switching inventory");
         assert_eq!(advertised.revision, 5);
         assert_eq!(advertised.models[0].id, "qwen3-flash");
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use crate::config::AvailabilitySchedule;
+    use crate::mesh::protocol::PROTOCOL_VERSION;
+    use iroh::SecretKey;
+
+    fn advertisement(node_name: Option<&str>, context_limit: Option<i64>) -> WorkerAdvertisement {
+        WorkerAdvertisement {
+            protocol_version: PROTOCOL_VERSION,
+            node_name: node_name.map(str::to_string),
+            agent_version: "test".into(),
+            resources: vec![ResourceAdvertisement {
+                resource_id: "gpu".into(),
+                models: vec![ModelAdvertisement {
+                    id: "qwen".into(),
+                    context_limit,
+                }],
+                availability: AvailabilitySchedule::default(),
+                effective_capacity: 1,
+                accepting_requests: true,
+                healthy: true,
+                revision: 1,
+            }],
+            model_switching: None,
+            request_encodings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn conflicting_context_limits_resolve_to_the_smallest_known_value() {
+        // Repeat with fresh registries: HashMap order must not change the
+        // answer.
+        for _ in 0..16 {
+            let registry = MeshRegistry::new(Duration::from_secs(30));
+            for limit in [Some(131_072), None, Some(32_768), Some(0), Some(i64::MAX)] {
+                registry.register_test(SecretKey::generate().public(), advertisement(None, limit));
+            }
+            let catalog = registry.model_catalog();
+            assert_eq!(catalog.len(), 1);
+            assert_eq!(catalog[0].context_limit, Some(32_768));
+        }
+    }
+
+    #[test]
+    fn case_variant_model_ids_collapse_to_the_allowlist_spelling() {
+        let registry =
+            MeshRegistry::new(Duration::from_secs(30)).with_canonical_model_ids(["Qwen/Qwen3-32B"]);
+        for spelling in ["qwen/qwen3-32b", "QWEN/QWEN3-32B"] {
+            let mut ad = advertisement(None, Some(32_768));
+            ad.resources[0].models[0].id = spelling.into();
+            registry.register_test(SecretKey::generate().public(), ad);
+        }
+
+        let catalog = registry.model_catalog();
+        assert_eq!(catalog.len(), 1, "{catalog:?}");
+        assert_eq!(catalog[0].id, "Qwen/Qwen3-32B");
+        assert!(
+            registry
+                .provider_inventory()
+                .iter()
+                .all(|entry| entry.models[0].id == "Qwen/Qwen3-32B")
+        );
+
+        // Each reservation still names the model as that worker spells it.
+        let first = registry.reserve("Qwen/Qwen3-32B").expect("first");
+        let second = registry.reserve("Qwen/Qwen3-32B").expect("second");
+        let mut local = vec![
+            first.resource.local_model_id.clone(),
+            second.resource.local_model_id.clone(),
+        ];
+        local.sort();
+        assert_eq!(local, vec!["QWEN/QWEN3-32B", "qwen/qwen3-32b"]);
+    }
+
+    #[test]
+    fn case_variants_without_an_allowlist_entry_still_dedupe_deterministically() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        for spelling in ["model-a", "Model-A"] {
+            let mut ad = advertisement(None, None);
+            ad.resources[0].models[0].id = spelling.into();
+            registry.register_test(SecretKey::generate().public(), ad);
+        }
+        let catalog = registry.model_catalog();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "Model-A");
+    }
+
+    #[test]
+    fn workers_reusing_a_name_stay_distinguishable() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let honest = SecretKey::generate().public();
+        let spoofer = SecretKey::generate().public();
+        registry.register_test(honest, advertisement(Some("prod-gpu"), None));
+        registry.register_test(spoofer, advertisement(Some("prod-gpu"), None));
+
+        let inventory = registry.provider_inventory();
+        assert_eq!(inventory.len(), 2);
+        assert_ne!(inventory[0].provider_name, inventory[1].provider_name);
+        for entry in &inventory {
+            assert!(entry.provider_name.starts_with("prod-gpu ("));
+        }
+    }
+
+    #[test]
+    fn enrollment_label_wins_over_the_self_reported_name() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let endpoint = SecretKey::generate().public();
+        registry.register_test_with_label(
+            endpoint,
+            advertisement(Some("pretend-to-be-prod"), None),
+            Some("lab-box".into()),
+        );
+
+        let inventory = registry.provider_inventory();
+        assert_eq!(
+            inventory[0].provider_name,
+            format!("lab-box ({})", endpoint.fmt_short())
+        );
+    }
+
+    #[test]
+    fn reservation_snapshot_reports_zstd_capability() {
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        let mut modern = advertisement(None, None);
+        modern.request_encodings = vec!["zstd".into()];
+        registry.register_test(SecretKey::generate().public(), modern);
+        assert!(
+            registry
+                .reserve("qwen")
+                .expect("reserve")
+                .resource
+                .accepts_zstd
+        );
+
+        let registry = MeshRegistry::new(Duration::from_secs(30));
+        registry.register_test(SecretKey::generate().public(), advertisement(None, None));
+        assert!(
+            !registry
+                .reserve("qwen")
+                .expect("reserve")
+                .resource
+                .accepts_zstd
+        );
     }
 }
