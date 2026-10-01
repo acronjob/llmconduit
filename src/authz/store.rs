@@ -31,6 +31,8 @@ pub(crate) struct StoredCredential {
     pub prefix: String,
     pub digest: [u8; 32],
     pub capture_payloads: bool,
+    pub reject_unknown_models: bool,
+    pub exact_max_tokens: bool,
 }
 
 pub(crate) struct StoredAuthority {
@@ -57,6 +59,102 @@ pub struct ApiKeySummary {
     pub expires_at: Option<i64>,
     pub last_used_at: Option<i64>,
     pub capture_payloads: bool,
+    pub reject_unknown_models: bool,
+    pub exact_max_tokens: bool,
+}
+
+/// Per-key eval safety flags. Both default to `false` (historical behavior).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyEvalPolicy {
+    /// A requested model that no upstream serves is a 404 for this key even
+    /// under the global `unknown_model_policy: passthrough`.
+    pub reject_unknown_models: bool,
+    /// Never shrink `max_tokens` for this key; surface upstream overflow errors.
+    pub exact_max_tokens: bool,
+}
+
+/// Maximum lifetime of an eval run key.
+pub const MAX_EVAL_KEY_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+pub const MAX_EVAL_KEY_SESSIONS: u32 = 256;
+const MAX_EVAL_MODEL_BYTES: usize = 512;
+
+/// A validated `POST /dashboard/api/auth/eval-keys` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalKeySpec {
+    pub principal_id: String,
+    pub name: String,
+    pub requested_model: String,
+    pub served_model: String,
+    pub max_concurrent_sessions: u32,
+    /// Epoch seconds.
+    pub expires_at: i64,
+    pub eval: KeyEvalPolicy,
+}
+
+impl EvalKeySpec {
+    pub fn validate(
+        body: crate::dashboard_access::CreateEvalKeyRequest,
+        now: DateTime<Utc>,
+    ) -> Result<Self, AccessError> {
+        let invalid =
+            |message: &str| AccessError::new(StatusCode::UNPROCESSABLE_ENTITY, message.to_string());
+        let exact_model = |value: &str, field: &str| -> Result<String, AccessError> {
+            let value = value.trim();
+            if value.is_empty()
+                || value.len() > MAX_EVAL_MODEL_BYTES
+                || value.chars().any(char::is_control)
+            {
+                return Err(invalid(&format!("{field} must be a non-empty model id")));
+            }
+            if value.contains(['*', '?', '[']) {
+                return Err(invalid(&format!(
+                    "{field} must be an exact model id; globs are not allowed"
+                )));
+            }
+            Ok(value.to_string())
+        };
+        let served_model = exact_model(&body.served_model, "served_model")?;
+        let requested_model = match body.requested_model.as_deref() {
+            Some(requested) => exact_model(requested, "requested_model")?,
+            None => served_model.clone(),
+        };
+        let name = body.name.trim();
+        if name.is_empty() || name.len() > 128 {
+            return Err(invalid("name must be 1-128 characters"));
+        }
+        if !(1..=MAX_EVAL_KEY_SESSIONS).contains(&body.max_concurrent_sessions) {
+            return Err(invalid("max_concurrent_sessions must be between 1 and 256"));
+        }
+        let expires_at = DateTime::parse_from_rfc3339(&body.expires_at)
+            .map_err(|_| invalid("expires_at must be an RFC 3339 timestamp"))?
+            .timestamp();
+        let now = now.timestamp();
+        if expires_at <= now {
+            return Err(invalid("expires_at must be in the future"));
+        }
+        if expires_at > now + MAX_EVAL_KEY_TTL_SECS {
+            return Err(invalid("expires_at must be at most 7 days away"));
+        }
+        Ok(Self {
+            principal_id: body.principal_id.trim().to_string(),
+            name: name.to_string(),
+            requested_model,
+            served_model,
+            max_concurrent_sessions: body.max_concurrent_sessions,
+            expires_at,
+            eval: KeyEvalPolicy {
+                reject_unknown_models: body.reject_unknown_models,
+                exact_max_tokens: body.exact_max_tokens,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedEvalKeyRecord {
+    pub key_id: String,
+    pub policy_id: String,
+    pub prefix: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -277,7 +375,17 @@ impl AuthStore {
             "INSERT INTO auth_principals(id,kind,display_name,enabled,created_at) VALUES(?1,'service_account',?2,1,?3)",
             params![principal_id, required(principal_name, "principal_name")?, now],
         ).map_err(db)?;
-        let created = insert_key(&tx, &principal_id, key_name, raw, digest, None, false, now)?;
+        let created = insert_key(
+            &tx,
+            &principal_id,
+            key_name,
+            raw,
+            digest,
+            None,
+            false,
+            KeyEvalPolicy::default(),
+            now,
+        )?;
         let policy_id = format!("pol_{}", Uuid::new_v4().simple());
         tx.execute(
             "INSERT INTO auth_policies(id,name,effect,enabled,created_at,updated_at) VALUES(?1,?2,'allow',1,?3,?3)",
@@ -324,6 +432,7 @@ impl AuthStore {
         digest: &[u8; 32],
         expires_at: Option<i64>,
         capture_payloads: bool,
+        eval: KeyEvalPolicy,
         actor: &ManagementActor,
     ) -> Result<CreatedApiKey, String> {
         let now = Utc::now().timestamp();
@@ -350,6 +459,7 @@ impl AuthStore {
             digest,
             expires_at,
             capture_payloads,
+            eval,
             now,
         )?;
         bump_epoch(&tx)?;
@@ -386,6 +496,10 @@ impl AuthStore {
             digest,
             old.expires_at,
             old.capture_payloads,
+            KeyEvalPolicy {
+                reject_unknown_models: old.reject_unknown_models,
+                exact_max_tokens: old.exact_max_tokens,
+            },
             now,
         )?;
         tx.execute(
@@ -474,9 +588,243 @@ impl AuthStore {
         Ok(changed)
     }
 
+    /// Atomically creates one eval key and its single pinned allow policy
+    /// (endpoints `chat`+`models`, exact requested/served model, session cap,
+    /// absolute window ending at the key expiry), with payload capture off.
+    pub(crate) fn create_eval_key(
+        &mut self,
+        spec: &EvalKeySpec,
+        raw: &str,
+        digest: &[u8; 32],
+        actor: &ManagementActor,
+    ) -> Result<CreatedEvalKeyRecord, AccessError> {
+        let now = Utc::now().timestamp();
+        let tx = self.connection.transaction().map_err(access_db)?;
+        let principal = tx
+            .query_row(
+                "SELECT kind,enabled FROM auth_principals WHERE id=?1",
+                [&spec.principal_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(access_db)?;
+        match principal {
+            None => {
+                return Err(AccessError::new(
+                    StatusCode::NOT_FOUND,
+                    "principal does not exist",
+                ));
+            }
+            Some((kind, enabled)) if kind != "service_account" || enabled != 1 => {
+                return Err(AccessError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "principal must be an enabled service account",
+                ));
+            }
+            Some(_) => {}
+        }
+        // Keys inherit every principal/group/role grant of their principal, so
+        // an eval key is only pinned if its principal carries no other grant.
+        let bindings: i64 = tx
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM auth_group_members WHERE principal_id=?1) \
+                 + (SELECT COUNT(*) FROM auth_role_bindings WHERE subject_kind='principal' AND subject_id=?1) \
+                 + (SELECT COUNT(*) FROM auth_policy_subjects WHERE subject_kind='principal' AND subject_id=?1)",
+                [&spec.principal_id],
+                |row| row.get(0),
+            )
+            .map_err(access_db)?;
+        if bindings > 0 {
+            return Err(AccessError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "principal must have no group, role or policy bindings",
+            ));
+        }
+        let created = insert_key(
+            &tx,
+            &spec.principal_id,
+            &spec.name,
+            raw,
+            digest,
+            Some(spec.expires_at),
+            false,
+            spec.eval,
+            now,
+        )
+        .map_err(access_internal)?;
+        let key_id = created.summary.id.clone();
+        let policy_id = format!("pol_{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO auth_policies(id,name,effect,enabled,created_at,updated_at) VALUES(?1,?2,'allow',1,?3,?3)",
+            params![policy_id, format!("{} eval access", spec.name), now],
+        )
+        .map_err(access_db)?;
+        tx.execute(
+            "INSERT INTO auth_policy_subjects(policy_id,subject_kind,subject_id) VALUES(?1,'key',?2)",
+            params![policy_id, key_id],
+        )
+        .map_err(access_db)?;
+        for (dimension, matcher) in [
+            ("endpoint", "chat"),
+            ("endpoint", "models"),
+            ("requested_model", spec.requested_model.as_str()),
+            ("served_model", spec.served_model.as_str()),
+        ] {
+            tx.execute(
+                "INSERT INTO auth_policy_scopes(policy_id,dimension,matcher) VALUES(?1,?2,?3)",
+                params![policy_id, dimension, matcher],
+            )
+            .map_err(access_db)?;
+        }
+        tx.execute(
+            "INSERT INTO auth_time_windows(id,policy_id,weekday_mask,start_minute,end_minute,absolute_start,absolute_end) VALUES(?1,?2,0,0,0,NULL,?3)",
+            params![
+                format!("win_{}", Uuid::new_v4().simple()),
+                policy_id,
+                spec.expires_at.saturating_mul(1000)
+            ],
+        )
+        .map_err(access_db)?;
+        tx.execute(
+            "INSERT INTO auth_limits(policy_id,max_concurrent_sessions,max_daily_session_starts) VALUES(?1,?2,NULL)",
+            params![policy_id, spec.max_concurrent_sessions],
+        )
+        .map_err(access_db)?;
+        tx.execute(
+            "INSERT INTO auth_eval_keys(key_id,policy_id,created_by,created_at) VALUES(?1,?2,?3,?4)",
+            params![key_id, policy_id, actor_name(actor), now],
+        )
+        .map_err(access_db)?;
+        bump_epoch(&tx).map_err(access_internal)?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert("policy_id".into(), Value::String(policy_id.clone()));
+        metadata.insert(
+            "requested_model".into(),
+            Value::String(spec.requested_model.clone()),
+        );
+        metadata.insert(
+            "served_model".into(),
+            Value::String(spec.served_model.clone()),
+        );
+        audit(
+            &tx,
+            &actor_name(actor),
+            "eval_key.created",
+            &key_id,
+            "ok",
+            metadata,
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)?;
+        Ok(CreatedEvalKeyRecord {
+            key_id,
+            policy_id,
+            prefix: created.summary.prefix,
+        })
+    }
+
+    /// Revokes a key created through the eval-key endpoint (and disables its
+    /// pinned policy). `false` for unknown, non-eval, or already revoked keys.
+    pub(crate) fn revoke_eval_key(
+        &mut self,
+        key_id: &str,
+        actor: &ManagementActor,
+    ) -> Result<bool, AccessError> {
+        let now = Utc::now().timestamp();
+        let tx = self.connection.transaction().map_err(access_db)?;
+        let policy_id = tx
+            .query_row(
+                "SELECT e.policy_id FROM auth_eval_keys e JOIN auth_api_keys k ON k.id=e.key_id \
+                 WHERE e.key_id=?1 AND k.enabled=1",
+                [key_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(access_db)?;
+        let Some(policy_id) = policy_id else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE auth_api_keys SET enabled=0,revoked_at=?2 WHERE id=?1",
+            params![key_id, now],
+        )
+        .map_err(access_db)?;
+        tx.execute(
+            "UPDATE auth_policies SET enabled=0,updated_at=?2 WHERE id=?1",
+            params![policy_id, now],
+        )
+        .map_err(access_db)?;
+        tx.execute("UPDATE auth_dashboard_sessions SET revoked_at=?2,revoked_reason='key_revoked' WHERE key_id=?1 AND revoked_at IS NULL", params![key_id, now]).map_err(access_db)?;
+        tx.execute("DELETE FROM auth_sessions WHERE key_id=?1", [key_id])
+            .map_err(access_db)?;
+        bump_epoch(&tx).map_err(access_internal)?;
+        audit(
+            &tx,
+            &actor_name(actor),
+            "eval_key.revoked",
+            key_id,
+            "ok",
+            BTreeMap::new(),
+        )
+        .map_err(access_internal)?;
+        tx.commit().map_err(access_db)?;
+        Ok(true)
+    }
+
+    /// Updates any subset of a key's flags atomically. Returns `false` when
+    /// the key does not exist.
+    pub(crate) fn update_key_flags(
+        &mut self,
+        key_id: &str,
+        capture_payloads: Option<bool>,
+        reject_unknown_models: Option<bool>,
+        exact_max_tokens: Option<bool>,
+        actor: &ManagementActor,
+    ) -> Result<bool, String> {
+        let tx = self.connection.transaction().map_err(db)?;
+        let changed = tx
+            .execute(
+                "UPDATE auth_api_keys SET \
+                 capture_payloads=COALESCE(?2,capture_payloads), \
+                 reject_unknown_models=COALESCE(?3,reject_unknown_models), \
+                 exact_max_tokens=COALESCE(?4,exact_max_tokens) WHERE id=?1",
+                params![
+                    key_id,
+                    capture_payloads.map(i64::from),
+                    reject_unknown_models.map(i64::from),
+                    exact_max_tokens.map(i64::from)
+                ],
+            )
+            .map_err(db)?
+            > 0;
+        if changed {
+            bump_epoch(&tx)?;
+            let mut metadata = BTreeMap::new();
+            for (name, value) in [
+                ("capture_payloads", capture_payloads),
+                ("reject_unknown_models", reject_unknown_models),
+                ("exact_max_tokens", exact_max_tokens),
+            ] {
+                if let Some(value) = value {
+                    metadata.insert(name.into(), Value::Bool(value));
+                }
+            }
+            audit(
+                &tx,
+                &actor_name(actor),
+                "key.flags_updated",
+                key_id,
+                "ok",
+                metadata,
+            )?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(changed)
+    }
+
     pub fn list_keys(&self) -> Result<Vec<ApiKeySummary>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at,capture_payloads FROM auth_api_keys ORDER BY created_at DESC,id"
+            "SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at,capture_payloads,reject_unknown_models,exact_max_tokens FROM auth_api_keys ORDER BY created_at DESC,id"
         ).map_err(db)?;
         statement
             .query_map([], map_key)
@@ -489,7 +837,7 @@ impl AuthStore {
         let now = Utc::now().timestamp();
         let epoch = current_epoch(&self.connection)?;
         let mut stmt = self.connection.prepare(
-            "SELECT id,principal_id,prefix,hmac_sha256_digest,capture_payloads FROM auth_api_keys WHERE enabled=1 AND (expires_at IS NULL OR expires_at>?1)"
+            "SELECT id,principal_id,prefix,hmac_sha256_digest,capture_payloads,reject_unknown_models,exact_max_tokens FROM auth_api_keys WHERE enabled=1 AND (expires_at IS NULL OR expires_at>?1)"
         ).map_err(db)?;
         let credentials = stmt
             .query_map([now], |row| {
@@ -507,6 +855,8 @@ impl AuthStore {
                     prefix: row.get(2)?,
                     digest,
                     capture_payloads: row.get::<_, i64>(4)? != 0,
+                    reject_unknown_models: row.get::<_, i64>(5)? != 0,
+                    exact_max_tokens: row.get::<_, i64>(6)? != 0,
                 })
             })
             .map_err(db)?
@@ -820,7 +1170,10 @@ impl AuthStore {
                 self.revoke_session(actor, &id)?;
                 self.list_sessions().map(AccessResult::Sessions)
             }
-            AccessOperation::Usage => self.usage().map(AccessResult::Usage),
+            AccessOperation::Usage(query) if query.windowed => {
+                self.usage_page(&query).map(AccessResult::UsagePage)
+            }
+            AccessOperation::Usage(_) => self.usage().map(AccessResult::Usage),
             AccessOperation::Audit => self.audit_events().map(AccessResult::Audit),
             AccessOperation::Pricing => self.pricing().map(AccessResult::Pricing),
             AccessOperation::SyncPricing(_) => Err(AccessError::new(
@@ -833,7 +1186,10 @@ impl AuthStore {
             }
             AccessOperation::CreateApiKey(_)
             | AccessOperation::RotateApiKey(_)
-            | AccessOperation::UpdateApiKeyPayloadCapture(_, _) => Err(AccessError::new(
+            | AccessOperation::UpdateApiKeyPayloadCapture(_, _)
+            | AccessOperation::UpdateApiKey(_, _)
+            | AccessOperation::CreateEvalKey(_)
+            | AccessOperation::RevokeEvalKey(_) => Err(AccessError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "key secret operation must be handled by AuthzService",
             )),
@@ -1364,11 +1720,95 @@ impl AuthStore {
                     .get::<_, Option<i64>>(7)?
                     .map(|v| v as f64 / 1_000_000_000.0),
                 cost_confidence: r.get(8)?,
+                key_id: None,
+                served_model: None,
             })
         })
         .map_err(access_db)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(access_db)
+    }
+
+    /// Windowed, grouped and paginated usage. Rows are ordered by request
+    /// count (desc) then group key so pages are stable for a fixed window.
+    fn usage_page(
+        &self,
+        query: &crate::dashboard_access::UsageQuery,
+    ) -> Result<crate::dashboard_access::AccessUsagePage, AccessError> {
+        use crate::dashboard_access::UsageGroupBy;
+        let (dimension, select, group) = match query.group_by {
+            UsageGroupBy::Key => ("key", "key_id, NULL", "key_id"),
+            UsageGroupBy::ServedModel => ("served_model", "NULL, served_model", "served_model"),
+            UsageGroupBy::KeyAndServedModel => (
+                "key_and_served_model",
+                "key_id, served_model",
+                "key_id, served_model",
+            ),
+        };
+        let sql = format!(
+            "SELECT {select},COUNT(*),SUM(prompt_tokens),SUM(completion_tokens),SUM(cached_tokens),\
+             SUM(reasoning_tokens),SUM(cost_nano_usd),\
+             CASE WHEN SUM(CASE WHEN cost_confidence='estimated' THEN 1 ELSE 0 END)>0 THEN 'estimated' \
+             WHEN SUM(CASE WHEN cost_confidence='confident' THEN 1 ELSE 0 END)>0 THEN 'confident' \
+             ELSE 'unavailable' END \
+             FROM auth_usage_events \
+             WHERE (?1 IS NULL OR key_id=?1) AND (?2 IS NULL OR created_at_ms>=?2) \
+             AND (?3 IS NULL OR created_at_ms<?3) \
+             GROUP BY {group} ORDER BY COUNT(*) DESC, {group} LIMIT ?4 OFFSET ?5"
+        );
+        let mut stmt = self.connection.prepare(&sql).map_err(access_db)?;
+        let mut usage = stmt
+            .query_map(
+                params![
+                    query.key_id,
+                    query.since_ms,
+                    query.until_ms,
+                    i64::from(query.limit) + 1,
+                    i64::from(query.offset)
+                ],
+                |r| {
+                    let key_id: Option<String> = r.get(0)?;
+                    let served_model: Option<String> = r.get(1)?;
+                    let value = match query.group_by {
+                        UsageGroupBy::ServedModel => served_model.clone().unwrap_or_default(),
+                        _ => key_id.clone().unwrap_or_default(),
+                    };
+                    Ok(AccessUsageRow {
+                        dimension: dimension.to_string(),
+                        value,
+                        requests: r.get::<_, i64>(2)? as u64,
+                        prompt_tokens: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                        completion_tokens: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                        cached_tokens: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                        reasoning_tokens: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                        cost: r
+                            .get::<_, Option<i64>>(7)?
+                            .map(|v| v as f64 / 1_000_000_000.0),
+                        cost_confidence: r.get(8)?,
+                        key_id,
+                        served_model,
+                    })
+                },
+            )
+            .map_err(access_db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(access_db)?;
+        let next_offset = (usage.len() > query.limit as usize).then(|| {
+            usage.truncate(query.limit as usize);
+            query.offset.saturating_add(query.limit)
+        });
+        Ok(crate::dashboard_access::AccessUsagePage {
+            usage,
+            group_by: query.group_by,
+            window: crate::dashboard_access::AccessUsageWindow {
+                since_ms: query.since_ms,
+                until_ms: query.until_ms,
+            },
+            key_id: query.key_id.clone(),
+            limit: query.limit,
+            offset: query.offset,
+            next_offset,
+        })
     }
 
     fn audit_events(&self) -> Result<Vec<AccessAuditEvent>, AccessError> {
@@ -1486,11 +1926,12 @@ fn insert_key(
     digest: &[u8; 32],
     expires_at: Option<i64>,
     capture_payloads: bool,
+    eval: KeyEvalPolicy,
     now: i64,
 ) -> Result<CreatedApiKey, String> {
     let id = format!("key_{}", Uuid::new_v4().simple());
     let prefix = display_prefix(raw);
-    tx.execute("INSERT INTO auth_api_keys(id,principal_id,name,prefix,hmac_sha256_digest,enabled,created_at,expires_at,capture_payloads) VALUES(?1,?2,?3,?4,?5,1,?6,?7,?8)",params![id,principal_id,required(name,"name")?,prefix,digest.as_slice(),now,expires_at,i64::from(capture_payloads)]).map_err(db)?;
+    tx.execute("INSERT INTO auth_api_keys(id,principal_id,name,prefix,hmac_sha256_digest,enabled,created_at,expires_at,capture_payloads,reject_unknown_models,exact_max_tokens) VALUES(?1,?2,?3,?4,?5,1,?6,?7,?8,?9,?10)",params![id,principal_id,required(name,"name")?,prefix,digest.as_slice(),now,expires_at,i64::from(capture_payloads),i64::from(eval.reject_unknown_models),i64::from(eval.exact_max_tokens)]).map_err(db)?;
     Ok(CreatedApiKey {
         summary: ApiKeySummary {
             id,
@@ -1502,12 +1943,14 @@ fn insert_key(
             expires_at,
             last_used_at: None,
             capture_payloads,
+            reject_unknown_models: eval.reject_unknown_models,
+            exact_max_tokens: eval.exact_max_tokens,
         },
         raw_key: None,
     })
 }
 fn query_key(tx: &Transaction<'_>, id: &str) -> Result<Option<ApiKeySummary>, String> {
-    tx.query_row("SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at,capture_payloads FROM auth_api_keys WHERE id=?1",[id],map_key).optional().map_err(db)
+    tx.query_row("SELECT id,principal_id,name,prefix,enabled,created_at,expires_at,last_used_at,capture_payloads,reject_unknown_models,exact_max_tokens FROM auth_api_keys WHERE id=?1",[id],map_key).optional().map_err(db)
 }
 fn map_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeySummary> {
     Ok(ApiKeySummary {
@@ -1520,6 +1963,8 @@ fn map_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeySummary> {
         expires_at: r.get(6)?,
         last_used_at: r.get(7)?,
         capture_payloads: r.get::<_, i64>(8)? != 0,
+        reject_unknown_models: r.get::<_, i64>(9)? != 0,
+        exact_max_tokens: r.get::<_, i64>(10)? != 0,
     })
 }
 fn access_key(k: ApiKeySummary) -> AccessApiKey {
@@ -1533,6 +1978,8 @@ fn access_key(k: ApiKeySummary) -> AccessApiKey {
         expires_at: k.expires_at.map(timestamp),
         last_used_at: k.last_used_at.map(timestamp),
         capture_payloads: k.capture_payloads,
+        reject_unknown_models: k.reject_unknown_models,
+        exact_max_tokens: k.exact_max_tokens,
     }
 }
 
@@ -1541,11 +1988,20 @@ fn migrate_api_key_payload_capture(connection: &Connection) -> rusqlite::Result<
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<HashSet<_>, _>>()?;
-    if !columns.contains("capture_payloads") {
-        connection.execute(
-            "ALTER TABLE auth_api_keys ADD COLUMN capture_payloads INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
+    // Additive key flags; existing keys keep the historical behavior (0).
+    for column in [
+        "capture_payloads",
+        "reject_unknown_models",
+        "exact_max_tokens",
+    ] {
+        if !columns.contains(column) {
+            connection.execute(
+                &format!(
+                    "ALTER TABLE auth_api_keys ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                ),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -1676,6 +2132,8 @@ fn wire_permission_name(permission: WirePermission) -> &'static str {
         WirePermission::FleetModelsRead => "fleet.models.read",
         WirePermission::FleetModelsLoad => "fleet.models.load",
         WirePermission::FleetModelsUnload => "fleet.models.unload",
+        WirePermission::FleetModelsHold => "fleet.models.hold",
+        WirePermission::EvalKeysCreate => "auth.eval_keys.create",
     }
 }
 fn wire_permission(v: &str) -> Option<WirePermission> {
@@ -1687,7 +2145,7 @@ fn wire_permission(v: &str) -> Option<WirePermission> {
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS auth_principals(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN('user','service_account')),display_name TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS auth_api_keys(id TEXT PRIMARY KEY,principal_id TEXT NOT NULL REFERENCES auth_principals(id),name TEXT NOT NULL,prefix TEXT NOT NULL,hmac_sha256_digest BLOB NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,expires_at INTEGER,last_used_at INTEGER,revoked_at INTEGER,capture_payloads INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS auth_api_keys(id TEXT PRIMARY KEY,principal_id TEXT NOT NULL REFERENCES auth_principals(id),name TEXT NOT NULL,prefix TEXT NOT NULL,hmac_sha256_digest BLOB NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,expires_at INTEGER,last_used_at INTEGER,revoked_at INTEGER,capture_payloads INTEGER NOT NULL DEFAULT 0,reject_unknown_models INTEGER NOT NULL DEFAULT 0,exact_max_tokens INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS auth_api_keys_prefix_idx ON auth_api_keys(prefix);
 CREATE TABLE IF NOT EXISTS auth_groups(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS auth_group_members(group_id TEXT NOT NULL REFERENCES auth_groups(id) ON DELETE CASCADE,principal_id TEXT NOT NULL REFERENCES auth_principals(id) ON DELETE CASCADE,PRIMARY KEY(group_id,principal_id));
@@ -1702,9 +2160,10 @@ CREATE TABLE IF NOT EXISTS auth_time_windows(id TEXT PRIMARY KEY,policy_id TEXT 
 CREATE TABLE IF NOT EXISTS auth_limits(policy_id TEXT PRIMARY KEY REFERENCES auth_policies(id) ON DELETE CASCADE,max_concurrent_sessions INTEGER,max_daily_session_starts INTEGER,max_tokens_per_day INTEGER,max_cost_nanos_per_day INTEGER);
 CREATE TABLE IF NOT EXISTS auth_sessions(id TEXT PRIMARY KEY,key_id TEXT NOT NULL REFERENCES auth_api_keys(id),started_at INTEGER NOT NULL,expires_at INTEGER,endpoint TEXT NOT NULL,requested_model TEXT);
 CREATE TABLE IF NOT EXISTS auth_dashboard_sessions(session_id TEXT PRIMARY KEY,principal_id TEXT NOT NULL REFERENCES auth_principals(id),key_id TEXT NOT NULL REFERENCES auth_api_keys(id),csrf_secret_digest BLOB NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,policy_epoch_at_login INTEGER NOT NULL,revoked_at INTEGER,revoked_reason TEXT,last_seen_at INTEGER);
-CREATE TABLE IF NOT EXISTS auth_usage_events(auth_request_id TEXT PRIMARY KEY,api_call_id TEXT,key_id TEXT NOT NULL,principal_id TEXT NOT NULL,endpoint TEXT NOT NULL,requested_model TEXT,served_model TEXT,provider TEXT,route TEXT,status TEXT NOT NULL,prompt_tokens INTEGER,completion_tokens INTEGER,total_tokens INTEGER,cached_tokens INTEGER,reasoning_tokens INTEGER,cost_nano_usd INTEGER,cost_confidence TEXT NOT NULL DEFAULT 'unavailable',created_at_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_usage_events(auth_request_id TEXT PRIMARY KEY,api_call_id TEXT,key_id TEXT NOT NULL,principal_id TEXT NOT NULL,endpoint TEXT NOT NULL,requested_model TEXT,served_model TEXT,provider TEXT,route TEXT,status TEXT NOT NULL,prompt_tokens INTEGER,completion_tokens INTEGER,total_tokens INTEGER,cached_tokens INTEGER,reasoning_tokens INTEGER,cost_nano_usd INTEGER,cost_confidence TEXT NOT NULL DEFAULT 'unavailable',created_at_ms INTEGER NOT NULL,client_request_id TEXT);
 CREATE TABLE IF NOT EXISTS auth_audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,actor TEXT NOT NULL,action TEXT NOT NULL,target TEXT NOT NULL,outcome TEXT NOT NULL,metadata_json TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS auth_price_snapshots(model TEXT NOT NULL,provider TEXT NOT NULL,source TEXT NOT NULL,fetched_at INTEGER NOT NULL,input_per_1k TEXT NOT NULL,output_per_1k TEXT NOT NULL,confidence TEXT NOT NULL,PRIMARY KEY(model,provider));
+CREATE TABLE IF NOT EXISTS auth_eval_keys(key_id TEXT PRIMARY KEY REFERENCES auth_api_keys(id),policy_id TEXT NOT NULL REFERENCES auth_policies(id),created_by TEXT NOT NULL,created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS auth_policy_epoch(singleton INTEGER PRIMARY KEY CHECK(singleton=1),epoch INTEGER NOT NULL);
 INSERT OR IGNORE INTO auth_policy_epoch(singleton,epoch) VALUES(1,1);
 "#;
@@ -1737,6 +2196,8 @@ impl WirePermissionSet for WirePermission {
             WirePermission::FleetModelsRead,
             WirePermission::FleetModelsLoad,
             WirePermission::FleetModelsUnload,
+            WirePermission::FleetModelsHold,
+            WirePermission::EvalKeysCreate,
         ]
     }
 }

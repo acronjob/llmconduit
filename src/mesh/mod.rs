@@ -12,3 +12,5 @@ mod worker;
 
 pub use upstream::MeshUpstreamClient;
 pub use worker::run_worker;
+#[cfg(test)]
+pub(crate) use worker::spawn_test_fleet_worker;

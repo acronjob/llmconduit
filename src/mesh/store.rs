@@ -72,6 +72,33 @@ pub struct DisabledMeshModelRecord {
     pub disabled_at_ms: i64,
 }
 
+/// An unexpired lease that keeps a mesh Fleet profile from being unloaded (or
+/// stopped by a conflicting load) by anyone but its owner. `owner` is the
+/// management identity that created it (`bootstrap` or `key:<key_id>`); it is
+/// never returned to API callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelHoldRecord {
+    pub hold_id: String,
+    pub endpoint_id: String,
+    pub model_id: String,
+    pub holder: String,
+    pub owner: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateHoldOutcome {
+    Created(ModelHoldRecord),
+    /// The per-model active-hold cap was reached.
+    TooMany,
+}
+
+/// Upper bound on concurrently active holds for one `(endpoint, model)`.
+pub const MAX_ACTIVE_HOLDS_PER_MODEL: i64 = 32;
+/// Hold audit rows retained in the store (oldest pruned first).
+const MAX_HOLD_EVENTS: i64 = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKeyDecision {
     Accepted,
@@ -390,6 +417,223 @@ impl MeshStore {
         .await
     }
 
+    /// Active (unexpired at `now_ms`) holds, optionally narrowed to one
+    /// endpoint and/or model. Expired rows are pruned on the way.
+    pub async fn list_active_holds(
+        &self,
+        endpoint_id: Option<&str>,
+        model_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Vec<ModelHoldRecord>, StoreError> {
+        let endpoint_id = endpoint_id.map(str::to_string);
+        let model_id = model_id.map(str::to_string);
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM mesh_model_holds WHERE expires_at_ms <= ?1",
+                params![now_ms],
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT hold_id, endpoint_id, model_id, holder, owner, created_at_ms, expires_at_ms \
+                 FROM mesh_model_holds \
+                 WHERE expires_at_ms > ?1 \
+                   AND (?2 IS NULL OR endpoint_id = ?2) \
+                   AND (?3 IS NULL OR model_id = ?3) \
+                 ORDER BY endpoint_id ASC, model_id ASC, expires_at_ms ASC, hold_id ASC",
+            )?;
+            let rows = stmt.query_map(params![now_ms, endpoint_id, model_id], map_hold)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// One active hold by id, if it exists and has not expired.
+    pub async fn active_hold(
+        &self,
+        hold_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<ModelHoldRecord>, StoreError> {
+        let hold_id = hold_id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT hold_id, endpoint_id, model_id, holder, owner, created_at_ms, expires_at_ms \
+                 FROM mesh_model_holds WHERE hold_id = ?1 AND expires_at_ms > ?2",
+                params![hold_id, now_ms],
+                map_hold,
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn create_hold(
+        &self,
+        endpoint_id: &str,
+        model_id: &str,
+        holder: &str,
+        owner: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<CreateHoldOutcome, StoreError> {
+        let record = ModelHoldRecord {
+            hold_id: format!("hold_{}", Uuid::new_v4().simple()),
+            endpoint_id: endpoint_id.to_string(),
+            model_id: model_id.to_string(),
+            holder: holder.to_string(),
+            owner: owner.to_string(),
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(ttl_ms),
+        };
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM mesh_model_holds WHERE expires_at_ms <= ?1",
+                params![now_ms],
+            )?;
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM mesh_model_holds WHERE endpoint_id = ?1 AND model_id = ?2",
+                params![record.endpoint_id, record.model_id],
+                |row| row.get(0),
+            )?;
+            if active >= MAX_ACTIVE_HOLDS_PER_MODEL {
+                return Ok(CreateHoldOutcome::TooMany);
+            }
+            tx.execute(
+                "INSERT INTO mesh_model_holds \
+                 (hold_id, endpoint_id, model_id, holder, owner, created_at_ms, expires_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    record.hold_id,
+                    record.endpoint_id,
+                    record.model_id,
+                    record.holder,
+                    record.owner,
+                    record.created_at_ms,
+                    record.expires_at_ms
+                ],
+            )?;
+            insert_hold_event(&tx, &record, "created", &record.owner, None, now_ms)?;
+            tx.commit()?;
+            Ok(CreateHoldOutcome::Created(record))
+        })
+        .await
+    }
+
+    /// Extends an active hold to `now_ms + ttl_ms`. `None` when the hold does
+    /// not exist or already expired (an expired hold cannot be revived).
+    pub async fn renew_hold(
+        &self,
+        hold_id: &str,
+        actor: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<Option<ModelHoldRecord>, StoreError> {
+        let hold_id = hold_id.to_string();
+        let actor = actor.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let expires_at_ms = now_ms.saturating_add(ttl_ms);
+            let changed = tx.execute(
+                "UPDATE mesh_model_holds SET expires_at_ms = ?3 \
+                 WHERE hold_id = ?1 AND expires_at_ms > ?2",
+                params![hold_id, now_ms, expires_at_ms],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let record = tx.query_row(
+                "SELECT hold_id, endpoint_id, model_id, holder, owner, created_at_ms, expires_at_ms \
+                 FROM mesh_model_holds WHERE hold_id = ?1",
+                params![hold_id],
+                map_hold,
+            )?;
+            insert_hold_event(&tx, &record, "renewed", &actor, None, now_ms)?;
+            tx.commit()?;
+            Ok(Some(record))
+        })
+        .await
+    }
+
+    /// Deletes a hold. Returns the removed record when it was still active.
+    pub async fn release_hold(
+        &self,
+        hold_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<Option<ModelHoldRecord>, StoreError> {
+        let hold_id = hold_id.to_string();
+        let actor = actor.to_string();
+        let reason = reason.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let record = tx
+                .query_row(
+                    "SELECT hold_id, endpoint_id, model_id, holder, owner, created_at_ms, expires_at_ms \
+                     FROM mesh_model_holds WHERE hold_id = ?1 AND expires_at_ms > ?2",
+                    params![hold_id, now_ms],
+                    map_hold,
+                )
+                .optional()?;
+            tx.execute(
+                "DELETE FROM mesh_model_holds WHERE hold_id = ?1",
+                params![hold_id],
+            )?;
+            if let Some(record) = &record {
+                insert_hold_event(&tx, record, &reason, &actor, None, now_ms)?;
+            }
+            tx.commit()?;
+            Ok(record)
+        })
+        .await
+    }
+
+    /// Records an administrator override of active holds in the audit table.
+    pub async fn audit_hold_override(
+        &self,
+        holds: Vec<ModelHoldRecord>,
+        actor: &str,
+        action: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let actor = actor.to_string();
+        let action = action.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for record in &holds {
+                insert_hold_event(&tx, record, "force_override", &actor, Some(&action), now_ms)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Most recent hold audit rows, newest first (bounded by `limit`).
+    pub async fn list_hold_events(&self, limit: i64) -> Result<Vec<HoldEventRecord>, StoreError> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT hold_id, endpoint_id, model_id, action, actor, detail, created_at_ms \
+                 FROM mesh_model_hold_events ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| {
+                Ok(HoldEventRecord {
+                    hold_id: row.get(0)?,
+                    endpoint_id: row.get(1)?,
+                    model_id: row.get(2)?,
+                    action: row.get(3)?,
+                    actor: row.get(4)?,
+                    detail: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
     async fn with_conn<F, T>(&self, f: F) -> Result<T, StoreError>
     where
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
@@ -412,6 +656,47 @@ impl MeshStore {
         .await
         .map_err(StoreError::Join)?
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldEventRecord {
+    pub hold_id: String,
+    pub endpoint_id: String,
+    pub model_id: String,
+    pub action: String,
+    pub actor: String,
+    pub detail: Option<String>,
+    pub created_at_ms: i64,
+}
+
+fn insert_hold_event(
+    tx: &rusqlite::Transaction<'_>,
+    record: &ModelHoldRecord,
+    action: &str,
+    actor: &str,
+    detail: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO mesh_model_hold_events \
+         (hold_id, endpoint_id, model_id, action, actor, detail, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            record.hold_id,
+            record.endpoint_id,
+            record.model_id,
+            action,
+            actor,
+            detail,
+            now_ms
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM mesh_model_hold_events WHERE id <= \
+         (SELECT MAX(id) FROM mesh_model_hold_events) - ?1",
+        params![MAX_HOLD_EVENTS],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,6 +800,32 @@ CREATE TABLE IF NOT EXISTS mesh_disabled_models (
     disabled_at_ms INTEGER NOT NULL,
     PRIMARY KEY(endpoint_id, resource_id, model)
 );
+
+-- Model holds (eval-coordinator leases). Added additively: older binaries
+-- ignore these tables, and `CREATE ... IF NOT EXISTS` migrates existing stores.
+CREATE TABLE IF NOT EXISTS mesh_model_holds (
+    hold_id TEXT PRIMARY KEY,
+    endpoint_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS mesh_model_holds_target_idx
+    ON mesh_model_holds(endpoint_id, model_id, expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS mesh_model_hold_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hold_id TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    detail TEXT,
+    created_at_ms INTEGER NOT NULL
+);
 "#;
 
 pub fn now_ms() -> i64 {
@@ -558,6 +869,18 @@ fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeshNodeRecord> {
         joined_at_ms: row.get(3)?,
         join_key_id: row.get(4)?,
         last_seen_at_ms: row.get(5)?,
+    })
+}
+
+fn map_hold(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelHoldRecord> {
+    Ok(ModelHoldRecord {
+        hold_id: row.get(0)?,
+        endpoint_id: row.get(1)?,
+        model_id: row.get(2)?,
+        holder: row.get(3)?,
+        owner: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        expires_at_ms: row.get(6)?,
     })
 }
 
@@ -862,6 +1185,120 @@ mod tests {
         );
         assert!(store.list_disabled_models().await.expect("list").is_empty());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn holds_expire_by_ttl_and_survive_reopen() {
+        let path = temp_db("holds");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let CreateHoldOutcome::Created(hold) = store
+            .create_hold("node", "qwen", "harbor/run-1", "key:key_a", 60_000, 1_000)
+            .await
+            .expect("create")
+        else {
+            panic!("hold should be created");
+        };
+        assert!(hold.hold_id.starts_with("hold_"));
+        assert_eq!(hold.expires_at_ms, 61_000);
+        drop(store);
+
+        // A controller restart reopens the same database: the hold persists.
+        let reopened = MeshStore::open(&path).await.expect("reopen store");
+        let active = reopened
+            .list_active_holds(Some("node"), Some("qwen"), 2_000)
+            .await
+            .expect("list");
+        assert_eq!(active, vec![hold.clone()]);
+        assert_eq!(
+            reopened.active_hold(&hold.hold_id, 2_000).await.unwrap(),
+            Some(hold.clone())
+        );
+        // Other models and endpoints are unaffected.
+        assert!(
+            reopened
+                .list_active_holds(Some("node"), Some("other"), 2_000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Renewal extends from "now"; an expired hold can neither be renewed
+        // nor seen.
+        let renewed = reopened
+            .renew_hold(&hold.hold_id, "key:key_a", 120_000, 30_000)
+            .await
+            .unwrap()
+            .expect("renewed");
+        assert_eq!(renewed.expires_at_ms, 150_000);
+        assert!(
+            reopened
+                .list_active_holds(None, None, 150_000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .renew_hold(&hold.hold_id, "key:key_a", 60_000, 150_001)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened.active_hold(&hold.hold_id, 150_000).await.unwrap(),
+            None
+        );
+
+        let events = reopened.list_hold_events(10).await.unwrap();
+        let actions: Vec<_> = events.iter().map(|event| event.action.as_str()).collect();
+        assert_eq!(actions, vec!["renewed", "created"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn hold_release_is_audited_and_capped_per_model() {
+        let path = temp_db("hold-release");
+        let store = MeshStore::open(&path).await.expect("open store");
+        let mut ids = Vec::new();
+        for index in 0..MAX_ACTIVE_HOLDS_PER_MODEL {
+            match store
+                .create_hold("node", "qwen", &format!("h{index}"), "bootstrap", 60_000, 1)
+                .await
+                .unwrap()
+            {
+                CreateHoldOutcome::Created(hold) => ids.push(hold.hold_id),
+                CreateHoldOutcome::TooMany => panic!("below the cap"),
+            }
+        }
+        assert_eq!(
+            store
+                .create_hold("node", "qwen", "one-too-many", "bootstrap", 60_000, 1)
+                .await
+                .unwrap(),
+            CreateHoldOutcome::TooMany
+        );
+        let released = store
+            .release_hold(&ids[0], "bootstrap", "released", 2)
+            .await
+            .unwrap()
+            .expect("released");
+        assert_eq!(released.hold_id, ids[0]);
+        assert_eq!(
+            store
+                .release_hold(&ids[0], "bootstrap", "released", 3)
+                .await
+                .unwrap(),
+            None
+        );
+        store
+            .audit_hold_override(vec![released], "bootstrap", "unload", 4)
+            .await
+            .unwrap();
+        let events = store.list_hold_events(2).await.unwrap();
+        assert_eq!(events[0].action, "force_override");
+        assert_eq!(events[0].detail.as_deref(), Some("unload"));
+        assert_eq!(events[1].action, "released");
         let _ = std::fs::remove_file(path);
     }
 }

@@ -1247,9 +1247,11 @@ impl Gateway {
             let rates = crate::usage_accounting::UsageRates::from_model_price(price)?;
             crate::usage_accounting::charge_for_usage(usage, rates)
         });
+        let api_call_id = api_call_id.or_else(|| context.api_call_id().map(str::to_owned));
         let event = crate::usage_accounting::UsageEvent {
             auth_request_id: context.auth_request_id.clone(),
             api_call_id,
+            client_request_id: context.client_request_id().map(str::to_owned),
             key_id: context.key_id.clone(),
             principal_id: context.principal_id.clone(),
             endpoint: inference_endpoint_name(endpoint).to_string(),
@@ -1466,10 +1468,23 @@ impl Gateway {
         &self,
         request_model: &str,
     ) -> AppResult<(String, bool)> {
+        self.checked_resolve_request_model_for(request_model, None)
+            .await
+    }
+
+    /// Like [`Self::checked_resolve_request_model`], additionally honoring the
+    /// authenticated key's `reject_unknown_models` flag: a model no upstream
+    /// serves is a 404 for that key even under the global passthrough policy.
+    pub async fn checked_resolve_request_model_for(
+        &self,
+        request_model: &str,
+        auth: Option<&crate::authz::AuthContext>,
+    ) -> AppResult<(String, bool)> {
         let resolved = self.resolve_request_model(request_model).await;
-        if self.operational_unknown_model_policy == crate::control_plane::UnknownModelPolicy::Reject
-            && !resolved.1
-        {
+        let reject = self.operational_unknown_model_policy
+            == crate::control_plane::UnknownModelPolicy::Reject
+            || auth.is_some_and(crate::authz::AuthContext::reject_unknown_models);
+        if reject && !resolved.1 {
             return Err(AppError::not_found(
                 "requested model is not currently routable",
             ));
@@ -1810,8 +1825,9 @@ impl Gateway {
         // model the leaf records as `model_served`. Stamped onto the record via
         // `set_normalized` below alongside the normalized canonical body.
         let model_requested = request.model.clone();
-        let (resolved_model, request_genuine) =
-            self.checked_resolve_request_model(&request.model).await?;
+        let (resolved_model, request_genuine) = self
+            .checked_resolve_request_model_for(&request.model, auth_context.as_ref())
+            .await?;
         // F1c: stamp the resolved/served model onto the capture outcome metadata now
         // that resolution has settled (absent for a turn that fails before here).
         if let Some(guard) = &capture_guard {
@@ -2080,7 +2096,12 @@ impl Gateway {
         // finding.
         let estimated_input_tokens =
             estimate_input_tokens(&lowered, self.config.flatten_content, &resolved_model);
-        if let Some(limit) = limit {
+        // `exact_max_tokens` keys never have their explicit budget capped: an
+        // eval must run with exactly the requested `max_tokens` or fail.
+        let exact_max_tokens = auth_context
+            .as_ref()
+            .is_some_and(crate::authz::AuthContext::exact_max_tokens);
+        if let Some(limit) = limit.filter(|_| !exact_max_tokens) {
             match budget_explicit_max_output_tokens(
                 request.max_output_tokens,
                 limit,

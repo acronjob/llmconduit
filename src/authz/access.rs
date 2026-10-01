@@ -55,6 +55,9 @@ impl AuthzService {
                 | AccessOperation::RevokeApiKey(_)
                 | AccessOperation::RotateApiKey(_)
                 | AccessOperation::UpdateApiKeyPayloadCapture(_, _)
+                | AccessOperation::UpdateApiKey(_, _)
+                | AccessOperation::CreateEvalKey(_)
+                | AccessOperation::RevokeEvalKey(_)
                 | AccessOperation::RevokeSession(_)
                 | AccessOperation::WritePricing(_)
         );
@@ -77,6 +80,10 @@ impl AuthzService {
                         &digest,
                         expires_at,
                         body.capture_payloads,
+                        super::store::KeyEvalPolicy {
+                            reject_unknown_models: body.reject_unknown_models,
+                            exact_max_tokens: body.exact_max_tokens,
+                        },
                         actor,
                     )
                     .map_err(internal)?;
@@ -94,6 +101,60 @@ impl AuthzService {
             AccessOperation::UpdateApiKeyPayloadCapture(id, capture_payloads) => {
                 if !store
                     .set_key_payload_capture(&id, capture_payloads, actor)
+                    .map_err(internal)?
+                {
+                    return Err(AccessError::new(StatusCode::NOT_FOUND, "API key not found"));
+                }
+                store.list_access_keys().map(AccessResult::ApiKeys)
+            }
+            AccessOperation::CreateEvalKey(body) => {
+                let spec = super::store::EvalKeySpec::validate(body, Utc::now())?;
+                let generated = generate_api_key(&inner.pepper);
+                let raw = generated.expose_once();
+                let digest = inner.pepper.digest(&raw);
+                let created = store.create_eval_key(&spec, &raw, &digest, actor)?;
+                Ok(AccessResult::CreatedEvalKey(
+                    crate::dashboard_access::CreatedEvalKey {
+                        key_id: created.key_id,
+                        policy_id: created.policy_id,
+                        raw_key: raw,
+                        prefix: created.prefix,
+                        principal_id: spec.principal_id,
+                        name: spec.name,
+                        requested_model: spec.requested_model,
+                        served_model: spec.served_model,
+                        endpoints: vec!["chat".into(), "models".into()],
+                        max_concurrent_sessions: spec.max_concurrent_sessions,
+                        expires_at: timestamp(spec.expires_at),
+                        capture_payloads: false,
+                        reject_unknown_models: spec.eval.reject_unknown_models,
+                        exact_max_tokens: spec.eval.exact_max_tokens,
+                    },
+                ))
+            }
+            AccessOperation::RevokeEvalKey(id) => {
+                if !store.revoke_eval_key(&id, actor)? {
+                    return Err(AccessError::new(
+                        StatusCode::NOT_FOUND,
+                        "eval key not found or already revoked",
+                    ));
+                }
+                Ok(AccessResult::RevokedEvalKey(
+                    crate::dashboard_access::RevokedEvalKey {
+                        key_id: id,
+                        revoked: true,
+                    },
+                ))
+            }
+            AccessOperation::UpdateApiKey(id, body) => {
+                if !store
+                    .update_key_flags(
+                        &id,
+                        body.capture_payloads,
+                        body.reject_unknown_models,
+                        body.exact_max_tokens,
+                        actor,
+                    )
                     .map_err(internal)?
                 {
                     return Err(AccessError::new(StatusCode::NOT_FOUND, "API key not found"));
@@ -142,7 +203,21 @@ fn disabled_access_result(
         AccessOperation::ListPolicies => AccessResult::Policies(Vec::new()),
         AccessOperation::ListApiKeys => AccessResult::ApiKeys(Vec::new()),
         AccessOperation::ListSessions => AccessResult::Sessions(Vec::new()),
-        AccessOperation::Usage => AccessResult::Usage(Vec::new()),
+        AccessOperation::Usage(query) if query.windowed => {
+            AccessResult::UsagePage(crate::dashboard_access::AccessUsagePage {
+                usage: Vec::new(),
+                group_by: query.group_by,
+                window: crate::dashboard_access::AccessUsageWindow {
+                    since_ms: query.since_ms,
+                    until_ms: query.until_ms,
+                },
+                key_id: query.key_id,
+                limit: query.limit,
+                offset: query.offset,
+                next_offset: None,
+            })
+        }
+        AccessOperation::Usage(_) => AccessResult::Usage(Vec::new()),
         AccessOperation::Audit => AccessResult::Audit(Vec::new()),
         AccessOperation::Pricing => AccessResult::Pricing(Vec::new()),
         _ => {
@@ -168,6 +243,8 @@ fn created_access(created: super::CreatedApiKey, raw_key: String) -> CreatedAcce
             expires_at: key.expires_at.map(timestamp),
             last_used_at: key.last_used_at.map(timestamp),
             capture_payloads: key.capture_payloads,
+            reject_unknown_models: key.reject_unknown_models,
+            exact_max_tokens: key.exact_max_tokens,
         },
         raw_key,
     }
@@ -219,6 +296,8 @@ pub(crate) fn wire_permission(permission: ManagementPermission) -> Option<WirePe
         ManagementPermission::FleetModelsRead => WirePermission::FleetModelsRead,
         ManagementPermission::FleetModelsLoad => WirePermission::FleetModelsLoad,
         ManagementPermission::FleetModelsUnload => WirePermission::FleetModelsUnload,
+        ManagementPermission::FleetModelsHold => WirePermission::FleetModelsHold,
+        ManagementPermission::EvalKeysCreate => WirePermission::EvalKeysCreate,
     })
 }
 
@@ -388,6 +467,8 @@ mod tests {
                     name: "primary".into(),
                     expires_at: None,
                     capture_payloads: false,
+                    reject_unknown_models: false,
+                    exact_max_tokens: false,
                 }),
             )
             .unwrap();
@@ -469,7 +550,10 @@ mod tests {
             Ok(AccessResult::ApiKeys(_))
         ));
         assert!(matches!(
-            service.dispatch_access(&actor, AccessOperation::Usage),
+            service.dispatch_access(
+                &actor,
+                AccessOperation::Usage(crate::dashboard_access::UsageQuery::legacy())
+            ),
             Ok(AccessResult::Usage(_))
         ));
         assert!(matches!(

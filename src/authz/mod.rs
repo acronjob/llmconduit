@@ -28,9 +28,44 @@ pub struct AuthContext {
     policy: Arc<PolicySnapshot>,
     usage_admission: Option<UsageAdmission>,
     capture_payloads: bool,
+    /// Per-key eval safety flags (see `AuthorizationScope`).
+    reject_unknown_models: bool,
+    exact_max_tokens: bool,
+    /// Ingress correlation attached by the HTTP layer: the gateway's
+    /// `api_call_id` and the client's validated `X-Request-ID`.
+    api_call_id: Option<String>,
+    client_request_id: Option<String>,
 }
 
 impl AuthContext {
+    /// Attach the ingress correlation ids so terminal usage rows carry them
+    /// even when no flow/persistence seam minted an `ApiCallId` extension.
+    pub fn with_request_correlation(
+        mut self,
+        api_call_id: impl Into<String>,
+        client_request_id: Option<String>,
+    ) -> Self {
+        self.api_call_id = Some(api_call_id.into());
+        self.client_request_id = client_request_id;
+        self
+    }
+
+    pub fn api_call_id(&self) -> Option<&str> {
+        self.api_call_id.as_deref()
+    }
+
+    pub fn client_request_id(&self) -> Option<&str> {
+        self.client_request_id.as_deref()
+    }
+
+    pub fn reject_unknown_models(&self) -> bool {
+        self.reject_unknown_models
+    }
+
+    pub fn exact_max_tokens(&self) -> bool {
+        self.exact_max_tokens
+    }
+
     pub fn management_actor(&self) -> crate::dashboard_access::ManagementActor {
         if self.key_id == "key_bootstrap" {
             return crate::dashboard_access::ManagementActor::Bootstrap;
@@ -81,7 +116,8 @@ impl AuthContext {
                 inference_endpoint(candidate_endpoint) == policy_endpoint
                     && scope.allows_candidate(Some(provider_id), route_id, Some(served_model))
             },
-        ))
+        )
+        .with_eval_policy(self.reject_unknown_models, self.exact_max_tokens))
     }
 
     pub fn effective_limits(&self) -> LimitSet {
@@ -405,6 +441,10 @@ impl AuthzService {
             policy: Arc::clone(&authority.policy),
             usage_admission: Some(usage_admission),
             capture_payloads: credential.capture_payloads,
+            reject_unknown_models: credential.reject_unknown_models,
+            exact_max_tokens: credential.exact_max_tokens,
+            api_call_id: None,
+            client_request_id: None,
         }))
     }
 
@@ -591,11 +631,14 @@ impl AuthzService {
             .read()
             .map_err(|_| AuthError::PolicyUnavailable)?
             .clone();
-        let capture_payloads = authority
+        let credential = authority
             .credentials
             .iter()
-            .find(|credential| credential.id == session.key_id)
-            .is_some_and(|credential| credential.capture_payloads);
+            .find(|credential| credential.id == session.key_id);
+        let capture_payloads = credential.is_some_and(|credential| credential.capture_payloads);
+        let reject_unknown_models =
+            credential.is_some_and(|credential| credential.reject_unknown_models);
+        let exact_max_tokens = credential.is_some_and(|credential| credential.exact_max_tokens);
         let identity = PolicyIdentity {
             request_id: AuthRequestId::new(),
             key_id: session.key_id,
@@ -615,6 +658,10 @@ impl AuthzService {
             policy: Arc::clone(&authority.policy),
             usage_admission: Some(usage_admission),
             capture_payloads,
+            reject_unknown_models,
+            exact_max_tokens,
+            api_call_id: None,
+            client_request_id: None,
         }))
     }
 
@@ -1142,6 +1189,10 @@ mod tests {
             policy,
             usage_admission: None,
             capture_payloads: false,
+            reject_unknown_models: false,
+            exact_max_tokens: false,
+            api_call_id: None,
+            client_request_id: None,
         };
 
         let scope = context
@@ -1275,6 +1326,7 @@ mod tests {
         let event = crate::usage_accounting::UsageEvent {
             auth_request_id: context.auth_request_id.clone(),
             api_call_id: None,
+            client_request_id: None,
             key_id: context.key_id.clone(),
             principal_id: context.principal_id.clone(),
             endpoint: "completions".into(),

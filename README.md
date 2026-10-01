@@ -380,7 +380,8 @@ disable its node or revoke its enrollment key instead. Mesh enrollment and
 routing administration is restricted to bootstrap dashboard sessions and
 administrator user sessions. The mesh-state read and remote Fleet model
 lifecycle endpoints additionally accept delegated management credentials with
-the corresponding `fleet.models.*` permission. Mutations retain the dashboard's
+the corresponding `fleet.models.*` permission (`fleet.models.hold` for model
+holds; see [Eval coordinators](#eval-coordinators)). Mutations retain the dashboard's
 existing CSRF and mutation-policy checks.
 
 A downstream mesh worker that has local Fleet configured also advertises its
@@ -410,6 +411,113 @@ Mesh enrollment and disabled-model state remains in the mesh controller's
 dedicated SQLite database. `control_plane.storage: postgres` stores dashboard
 accounts, API keys, request history, and metrics; it intentionally does not move
 mesh identity state or Access RBAC state into PostgreSQL.
+
+### Eval coordinators
+
+These additions let an automated evaluation coordinator (for example Harbor)
+drive mesh Fleet profiles and attribute inference exactly. All are additive:
+existing clients, response shapes and the legacy harness are unchanged.
+
+**Model holds (leases).** A hold keeps a mesh Fleet profile from being
+unloaded underneath a running evaluation.
+
+- `POST /dashboard/api/mesh/nodes/{endpoint_id}/models/{model_id}/holds` with
+  `{"holder": "harbor/run-42", "ttl_secs": 3600}` returns `201`
+  `{hold_id, holder, expires_at_ms, endpoint_id, model_id, created_at_ms}`.
+  `holder` is 1-128 characters of `[A-Za-z0-9._:@/-]`; `ttl_secs` is 60-86400.
+  The node must be enrolled and, when its worker is connected, advertise the
+  profile. At most 32 active holds per profile (`409 too_many_holds`).
+- `POST …/holds/{hold_id}/renew` with `{"ttl_secs": N}` extends the lease to
+  now + N; `DELETE …/holds/{hold_id}` releases it; `GET …/holds` lists active
+  holds. Renew and release are limited to the credential that created the
+  hold (`403 hold_not_owned`); an unknown or expired hold is `404`.
+- While an unexpired hold exists, `unload` of that profile, and a
+  `load`/`switch` of another profile that would make Fleet stop it (the held
+  profile is active and the worker is not visibly running concurrent
+  deployments), return `409 {"error", "code": "model_held", "holders": [...]}`.
+  The owner passes `?release_hold=<hold_id>` (repeatable or comma separated) to
+  unload or switch away from its own profile; the hold is deleted once the
+  worker accepts the change (`released_holds` in the response). Loading or
+  rescaling the held profile itself never conflicts.
+- An administrator dashboard session may add `?force=true` to override holds
+  (and to release another credential's hold). API keys and delegated sessions
+  cannot. Every hold change and override is recorded in the mesh store's
+  `mesh_model_hold_events` table and logged.
+- Holds live in the mesh controller's SQLite store (`mesh_model_holds`), so
+  they survive a controller restart and expire by TTL. `GET /dashboard/api/mesh`
+  shows them per model (`holds: [{hold_id, holder, expires_at_ms}]`) and in a
+  top-level `model_holds` list. Holds are coordination, not a security
+  boundary against an administrator.
+- Permission `fleet.models.hold` creates, renews and releases holds; reads
+  need `fleet.models.read`.
+
+**Lifecycle operations.** Mesh `load`/`switch`/`unload` responses keep
+`accepted`, `changed` and `error` and add an optional
+`operation: {id, state, error, kind?, model_id?, ...}` when the worker reports
+the Fleet operation it started or joined (absent for no-ops and for older
+workers). `GET /dashboard/api/mesh/nodes/{endpoint_id}/operations/{operation_id}`
+(`fleet.models.read`) relays Fleet's `GET /v1/operations/{id}` over the mesh and
+returns `{endpoint_id, operation}`; `404 operation_not_found` once Fleet has
+forgotten it, and `501 worker_unsupported` for workers that predate the
+`fleet_operations` capability. Workers advertise the capability in their hello;
+the hub never sends older workers the new stream type.
+
+Mesh lifecycle errors carry a machine-readable `code` next to the unchanged
+`error` message: `model_held`, `operation_in_progress`,
+`insufficient_resources`, `fleet_conflict`, `model_not_found`,
+`model_not_switchable`, `switching_unsupported`, `fleet_rejected`,
+`fleet_unavailable`, `fleet_timeout`, `worker_disconnected`, `worker_stale`,
+`worker_timeout`, `worker_unreachable`, `mesh_error`.
+
+**Request correlation.** Every `/v1/*` response carries
+`x-llmconduit-request-id: <api_call_id>` (also on streaming responses, in the
+initial headers). A client may send `X-Request-ID` (1-128 characters of
+`[A-Za-z0-9._:-]`, once); it is echoed back as `x-request-id`, stored with the
+request history row (`requests.client_request_id`) and the per-key usage row
+(`auth_usage_events.client_request_id`, next to `api_call_id`). A malformed
+value is rejected with `400` (`code: invalid_request_id`).
+
+**Windowed usage.** `GET /dashboard/api/auth/usage` (`auth.usage.read`)
+without parameters keeps its lifetime-per-key `{usage}` response. Any of
+`key_id`, `since_ms` (inclusive), `until_ms` (exclusive), `group_by`
+(`key` default, `served_model`, `key_and_served_model`), `limit` (1-1000,
+default 500) and `offset` switches to a page:
+`{usage, group_by, window: {since_ms, until_ms}, key_id?, limit, offset,
+next_offset}`. Windowed rows add `key_id` and/or `served_model`. Times are the
+request's terminal time in epoch milliseconds.
+
+**Per-key eval safety flags.** API keys have two flags, both `false` by
+default, settable at creation (`POST /dashboard/api/auth/api-keys`) and with
+`PATCH /dashboard/api/auth/api-keys/{id}` (`auth.keys.create`):
+
+- `reject_unknown_models`: a requested model that no upstream serves returns
+  `404` for this key even when `unknown_model_policy` is `passthrough`.
+- `exact_max_tokens`: the gateway never reduces this key's `max_tokens`,
+  neither the pre-flight context-window cap nor the shrink-and-retry after a
+  context overflow; the upstream's error is returned instead.
+
+**Eval run keys.** `POST /dashboard/api/auth/eval-keys`
+(`auth.eval_keys.create`) atomically creates one key and one allow policy:
+
+```json
+{"principal_id": "usr_…", "name": "run-42", "served_model": "qwen3-32b",
+ "requested_model": "qwen3-32b", "max_concurrent_sessions": 8,
+ "expires_at": "2026-10-02T00:00:00Z",
+ "reject_unknown_models": true, "exact_max_tokens": true}
+```
+
+The policy grants only the `chat` and `models` endpoints, the exact requested
+and served model (globs are refused), the session limit and a window ending at
+`expires_at` (at most 7 days ahead). Payload capture is always off. The
+principal must be an enabled service account with no group, role or policy
+bindings, so the key inherits nothing else. The `201` response returns
+`{key_id, policy_id, raw_key, prefix, principal_id, name, requested_model,
+served_model, endpoints, max_concurrent_sessions, expires_at,
+capture_payloads, reject_unknown_models, exact_max_tokens}`; `raw_key` is shown
+once. `POST /dashboard/api/auth/eval-keys/{key_id}/revoke` revokes only keys
+created this way (and disables their policy), returning
+`{key_id, revoked: true}`. The permission does not let the caller create
+general policies or keys.
 
 ### Upstream engine metrics and throughput
 
@@ -1093,6 +1201,13 @@ server-side and are never returned to the browser.
 | `GET /dashboard/api/mesh` | Mesh state, including remote Fleet model load state; requires administrator access or `fleet.models.read` |
 | `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/switch`, `/load` | Load an exactly advertised model on a connected Fleet-capable mesh worker; requires administrator access or `fleet.models.load` |
 | `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/unload` | Unload an exactly advertised model on a connected Fleet-capable mesh worker; requires administrator access or `fleet.models.unload` |
+| `GET /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/holds` | Active holds (leases) on a mesh Fleet profile; requires administrator access or `fleet.models.read` |
+| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/holds` | Create a hold (`{"holder","ttl_secs"}` → `201`); requires administrator access or `fleet.models.hold` |
+| `POST /dashboard/api/mesh/nodes/:endpoint_id/models/:model_id/holds/:hold_id/renew`, `DELETE …/holds/:hold_id` | Renew (`{"ttl_secs"}`) or release the caller's own hold; requires administrator access or `fleet.models.hold` |
+| `GET /dashboard/api/mesh/nodes/:endpoint_id/operations/:operation_id` | A Fleet lifecycle operation relayed from the worker; requires administrator access or `fleet.models.read` |
+| `GET /dashboard/api/auth/usage` | Per-key usage; optional `key_id`, `since_ms`, `until_ms`, `group_by`, `limit`, `offset` (see [Eval coordinators](#eval-coordinators)); requires `auth.usage.read` |
+| `PATCH /dashboard/api/auth/api-keys/:id` | Update key flags (`capture_payloads`, `reject_unknown_models`, `exact_max_tokens`); requires `auth.keys.create` |
+| `POST /dashboard/api/auth/eval-keys`, `POST /dashboard/api/auth/eval-keys/:id/revoke` | Mint or revoke a pinned eval run key; requires `auth.eval_keys.create` |
 | `GET /dashboard/api/me`, `/users`, `/keys` (+ `POST`/`PATCH`/`DELETE`) | Authenticated accounts API: the current user, user administration, API keys |
 | `GET /dashboard/auth/github/start`, `GET /dashboard/auth/github/callback`, `POST /dashboard/logout` | GitHub SSO dashboard session (signed state + PKCE; session and CSRF cookies) |
 | `GET /dashboard/ws`, `GET /debug/ws` | Authenticated WebSocket feeds behind the dashboard and debug UI |

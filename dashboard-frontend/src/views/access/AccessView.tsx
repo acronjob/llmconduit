@@ -37,7 +37,8 @@ const managementPermissions: ManagementPermission[] = [
   'auth.roles.read', 'auth.roles.write', 'auth.policies.read', 'auth.policies.write',
   'auth.usage.read', 'auth.audit.read', 'auth.pricing.read', 'auth.pricing.sync',
   'auth.pricing.write', 'auth.sessions.read', 'auth.sessions.terminate',
-  'fleet.models.read', 'fleet.models.load', 'fleet.models.unload',
+  'fleet.models.read', 'fleet.models.load', 'fleet.models.unload', 'fleet.models.hold',
+  'auth.eval_keys.create',
 ];
 const accessTabs = ['overview', 'keys', 'people', 'policies', 'administration', 'sessions', 'audit'] as const;
 type AccessTab = typeof accessTabs[number];

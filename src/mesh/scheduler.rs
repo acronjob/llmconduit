@@ -55,6 +55,7 @@ mod tests {
             }],
             model_switching: None,
             request_encodings: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 

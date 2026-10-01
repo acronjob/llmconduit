@@ -1183,6 +1183,20 @@ export interface MeshSwitchableModel {
   instances?: FleetInstanceStatus[];
   container_status?: string;
   last_error?: string;
+  /** Active eval-coordinator leases on this profile (older servers omit it). */
+  holds?: MeshModelHoldSummary[];
+}
+
+export interface MeshModelHoldSummary {
+  hold_id: string;
+  holder: string;
+  expires_at_ms: number;
+}
+
+export interface MeshModelHold extends MeshModelHoldSummary {
+  endpoint_id: string;
+  model_id: string;
+  created_at_ms: number;
 }
 
 export interface MeshDisabledModel {
@@ -1196,6 +1210,8 @@ export interface MeshAdminState {
   join_keys: MeshJoinKey[];
   nodes: MeshNode[];
   disabled_models: MeshDisabledModel[];
+  /** Every active hold, including holds on offline workers (older servers omit it). */
+  model_holds?: MeshModelHold[];
 }
 
 export interface CreateMeshJoinKeyRequest {
@@ -1439,7 +1455,9 @@ export type ManagementPermission =
   | 'auth.sessions.terminate'
   | 'fleet.models.read'
   | 'fleet.models.load'
-  | 'fleet.models.unload';
+  | 'fleet.models.unload'
+  | 'fleet.models.hold'
+  | 'auth.eval_keys.create';
 
 export interface AuthSummary {
   enabled: boolean;
@@ -1518,6 +1536,10 @@ export interface AuthApiKey {
   expires_at: string | null;
   last_used_at: string | null;
   capture_payloads: boolean;
+  /** Eval safety: unknown models are a 404 for this key (no passthrough fallback). Older servers omit it. */
+  reject_unknown_models?: boolean;
+  /** Eval safety: the gateway never reduces this key's max_tokens. Older servers omit it. */
+  exact_max_tokens?: boolean;
 }
 
 /** Returned only by create/rotate. `raw_key` must never be persisted or fetched later. */
@@ -1596,6 +1618,8 @@ export interface CreateAuthApiKeyRequest {
   name: string;
   expires_at?: string | null;
   capture_payloads?: boolean;
+  reject_unknown_models?: boolean;
+  exact_max_tokens?: boolean;
 }
 export interface CreateAuthPolicyRequest {
   name: string;

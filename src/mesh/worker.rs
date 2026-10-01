@@ -5,9 +5,13 @@ use crate::config::{
 use crate::error::{AppError, AppResult};
 use crate::mesh::capacity::CapacityGate;
 use crate::mesh::identity::load_or_create;
-use crate::mesh::io::{Admission, read_stream_open, write_admission, write_switch_response};
+use crate::mesh::io::{
+    Admission, read_stream_open, write_admission, write_fleet_operation_response,
+    write_switch_response,
+};
 use crate::mesh::protocol::{
-    AdmissionRejectCode, ENROLL_ALPN, EnrollRequest, EnrollResponse, Heartbeat, HubToWorker,
+    AdmissionRejectCode, CAPABILITY_FLEET_OPERATIONS, ENROLL_ALPN, EnrollRequest, EnrollResponse,
+    FleetOperationRequest, FleetOperationResponse, Heartbeat, HubToWorker, LifecycleOperation,
     MAX_CAPACITY_PER_RESOURCE, ModelAdvertisement, ModelLifecycleAction,
     ModelSwitchingAdvertisement, PROTOCOL_VERSION, REQUEST_ENCODING_ZSTD, ResourceAdvertisement,
     ResourceRuntimeState, StreamOpen, SwitchModelRequest, SwitchModelResponse,
@@ -117,6 +121,11 @@ impl WorkerRuntime {
             resources,
             model_switching: self.model_switching.lock().await.clone(),
             request_encodings: vec![REQUEST_ENCODING_ZSTD.to_string()],
+            capabilities: if self.fleet.is_some() {
+                vec![CAPABILITY_FLEET_OPERATIONS.to_string()]
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -581,6 +590,7 @@ pub(super) async fn handle_stream(
         StreamOpen::UnloadModel(request) => {
             handle_switch_model(send, runtime, request, ModelLifecycleAction::Unload).await
         }
+        StreamOpen::FleetOperation(request) => handle_fleet_operation(send, runtime, request).await,
     }
 }
 
@@ -1000,9 +1010,12 @@ async fn handle_switch_model(
         error: None,
         model_switching: None,
         error_status: None,
+        error_code: None,
+        operation: None,
     };
     let Some(fleet) = runtime.fleet.as_ref() else {
         response.error = Some("model switching is not configured".to_string());
+        response.error_code = Some("switching_unsupported".to_string());
         write_switch_response(&mut send, &response).await?;
         return Ok(());
     };
@@ -1014,6 +1027,7 @@ async fn handle_switch_model(
             .any(|model| model.id == request.model_id)
     }) {
         response.error = Some("model is not advertised as switchable".to_string());
+        response.error_code = Some("model_not_switchable".to_string());
         write_switch_response(&mut send, &response).await?;
         return Ok(());
     }
@@ -1029,6 +1043,10 @@ async fn handle_switch_model(
         Ok(operation) => {
             response.accepted = true;
             response.changed = operation.changed;
+            response.operation = operation
+                .operation
+                .map(LifecycleOperation::from_fleet)
+                .and_then(LifecycleOperation::sanitized);
             runtime.refresh_model_switching().await;
             response.model_switching = runtime.model_switching.lock().await.clone();
             if operation.changed {
@@ -1038,9 +1056,48 @@ async fn handle_switch_model(
         Err(err) => {
             response.error = Some(err.to_string());
             response.error_status = Some(err.status().as_u16());
+            response.error_code = err.code().map(str::to_owned);
         }
     }
     write_switch_response(&mut send, &response).await
+}
+
+async fn handle_fleet_operation(
+    mut send: iroh::endpoint::SendStream,
+    runtime: Arc<WorkerRuntime>,
+    request: FleetOperationRequest,
+) -> AppResult<()> {
+    let mut response = FleetOperationResponse {
+        request_id: request.request_id,
+        operation_id: request.operation_id.clone(),
+        operation: None,
+        error: None,
+        error_status: None,
+    };
+    if crate::mesh::protocol::validate_fleet_operation_request(&request).is_err() {
+        response.error = Some("invalid operation lookup".to_string());
+        response.error_status = Some(400);
+        return write_fleet_operation_response(&mut send, &response).await;
+    }
+    let Some(fleet) = runtime.fleet.as_ref() else {
+        response.error = Some("model switching is not configured".to_string());
+        response.error_status = Some(404);
+        return write_fleet_operation_response(&mut send, &response).await;
+    };
+    match fleet.operation(&request.operation_id).await {
+        Ok(operation) => {
+            response.operation = LifecycleOperation::from_fleet(operation).sanitized();
+            if response.operation.is_none() {
+                response.error = Some("Fleet returned an invalid operation".to_string());
+                response.error_status = Some(502);
+            }
+        }
+        Err(err) => {
+            response.error = Some(err.to_string());
+            response.error_status = Some(err.status().as_u16());
+        }
+    }
+    write_fleet_operation_response(&mut send, &response).await
 }
 
 async fn refresh_models(runtime: &WorkerRuntime) -> Vec<ResourceAdvertisement> {
@@ -1376,6 +1433,110 @@ fn previous_weekday(day: MeshWeekday) -> MeshWeekday {
         MeshWeekday::Fri => MeshWeekday::Thu,
         MeshWeekday::Sat => MeshWeekday::Fri,
         MeshWeekday::Sun => MeshWeekday::Sat,
+    }
+}
+
+/// A live mesh worker for cross-module tests: a real Iroh connection to an
+/// in-process "controller" endpoint, registered in `registry`, whose Fleet
+/// client points at `fleet_base_url` (a loopback mock). With
+/// `advertise_operations = false` it impersonates a worker that predates the
+/// `fleet_operations` capability.
+#[cfg(test)]
+pub(crate) struct TestFleetWorker {
+    pub(crate) endpoint_id: EndpointId,
+    _controller: Endpoint,
+    _worker: Endpoint,
+    _keepalive: iroh::endpoint::Connection,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl Drop for TestFleetWorker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn spawn_test_fleet_worker(
+    registry: &crate::mesh::registry::MeshRegistry,
+    fleet_base_url: &str,
+    advertise_operations: bool,
+) -> TestFleetWorker {
+    use iroh::endpoint::presets;
+    use std::net::Ipv4Addr;
+
+    let controller_key = iroh::SecretKey::generate();
+    let controller_id = controller_key.public();
+    let controller = Endpoint::builder(presets::Minimal)
+        .secret_key(controller_key)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .alpns(vec![WORKER_ALPN.to_vec()])
+        .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let controller_addr = EndpointAddr::from_parts(
+        controller_id,
+        controller
+            .bound_sockets()
+            .into_iter()
+            .map(TransportAddr::Ip),
+    );
+    let worker_key = iroh::SecretKey::generate();
+    let worker_id = worker_key.public();
+    let worker = Endpoint::builder(presets::Minimal)
+        .secret_key(worker_key)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let worker_connect = worker.connect(controller_addr, WORKER_ALPN);
+    let controller_accept = async {
+        controller
+            .accept()
+            .await
+            .unwrap()
+            .accept()
+            .unwrap()
+            .await
+            .unwrap()
+    };
+    let (worker_connection, controller_connection) =
+        tokio::join!(worker_connect, controller_accept);
+    let worker_connection = worker_connection.unwrap();
+    let keepalive = worker_connection.clone();
+
+    let mut runtime = WorkerRuntime::new(MeshWorkerConfig::default()).await;
+    runtime.fleet = Some(Arc::new(crate::dashboard_fleet::FleetClient::for_test(
+        reqwest::Client::new(),
+        fleet_base_url,
+        "test-fleet-token",
+    )));
+    runtime.refresh_model_switching().await;
+    let mut advertisement = runtime.advertisement().await;
+    if !advertise_operations {
+        advertisement.capabilities.clear();
+    }
+    let runtime = Arc::new(runtime);
+    registry.register(worker_id, controller_connection, advertisement);
+    let task = tokio::spawn(async move {
+        while let Ok((send, recv)) = worker_connection.accept_bi().await {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let _ = handle_stream(send, recv, runtime).await;
+            });
+        }
+    });
+    TestFleetWorker {
+        endpoint_id: worker_id,
+        _controller: controller,
+        _worker: worker,
+        _keepalive: keepalive,
+        task,
     }
 }
 

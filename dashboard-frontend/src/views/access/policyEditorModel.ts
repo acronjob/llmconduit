@@ -42,6 +42,8 @@ export const managementPermissionLabels: Record<ManagementPermission, string> = 
   'fleet.models.read': 'View Fleet model state',
   'fleet.models.load': 'Load Fleet models',
   'fleet.models.unload': 'Unload Fleet models',
+  'fleet.models.hold': 'Hold Fleet models (leases)',
+  'auth.eval_keys.create': 'Create pinned eval run keys',
 };
 
 export function validatePolicy(policy: CreateAuthPolicyRequest, kind: PolicyEditorKind = 'model'): string[] {

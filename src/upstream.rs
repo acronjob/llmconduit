@@ -402,12 +402,21 @@ type CandidatePredicate =
 #[derive(Clone, Default)]
 pub struct AuthorizationScope {
     predicate: Option<Arc<CandidatePredicate>>,
+    /// Per-key eval safety: a requested model no upstream serves is a 404 for
+    /// this request even under `unknown_model_policy: passthrough`.
+    reject_unknown_models: bool,
+    /// Per-key eval safety: never shrink `max_tokens` (neither the pre-flight
+    /// context-budget cap nor the overflow shrink-and-retry); the upstream's
+    /// context-overflow error is returned instead.
+    exact_max_tokens: bool,
 }
 
 impl std::fmt::Debug for AuthorizationScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizationScope")
             .field("restricted", &self.predicate.is_some())
+            .field("reject_unknown_models", &self.reject_unknown_models)
+            .field("exact_max_tokens", &self.exact_max_tokens)
             .finish()
     }
 }
@@ -423,7 +432,22 @@ impl AuthorizationScope {
     {
         Self {
             predicate: Some(Arc::new(predicate)),
+            ..Self::default()
         }
+    }
+
+    pub fn with_eval_policy(mut self, reject_unknown_models: bool, exact_max_tokens: bool) -> Self {
+        self.reject_unknown_models = reject_unknown_models;
+        self.exact_max_tokens = exact_max_tokens;
+        self
+    }
+
+    pub fn rejects_unknown_models(&self) -> bool {
+        self.reject_unknown_models
+    }
+
+    pub fn exact_max_tokens(&self) -> bool {
+        self.exact_max_tokens
     }
 
     pub fn allows_candidate(
@@ -1680,6 +1704,7 @@ impl ReqwestUpstreamClient {
         &self,
         url: &Url,
         request: ChatCompletionRequest,
+        exact_max_tokens: bool,
         capture_payloads: bool,
         response_id: Option<&str>,
         serving: Option<&Arc<ServingToken>>,
@@ -1735,11 +1760,19 @@ impl ReqwestUpstreamClient {
         }
 
         let body = read_capped_upstream_error_body(response).await;
-        if let Some(retry) = classify_context_overflow(
-            &body.text,
-            self.min_completion_tokens,
-            Some(estimate_leaf_input_tokens(&request)),
-        ) {
+        // `exact_max_tokens` keys opt out of the shrink-and-retry: the request
+        // must run with exactly the budget the client sent, so the upstream's
+        // overflow error is surfaced unchanged instead.
+        let overflow_retry = if exact_max_tokens {
+            None
+        } else {
+            classify_context_overflow(
+                &body.text,
+                self.min_completion_tokens,
+                Some(estimate_leaf_input_tokens(&request)),
+            )
+        };
+        if let Some(retry) = overflow_retry {
             let mut retried = request.clone();
             retried.max_output_tokens = Some(retry.max_completion_tokens);
             // The reduced budget lives on the typed `max_output_tokens` field
@@ -1965,6 +1998,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 .dispatch_chat_stream(
                     &url,
                     request,
+                    backend.authorization.exact_max_tokens(),
                     backend.capture_payloads,
                     response_id.as_deref(),
                     serving.as_ref(),
@@ -2009,6 +2043,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         self.dispatch_chat_stream(
             &url,
             request,
+            backend.authorization.exact_max_tokens(),
             backend.capture_payloads,
             response_id.as_deref(),
             serving.as_ref(),
@@ -2914,8 +2949,12 @@ impl RoutingUpstreamClient {
         requested_model: &str,
         resolved_model: &str,
         kind: MatchKind,
+        authorization: &AuthorizationScope,
     ) -> AppResult<()> {
-        if kind == MatchKind::Default && self.reject_unknown_models.load(Ordering::Relaxed) {
+        if kind == MatchKind::Default
+            && (self.reject_unknown_models.load(Ordering::Relaxed)
+                || authorization.rejects_unknown_models())
+        {
             tracing::warn!(
                 requested_model = %requested_model,
                 resolved_model = %resolved_model,
@@ -3724,6 +3763,7 @@ impl UpstreamClient for RoutingUpstreamClient {
             &backend.request.model,
             &resolution.model_id,
             match_kind,
+            &backend.authorization,
         )?;
         let routed_request =
             self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
@@ -3787,6 +3827,7 @@ impl UpstreamClient for RoutingUpstreamClient {
             &backend.request.model,
             &resolution.model_id,
             match_kind,
+            &backend.authorization,
         )?;
         let routed = self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
         match resolution.target {
@@ -3841,7 +3882,12 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
-        self.ensure_default_resolution_allowed(&requested_model, &resolution.model_id, match_kind)?;
+        self.ensure_default_resolution_allowed(
+            &requested_model,
+            &resolution.model_id,
+            match_kind,
+            &request.authorization,
+        )?;
         log_model_resolution(
             &requested_model,
             &resolution.model_id,
@@ -6242,6 +6288,44 @@ mod tests {
         assert_eq!(probe.completions_calls.load(AtomicOrdering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn per_key_reject_unknown_models_blocks_catalog_default_under_passthrough() {
+        let probe = CatalogDefaultDispatchProbe::default();
+        let client = RoutingUpstreamClient::new(vec![RoutingUpstreamProvider::new(
+            "mesh",
+            probe.clone(),
+            None,
+            JsonMap::new(),
+            Vec::new(),
+            Duration::ZERO,
+        )]);
+        // Global policy stays passthrough; only the key's scope rejects.
+        let strict = AuthorizationScope::unrestricted().with_eval_policy(true, false);
+        let mut backend = family_backend("DeepSeek-V4.1-Flash", None);
+        backend.authorization = strict.clone();
+        let error = match client.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("strict key must not fall back to the catalog default"),
+            Err(err) => err,
+        };
+        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
+        let completions = ProxyCompletionsRequest::new(
+            HeaderMap::new(),
+            Bytes::from(json!({"model": "DeepSeek-V4.1-Flash", "prompt": "hello"}).to_string()),
+        )
+        .with_authorization(strict);
+        let error = match client.proxy_completions(completions).await {
+            Ok(_) => panic!("strict key must not fall back on completions"),
+            Err(err) => err,
+        };
+        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(probe.stream_calls.load(AtomicOrdering::Relaxed), 0);
+
+        // Another key on the same gateway keeps the passthrough fallback.
+        let lenient = family_backend("DeepSeek-V4.1-Flash", None);
+        let _ = client.stream_chat_completion(&lenient).await;
+        assert_eq!(probe.stream_calls.load(AtomicOrdering::Relaxed), 1);
+    }
+
     /// Empty finalization policies (no effort map, no family override, no
     /// per-model kwargs). The leaf's unmapped/clamp path.
     fn empty_policies() -> BackendFinalizationPolicies {
@@ -8008,6 +8092,42 @@ mod tests {
             key.model, "unknown",
             "served model did not collapse to unknown"
         );
+    }
+
+    #[tokio::test]
+    async fn exact_max_tokens_scope_surfaces_overflow_without_shrinking() {
+        let server = MockServer::start().await;
+        let overflow = "This model's maximum context length is 202752 tokens. \
+            However, you requested 64000 output tokens and your prompt contains 139000 input tokens.";
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(overflow))
+            .mount(&server)
+            .await;
+        let store = DashboardFlowStore::new();
+        let (_api_call_id, response_id) = d2_open_linked_flow(&store);
+        let client = d2_capturing_client(&server.uri(), store.clone());
+        let mut request = family_request("served-model");
+        request.max_output_tokens = Some(64000);
+        let mut backend = BackendChatRequest::new(
+            request,
+            None,
+            Some(response_id),
+            Some(Arc::new(super::ServingToken::default())),
+        );
+        backend.authorization = AuthorizationScope::unrestricted().with_eval_policy(false, true);
+        let error = match client.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("exact max_tokens must not retry into a success"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("maximum context length"),
+            "the upstream overflow is surfaced: {error}"
+        );
+        let received = server.received_requests().await.expect("requests");
+        assert_eq!(received.len(), 1, "no shrink-and-retry for exact keys");
+        let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(sent["max_tokens"], json!(64000));
     }
 
     #[tokio::test]
