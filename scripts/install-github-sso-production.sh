@@ -14,7 +14,9 @@ set -Eeuo pipefail
 #
 # then install it here with `--binary /tmp/llmconduit` (or `--binary-url URL
 # --binary-sha256 HEX`). Without either, the script builds locally with a
-# low-memory profile (no LTO, 16 codegen units, one job).
+# low-memory profile (no LTO, 16 codegen units, one job), which still peaks
+# around 2.1 GB, so it refuses on hosts with under 3 GiB of RAM+swap unless
+# `--build-on-host` is passed.
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -27,6 +29,9 @@ INSTALL_DIR="${LLMCONDUIT_INSTALL_DIR:-${HOME}/.local/lib/llmconduit}"
 BINARY_PATH="${LLMCONDUIT_BINARY_PATH:-}"
 BINARY_URL="${LLMCONDUIT_BINARY_URL:-}"
 BINARY_SHA256="${LLMCONDUIT_BINARY_SHA256:-}"
+BUILD_ON_HOST="${LLMCONDUIT_BUILD_ON_HOST:-0}"
+# The low-memory local build peaks around 2.1 GB of RSS.
+readonly MIN_BUILD_MEMORY_KIB=$((3 * 1024 * 1024))
 # systemd memory guardrails sized for a 2 GB host: reclaim pressure starts at
 # MemoryHigh, and the kernel OOM-kills only this service at MemoryMax.
 MEMORY_HIGH="${LLMCONDUIT_MEMORY_HIGH:-1200M}"
@@ -58,6 +63,7 @@ secrets only to the separate EnvironmentFile.
   --binary PATH        Install a prebuilt llmconduit binary instead of compiling.
   --binary-url URL     Download a prebuilt binary (requires --binary-sha256).
   --binary-sha256 HEX  Expected SHA-256 of the prebuilt binary.
+  --build-on-host      Compile here even when RAM+swap is under 3 GiB.
 
 Prebuilt binaries must be built with LLMCONDUIT_BUILD_DASHBOARD=1 on a host
 with the same architecture and an equal-or-older glibc. Without one, the
@@ -94,6 +100,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die '--binary-sha256 requires a hex digest'
       BINARY_SHA256="$2"
       shift 2
+      ;;
+    --build-on-host)
+      BUILD_ON_HOST=1
+      shift
       ;;
     -h|--help)
       usage
@@ -144,6 +154,12 @@ if [[ -n "${BINARY_PATH}" ]]; then
   [[ -z "${BINARY_SHA256}" || "${BINARY_SHA256}" =~ ^[0-9A-Fa-f]{64}$ ]] || die '--binary-sha256 must be a 64-hex-digit digest'
 fi
 if [[ -z "${BINARY_PATH}" && -z "${BINARY_URL}" ]]; then
+  if [[ "${BUILD_ON_HOST}" != 1 && -r /proc/meminfo ]]; then
+    build_memory_kib="$(awk '/^(MemTotal|SwapTotal):/ { total += $2 } END { print total + 0 }' /proc/meminfo)"
+    if (( build_memory_kib < MIN_BUILD_MEMORY_KIB )); then
+      die "this host has $((build_memory_kib / 1024)) MiB of RAM+swap; compiling needs ~2.1 GB. Build elsewhere and pass --binary PATH (or --binary-url URL --binary-sha256 HEX), add swap, or pass --build-on-host"
+    fi
+  fi
   need cargo
   need npm
 fi
