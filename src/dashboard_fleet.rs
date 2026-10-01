@@ -208,12 +208,10 @@ impl FleetClient {
     ) -> Result<FleetOperationResponse, FleetProxyError> {
         validate_model_id(model_id)?;
         validate_optional_instances(instances)?;
-        // Fleet rejects any load body it does not need (400
-        // `overrides_not_allowed`), and a single instance is its default, so
-        // only a real scale-out request carries a body.
-        let body = instances
-            .filter(|instances| *instances > 1)
-            .map(|instances| FleetLoadModelPayload { instances });
+        // An explicit count, including 1, must reach Fleet: an empty load body
+        // means "keep the current replica count", so dropping `{"instances":1}`
+        // would make scaling a model back down to one replica impossible.
+        let body = instances.map(|instances| FleetLoadModelPayload { instances });
         self.request_json(
             reqwest::Method::POST,
             &format!("/v1/models/{model_id}/load"),
@@ -388,10 +386,22 @@ fn fleet_status_error(status: u16, body: &[u8]) -> FleetProxyError {
         400..=499 => (StatusCode::BAD_REQUEST, "Fleet rejected the request"),
         _ => (StatusCode::BAD_GATEWAY, "Fleet failed the request"),
     };
+    let code = fleet_error_code(body);
+    // Fleet's code distinguishes a transient lifecycle race from a capacity
+    // shortfall; operators act differently on each.
+    let message = match (status, code.as_deref()) {
+        (StatusCode::CONFLICT, Some("operation_in_progress")) => {
+            "Fleet is already changing this model"
+        }
+        (StatusCode::CONFLICT, Some("insufficient_resources")) => {
+            "Fleet has insufficient GPU capacity"
+        }
+        _ => message,
+    };
     FleetProxyError {
         status,
         message,
-        code: fleet_error_code(body),
+        code,
     }
 }
 
@@ -801,7 +811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_instance_loads_send_no_body() {
+    async fn explicit_instance_counts_are_always_sent() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/models/qwen3-flash/load"))
@@ -819,10 +829,10 @@ mod tests {
         }
         let requests = server.received_requests().await.expect("recorded requests");
         assert_eq!(requests.len(), 2);
-        for request in &requests {
-            assert!(request.body.is_empty(), "{:?}", request.body);
-            assert!(!request.headers.contains_key("content-type"));
-        }
+        assert!(requests[0].body.is_empty(), "{:?}", requests[0].body);
+        let scale_down: serde_json::Value =
+            serde_json::from_slice(&requests[1].body).expect("json load body");
+        assert_eq!(scale_down, serde_json::json!({"instances": 1}));
     }
 
     #[tokio::test]
