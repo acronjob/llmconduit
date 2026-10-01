@@ -1103,7 +1103,7 @@ upstreams:
 ```
 
 ```bash
-export LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=30
+export LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=120   # default; 5..3600
 ```
 
 Scrapes run only with `--with-debug-ui`; failures retain the last good sample
