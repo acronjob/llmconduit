@@ -416,7 +416,10 @@ mesh identity state or Access RBAC state into PostgreSQL.
 With a SQL store, llmconduit scrapes every backend's Prometheus `/metrics`
 endpoint (derived from its base URL by stripping `/v1`; override or disable per
 backend under `control_plane.metrics.backends`) every
-`control_plane.metrics.scrape_interval_secs` seconds. vLLM V1 and SGLang
+`control_plane.metrics.scrape_interval_secs` seconds. Derived URLs are only
+scraped for self-hosted backends (loopback, private/CGNAT IPs, single-label or
+`.local`/`.internal`/`.lan`/`.ts.net` hosts); public hosted APIs are skipped
+unless given an explicit `url` or `enabled: true`. Each body is capped at 2 MiB. vLLM V1 and SGLang
 families are recognised (running/waiting requests, KV-cache usage, prompt,
 generation and cached prompt tokens, prefix-cache hits/queries, TTFT,
 inter-token and end-to-end latency sums and counts, prefill/decode time,
@@ -816,7 +819,7 @@ disable it under `control_plane`:
 control_plane:
   vision_probe:
     enabled: true
-    interval_secs: 600
+    interval_secs: 3600   # default; each round sends real image requests
     timeout_secs: 20
 ```
 

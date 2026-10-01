@@ -58,7 +58,7 @@ const fn default_true() -> bool {
     true
 }
 const fn default_interval_secs() -> u64 {
-    600
+    3_600
 }
 const fn default_timeout_secs() -> u64 {
     20
@@ -557,7 +557,7 @@ mod tests {
     fn config_defaults_and_yaml() {
         let config = VisionProbeBootstrap::default();
         assert!(config.enabled);
-        assert_eq!(config.interval_secs, 600);
+        assert_eq!(config.interval_secs, 3_600);
         assert!(VisionProbeBootstrap::is_default(&config));
         let parsed: VisionProbeBootstrap =
             serde_yaml::from_str("enabled: false\ninterval_secs: 60\n").unwrap();
