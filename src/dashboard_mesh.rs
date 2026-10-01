@@ -572,7 +572,7 @@ async fn set_node_model_state(
             },
         ),
         Ok(result) => mesh_error(
-            StatusCode::CONFLICT,
+            result.rejection_status(),
             result
                 .error
                 .as_deref()
