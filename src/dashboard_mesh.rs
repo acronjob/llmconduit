@@ -109,11 +109,31 @@ pub struct MeshDisabledModel {
     pub disabled_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+/// Omitted `max_uses` / `expires_in_secs` default to a single-use key valid
+/// for 24 hours: a forgotten join key is a standing credential to add GPU
+/// workers. An explicit JSON `null` still requests no limit.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct CreateMeshJoinKeyRequest {
     pub label: Option<String>,
-    pub max_uses: Option<i64>,
-    pub expires_in_secs: Option<i64>,
+    #[serde(default, deserialize_with = "present_option")]
+    #[schema(value_type = Option<i64>, nullable = true)]
+    pub max_uses: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "present_option")]
+    #[schema(value_type = Option<i64>, nullable = true)]
+    pub expires_in_secs: Option<Option<i64>>,
+}
+
+const DEFAULT_JOIN_KEY_MAX_USES: i64 = 1;
+const DEFAULT_JOIN_KEY_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// Distinguishes an absent field (`None`) from an explicit `null`
+/// (`Some(None)`).
+fn present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -833,15 +853,17 @@ pub(crate) fn authorize_mesh_admin_read(
 fn validate_join_key_request(
     body: &CreateMeshJoinKeyRequest,
 ) -> Option<(Option<i64>, Option<i64>)> {
-    if body.max_uses.is_some_and(|uses| uses <= 0)
-        || body.expires_in_secs.is_some_and(|seconds| seconds <= 0)
+    let max_uses = body.max_uses.unwrap_or(Some(DEFAULT_JOIN_KEY_MAX_USES));
+    let expires_in_secs = body
+        .expires_in_secs
+        .unwrap_or(Some(DEFAULT_JOIN_KEY_TTL_SECS));
+    if max_uses.is_some_and(|uses| uses <= 0) || expires_in_secs.is_some_and(|seconds| seconds <= 0)
     {
         return None;
     }
-    let expires_at_ms = body
-        .expires_in_secs
-        .map(|seconds| now_ms().saturating_add(seconds.saturating_mul(1000)));
-    Some((expires_at_ms, body.max_uses))
+    let expires_at_ms =
+        expires_in_secs.map(|seconds| now_ms().saturating_add(seconds.saturating_mul(1000)));
+    Some((expires_at_ms, max_uses))
 }
 
 #[derive(Debug)]
@@ -1119,7 +1141,7 @@ mod tests {
         assert!(
             validate_join_key_request(&CreateMeshJoinKeyRequest {
                 label: None,
-                max_uses: Some(0),
+                max_uses: Some(Some(0)),
                 expires_in_secs: None,
             })
             .is_none()
@@ -1128,9 +1150,36 @@ mod tests {
             validate_join_key_request(&CreateMeshJoinKeyRequest {
                 label: None,
                 max_uses: None,
-                expires_in_secs: Some(-1),
+                expires_in_secs: Some(Some(-1)),
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn join_keys_default_to_single_use_and_a_day_but_allow_explicit_unlimited() {
+        let parse = |json: serde_json::Value| -> CreateMeshJoinKeyRequest {
+            serde_json::from_value(json).expect("request")
+        };
+
+        let before = now_ms();
+        let (expires_at_ms, max_uses) =
+            validate_join_key_request(&parse(serde_json::json!({}))).expect("defaults");
+        assert_eq!(max_uses, Some(DEFAULT_JOIN_KEY_MAX_USES));
+        let expires_at_ms = expires_at_ms.expect("default expiry");
+        assert!(expires_at_ms >= before + DEFAULT_JOIN_KEY_TTL_SECS * 1000);
+        assert!(expires_at_ms <= now_ms() + DEFAULT_JOIN_KEY_TTL_SECS * 1000);
+
+        let explicit = parse(serde_json::json!({"max_uses": 5, "expires_in_secs": 60}));
+        let (expires_at_ms, max_uses) = validate_join_key_request(&explicit).expect("explicit");
+        assert_eq!(max_uses, Some(5));
+        assert!(expires_at_ms.unwrap() <= now_ms() + 60_000);
+
+        let unlimited = parse(serde_json::json!({"max_uses": null, "expires_in_secs": null}));
+        assert_eq!(unlimited.max_uses, Some(None));
+        assert_eq!(
+            validate_join_key_request(&unlimited).expect("unlimited"),
+            (None, None)
         );
     }
 
