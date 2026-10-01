@@ -605,17 +605,34 @@ pub(super) async fn handle_request(
     };
     write_admission(&mut send, &Admission::Accepted).await?;
     let (mut local_read, mut local_write) = local.into_split();
-    let (response_done_tx, response_done_rx) = tokio::sync::oneshot::channel();
+    // The local engine only ever sees a request this worker re-serialized
+    // from a validated head, never the controller's raw bytes.
+    let upload = tokio::time::timeout(
+        REQUEST_UPLOAD_TIMEOUT,
+        forward_request_upload(&mut recv, &mut local_write, resource.config.target),
+    )
+    .await
+    .unwrap_or(Err(UploadError::Rejected {
+        status: http::StatusCode::REQUEST_TIMEOUT,
+        message: "mesh request upload timed out",
+    }));
+    if let Err(err) = upload {
+        drop(_permit);
+        return match err {
+            UploadError::Rejected { status, message } => {
+                write_http_error(&mut send, status, message).await;
+                Err(AppError::bad_request(format!(
+                    "rejected mesh request from controller: {message}"
+                )))
+            }
+            UploadError::Io(err) => Err(AppError::upstream(format!(
+                "mesh request forwarding failed: {err}"
+            ))),
+        };
+    }
     let response_stopped = send.stopped();
-    let forward_request = async {
-        tokio::io::copy(&mut recv, &mut local_write).await?;
-        // Content-Length delimits the request. Keep the TCP write half alive while
-        // the model generates: uvicorn interprets a client EOF as cancellation.
-        let _ = response_done_rx.await;
-        Ok::<(), std::io::Error>(())
-    };
     let forward_response = async {
-        let result = tokio::select! {
+        tokio::select! {
             result = async {
                 tokio::io::copy(&mut local_read, &mut send).await?;
                 tokio::io::AsyncWriteExt::shutdown(&mut send).await
@@ -624,12 +641,14 @@ pub(super) async fn handle_request(
                 std::io::ErrorKind::ConnectionReset,
                 "mesh response receiver closed",
             )),
-        };
-        let _ = response_done_tx.send(());
-        result
+        }
     };
-    let result = tokio::try_join!(forward_request, forward_response)
+    // Content-Length delimits the request, and `local_write` stays open until
+    // the response is done: uvicorn interprets a client EOF as cancellation.
+    let result = forward_response
+        .await
         .map_err(|err| AppError::upstream(format!("mesh request forwarding failed: {err}")));
+    drop(local_write);
     drop(_permit);
     tracing::debug!(
         request_id = %open.request_id,
@@ -639,6 +658,259 @@ pub(super) async fn handle_request(
     );
     result?;
     Ok(())
+}
+
+/// The only request the hub sends over an inference stream.
+const FORWARDED_METHOD: &str = "POST";
+const FORWARDED_PATH: &str = "/v1/chat/completions";
+const MAX_FORWARDED_HEAD_BYTES: usize = 16 * 1024;
+/// Matches the gateway's inbound body buffer; a larger body cannot have
+/// come from a well-behaved hub.
+const MAX_FORWARDED_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Bounds the whole upload (head and body) so a stalled controller stream
+/// cannot hold a capacity permit and a local engine connection forever.
+const REQUEST_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug)]
+enum UploadError {
+    /// Answered to the hub as an HTTP error before any engine response.
+    Rejected {
+        status: http::StatusCode,
+        message: &'static str,
+    },
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for UploadError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+fn reject(status: http::StatusCode, message: &'static str) -> UploadError {
+    UploadError::Rejected { status, message }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ForwardedRequestHead {
+    content_length: usize,
+    zstd: bool,
+}
+
+/// Reads the controller's request, validates it against the one shape the
+/// hub emits, and writes a freshly built request to the local engine.
+async fn forward_request_upload<W>(
+    recv: &mut iroh::endpoint::RecvStream,
+    local: &mut W,
+    target: SocketAddr,
+) -> Result<(), UploadError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffered = tokio_util::bytes::BytesMut::new();
+    let head_end = loop {
+        if let Some(end) = find_head_end(&buffered) {
+            break end;
+        }
+        if buffered.len() > MAX_FORWARDED_HEAD_BYTES {
+            return Err(reject(
+                http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "mesh request head is too large",
+            ));
+        }
+        let chunk = recv
+            .read_chunk(MAX_FORWARDED_HEAD_BYTES)
+            .await
+            .map_err(|err| UploadError::Io(std::io::Error::other(err)))?;
+        let Some(chunk) = chunk else {
+            return Err(reject(
+                http::StatusCode::BAD_REQUEST,
+                "mesh request ended before its head",
+            ));
+        };
+        buffered.extend_from_slice(&chunk);
+    };
+    let head = parse_forwarded_head(&buffered[..head_end])?;
+    let prefix = buffered.split_off(head_end).freeze();
+    if prefix.len() > head.content_length {
+        return Err(reject(
+            http::StatusCode::BAD_REQUEST,
+            "mesh request body exceeds its content-length",
+        ));
+    }
+    let remaining = (head.content_length - prefix.len()) as u64;
+
+    if head.zstd {
+        let mut compressed = Vec::with_capacity(head.content_length);
+        compressed.extend_from_slice(&prefix);
+        recv.take(remaining).read_to_end(&mut compressed).await?;
+        if compressed.len() != head.content_length {
+            return Err(reject(
+                http::StatusCode::BAD_REQUEST,
+                "mesh request body is shorter than its content-length",
+            ));
+        }
+        let body = tokio::task::spawn_blocking(move || {
+            decompress_zstd_capped(&compressed, MAX_FORWARDED_BODY_BYTES)
+        })
+        .await
+        .map_err(|err| UploadError::Io(std::io::Error::other(err)))??;
+        local
+            .write_all(&local_request_head(target, body.len()))
+            .await?;
+        local.write_all(&body).await?;
+    } else {
+        local
+            .write_all(&local_request_head(target, head.content_length))
+            .await?;
+        local.write_all(&prefix).await?;
+        let copied = tokio::io::copy(&mut recv.take(remaining), local).await?;
+        if copied != remaining {
+            return Err(UploadError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mesh request body ended before its content-length",
+            )));
+        }
+    }
+    local.flush().await?;
+    Ok(())
+}
+
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+}
+
+fn parse_forwarded_head(head: &[u8]) -> Result<ForwardedRequestHead, UploadError> {
+    let bad = |message| reject(http::StatusCode::BAD_REQUEST, message);
+    let text = std::str::from_utf8(head).map_err(|_| bad("mesh request head is not UTF-8"))?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split(' ');
+    let (Some(method), Some(path), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad("malformed mesh request line"));
+    };
+    if method != FORWARDED_METHOD || path != FORWARDED_PATH || version != "HTTP/1.1" {
+        return Err(reject(
+            http::StatusCode::FORBIDDEN,
+            "mesh worker only forwards POST /v1/chat/completions",
+        ));
+    }
+    let mut content_length = None;
+    let mut zstd = false;
+    for line in lines.filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| bad("malformed mesh request header"))?;
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => {
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| bad("invalid mesh request content-length"))?;
+                if content_length.is_some_and(|existing| existing != parsed) {
+                    return Err(bad("conflicting mesh request content-length"));
+                }
+                content_length = Some(parsed);
+            }
+            "transfer-encoding" => {
+                return Err(bad("mesh requests must use content-length framing"));
+            }
+            "content-encoding" => {
+                if value.eq_ignore_ascii_case(crate::mesh::protocol::REQUEST_ENCODING_ZSTD) {
+                    zstd = true;
+                } else if !value.eq_ignore_ascii_case("identity") {
+                    return Err(reject(
+                        http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "unsupported mesh request content-encoding",
+                    ));
+                }
+            }
+            "content-type" => {
+                let media_type = value.split(';').next().unwrap_or_default().trim();
+                if !media_type.eq_ignore_ascii_case("application/json") {
+                    return Err(reject(
+                        http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "mesh request body must be JSON",
+                    ));
+                }
+            }
+            // Everything else is dropped: the local request is rebuilt from
+            // a fixed header set below.
+            _ => {}
+        }
+    }
+    let content_length =
+        content_length.ok_or_else(|| bad("mesh request is missing content-length"))?;
+    if content_length > MAX_FORWARDED_BODY_BYTES {
+        return Err(reject(
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+            "mesh request body is too large",
+        ));
+    }
+    Ok(ForwardedRequestHead {
+        content_length,
+        zstd,
+    })
+}
+
+fn local_request_head(target: SocketAddr, content_length: usize) -> Vec<u8> {
+    format!(
+        "{FORWARDED_METHOD} {FORWARDED_PATH} HTTP/1.1\r\n\
+         host: {target}\r\n\
+         content-type: application/json\r\n\
+         content-length: {content_length}\r\n\
+         accept: text/event-stream\r\n\
+         connection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// Streams the decode so a small "zstd bomb" cannot allocate past `cap`.
+fn decompress_zstd_capped(compressed: &[u8], cap: usize) -> Result<Vec<u8>, UploadError> {
+    use std::io::Read;
+
+    let invalid = || {
+        reject(
+            http::StatusCode::BAD_REQUEST,
+            "mesh request body is not valid zstd",
+        )
+    };
+    let decoder = zstd::stream::read::Decoder::new(compressed).map_err(|_| invalid())?;
+    let mut body = Vec::new();
+    decoder
+        .take(cap as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| invalid())?;
+    if body.len() > cap {
+        return Err(reject(
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+            "mesh request body is too large",
+        ));
+    }
+    Ok(body)
+}
+
+async fn write_http_error(
+    send: &mut iroh::endpoint::SendStream,
+    status: http::StatusCode,
+    message: &str,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let body = serde_json::json!({"error": {"message": message}}).to_string();
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if send.write_all(response.as_bytes()).await.is_ok() {
+        let _ = send.shutdown().await;
+    }
 }
 
 async fn handle_switch_model(
@@ -1084,6 +1356,125 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "vllm_config": {"scheduler_config": {"max_num_seqs": capacity}}
         }))
+    }
+
+    fn rejection_status(result: Result<ForwardedRequestHead, UploadError>) -> http::StatusCode {
+        match result {
+            Err(UploadError::Rejected { status, .. }) => status,
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forwarded_head_accepts_only_the_hub_chat_request_shape() {
+        let hub = b"POST /v1/chat/completions HTTP/1.1\r\nhost: llmconduit-mesh-worker\r\ncontent-type: application/json\r\ncontent-length: 42\r\naccept: text/event-stream\r\nconnection: close\r\n\r\n";
+        assert_eq!(
+            parse_forwarded_head(hub).unwrap(),
+            ForwardedRequestHead {
+                content_length: 42,
+                zstd: false
+            }
+        );
+        let compressed = b"POST /v1/chat/completions HTTP/1.1\r\ncontent-type: application/json; charset=utf-8\r\ncontent-encoding: zstd\r\ncontent-length: 7\r\n\r\n";
+        assert!(parse_forwarded_head(compressed).unwrap().zstd);
+
+        for (head, expected) in [
+            (
+                &b"GET /v1/chat/completions HTTP/1.1\r\ncontent-length: 0\r\n\r\n"[..],
+                http::StatusCode::FORBIDDEN,
+            ),
+            (
+                b"POST /admin/shutdown HTTP/1.1\r\ncontent-length: 0\r\n\r\n",
+                http::StatusCode::FORBIDDEN,
+            ),
+            (
+                b"POST /v1/chat/completions?x=1 HTTP/1.1\r\ncontent-length: 0\r\n\r\n",
+                http::StatusCode::FORBIDDEN,
+            ),
+            (
+                b"POST /v1/chat/completions HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n",
+                http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                b"POST /v1/chat/completions HTTP/1.1\r\n\r\n",
+                http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length: 1\r\ncontent-length: 2\r\n\r\n",
+                http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length: 1\r\ncontent-encoding: br\r\n\r\n",
+                http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length: 1\r\ncontent-type: text/plain\r\n\r\n",
+                http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ] {
+            assert_eq!(
+                rejection_status(parse_forwarded_head(head)),
+                expected,
+                "{}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        let oversized = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: {}\r\n\r\n",
+            MAX_FORWARDED_BODY_BYTES + 1
+        );
+        assert_eq!(
+            rejection_status(parse_forwarded_head(oversized.as_bytes())),
+            http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn rebuilt_local_request_carries_only_allowlisted_headers() {
+        let head =
+            String::from_utf8(local_request_head("127.0.0.1:8000".parse().unwrap(), 12)).unwrap();
+        assert_eq!(
+            head,
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1:8000\r\ncontent-type: application/json\r\ncontent-length: 12\r\naccept: text/event-stream\r\nconnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn zstd_decode_is_capped_and_rejects_garbage() {
+        let body = vec![b'a'; 64 * 1024];
+        let compressed = zstd::bulk::compress(&body, 3).unwrap();
+        assert_eq!(
+            decompress_zstd_capped(&compressed, body.len()).unwrap(),
+            body
+        );
+        assert!(matches!(
+            decompress_zstd_capped(&compressed, body.len() - 1),
+            Err(UploadError::Rejected {
+                status: http::StatusCode::PAYLOAD_TOO_LARGE,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decompress_zstd_capped(b"not zstd at all", 1024),
+            Err(UploadError::Rejected {
+                status: http::StatusCode::BAD_REQUEST,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_advertises_zstd_request_support() {
+        let runtime = test_runtime(test_resource(
+            "127.0.0.1:9".parse().unwrap(),
+            MeshWorkerCapacitySource::Configured,
+        ));
+        assert!(
+            runtime
+                .advertisement()
+                .await
+                .accepts_request_encoding(REQUEST_ENCODING_ZSTD)
+        );
     }
 
     #[test]
