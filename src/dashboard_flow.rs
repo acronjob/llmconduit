@@ -1878,6 +1878,23 @@ impl DashboardFlowStore {
             .collect()
     }
 
+    /// Number of live records with `status == Open` (the dashboard's
+    /// `active_streams`). Counts in place under the lock — every viewer asks once
+    /// a second, and [`list`](Self::list) would clone every record handle into a
+    /// fresh `Vec` just to count it. `0` when disabled.
+    pub fn open_count(&self) -> u64 {
+        if !self.enabled {
+            return 0;
+        }
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        state
+            .by_id
+            .values()
+            .filter(|record| record.status == FlowStatus::Open)
+            .count() as u64
+    }
+
     /// Resolve a single record by `api_call_id` OR `response_id` (via the link
     /// index). `None` when disabled or unknown. Prunes expired records first.
     pub fn detail(&self, id: &str) -> Option<Arc<FlowRecord>> {
