@@ -17,9 +17,12 @@ control_plane:
     # rather than delaying inference; shutdown logs report its counters.
     queue_capacity: 1024
     # SQL history and daily JSONL files older than this are pruned.
+    # Small hosts (2 GB / 2 vCPU): 7-14 days keeps the SQLite file and its
+    # page cache small.
     retention_days: 30
     # Request bodies are stored in full, split into content-addressed items.
     # Secrets are always redacted; this keeps or strips image/data URIs.
+    # Small hosts: `keep_media: false` avoids storing base64 images.
     keep_media: true
 
   # Client inference auth is separate from /dashboard session auth. With no
@@ -41,8 +44,11 @@ control_plane:
 
   # Upstream engine metrics: every backend's Prometheus /metrics (vLLM, SGLang)
   # is scraped and stored per model next to the gateway's own health samples.
-  # The URL is derived from the backend base_url (…/v1 -> …/metrics); override
-  # or disable per backend name.
+  # The URL is derived from the backend base_url (…/v1 -> …/metrics) only for
+  # self-hosted backends (loopback, private/Tailscale IPs, single-label or
+  # .local/.internal/.lan/.ts.net hosts); public hosted APIs are skipped unless
+  # given an explicit `url` or `enabled: true`. Bodies are capped at 2 MiB.
+  # Small hosts: 60 seconds is plenty for dashboard trends.
   metrics:
     enabled: true
     scrape_interval_secs: 15
@@ -51,11 +57,13 @@ control_plane:
     #  openrouter: { enabled: false }
 
   # Native-vision detection: each routed backend model is sent a one-pixel
-  # image at startup and every interval; a model that accepts it receives
-  # images unchanged, a model that rejects it gets the text placeholder.
+  # image at startup, whenever dashboard providers change, and every interval
+  # (default 3600 s); a model that accepts it receives images unchanged, a
+  # model that rejects it gets the text placeholder. Each probe is a real
+  # inference request, so keep the interval long on paid/GPU backends.
   vision_probe:
     enabled: true
-    interval_secs: 600
+    interval_secs: 3600
 
   operational:
     backends:
