@@ -208,7 +208,12 @@ impl FleetClient {
     ) -> Result<FleetOperationResponse, FleetProxyError> {
         validate_model_id(model_id)?;
         validate_optional_instances(instances)?;
-        let body = instances.map(|instances| FleetLoadModelPayload { instances });
+        // Fleet rejects any load body it does not need (400
+        // `overrides_not_allowed`), and a single instance is its default, so
+        // only a real scale-out request carries a body.
+        let body = instances
+            .filter(|instances| *instances > 1)
+            .map(|instances| FleetLoadModelPayload { instances });
         self.request_json(
             reqwest::Method::POST,
             &format!("/v1/models/{model_id}/load"),
@@ -290,17 +295,7 @@ impl FleetClient {
             body.extend_from_slice(&chunk);
         }
         if !upstream_status.is_success() {
-            let (status, message) = match upstream_status {
-                reqwest::StatusCode::NOT_FOUND => {
-                    (StatusCode::NOT_FOUND, "Fleet model was not found")
-                }
-                reqwest::StatusCode::CONFLICT => (
-                    StatusCode::CONFLICT,
-                    "Fleet is busy or has insufficient GPU capacity",
-                ),
-                _ => (StatusCode::BAD_GATEWAY, "Fleet rejected the request"),
-            };
-            return Err(FleetProxyError::new(status, message));
+            return Err(fleet_status_error(upstream_status.as_u16(), &body));
         }
         serde_json::from_slice(&body).map_err(|_| {
             FleetProxyError::new(StatusCode::BAD_GATEWAY, "Fleet returned invalid JSON")
@@ -334,22 +329,87 @@ impl FleetClient {
 pub struct FleetProxyError {
     status: StatusCode,
     message: &'static str,
+    /// Fleet's own machine-readable error code, sanitized, when it sent one.
+    code: Option<String>,
 }
 
 impl FleetProxyError {
     fn new(status: StatusCode, message: &'static str) -> Self {
-        Self { status, message }
+        Self {
+            status,
+            message,
+            code: None,
+        }
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
     }
 
     fn into_response(self) -> Response {
-        fleet_error(self.status, self.message)
+        let mut body = serde_json::json!({ "error": self.to_string() });
+        if let Some(code) = &self.code {
+            body["code"] = serde_json::Value::String(code.clone());
+        }
+        json_no_store(self.status, &body)
     }
 }
 
 impl std::fmt::Display for FleetProxyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(self.message)?;
+        if let Some(code) = &self.code {
+            write!(formatter, " ({code})")?;
+        }
+        Ok(())
     }
+}
+
+/// Maps a non-2xx Fleet response. Fleet's 4xx answers describe the request
+/// (unknown model, busy GPUs, rejected body), so they stay 4xx for the
+/// operator instead of collapsing into a generic gateway error; only Fleet
+/// failures and credential problems on our side are 502s.
+fn fleet_status_error(status: u16, body: &[u8]) -> FleetProxyError {
+    let (status, message) = match status {
+        400 | 422 => (StatusCode::BAD_REQUEST, "Fleet rejected the request"),
+        404 => (StatusCode::NOT_FOUND, "Fleet model was not found"),
+        409 | 423 => (
+            StatusCode::CONFLICT,
+            "Fleet is busy or has insufficient GPU capacity",
+        ),
+        429 => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Fleet is rate limiting requests",
+        ),
+        401 | 403 => (
+            StatusCode::BAD_GATEWAY,
+            "Fleet rejected the configured credentials",
+        ),
+        400..=499 => (StatusCode::BAD_REQUEST, "Fleet rejected the request"),
+        _ => (StatusCode::BAD_GATEWAY, "Fleet failed the request"),
+    };
+    FleetProxyError {
+        status,
+        message,
+        code: fleet_error_code(body),
+    }
+}
+
+/// Extracts Fleet's error code (`{"error":"code"}`, `{"error":{"code":..}}`
+/// or `{"code":..}`) and keeps it only if it is a short identifier, so free
+/// text from Fleet (paths, docker output) never reaches the client.
+fn fleet_error_code(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value
+        .get("error")
+        .and_then(|error| error.as_str().or_else(|| error.get("code")?.as_str()))
+        .or_else(|| value.get("code")?.as_str())?;
+    let valid = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    valid.then(|| code.to_ascii_lowercase())
 }
 
 impl std::error::Error for FleetProxyError {}
@@ -398,6 +458,7 @@ pub async fn fleet_models(
         (status = 403, body = crate::openapi::DashboardError),
         (status = 404, body = crate::openapi::DashboardError),
         (status = 409, body = crate::openapi::DashboardError),
+        (status = 429, body = crate::openapi::DashboardError),
         (status = 502, body = crate::openapi::DashboardError),
         (status = 504, body = crate::openapi::DashboardError)
     ),
@@ -429,6 +490,7 @@ pub async fn fleet_load_model(
         (status = 403, body = crate::openapi::DashboardError),
         (status = 404, body = crate::openapi::DashboardError),
         (status = 409, body = crate::openapi::DashboardError),
+        (status = 429, body = crate::openapi::DashboardError),
         (status = 502, body = crate::openapi::DashboardError),
         (status = 504, body = crate::openapi::DashboardError)
     ),
@@ -736,6 +798,95 @@ mod tests {
             serde_json::from_slice(&requests[0].body).expect("request body");
         assert_eq!(body, serde_json::json!({"instances": 2}));
         assert!(!String::from_utf8_lossy(&requests[0].body).contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn single_instance_loads_send_no_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/models/qwen3-flash/load"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "changed": true
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server.uri());
+        for instances in [None, Some(1)] {
+            client
+                .load_model_instances("qwen3-flash", instances)
+                .await
+                .expect("load operation");
+        }
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert!(request.body.is_empty(), "{:?}", request.body);
+            assert!(!request.headers.contains_key("content-type"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_client_errors_keep_request_level_statuses_and_sanitized_codes() {
+        let server = MockServer::start().await;
+        for (model, status, body) in [
+            (
+                "rejects-body",
+                400,
+                serde_json::json!({"error": "overrides_not_allowed"}),
+            ),
+            (
+                "busy",
+                409,
+                serde_json::json!({"error": {"code": "gpu_busy", "message": "GPU 0 in use by /secret/path"}}),
+            ),
+            (
+                "missing",
+                404,
+                serde_json::json!({"code": "model_not_found"}),
+            ),
+            (
+                "free-text",
+                422,
+                serde_json::json!({"error": "docker: failed at /var/lib/secret"}),
+            ),
+            (
+                "bad-token",
+                401,
+                serde_json::json!({"error": "unauthorized"}),
+            ),
+            ("broken", 500, serde_json::json!({"error": "internal"})),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/v1/models/{model}/load")))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let client = test_client(&server.uri());
+        for (model, expected_status, expected_code) in [
+            (
+                "rejects-body",
+                StatusCode::BAD_REQUEST,
+                Some("overrides_not_allowed"),
+            ),
+            ("busy", StatusCode::CONFLICT, Some("gpu_busy")),
+            ("missing", StatusCode::NOT_FOUND, Some("model_not_found")),
+            ("free-text", StatusCode::BAD_REQUEST, None),
+            ("bad-token", StatusCode::BAD_GATEWAY, Some("unauthorized")),
+            ("broken", StatusCode::BAD_GATEWAY, Some("internal")),
+        ] {
+            let error = client
+                .load_model(model)
+                .await
+                .expect_err("Fleet error surfaces");
+            assert_eq!(error.status(), expected_status, "{model}");
+            assert_eq!(error.code.as_deref(), expected_code, "{model}");
+            let rendered = error.to_string();
+            assert!(!rendered.contains("secret"), "{rendered}");
+            if let Some(code) = expected_code {
+                assert!(rendered.contains(code), "{rendered}");
+            }
+        }
     }
 
     #[tokio::test]

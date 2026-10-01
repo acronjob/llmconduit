@@ -54,6 +54,7 @@ mod tests {
                 revision: 1,
             }],
             model_switching: None,
+            request_encodings: Vec::new(),
         }
     }
 
