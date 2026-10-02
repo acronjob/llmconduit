@@ -730,6 +730,12 @@ fn merge_json_value_prefer_source(destination: &mut Value, source: &Value) {
 /// provider is cooling (the task then just waits for the next 1 s tick). A
 /// deadline already at/behind now yields `Duration::ZERO` (wake immediately), so
 /// the elapsed window is observed on the very next recompute.
+fn provider_health_fingerprint(health: &[ProviderHealth]) -> Vec<u8> {
+    // Serialization of plain owned data cannot fail; an empty fingerprint on the
+    // impossible error path only causes one extra publish.
+    serde_json::to_vec(health).unwrap_or_default()
+}
+
 fn next_cooldown_wake(health: &[ProviderHealth]) -> Option<std::time::Duration> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1397,7 +1403,9 @@ impl Gateway {
         // Publish an initial snapshot immediately so a consumer that reads before
         // the first tick still sees the current health (version 1), not the empty
         // default.
-        publisher.publish(upstream.provider_health());
+        let initial = upstream.provider_health();
+        let mut last_published = provider_health_fingerprint(&initial);
+        publisher.publish(initial);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1407,7 +1415,17 @@ impl Gateway {
                 // than the next 1 s tick, so an idle cooling→Healthy flip is
                 // published right at the deadline (not up to a second late).
                 let next_deadline = next_cooldown_wake(&health);
-                publisher.publish(health);
+                // Publish only a CHANGED vector. An unchanged republish bumped the
+                // topology version every second, so every dashboard viewer was
+                // re-sent an identical topology frame and every 5 s snapshot cut
+                // retained a fresh copy of it, on a box with no traffic at all.
+                // Compared by serialized form so a field added to
+                // `ProviderHealth` can never be silently ignored.
+                let fingerprint = provider_health_fingerprint(&health);
+                if fingerprint != last_published {
+                    last_published = fingerprint;
+                    publisher.publish(health);
+                }
                 match next_deadline {
                     Some(wake) if wake < std::time::Duration::from_secs(1) => {
                         // A tiny epsilon past the deadline so the recomputed status
@@ -1501,13 +1519,15 @@ impl Gateway {
         event: SseEvent,
         abort_token: &tokio_util::sync::CancellationToken,
     ) -> AppResult<()> {
-        let raw_event = event.clone();
+        // Only `--raw` needs the event after it is sent; cloning the JSON tree for
+        // every delta otherwise doubled the per-token allocation work.
+        let raw_event = self.raw_output.as_ref().map(|_| event.clone());
         tokio::select! {
             biased;
             _ = abort_token.cancelled() => return Err(AppError::cancelled()),
             result = tx.send(event) => result.map_err(|_| AppError::cancelled())?,
         }
-        if let Some(raw_output) = &self.raw_output {
+        if let (Some(raw_output), Some(raw_event)) = (&self.raw_output, raw_event) {
             raw_output
                 .write_sse_event(&raw_event)
                 .map_err(|err| AppError::internal(format!("failed to write raw output: {err}")))?;

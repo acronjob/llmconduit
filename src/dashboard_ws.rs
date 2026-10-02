@@ -1348,13 +1348,18 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                 // Atomic view + seq (D7b R2 finding 2): pair the tile body with its own
                 // ring cursor. `active_streams` is sampled AT tick time from the live
                 // FlowStore — the honest in-flight count for THIS frame.
-                let (view, seq) = gateway.metrics().view_with_seq();
                 let active = crate::dashboard_api::active_stream_count(&gateway);
                 // Gap 01 finding 1: emit when EITHER the aggregated view changed
                 // (`seq` advanced at a terminal finalize) OR the live open-flow count
                 // changed (a request started/ended mid-flight, which does NOT bump the
                 // ring seq). Without the active-count clause, an in-flight count change
-                // never reaches the strip until the next finalize.
+                // never reaches the strip until the next finalize. Peek the cheap seq
+                // first so an idle second skips aggregating the 1 h ring entirely; a
+                // send still re-reads view + seq atomically below.
+                if gateway.metrics().metrics_seq() == last_metrics_seq && active == last_active {
+                    continue;
+                }
+                let (view, seq) = gateway.metrics().view_with_seq();
                 if seq != last_metrics_seq || active != last_active {
                     last_metrics_seq = seq;
                     last_active = active;

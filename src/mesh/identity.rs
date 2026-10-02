@@ -49,7 +49,11 @@ impl MeshIdentity {
 pub async fn load_or_create(path: impl AsRef<Path>) -> io::Result<MeshIdentity> {
     let path = path.as_ref();
     match fs::read(path).await {
-        Ok(bytes) => return parse_identity_bytes(&bytes),
+        Ok(bytes) => {
+            let identity = parse_identity_bytes(&bytes)?;
+            restrict_existing_secret_file(path).await?;
+            return Ok(identity);
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
@@ -57,7 +61,7 @@ pub async fn load_or_create(path: impl AsRef<Path>) -> io::Result<MeshIdentity> 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent).await?;
+        create_private_dir_all(parent).await?;
     }
 
     let secret_key = SecretKey::generate();
@@ -102,6 +106,53 @@ fn temp_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| ".mesh-identity".into());
     name.push(format!(".{}.tmp", Uuid::new_v4()));
     path.with_file_name(name)
+}
+
+/// A key file copied around or created by an older release may be group or
+/// world readable; anyone who can read it can impersonate this node.
+#[cfg(unix)]
+async fn restrict_existing_secret_file(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(path).await?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{mode:o}"),
+            "mesh identity key was group/world accessible; restricting it to 0600"
+        );
+        // Read-only mounts (e.g. a container's `:ro` key bind) cannot be
+        // tightened from inside; the key is still usable, so refusing to start
+        // would turn a hardening nudge into an outage.
+        if let Err(error) = fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not restrict mesh identity key permissions; fix them on the host"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn restrict_existing_secret_file(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Directories this process creates for the key are owner-only; existing
+/// ancestors are left alone.
+#[cfg(unix)]
+async fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(path).await
+}
+
+#[cfg(not(unix))]
+async fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path).await
 }
 
 #[cfg(unix)]
@@ -179,5 +230,31 @@ mod tests {
 
         assert_eq!(mode, 0o600);
         let _ = fs::remove_file(path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loose_existing_identity_is_restricted_and_new_dirs_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_file("identity-dir");
+        let path = dir.join("nested").join("node.key");
+        let created = load_or_create(&path).await.expect("create identity");
+        let dir_mode = fs::metadata(path.parent().unwrap())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+        let loaded = load_or_create(&path).await.expect("load identity");
+        assert_eq!(created.endpoint_id(), loaded.endpoint_id());
+        let mode = fs::metadata(&path).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(dir).await;
     }
 }

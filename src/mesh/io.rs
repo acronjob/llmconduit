@@ -220,7 +220,10 @@ pub fn is_chunked(headers: &http::HeaderMap) -> bool {
 pub const MAX_HTTP_CHUNK_LINE_BYTES: usize = 1024;
 pub const MAX_HTTP_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
-pub fn drain_http_chunk(buf: &mut BytesMut, max_chunk_bytes: usize) -> AppResult<Option<Vec<u8>>> {
+pub fn drain_http_chunk(
+    buf: &mut BytesMut,
+    max_chunk_bytes: usize,
+) -> AppResult<Option<tokio_util::bytes::Bytes>> {
     let Some(line_end) = buf.windows(2).position(|window| window == b"\r\n") else {
         if buf.len() > MAX_HTTP_CHUNK_LINE_BYTES {
             return Err(AppError::upstream(format!(
@@ -262,7 +265,8 @@ pub fn drain_http_chunk(buf: &mut BytesMut, max_chunk_bytes: usize) -> AppResult
         return Err(AppError::upstream("mesh HTTP chunk missing trailing CRLF"));
     }
     buf.advance(line_end + 2);
-    let chunk = buf.split_to(size).to_vec();
+    // Hand out the chunk without copying; the buffer keeps only what follows.
+    let chunk = buf.split_to(size).freeze();
     buf.advance(2);
     Ok(Some(chunk))
 }
@@ -312,6 +316,7 @@ mod tests {
                     .collect(),
                 revision: 2,
             }),
+            error_status: None,
         };
         let write = tokio::spawn(async move { write_switch_response(&mut a, &response).await });
         let got = read_switch_response(&mut b).await.expect("read response");
