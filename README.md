@@ -416,7 +416,10 @@ mesh identity state or Access RBAC state into PostgreSQL.
 With a SQL store, llmconduit scrapes every backend's Prometheus `/metrics`
 endpoint (derived from its base URL by stripping `/v1`; override or disable per
 backend under `control_plane.metrics.backends`) every
-`control_plane.metrics.scrape_interval_secs` seconds. vLLM V1 and SGLang
+`control_plane.metrics.scrape_interval_secs` seconds. Derived URLs are only
+scraped for self-hosted backends (loopback, private/CGNAT IPs, single-label or
+`.local`/`.internal`/`.lan`/`.ts.net` hosts); public hosted APIs are skipped
+unless given an explicit `url` or `enabled: true`. Each body is capped at 2 MiB. vLLM V1 and SGLang
 families are recognised (running/waiting requests, KV-cache usage, prompt,
 generation and cached prompt tokens, prefix-cache hits/queries, TTFT,
 inter-token and end-to-end latency sums and counts, prefill/decode time,
@@ -816,7 +819,7 @@ disable it under `control_plane`:
 control_plane:
   vision_probe:
     enabled: true
-    interval_secs: 600
+    interval_secs: 3600   # default; each round sends real image requests
     timeout_secs: 20
 ```
 
@@ -945,7 +948,8 @@ management.
 The production helper deliberately refuses to install on an unacknowledged
 machine. Validate it first with
 `scripts/install-github-sso-production.sh --confirm-production-host "$(hostname)" --dry-run`,
-then omit `--dry-run` on the intended production host. The generated unit reads
+then omit `--dry-run` on the intended production host (see "Small production
+hosts" below for installing a prebuilt binary). The generated unit reads
 ordinary gateway settings from `LLMCONDUIT_CONFIG_PATH` and env-only OAuth
 credentials from the mode-`0600` `LLMCONDUIT_ENV_FILE`.
 
@@ -990,7 +994,63 @@ Environment=MALLOC_TRIM_THRESHOLD_=131072
 
 These are [glibc allocator settings](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html).
 The fixed mmap threshold disables glibc's automatic threshold increases; the
-arena cap trades allocation concurrency for lower memory retention.
+arena cap trades allocation concurrency for lower memory retention. The
+`llmconduit` binary itself allocates through mimalloc, so these only affect
+glibc-internal allocations and are harmless to keep.
+
+Large request bodies are parsed on Tokio's blocking pool, which is capped at
+16 threads (`LLMCONDUIT_MAX_BLOCKING_THREADS` overrides).
+
+#### Small production hosts (2 GB / 2 vCPU)
+
+The production helper writes these defaults into the systemd unit, with
+`MemoryHigh=1200M` / `MemoryMax=1536M` guardrails (`LLMCONDUIT_MEMORY_HIGH` /
+`LLMCONDUIT_MEMORY_MAX` at install time):
+
+```ini
+Environment=MALLOC_ARENA_MAX=2
+Environment=LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES=33554432
+Environment=LLMCONDUIT_MONITOR_PAYLOAD_PREVIEW_BYTES=16777216
+Environment=LLMCONDUIT_INFLIGHT_REQUEST_BODY_BYTES=67108864
+Environment=LLMCONDUIT_PERSISTENCE_QUEUE_MAX_BYTES=16777216
+Environment=LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=120
+```
+
+Override any of them in `~/.config/llmconduit/tuning.env` (created commented-out
+on first install, never overwritten). Do not compile the release binary on such
+a host — thin LTO with one codegen unit can run it out of memory. Build on a
+larger machine with the same architecture and an equal-or-older glibc, then
+install the result:
+
+```bash
+LLMCONDUIT_BUILD_DASHBOARD=1 cargo build --locked --release   # build host
+scripts/install-github-sso-production.sh --confirm-production-host "$(hostname)" \
+  --binary /path/to/llmconduit          # or --binary-url URL --binary-sha256 HEX
+```
+
+Without `--binary`, the helper compiles locally with
+`CARGO_PROFILE_RELEASE_LTO=false`, 16 codegen units and one build job. That
+still peaks around 2.1 GB, so it refuses on hosts with under 3 GiB of RAM+swap
+unless `--build-on-host` is passed (for example after adding swap). Also
+consider `control_plane.storage.keep_media: false` and a shorter `retention_days`.
+
+Streaming responses are Server-Sent Events. A reverse proxy in front of the
+gateway must not buffer or compress them, or clients see tokens in bursts and
+the proxy holds whole responses in memory. Streaming responses already carry
+`X-Accel-Buffering: no`, which nginx honours; still, on the nginx location
+that proxies llmconduit:
+
+```nginx
+proxy_http_version 1.1;
+proxy_buffering off;
+proxy_cache off;
+gzip off;
+proxy_read_timeout 1h;
+```
+
+Caddy streams `text/event-stream` responses without buffering by default; do not
+add an `encode` directive that covers `/v1/*`. Dashboard WebSockets (`/dashboard/ws`,
+`/debug/ws`) also need the usual `Upgrade`/`Connection` forwarding.
 
 The Providers view can also control a local [lil-fleet](https://github.com/local-inference-lab/lil-fleet)
 instance. Set `LLMCONDUIT_FLEET_URL` to its loopback origin and provide either
@@ -1103,7 +1163,7 @@ upstreams:
 ```
 
 ```bash
-export LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=30
+export LLMCONDUIT_PROVIDER_METRICS_INTERVAL_SECS=120   # default; 5..3600
 ```
 
 Scrapes run only with `--with-debug-ui`; failures retain the last good sample

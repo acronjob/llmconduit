@@ -20,13 +20,24 @@
 use crate::content_store::{ItemSection, SplitItem};
 use crate::harness::{HarnessIdentity, SubSessionPolicy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 /// Upper bound on session nodes kept in memory; oldest-touched are evicted.
-pub const MAX_NODES: usize = 20_000;
+/// Evicted nodes are re-warmed from durable rows on their next request, so
+/// this only bounds the hot set (a 2 GB host cannot afford 20k chain heads).
+pub const MAX_NODES: usize = 2_000;
 /// Upper bound on item hashes retained per chain head.
 pub const MAX_HEAD_ITEMS: usize = 8_192;
+/// Upper bound on item hashes retained across ALL chain heads (~34 bytes each
+/// in compact form, so ~34 MiB). `MAX_NODES * MAX_HEAD_ITEMS` alone would
+/// still allow >500 MiB of heads; past this budget the oldest-touched nodes
+/// are evicted.
+pub const MAX_TOTAL_HEAD_ITEMS: usize = 1_000_000;
+/// Default idle TTL for an in-memory node; override with
+/// `LLMCONDUIT_SESSION_INDEX_TTL_HOURS` (`0` disables the TTL).
+pub const DEFAULT_NODE_TTL_HOURS: u64 = 24;
 /// Upper bound on inferred children examined when matching a request.
 const MAX_CANDIDATE_CHAINS: usize = 256;
 
@@ -40,18 +51,15 @@ pub const KIND_INFERRED: &str = "inferred";
 /// the larger side. A title call that repeats the user's one message is not
 /// a rewrite of a 34-item chain; a re-sent conversation with a new system
 /// prompt still is.
-fn overlap_is_a_match(common: usize, head: &[ItemFingerprint], input: &[ItemFingerprint]) -> bool {
+fn overlap_is_a_match(common: usize, head: &[CompactItem], input: &[CompactItem]) -> bool {
     common >= 1 && common * 2 >= conversation_messages(head).max(conversation_messages(input))
 }
 
 /// The number of user/assistant/tool turns (the population [`overlap`] counts).
-fn conversation_messages(items: &[ItemFingerprint]) -> usize {
+fn conversation_messages(items: &[CompactItem]) -> usize {
     items
         .iter()
-        .filter(|item| {
-            item.section == ItemSection::Message
-                && !matches!(item.kind.as_deref(), Some("system") | Some("developer"))
-        })
+        .filter(|item| item.is_conversation_message())
         .count()
 }
 
@@ -71,6 +79,59 @@ impl From<&SplitItem> for ItemFingerprint {
             kind: item.kind.clone(),
         }
     }
+}
+
+/// In-memory form of an [`ItemFingerprint`]: 34 inline bytes instead of two
+/// heap strings (~150 bytes). Lineage only ever compares hashes for equality
+/// and asks whether a message is a system/developer turn, so that is all a
+/// retained chain head keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactItem {
+    hash: [u8; 32],
+    section: ItemSection,
+    /// `kind` was `system` or `developer`.
+    instruction_like: bool,
+}
+
+impl CompactItem {
+    fn is_conversation_message(&self) -> bool {
+        self.section == ItemSection::Message && !self.instruction_like
+    }
+}
+
+impl From<&ItemFingerprint> for CompactItem {
+    fn from(item: &ItemFingerprint) -> Self {
+        Self {
+            hash: compact_hash(&item.hash),
+            section: item.section,
+            instruction_like: matches!(item.kind.as_deref(), Some("system") | Some("developer")),
+        }
+    }
+}
+
+fn compact_items(items: &[ItemFingerprint]) -> Vec<CompactItem> {
+    items.iter().map(CompactItem::from).collect()
+}
+
+/// Map an item hash to 32 bytes while preserving equality. Identities are
+/// lowercase hex SHA-256 (decoded losslessly); anything else (legacy rows,
+/// tests) is digested with a domain prefix, so two distinct strings collide
+/// only with a SHA-256 collision. Only LOWERCASE hex is decoded so `"AB.."`
+/// and `"ab.."` stay distinct, exactly as the string comparison had them.
+fn compact_hash(hash: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    if hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && hex::decode_to_slice(hash, &mut out).is_ok()
+    {
+        return out;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"llmconduit-session-item\0");
+    hasher.update(hash.as_bytes());
+    hasher.finalize().into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +174,7 @@ pub struct Lineage {
 }
 
 /// Length of the common prefix of two item sequences.
-fn shared_prefix(predecessor: &[ItemFingerprint], current: &[ItemFingerprint]) -> usize {
+fn shared_prefix(predecessor: &[CompactItem], current: &[CompactItem]) -> usize {
     predecessor
         .iter()
         .zip(current.iter())
@@ -127,20 +188,21 @@ fn shared_prefix(predecessor: &[ItemFingerprint], current: &[ItemFingerprint]) -
 /// Code sub-agent has the same tools as the main thread), so they cannot
 /// tell "the system prompt changed, same conversation" (cache bust) apart
 /// from "a different conversation" (new chain). Shared history can.
-fn overlap(predecessor: &[ItemFingerprint], current: &[ItemFingerprint]) -> usize {
-    let present: HashSet<&str> = current.iter().map(|item| item.hash.as_str()).collect();
+fn overlap(predecessor: &[CompactItem], current: &[CompactItem]) -> usize {
+    let present: HashSet<&[u8; 32]> = current.iter().map(|item| &item.hash).collect();
     predecessor
         .iter()
-        .filter(|item| {
-            item.section == ItemSection::Message
-                && !matches!(item.kind.as_deref(), Some("system") | Some("developer"))
-        })
-        .filter(|item| present.contains(item.hash.as_str()))
+        .filter(|item| item.is_conversation_message())
+        .filter(|item| present.contains(&item.hash))
         .count()
 }
 
 /// Compare a request's items with its chain predecessor's.
 pub fn classify(predecessor: &[ItemFingerprint], current: &[ItemFingerprint]) -> Lineage {
+    classify_compact(&compact_items(predecessor), &compact_items(current))
+}
+
+fn classify_compact(predecessor: &[CompactItem], current: &[CompactItem]) -> Lineage {
     let shared = shared_prefix(predecessor, current);
     if shared == predecessor.len() {
         return Lineage {
@@ -178,10 +240,8 @@ pub fn classify(predecessor: &[ItemFingerprint], current: &[ItemFingerprint]) ->
         .map(|item| match item.section {
             ItemSection::Instructions => DivergenceKind::InstructionsChanged,
             ItemSection::Tool => DivergenceKind::ToolsChanged,
-            ItemSection::Message => match item.kind.as_deref() {
-                Some("system") | Some("developer") => DivergenceKind::InstructionsChanged,
-                _ => DivergenceKind::HistoryRewritten,
-            },
+            ItemSection::Message if item.instruction_like => DivergenceKind::InstructionsChanged,
+            ItemSection::Message => DivergenceKind::HistoryRewritten,
         })
         // Instructions and tools outrank a history rewrite when either side says so.
         .min_by_key(|kind| match kind {
@@ -251,20 +311,79 @@ pub struct ChainHead {
     pub items: Vec<ItemFingerprint>,
 }
 
+/// A node's chain head as retained in memory.
+#[derive(Debug)]
+struct CompactHead {
+    request_id: String,
+    items: Box<[CompactItem]>,
+}
+
+impl CompactHead {
+    fn new(request_id: String, items: &[ItemFingerprint]) -> Self {
+        let items = &items[..items.len().min(MAX_HEAD_ITEMS)];
+        Self {
+            request_id,
+            items: items.iter().map(CompactItem::from).collect(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Node {
     row: SessionRow,
-    head: Option<ChainHead>,
+    head: Option<CompactHead>,
     children: Vec<String>,
+    /// Generation of this node's latest entry in `Index::order`; older entries
+    /// for the same id are stale. Makes "was this its last touch?" O(1).
+    touch_generation: u64,
+    /// Linker clock (request `now_ms`) at the latest touch, for the idle TTL.
+    touched_ms: i64,
 }
 
-#[derive(Debug, Default)]
+impl Node {
+    fn head_len(&self) -> usize {
+        self.head.as_ref().map_or(0, |head| head.items.len())
+    }
+}
+
+#[derive(Debug)]
 struct Index {
     nodes: HashMap<String, Node>,
     declared: HashMap<(String, String), String>,
     anonymous: HashMap<(String, String), String>,
-    /// Touch order for eviction (front = oldest). May hold stale ids.
-    order: VecDeque<String>,
+    /// Touch order for eviction (front = oldest), tagged with the touch
+    /// generation. May hold stale entries (generation no longer current).
+    order: VecDeque<(String, u64)>,
+    next_generation: u64,
+    /// Latest `now_ms` seen, so seeded nodes count as freshly touched.
+    clock_ms: i64,
+    /// Sum of every node's retained head items (the byte budget).
+    head_items: usize,
+    /// Idle TTL in ms; `0` disables it.
+    ttl_ms: i64,
+}
+
+impl Index {
+    fn new(ttl_ms: i64) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            declared: HashMap::new(),
+            anonymous: HashMap::new(),
+            order: VecDeque::new(),
+            next_generation: 0,
+            clock_ms: 0,
+            head_items: 0,
+            ttl_ms,
+        }
+    }
+}
+
+fn ttl_ms_from_env() -> i64 {
+    let hours = std::env::var("LLMCONDUIT_SESSION_INDEX_TTL_HOURS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NODE_TTL_HOURS);
+    i64::try_from(hours.saturating_mul(3_600_000)).unwrap_or(i64::MAX)
 }
 
 /// In-memory session index. Cheap to clone the handle (`Arc` it).
@@ -276,8 +395,12 @@ pub struct SessionLinker {
 
 impl SessionLinker {
     pub fn new(infer_sub_sessions: bool) -> Self {
+        Self::with_ttl_ms(infer_sub_sessions, ttl_ms_from_env())
+    }
+
+    fn with_ttl_ms(infer_sub_sessions: bool, ttl_ms: i64) -> Self {
         Self {
-            index: Mutex::new(Index::default()),
+            index: Mutex::new(Index::new(ttl_ms)),
             infer_sub_sessions,
         }
     }
@@ -318,12 +441,26 @@ impl SessionLinker {
             .index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Seeding is a resume: the warmed nodes are about to be used, so they
+        // count as touched now (not at their durable `last_seen_ms`, which
+        // would let the idle TTL evict them before the request links).
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+            });
+        index.clock_ms = index.clock_ms.max(wall_ms);
         for (row, head) in rows {
             if index.nodes.contains_key(&row.id) {
                 continue;
             }
+            let head = head.map(|head| CompactHead::new(head.request_id, &head.items));
             index.insert_node(row, head);
         }
+        // Seeding can push the index over its budgets; the oldest-touched
+        // nodes (never the ones just seeded) go first.
+        let now_ms = index.clock_ms;
+        index.evict(now_ms);
     }
 
     pub fn node_count(&self) -> usize {
@@ -343,6 +480,8 @@ impl SessionLinker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let identity = input.identity;
         let mut touched: Vec<String> = Vec::new();
+        index.clock_ms = index.clock_ms.max(input.now_ms);
+        let items = compact_items(input.items);
 
         // 1. The anchor: the declared session/sub-session, or the per-client
         //    anonymous bucket when nothing was declared.
@@ -404,9 +543,9 @@ impl SessionLinker {
             else {
                 continue;
             };
-            let prefix = shared_prefix(&head.items, input.items);
-            let common = overlap(&head.items, input.items);
-            if prefix == 0 && !overlap_is_a_match(common, &head.items, input.items) {
+            let prefix = shared_prefix(&head.items, &items);
+            let common = overlap(&head.items, &items);
+            if prefix == 0 && !overlap_is_a_match(common, &head.items, &items) {
                 continue;
             }
             let score = (prefix, common);
@@ -425,7 +564,7 @@ impl SessionLinker {
                     .get(&node_id)
                     .and_then(|node| node.head.as_ref())
                     .expect("best candidate has a head");
-                let lineage = classify(&head.items, input.items);
+                let lineage = classify_compact(&head.items, &items);
                 let parent = head.request_id.clone();
                 (node_id, lineage, Some(parent))
             }
@@ -434,7 +573,7 @@ impl SessionLinker {
                     .nodes
                     .get(&anchor)
                     .and_then(|node| node.head.as_ref())
-                    .cloned();
+                    .map(|head| (head.request_id.clone(), head.items.len()));
                 match anchor_head {
                     None => (anchor.clone(), new_chain(), None),
                     // An unrelated conversation is a sub-session only when it
@@ -443,31 +582,35 @@ impl SessionLinker {
                     // parent has grown through tool round-trips. A larger
                     // conversation arriving after a short side call (a title
                     // request, a summary) is the session's real chain.
-                    Some(head) if inference_allowed && head.items.len() > input.items.len() => {
+                    Some((head_request, head_len))
+                        if inference_allowed && head_len > input.items.len() =>
+                    {
                         let child = index.inferred_child(
                             &anchor,
                             identity,
                             &input,
-                            Some(head.request_id.clone()),
+                            Some(head_request),
                             &mut touched,
                         );
                         (child, new_chain(), None)
                     }
                     // No chain matched (no prefix, no substantial overlap):
                     // a new conversation on the anchor, after the previous one.
-                    Some(head) => (anchor.clone(), new_chain(), Some(head.request_id)),
+                    Some((head_request, _)) => (anchor.clone(), new_chain(), Some(head_request)),
                 }
             }
         };
 
         // 4. Advance the chosen chain and account the request on its node.
         if let Some(node) = index.nodes.get_mut(&node_id) {
-            let mut items = input.items.to_vec();
-            items.truncate(MAX_HEAD_ITEMS);
-            node.head = Some(ChainHead {
+            let old_len = node.head_len();
+            let mut kept = items;
+            kept.truncate(MAX_HEAD_ITEMS);
+            node.head = Some(CompactHead {
                 request_id: input.api_call_id.to_string(),
-                items,
+                items: kept.into_boxed_slice(),
             });
+            let new_len = node.head_len();
             node.row.request_count += 1;
             node.row.last_seen_ms = input.now_ms;
             if node.row.root_request_id.is_none() {
@@ -476,12 +619,18 @@ impl SessionLinker {
             if node.row.harness_version.is_none() {
                 node.row.harness_version = identity.version.clone();
             }
+            index.head_items = index.head_items.saturating_sub(old_len) + new_len;
+        }
+        // The anchor is in use even when an inferred child took the request;
+        // touching it keeps a parent from aging out ahead of its children.
+        if anchor != node_id {
+            index.touch(&anchor);
         }
         index.touch(&node_id);
         if !touched.contains(&node_id) {
             touched.push(node_id.clone());
         }
-        index.evict();
+        index.evict(input.now_ms);
 
         let upserts = touched
             .iter()
@@ -511,7 +660,7 @@ fn new_id() -> String {
 }
 
 impl Index {
-    fn insert_node(&mut self, row: SessionRow, head: Option<ChainHead>) {
+    fn insert_node(&mut self, row: SessionRow, head: Option<CompactHead>) {
         if let Some(external_id) = &row.external_id {
             self.declared
                 .insert((row.harness.clone(), external_id.clone()), row.id.clone());
@@ -525,56 +674,86 @@ impl Index {
         {
             parent.children.push(row.id.clone());
         }
-        self.order.push_back(row.id.clone());
-        self.nodes.insert(
-            row.id.clone(),
-            Node {
-                row,
-                head,
-                children: Vec::new(),
-            },
-        );
+        let id = row.id.clone();
+        let node = Node {
+            row,
+            head,
+            children: Vec::new(),
+            touch_generation: 0,
+            touched_ms: self.clock_ms,
+        };
+        self.head_items += node.head_len();
+        self.nodes.insert(id.clone(), node);
+        self.touch(&id);
     }
 
     fn touch(&mut self, id: &str) {
-        self.order.push_back(id.to_string());
+        let generation = self.next_generation;
+        let clock_ms = self.clock_ms;
+        let Some(node) = self.nodes.get_mut(id) else {
+            return;
+        };
+        self.next_generation += 1;
+        node.touch_generation = generation;
+        node.touched_ms = clock_ms;
+        self.order.push_back((id.to_string(), generation));
     }
 
-    fn evict(&mut self) {
-        while self.nodes.len() > MAX_NODES {
-            let Some(candidate) = self.order.pop_front() else {
-                break;
+    fn over_budget(&self) -> bool {
+        self.nodes.len() > MAX_NODES || self.head_items > MAX_TOTAL_HEAD_ITEMS
+    }
+
+    /// Evict oldest-touched nodes while over the node/item budget or idle
+    /// past the TTL. Each `order` entry is popped at most once, so the
+    /// amortized cost per touch is O(1).
+    fn evict(&mut self, now_ms: i64) {
+        while let Some((candidate, generation)) = self.order.front() {
+            let Some(node) = self.nodes.get(candidate) else {
+                self.order.pop_front();
+                continue;
             };
-            // A later touch keeps the node alive; only evict if this was its
-            // last (front-most) position.
-            if self.order.iter().any(|id| id == &candidate) {
+            // A later touch keeps the node alive; only its latest entry counts.
+            if node.touch_generation != *generation {
+                self.order.pop_front();
                 continue;
             }
-            if let Some(node) = self.nodes.remove(&candidate) {
-                if let Some(external_id) = &node.row.external_id {
-                    self.declared
-                        .remove(&(node.row.harness.clone(), external_id.clone()));
-                } else if node.row.kind == KIND_INFERRED && node.row.parent_id.is_none() {
-                    let key = node.row.client_label.clone().unwrap_or_default();
-                    self.anonymous.remove(&(node.row.harness.clone(), key));
-                }
-                if let Some(parent_id) = &node.row.parent_id
-                    && let Some(parent) = self.nodes.get_mut(parent_id)
-                {
-                    parent.children.retain(|child| child != &candidate);
-                }
+            let expired = self.ttl_ms > 0 && now_ms.saturating_sub(node.touched_ms) > self.ttl_ms;
+            if !expired && !self.over_budget() {
+                break;
             }
+            let Some((candidate, _)) = self.order.pop_front() else {
+                break;
+            };
+            self.remove_node(&candidate);
         }
-        // Keep the touch log from growing without bound.
-        if self.order.len() > MAX_NODES.saturating_mul(4) {
-            let mut seen = HashSet::new();
-            let mut compact = VecDeque::new();
-            for id in self.order.iter().rev() {
-                if seen.insert(id.clone()) {
-                    compact.push_front(id.clone());
-                }
-            }
-            self.order = compact;
+        // Keep the touch log from growing without bound: drop stale entries
+        // once they dominate (amortized O(1) per touch).
+        if self.order.len() > self.nodes.len().saturating_mul(4).max(1_024) {
+            let nodes = &self.nodes;
+            self.order.retain(|(id, generation)| {
+                nodes
+                    .get(id)
+                    .is_some_and(|node| node.touch_generation == *generation)
+            });
+        }
+    }
+
+    fn remove_node(&mut self, id: &str) {
+        let Some(node) = self.nodes.remove(id) else {
+            return;
+        };
+        self.head_items = self.head_items.saturating_sub(node.head_len());
+        if let Some(external_id) = &node.row.external_id {
+            self.declared
+                .remove(&(node.row.harness.clone(), external_id.clone()));
+        } else if node.row.kind == KIND_INFERRED && node.row.parent_id.is_none() {
+            let key = node.row.client_label.clone().unwrap_or_default();
+            self.anonymous.remove(&(node.row.harness.clone(), key));
+        }
+        if let Some(parent_id) = &node.row.parent_id
+            && let Some(parent) = self.nodes.get_mut(parent_id)
+        {
+            parent.children.retain(|child| child != id);
         }
     }
 
@@ -1222,5 +1401,71 @@ mod tests {
         assert!(linker.node_count() <= MAX_NODES);
         assert!(!linker.knows_declared("generic", "s-0"));
         assert!(linker.knows_declared("generic", &format!("s-{}", MAX_NODES + 49)));
+    }
+
+    #[test]
+    fn a_retouched_node_survives_count_eviction() {
+        let linker = SessionLinker::with_ttl_ms(true, 0);
+        let hot = identity("generic", Some("hot"));
+        link(&linker, "r0", &hot, &convo(&["u"]), 0);
+        for n in 0..(MAX_NODES + 50) {
+            let id = identity("generic", Some(&format!("s-{n}")));
+            link(&linker, "r", &id, &convo(&["u"]), n as i64);
+            if n % 100 == 0 {
+                link(&linker, "r-hot", &hot, &convo(&["u"]), n as i64);
+            }
+        }
+        assert!(linker.node_count() <= MAX_NODES);
+        assert!(linker.knows_declared("generic", "hot"));
+        assert!(!linker.knows_declared("generic", "s-0"));
+        // The touch log stays proportional to the live node count.
+        let index = linker.index.lock().unwrap();
+        assert!(index.order.len() <= index.nodes.len().saturating_mul(4).max(1_024));
+    }
+
+    #[test]
+    fn idle_nodes_expire_after_the_ttl() {
+        let ttl_ms = 1_000;
+        let linker = SessionLinker::with_ttl_ms(true, ttl_ms);
+        let idle = identity("generic", Some("idle"));
+        let busy = identity("generic", Some("busy"));
+        link(&linker, "r1", &idle, &convo(&["u"]), 0);
+        link(&linker, "r2", &busy, &convo(&["u"]), 500);
+        link(&linker, "r3", &busy, &convo(&["u", "a"]), ttl_ms + 1);
+        assert!(!linker.knows_declared("generic", "idle"));
+        assert!(linker.knows_declared("generic", "busy"));
+        assert_eq!(linker.node_count(), 1);
+        assert_eq!(linker.index.lock().unwrap().head_items, 4);
+    }
+
+    #[test]
+    fn total_head_items_are_budgeted_across_nodes() {
+        let linker = SessionLinker::with_ttl_ms(true, 0);
+        let big: Vec<ItemFingerprint> = (0..MAX_HEAD_ITEMS)
+            .map(|n| msg(&format!("item-{n}")))
+            .collect();
+        let sessions = MAX_TOTAL_HEAD_ITEMS / MAX_HEAD_ITEMS + 5;
+        for n in 0..sessions {
+            let id = identity("generic", Some(&format!("big-{n}")));
+            link(&linker, "r", &id, &big, n as i64);
+        }
+        let index = linker.index.lock().unwrap();
+        assert!(index.head_items <= MAX_TOTAL_HEAD_ITEMS);
+        let actual: usize = index.nodes.values().map(Node::head_len).sum();
+        assert_eq!(index.head_items, actual);
+        assert!(index.nodes.len() < sessions);
+    }
+
+    #[test]
+    fn compact_hash_preserves_string_equality() {
+        let hex_lower = "ab".repeat(32);
+        let hex_upper = "AB".repeat(32);
+        assert_eq!(compact_hash(&hex_lower), [0xab; 32]);
+        assert_ne!(compact_hash(&hex_lower), compact_hash(&hex_upper));
+        assert_eq!(compact_hash("u1"), compact_hash("u1"));
+        assert_ne!(compact_hash("u1"), compact_hash("u2"));
+        // A non-hex string never aliases a decoded hex identity.
+        assert_ne!(compact_hash(&hex_upper), [0xab; 32]);
+        assert_eq!(std::mem::size_of::<CompactItem>(), 34);
     }
 }

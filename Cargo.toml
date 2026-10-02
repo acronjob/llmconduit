@@ -77,6 +77,20 @@ flate2 = "1"
 brotli = "8"
 uuid = { version = "1", features = ["serde", "v4"] }
 utoipa = { version = "5", features = ["axum_extras"] }
+# Global allocator for the BINARY only (`src/main.rs`). Returns freed pages to
+# the OS promptly and avoids glibc's per-thread arena growth, keeping RSS low on
+# small hosts. The lib keeps the system allocator (its `#[cfg(test)]`
+# allocation probe installs its own `#[global_allocator]` in the lib test crate).
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+# Thin LTO + a single codegen unit: smaller, faster binary for one extra build
+# minute. `panic` stays `unwind` — request handling relies on unwind isolation.
+# Small build hosts can override with CARGO_PROFILE_RELEASE_LTO=false and
+# CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 (see scripts/install-github-sso-production.sh).
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [dev-dependencies]
 pretty_assertions = "1"
