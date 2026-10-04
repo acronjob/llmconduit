@@ -999,11 +999,11 @@ enum HoldEvaluation {
 /// Decides whether active holds on one endpoint allow a lifecycle change.
 ///
 /// An unload conflicts with every hold on the target model. A load of model
-/// X conflicts with a hold on another model H only when Fleet would stop H:
-/// H is currently active and the worker does not visibly run concurrent
-/// deployments (two or more active models at once). Loading or rescaling the
-/// held model itself never conflicts. Without a live inventory nothing else
-/// can be stopped, so only same-model unloads are checked.
+/// X conflicts with a hold on another model H only when Fleet would stop H to
+/// start X: H is currently active and the node may be switching models
+/// exclusively (see [`may_switch_exclusively`]). Loading or rescaling the held
+/// model itself never conflicts. Without a live inventory nothing else can be
+/// stopped, so only same-model unloads are checked.
 fn evaluate_holds(
     active: &[ModelHoldRecord],
     model_id: &str,
@@ -1012,21 +1012,14 @@ fn evaluate_holds(
     options: &LifecycleOptions,
     owner: &str,
 ) -> HoldEvaluation {
-    let concurrent = switching.is_some_and(|switching| {
-        switching
-            .models
-            .iter()
-            .filter(|model| model_is_active(model))
-            .count()
-            >= 2
-    });
+    let load_may_stop_others = switching.is_some_and(may_switch_exclusively);
     let conflicting: Vec<&ModelHoldRecord> = active
         .iter()
         .filter(|hold| match action {
             HoldAction::Unload => hold.model_id == model_id,
             HoldAction::Load => {
                 hold.model_id != model_id
-                    && !concurrent
+                    && load_may_stop_others
                     && switching.is_some_and(|switching| {
                         switching
                             .models
@@ -1055,6 +1048,31 @@ fn evaluate_holds(
     } else {
         HoldEvaluation::Blocked { release, blocking }
     }
+}
+
+/// Whether loading one model on this node may make Fleet stop the others.
+///
+/// lil-fleet only stops other models on activation when it runs without
+/// `runtime.concurrent_deployments` ("exclusive switching"). With concurrent
+/// deployments it places the new instances on GPUs no other model holds, or
+/// refuses the load as insufficient capacity; it never evicts a running model
+/// to make room. Fleet accepts per-model `placement.gpu_count` only together
+/// with concurrent deployments, so any advertised `gpu_count > 0` proves the
+/// node is not switching exclusively, as does seeing two models active at
+/// once. Without either signal (an older Fleet, static GPU lists, another
+/// provider), every load is conservatively treated as exclusive.
+fn may_switch_exclusively(switching: &ModelSwitchingAdvertisement) -> bool {
+    if switching.provider != "lil-fleet" {
+        return true;
+    }
+    let places_by_gpu_count = switching.models.iter().any(|model| model.gpu_count > 0);
+    let visibly_concurrent = switching
+        .models
+        .iter()
+        .filter(|model| model_is_active(model))
+        .count()
+        >= 2;
+    !(places_by_gpu_count || visibly_concurrent)
 }
 
 /// Fleet runs (or is starting) at least one instance of this profile.
@@ -2296,8 +2314,234 @@ mod tests {
         }
     }
 
+    /// A profile on an exclusive-switching Fleet (no per-model GPU placement).
     fn switchable(id: &str, phase: &str, desired: &str) -> SwitchableModelAdvertisement {
-        SwitchableModelAdvertisement::legacy(id, None, phase, desired, 1, vec![0])
+        SwitchableModelAdvertisement::legacy(id, None, phase, desired, 0, Vec::new())
+    }
+
+    /// A profile Fleet places on `gpu_count` free GPUs (concurrent deployments).
+    fn placed(
+        id: &str,
+        phase: &str,
+        desired: &str,
+        gpu_count: u32,
+        assigned_gpus: Vec<u32>,
+    ) -> SwitchableModelAdvertisement {
+        SwitchableModelAdvertisement::legacy(id, None, phase, desired, gpu_count, assigned_gpus)
+    }
+
+    fn fleet_inventory(models: Vec<SwitchableModelAdvertisement>) -> ModelSwitchingAdvertisement {
+        ModelSwitchingAdvertisement {
+            provider: "lil-fleet".into(),
+            models,
+            revision: 1,
+        }
+    }
+
+    fn hold_on(model: &str, hold_id: &str, owner: &str) -> ModelHoldRecord {
+        ModelHoldRecord {
+            hold_id: hold_id.into(),
+            endpoint_id: "endpoint".into(),
+            model_id: model.into(),
+            holder: "harbor/run-1".into(),
+            owner: owner.into(),
+            created_at_ms: 1,
+            expires_at_ms: i64::MAX,
+        }
+    }
+
+    /// The incident shape: an 8-GPU node with a held 4-GPU profile on GPUs
+    /// 0,1,6,7, a second 4-GPU profile just unloaded, and a third to load.
+    fn split_node() -> ModelSwitchingAdvertisement {
+        fleet_inventory(vec![
+            placed("qwen", "ready", "ready", 4, vec![0, 1, 6, 7]),
+            placed("deepseek", "unloaded", "unloaded", 4, Vec::new()),
+            placed("mimo", "unloaded", "unloaded", 4, Vec::new()),
+        ])
+    }
+
+    fn evaluate_load(
+        holds: &[ModelHoldRecord],
+        model: &str,
+        switching: Option<&ModelSwitchingAdvertisement>,
+        release: &[&str],
+    ) -> HoldEvaluation {
+        evaluate_holds(
+            holds,
+            model,
+            HoldAction::Load,
+            switching,
+            &LifecycleOptions {
+                release_holds: release.iter().map(|id| id.to_string()).collect(),
+                force: false,
+            },
+            "key_coordinator",
+        )
+    }
+
+    #[test]
+    fn placed_loads_beside_a_held_profile_do_not_conflict() {
+        let holds = [hold_on("qwen", "hold_qwen", "key_coordinator")];
+        let switching = split_node();
+        assert_eq!(
+            evaluate_load(&holds, "mimo", Some(&switching), &[]),
+            HoldEvaluation::Proceed {
+                release: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn placed_loads_that_exceed_free_gpus_are_left_to_fleet() {
+        // Both halves of the node are busy and one is held. Fleet refuses the
+        // load as insufficient capacity instead of evicting, so the hold is
+        // never at risk and Fleet's own 409 explains the refusal.
+        let holds = [hold_on("qwen", "hold_qwen", "key_coordinator")];
+        let switching = fleet_inventory(vec![
+            placed("qwen", "ready", "ready", 4, vec![0, 1, 6, 7]),
+            placed("deepseek", "ready", "ready", 4, vec![2, 3, 4, 5]),
+            placed("mimo", "unloaded", "unloaded", 4, Vec::new()),
+        ]);
+        assert_eq!(
+            evaluate_load(&holds, "mimo", Some(&switching), &[]),
+            HoldEvaluation::Proceed {
+                release: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn rescaling_and_multiple_holds_on_a_placed_node_do_not_conflict() {
+        let holds = [
+            hold_on("qwen", "hold_qwen", "key_coordinator"),
+            hold_on("qwen", "hold_other", "key_operator"),
+            hold_on("deepseek", "hold_deepseek", "key_operator"),
+        ];
+        let switching = fleet_inventory(vec![
+            placed("qwen", "ready", "ready", 4, vec![0, 1, 6, 7]),
+            placed("deepseek", "ready", "ready", 2, vec![2, 3]),
+            placed("mimo", "ready", "ready", 1, vec![4]),
+        ]);
+        // Rescaling mimo onto the remaining GPUs stops nothing.
+        assert_eq!(
+            evaluate_load(&holds, "mimo", Some(&switching), &[]),
+            HoldEvaluation::Proceed {
+                release: Vec::new()
+            }
+        );
+        // Another credential's hold cannot be named because nothing conflicts.
+        assert_eq!(
+            evaluate_load(&holds, "mimo", Some(&switching), &["hold_deepseek"]),
+            HoldEvaluation::Proceed {
+                release: Vec::new()
+            }
+        );
+        // Rescaling a held profile never conflicts with any hold.
+        assert_eq!(
+            evaluate_load(&holds, "qwen", Some(&switching), &[]),
+            HoldEvaluation::Proceed {
+                release: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn unloading_a_held_placed_profile_is_still_blocked() {
+        let holds = [
+            hold_on("qwen", "hold_qwen", "key_coordinator"),
+            hold_on("mimo", "hold_mimo", "key_coordinator"),
+        ];
+        let switching = split_node();
+        let options = LifecycleOptions::default();
+        let HoldEvaluation::Blocked { release, blocking } = evaluate_holds(
+            &holds,
+            "qwen",
+            HoldAction::Unload,
+            Some(&switching),
+            &options,
+            "key_coordinator",
+        ) else {
+            panic!("unload of a held profile must be blocked");
+        };
+        assert!(release.is_empty());
+        assert_eq!(blocking, vec![holds[0].clone()]);
+        // The owner may still release its own hold through the unload.
+        assert_eq!(
+            evaluate_holds(
+                &holds,
+                "qwen",
+                HoldAction::Unload,
+                Some(&switching),
+                &LifecycleOptions {
+                    release_holds: vec!["hold_qwen".into()],
+                    force: false,
+                },
+                "key_coordinator",
+            ),
+            HoldEvaluation::Proceed {
+                release: vec!["hold_qwen".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn exclusive_switching_loads_still_conflict_with_every_active_hold() {
+        let holds = [
+            hold_on("qwen", "hold_qwen", "key_coordinator"),
+            hold_on("idle", "hold_idle", "key_operator"),
+        ];
+        let switching = fleet_inventory(vec![
+            switchable("qwen", "ready", "ready"),
+            switchable("idle", "unloaded", "unloaded"),
+            switchable("mimo", "unloaded", "unloaded"),
+        ]);
+        assert_eq!(
+            evaluate_load(&holds, "mimo", Some(&switching), &[]),
+            HoldEvaluation::Blocked {
+                release: Vec::new(),
+                blocking: vec![holds[0].clone()],
+            }
+        );
+        assert_eq!(
+            evaluate_load(&holds, "mimo", Some(&switching), &["hold_qwen"]),
+            HoldEvaluation::Proceed {
+                release: vec!["hold_qwen".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_placement_signals_keep_the_conservative_rule() {
+        let holds = [hold_on("qwen", "hold_qwen", "key_coordinator")];
+        // Another provider's gpu_count says nothing about Fleet's eviction rule.
+        let mut other_provider = split_node();
+        other_provider.provider = "other".into();
+        assert!(matches!(
+            evaluate_load(&holds, "mimo", Some(&other_provider), &[]),
+            HoldEvaluation::Blocked { .. }
+        ));
+        // Without a live inventory nothing is known to be running.
+        assert_eq!(
+            evaluate_load(&holds, "mimo", None, &[]),
+            HoldEvaluation::Proceed {
+                release: Vec::new()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn loads_beside_a_held_profile_on_free_gpus_are_forwarded() {
+        let fixture = mesh_fixture(split_node().models).await;
+        new_hold(&fixture, coordinator(), "qwen").await;
+        // The hold does not refuse the load; the test worker is unreachable,
+        // so the forwarded request fails with 502 rather than 409.
+        assert_eq!(
+            load(&fixture, operator(), "mimo", &[]).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        let refused = unload(&fixture, operator(), ManagementChannel::ApiKey, "qwen", &[]).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(refused).await["code"], "model_held");
     }
 
     async fn mesh_fixture(models: Vec<SwitchableModelAdvertisement>) -> MeshFixture {
