@@ -432,9 +432,14 @@ unloaded underneath a running evaluation.
   holds. Renew and release are limited to the credential that created the
   hold (`403 hold_not_owned`); an unknown or expired hold is `404`.
 - While an unexpired hold exists, `unload` of that profile, and a
-  `load`/`switch` of another profile that would make Fleet stop it (the held
-  profile is active and the worker is not visibly running concurrent
-  deployments), return `409 {"error", "code": "model_held", "holders": [...]}`.
+  `load`/`switch` of another profile that would make Fleet stop it, return
+  `409 {"error", "code": "model_held", "holders": [...]}`. A load only stops
+  other profiles when Fleet switches exclusively: the held profile is active,
+  no advertised profile has a Fleet `gpu_count` placement (placement requires
+  `runtime.concurrent_deployments`, under which Fleet uses free GPUs or
+  refuses the load but never evicts), and fewer than two profiles are active.
+  Profiles on a placement-managed node are therefore loaded, rescaled, and
+  unloaded independently of holds on other profiles.
   The owner passes `?release_hold=<hold_id>` (repeatable or comma separated) to
   unload or switch away from its own profile; the hold is deleted once the
   worker accepts the change (`released_holds` in the response). Loading or
