@@ -344,10 +344,12 @@ mod tests {
                     })
                     .collect(),
                 revision: 2,
+                gpu_inventory: None,
             }),
             error_status: None,
             error_code: None,
             operation: None,
+            warnings: Vec::new(),
         };
         let write = tokio::spawn(async move { write_switch_response(&mut a, &response).await });
         let got = read_switch_response(&mut b).await.expect("read response");

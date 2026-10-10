@@ -149,6 +149,12 @@ pub struct MeshModelSwitching {
     pub provider: String,
     pub models: Vec<MeshSwitchableModel>,
     pub revision: u64,
+    /// The node's latest per-GPU VRAM sample. Absent for workers that do not
+    /// report one (older workers, older Fleet, or nvidia-smi failing): GPU
+    /// info is then unavailable, never zero. `age_ms` is measured on the
+    /// worker clock up to send time plus the hub's time since receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_inventory: Option<crate::dashboard_fleet::FleetGpuInventory>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -246,10 +252,25 @@ pub struct MeshModelOverrideRequest {
     pub model: String,
 }
 
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+/// Mesh load body: at least one of `instances` and `gpus`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MeshModelLoadRequest {
-    pub instances: u32,
+    /// Desired replica count, 1..=64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
+    /// Manual GPU pick for the newly started instances, in assignment order
+    /// (`gpu_count` x new instances), from the node's `gpu_inventory`. Empty
+    /// or omitted: Fleet places automatically on the most free VRAM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<Vec<u32>>,
+}
+
+/// Parsed mesh load options.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MeshLoadOptions {
+    instances: Option<u32>,
+    gpus: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -277,6 +298,10 @@ pub struct SwitchMeshModelResponse {
     /// Holds released because the caller passed `release_hold`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub released_holds: Vec<String>,
+    /// Fleet's advisory warnings for an accepted load (e.g. a GPU pick
+    /// spanning PCIe groups); short, capped and sanitized.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[utoipa::path(
@@ -336,8 +361,17 @@ pub async fn mesh_state(
                 .endpoint_id
                 .parse()
                 .ok()
-                .and_then(|endpoint| registry.model_switching(endpoint))
-                .map(MeshModelSwitching::from)
+                .and_then(|endpoint| registry.model_switching_snapshot(endpoint))
+                .map(|(switching, since_received)| {
+                    let mut switching = MeshModelSwitching::from(switching);
+                    if let Some(inventory) = switching.gpu_inventory.as_mut() {
+                        let since_received =
+                            u64::try_from(since_received.as_millis()).unwrap_or(u64::MAX);
+                        inventory.age_ms =
+                            Some(inventory.age_ms.unwrap_or(0).saturating_add(since_received));
+                    }
+                    switching
+                })
                 .map(|mut switching| {
                     for model in &mut switching.models {
                         if let Some(holds) =
@@ -595,7 +629,7 @@ fn parse_lifecycle_options(pairs: &[(String, String)]) -> Result<LifecycleOption
         (status = 401, body = crate::openapi::DashboardError),
         (status = 403, body = crate::openapi::DashboardError),
         (status = 404, body = crate::openapi::DashboardError),
-        (status = 409, body = MeshModelHeldError, description = "`model_held`: an active hold would be stopped, or Fleet refused (busy / insufficient GPUs)."),
+        (status = 409, body = MeshModelHeldError, description = "`model_held`: an active hold would be stopped, or Fleet refused (busy / insufficient GPUs / `gpus_unavailable`)."),
         (status = 502, body = crate::openapi::DashboardError)
     ),
     security(("session" = []))
@@ -608,8 +642,8 @@ pub async fn switch_node_model(
     Query(query): Query<Vec<(String, String)>>,
     body: Bytes,
 ) -> Response {
-    let instances = match parse_mesh_model_load_body(&body) {
-        Ok(instances) => instances,
+    let load = match parse_mesh_model_load_body(&body) {
+        Ok(load) => load,
         Err(error) => return error.into_response(),
     };
     let options = match parse_lifecycle_options(&query) {
@@ -623,7 +657,7 @@ pub async fn switch_node_model(
         endpoint_id,
         model_id,
         false,
-        instances,
+        load,
         options,
     )
     .await
@@ -647,7 +681,7 @@ pub async fn switch_node_model(
         (status = 401, body = crate::openapi::DashboardError),
         (status = 403, body = crate::openapi::DashboardError),
         (status = 404, body = crate::openapi::DashboardError),
-        (status = 409, body = MeshModelHeldError, description = "`model_held`: an active hold would be stopped, or Fleet refused (busy / insufficient GPUs)."),
+        (status = 409, body = MeshModelHeldError, description = "`model_held`: an active hold would be stopped, or Fleet refused (busy / insufficient GPUs / `gpus_unavailable`)."),
         (status = 502, body = crate::openapi::DashboardError)
     ),
     security(("session" = []))
@@ -660,8 +694,8 @@ pub async fn load_node_model(
     Query(query): Query<Vec<(String, String)>>,
     body: Bytes,
 ) -> Response {
-    let instances = match parse_mesh_model_load_body(&body) {
-        Ok(instances) => instances,
+    let load = match parse_mesh_model_load_body(&body) {
+        Ok(load) => load,
         Err(error) => return error.into_response(),
     };
     let options = match parse_lifecycle_options(&query) {
@@ -675,7 +709,7 @@ pub async fn load_node_model(
         endpoint_id,
         model_id,
         false,
-        instances,
+        load,
         options,
     )
     .await
@@ -721,7 +755,7 @@ pub async fn unload_node_model(
         endpoint_id,
         model_id,
         true,
-        None,
+        MeshLoadOptions::default(),
         options,
     )
     .await
@@ -735,7 +769,7 @@ async fn set_node_model_state(
     endpoint_id: String,
     model_id: String,
     unload: bool,
-    instances: Option<u32>,
+    load: MeshLoadOptions,
     options: LifecycleOptions,
 ) -> Response {
     let permission = fleet_model_permission(unload);
@@ -827,7 +861,7 @@ async fn set_node_model_state(
     } else {
         admin
             .registry()
-            .switch_model_instances(endpoint, model_id.clone(), instances)
+            .switch_model_instances(endpoint, model_id.clone(), load.instances, load.gpus)
             .await
     };
     match result {
@@ -865,6 +899,7 @@ async fn set_node_model_state(
                     error: None,
                     operation: result.operation,
                     released_holds,
+                    warnings: result.warnings,
                 },
             )
         }
@@ -907,6 +942,10 @@ fn rejection_code(
         "backend_unavailable",
         "switching_unsupported",
         "model_not_switchable",
+        "gpus_not_supported",
+        "gpus_not_applicable",
+        "invalid_gpus",
+        "gpus_unavailable",
     ];
     let message = result.error.as_deref().unwrap_or_default();
     let relayed = result.error_code.as_deref().or_else(|| {
@@ -952,6 +991,8 @@ fn mesh_failure_code(message: &str) -> &'static str {
         "mesh worker is stale" => "worker_stale",
         "mesh worker does not advertise model switching" => "switching_unsupported",
         "model is not advertised as switchable" => "model_not_switchable",
+        "mesh worker does not support GPU selection" => "gpus_not_supported",
+        message if message.starts_with("gpus") => "invalid_gpus",
         message if message.contains("timed out") => "worker_timeout",
         message if message.starts_with("failed to open mesh") => "worker_unreachable",
         message if message.starts_with("instances") || message.contains("instance") => {
@@ -1591,35 +1632,53 @@ fn fleet_model_permission(unload: bool) -> ManagementPermission {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeshLoadBodyError {
-    InvalidShape,
-    InvalidInstances,
+    Shape,
+    Instances,
+    Gpus,
 }
 
 impl MeshLoadBodyError {
     fn into_response(self) -> Response {
         match self {
-            Self::InvalidShape => mesh_error(
+            Self::Shape => mesh_error(
                 StatusCode::BAD_REQUEST,
-                "load body must be empty or JSON with only instances",
+                "load body must be empty or JSON with instances and/or gpus",
             ),
-            Self::InvalidInstances => mesh_error(
+            Self::Instances => mesh_error(
                 StatusCode::BAD_REQUEST,
                 "instances must be between 1 and 64",
+            ),
+            Self::Gpus => mesh_error_code(
+                StatusCode::BAD_REQUEST,
+                "gpus must list at most 64 distinct GPU indices between 0 and 255",
+                "invalid_gpus",
             ),
         }
     }
 }
 
-fn parse_mesh_model_load_body(body: &[u8]) -> Result<Option<u32>, MeshLoadBodyError> {
+fn parse_mesh_model_load_body(body: &[u8]) -> Result<MeshLoadOptions, MeshLoadBodyError> {
     if body.is_empty() {
-        return Ok(None);
+        return Ok(MeshLoadOptions::default());
     }
     let request: MeshModelLoadRequest =
-        serde_json::from_slice(body).map_err(|_| MeshLoadBodyError::InvalidShape)?;
-    if !(1..=MAX_SWITCH_MODEL_INSTANCES).contains(&request.instances) {
-        return Err(MeshLoadBodyError::InvalidInstances);
+        serde_json::from_slice(body).map_err(|_| MeshLoadBodyError::Shape)?;
+    if request.instances.is_none() && request.gpus.is_none() {
+        return Err(MeshLoadBodyError::Shape);
     }
-    Ok(Some(request.instances))
+    if request
+        .instances
+        .is_some_and(|instances| !(1..=MAX_SWITCH_MODEL_INSTANCES).contains(&instances))
+    {
+        return Err(MeshLoadBodyError::Instances);
+    }
+    let gpus = request.gpus.unwrap_or_default();
+    crate::mesh::protocol::validate_gpu_selection(&gpus)
+        .map_err(|_| MeshLoadBodyError::Gpus)?;
+    Ok(MeshLoadOptions {
+        instances: request.instances,
+        gpus,
+    })
 }
 
 #[utoipa::path(
@@ -1990,7 +2049,44 @@ impl From<ModelSwitchingAdvertisement> for MeshModelSwitching {
                 })
                 .collect(),
             revision: value.revision,
+            gpu_inventory: value.gpu_inventory.map(gpu_inventory_view),
         }
+    }
+}
+
+/// The dashboard shape of a relayed GPU sample (shared with the local Fleet
+/// view). `age_ms` starts at the worker-measured age; the caller adds the
+/// time since the hub received it.
+fn gpu_inventory_view(
+    value: crate::mesh::protocol::GpuInventoryAdvertisement,
+) -> crate::dashboard_fleet::FleetGpuInventory {
+    crate::dashboard_fleet::FleetGpuInventory {
+        sampled_at: value.sampled_at,
+        stale: value.stale,
+        age_ms: Some(value.age_ms),
+        groups: value.groups,
+        gpus: value
+            .gpus
+            .into_iter()
+            .map(|gpu| crate::dashboard_fleet::FleetGpu {
+                index: gpu.index,
+                name: gpu.name,
+                memory_total_mib: gpu.memory_total_mib,
+                memory_used_mib: gpu.memory_used_mib,
+                memory_free_mib: gpu.memory_free_mib,
+                utilization_percent: gpu.utilization_percent,
+                group: gpu.group,
+                assigned: gpu
+                    .assigned
+                    .into_iter()
+                    .map(|model_id| crate::dashboard_fleet::FleetGpuAssignment {
+                        model_id,
+                        instance_id: None,
+                    })
+                    .collect(),
+                hidden_assignments: gpu.hidden_assignments,
+            })
+            .collect(),
     }
 }
 
@@ -2104,11 +2200,38 @@ mod tests {
 
     #[test]
     fn mesh_load_body_is_empty_legacy_or_strict_instances() {
-        assert_eq!(parse_mesh_model_load_body(b"").unwrap(), None);
+        assert_eq!(
+            parse_mesh_model_load_body(b"").unwrap(),
+            MeshLoadOptions::default()
+        );
         assert_eq!(
             parse_mesh_model_load_body(br#"{"instances":2}"#).unwrap(),
-            Some(2)
+            MeshLoadOptions {
+                instances: Some(2),
+                gpus: Vec::new()
+            }
         );
+        assert_eq!(
+            parse_mesh_model_load_body(br#"{"instances":1,"gpus":[2,3]}"#).unwrap(),
+            MeshLoadOptions {
+                instances: Some(1),
+                gpus: vec![2, 3]
+            }
+        );
+        assert_eq!(
+            parse_mesh_model_load_body(br#"{"gpus":[]}"#).unwrap(),
+            MeshLoadOptions::default()
+        );
+        assert!(parse_mesh_model_load_body(br#"{"gpus":[1,1]}"#).is_err());
+        assert!(parse_mesh_model_load_body(br#"{"gpus":[256]}"#).is_err());
+        for value in [
+            serde_json::json!({"instances": 2}),
+            serde_json::json!({"instances": 2, "gpus": [4, 5]}),
+            serde_json::json!({"gpus": [0]}),
+        ] {
+            let decoded: MeshModelLoadRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), value);
+        }
         assert!(parse_mesh_model_load_body(br#"{"instances":0}"#).is_err());
         assert!(parse_mesh_model_load_body(br#"{"instances":65}"#).is_err());
         assert!(parse_mesh_model_load_body(br#"{"instances":1,"extra":true}"#).is_err());
@@ -2335,6 +2458,7 @@ mod tests {
             provider: "lil-fleet".into(),
             models,
             revision: 1,
+            gpu_inventory: None,
         }
     }
 
@@ -2597,6 +2721,7 @@ mod tests {
                     provider: "lil-fleet".into(),
                     models,
                     revision: 1,
+                    gpu_inventory: None,
                 }),
                 request_encodings: Vec::new(),
                 capabilities,
@@ -3362,6 +3487,7 @@ mod tests {
                 error_status: Some(409),
                 error_code: code.map(str::to_owned),
                 operation: None,
+                warnings: Vec::new(),
             };
         assert_eq!(
             rejection_code(
@@ -3406,6 +3532,292 @@ mod tests {
         assert_eq!(
             mesh_failure_code("mesh switch request timed out"),
             "worker_timeout"
+        );
+    }
+
+    async fn gpu_fleet_mock() -> wiremock::MockServer {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{
+                    "model": {"id": "qwen", "image": "vllm:latest", "gpu_count": 1, "max_instances": 1},
+                    "status": {"model_id": "qwen", "phase": "ready", "desired_state": "ready",
+                               "desired_instances": 1, "ready_instances": 1, "assigned_gpus": [0]}
+                }, {
+                    "model": {"id": "big", "image": "vllm:latest", "gpu_count": 2, "max_instances": 2},
+                    "status": {"model_id": "big", "phase": "unloaded", "desired_state": "unloaded"}
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/gpus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sampled_at": chrono::Utc::now().to_rfc3339(),
+                "groups": [[0, 1], [2, 3]],
+                "gpus": (0..4).map(|index| serde_json::json!({
+                    "index": index,
+                    "name": "NVIDIA RTX PRO 6000",
+                    "memory_total_mib": 97887,
+                    "memory_used_mib": if index == 0 { 90000 } else { 0 },
+                    "memory_free_mib": if index == 0 { 7887 } else { 97887 },
+                    "utilization_percent": if index == 0 { serde_json::json!(55) } else { serde_json::Value::Null },
+                    "group": index / 2,
+                    "assigned": if index == 0 {
+                        serde_json::json!([{"model_id": "qwen", "instance_id": "qwen"}])
+                    } else {
+                        serde_json::json!([])
+                    }
+                })).collect::<Vec<_>>()
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/models/big/load"))
+            .and(body_json(
+                serde_json::json!({"instances": 1, "gpus": [0, 1]}),
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": {"code": "gpus_unavailable", "message": "GPU 0 is assigned to qwen"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/models/big/load"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "changed": true,
+                "warnings": ["selected GPUs span PCIe groups [0 1] and [2 3]\n"],
+                "operation": {"id": "0456abcd", "kind": "activate", "model_id": "big",
+                              "state": "pending", "created_at": "2026-10-01T00:00:00Z"}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn gpu_fixture(
+        fleet: &wiremock::MockServer,
+        capable: bool,
+    ) -> (MeshFixture, crate::mesh::TestFleetWorker) {
+        let endpoint = SecretKey::generate().public();
+        let (gateway, dir) = mesh_gateway(endpoint).await;
+        let registry = gateway.mesh_admin().unwrap().registry();
+        let worker = crate::mesh::spawn_test_fleet_worker(&registry, &fleet.uri(), capable).await;
+        let admin = gateway.mesh_admin().unwrap();
+        let key = admin
+            .store()
+            .create_join_key(None, None, None)
+            .await
+            .unwrap();
+        admin
+            .store()
+            .validate_join_key_for_endpoint(
+                &key.token,
+                &worker.endpoint_id.to_string(),
+                None,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let fixture = MeshFixture {
+            gateway,
+            dir,
+            endpoint: worker.endpoint_id,
+            endpoint_id: worker.endpoint_id.to_string(),
+        };
+        (fixture, worker)
+    }
+
+    async fn load_with_body(
+        fixture: &MeshFixture,
+        model: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        load_node_model(
+            State(Arc::clone(&fixture.gateway)),
+            Extension(operator()),
+            Some(Extension(ManagementChannel::ApiKey)),
+            Path((fixture.endpoint_id.clone(), model.to_string())),
+            Query(Vec::new()),
+            Bytes::from(body.to_string()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn gpu_inventory_reaches_the_dashboard_and_manual_picks_are_checked_end_to_end() {
+        let fleet = gpu_fleet_mock().await;
+        let (fixture, worker) = gpu_fixture(&fleet, true).await;
+
+        let state = mesh_state(
+            State(Arc::clone(&fixture.gateway)),
+            Extension(key_actor(
+                "key_reader",
+                &[ManagementPermission::FleetModelsRead],
+            )),
+        )
+        .await;
+        assert_eq!(state.status(), StatusCode::OK);
+        let state = body_json(state).await;
+        let node = state["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["endpoint_id"] == fixture.endpoint_id.as_str())
+            .expect("node");
+        let inventory = &node["model_switching"]["gpu_inventory"];
+        assert_eq!(inventory["gpus"].as_array().unwrap().len(), 4);
+        assert_eq!(inventory["groups"], serde_json::json!([[0, 1], [2, 3]]));
+        assert_eq!(inventory["gpus"][0]["assigned"][0]["model_id"], "qwen");
+        assert_eq!(inventory["gpus"][0]["utilization_percent"], 55);
+        assert!(inventory["gpus"][1].get("utilization_percent").is_none());
+        assert!(inventory["age_ms"].as_u64().is_some());
+
+        // GPU 7 is not in the node's inventory: refused on the hub.
+        let unknown = load_with_body(
+            &fixture,
+            "big",
+            serde_json::json!({"instances": 1, "gpus": [1, 7]}),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(unknown).await["code"], "invalid_gpus");
+        // `big` needs 2 GPUs per instance.
+        let short = load_with_body(
+            &fixture,
+            "big",
+            serde_json::json!({"instances": 1, "gpus": [2]}),
+        )
+        .await;
+        assert_eq!(short.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(short).await["code"], "invalid_gpus");
+        let duplicate = load_with_body(
+            &fixture,
+            "big",
+            serde_json::json!({"instances": 1, "gpus": [2, 2]}),
+        )
+        .await;
+        assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+
+        // Fleet's refusal keeps its code and the operator-facing message.
+        let busy = load_with_body(
+            &fixture,
+            "big",
+            serde_json::json!({"instances": 1, "gpus": [0, 1]}),
+        )
+        .await;
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+        let busy = body_json(busy).await;
+        assert_eq!(busy["code"], "gpus_unavailable");
+        assert_eq!(
+            busy["error"],
+            "Requested GPUs are not available (gpus_unavailable)"
+        );
+
+        let accepted = load_with_body(
+            &fixture,
+            "big",
+            serde_json::json!({"instances": 1, "gpus": [1, 2]}),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let accepted = body_json(accepted).await;
+        assert_eq!(accepted["operation"]["id"], "0456abcd");
+        assert_eq!(
+            accepted["warnings"],
+            serde_json::json!(["selected GPUs span PCIe groups [0 1] and [2 3]"])
+        );
+        let loads: Vec<serde_json::Value> = fleet
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/v1/models/big/load")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(
+            loads,
+            vec![
+                serde_json::json!({"instances": 1, "gpus": [0, 1]}),
+                serde_json::json!({"instances": 1, "gpus": [1, 2]}),
+            ],
+            "hub-side refusals never reach Fleet"
+        );
+        // Automatic placement is unchanged: no `gpus` on the Fleet body.
+        let auto = load_with_body(&fixture, "big", serde_json::json!({"instances": 1})).await;
+        assert_eq!(auto.status(), StatusCode::ACCEPTED);
+        drop(worker);
+    }
+
+    #[tokio::test]
+    async fn workers_without_gpu_placement_refuse_manual_picks_but_still_load() {
+        let fleet = gpu_fleet_mock().await;
+        let (fixture, worker) = gpu_fixture(&fleet, false).await;
+        let refused = load_with_body(
+            &fixture,
+            "big",
+            serde_json::json!({"instances": 1, "gpus": [1, 2]}),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(refused).await["code"], "gpus_not_supported");
+        let auto = load_with_body(&fixture, "big", serde_json::json!({"instances": 1})).await;
+        assert_eq!(auto.status(), StatusCode::ACCEPTED);
+        drop(worker);
+    }
+
+    #[test]
+    fn gpu_selection_checks_only_what_the_hub_knows() {
+        use crate::mesh::protocol::{GpuAdvertisement, GpuInventoryAdvertisement};
+        let gpu = |index| GpuAdvertisement {
+            index,
+            name: "gpu".into(),
+            memory_total_mib: 1,
+            memory_used_mib: 0,
+            memory_free_mib: 1,
+            utilization_percent: None,
+            group: None,
+            assigned: Vec::new(),
+            hidden_assignments: 0,
+        };
+        let mut running =
+            SwitchableModelAdvertisement::legacy("tp2", None, "ready", "ready", 2, vec![0, 1]);
+        running.desired_instances = 1;
+        running.ready_instances = 1;
+        let unloaded =
+            SwitchableModelAdvertisement::legacy("cold", None, "unloaded", "unloaded", 2, vec![]);
+        let unknown_count =
+            SwitchableModelAdvertisement::legacy("legacy", None, "ready", "ready", 0, vec![]);
+        let mut switching = fleet_inventory(vec![running, unloaded, unknown_count]);
+        let check =
+            |switching: &ModelSwitchingAdvertisement, model: &str, instances, gpus: &[u32]| {
+                crate::mesh::registry::check_gpu_selection(switching, model, instances, gpus)
+            };
+        // No inventory: indices are Fleet's call; counts are still checked.
+        assert!(check(&switching, "cold", Some(1), &[9, 8]).is_ok());
+        assert!(check(&switching, "cold", Some(1), &[9]).is_err());
+        assert!(check(&switching, "cold", Some(2), &[2, 3, 4, 5]).is_ok());
+        // Scaling a running model: only the added replica needs GPUs.
+        assert!(check(&switching, "tp2", Some(2), &[2, 3]).is_ok());
+        assert!(check(&switching, "tp2", Some(2), &[2, 3, 4, 5]).is_err());
+        // Nothing new starts, unknown gpu_count, or no explicit count: Fleet decides.
+        assert!(check(&switching, "tp2", Some(1), &[2]).is_ok());
+        assert!(check(&switching, "legacy", Some(1), &[2]).is_ok());
+        assert!(check(&switching, "cold", None, &[2]).is_ok());
+        switching.gpu_inventory = Some(GpuInventoryAdvertisement {
+            sampled_at: "2026-10-10T00:00:00Z".into(),
+            age_ms: 0,
+            stale: false,
+            groups: Vec::new(),
+            gpus: (0..4).map(gpu).collect(),
+        });
+        assert!(check(&switching, "cold", Some(1), &[2, 3]).is_ok());
+        assert_eq!(
+            check(&switching, "cold", Some(1), &[3, 4]),
+            Err("gpus include an index that is not in the node's GPU inventory")
         );
     }
 }

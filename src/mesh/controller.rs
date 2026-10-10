@@ -810,13 +810,18 @@ fn filter_model_switching(
 ) -> Option<crate::mesh::protocol::ModelSwitchingAdvertisement> {
     let endpoint_id = endpoint_id.to_string();
     let resources = allowlist.get(&endpoint_id)?;
-    switching.models.retain(|model| {
+    let allowed = |model: &str| {
         resources.values().any(|allowed_models| {
             allowed_models
                 .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(&model.id))
+                .any(|allowed| allowed.eq_ignore_ascii_case(model))
         })
-    });
+    };
+    switching.models.retain(|model| allowed(&model.id));
+    // GPU occupants outside the allowlist stay counted but unnamed.
+    if let Some(inventory) = switching.gpu_inventory.as_mut() {
+        inventory.hide_assignments_except(allowed);
+    }
     Some(switching)
 }
 
@@ -1003,6 +1008,7 @@ mod tests {
                     ),
                 ],
                 revision: 1,
+                gpu_inventory: None,
             }),
             request_encodings: Vec::new(),
             capabilities: Vec::new(),
@@ -1029,6 +1035,45 @@ mod tests {
         let switching = filtered.model_switching.expect("filtered switching");
         assert_eq!(switching.models.len(), 1);
         assert_eq!(switching.models[0].id, "allowed-model");
+    }
+
+    #[test]
+    fn controller_model_allowlist_hides_unlisted_gpu_occupants() {
+        let endpoint = SecretKey::generate().public();
+        let allowlist = BTreeMap::from([(
+            endpoint.to_string(),
+            BTreeMap::from([("gpu-a".to_string(), vec!["ALLOWED-MODEL".to_string()])]),
+        )]);
+        let mut advertised = advertisement();
+        let switching = advertised.model_switching.as_mut().unwrap();
+        switching.gpu_inventory = Some(crate::mesh::protocol::GpuInventoryAdvertisement {
+            sampled_at: "2026-10-10T00:00:00Z".to_string(),
+            age_ms: 0,
+            stale: false,
+            groups: Vec::new(),
+            gpus: vec![crate::mesh::protocol::GpuAdvertisement {
+                index: 0,
+                name: "gpu".to_string(),
+                memory_total_mib: 97887,
+                memory_used_mib: 90000,
+                memory_free_mib: 7887,
+                utilization_percent: None,
+                group: None,
+                assigned: vec!["allowed-model".to_string(), "unlisted-model".to_string()],
+                hidden_assignments: 0,
+            }],
+        });
+
+        let filtered = filter_worker_advertisement(endpoint, &allowlist, advertised);
+
+        let gpu = &filtered
+            .model_switching
+            .unwrap()
+            .gpu_inventory
+            .unwrap()
+            .gpus[0];
+        assert_eq!(gpu.assigned, vec!["allowed-model".to_string()]);
+        assert_eq!(gpu.hidden_assignments, 1);
     }
 
     #[test]
