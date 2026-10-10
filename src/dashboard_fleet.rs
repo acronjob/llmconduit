@@ -54,6 +54,82 @@ impl std::fmt::Debug for FleetClient {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct FleetModelsResponse {
     pub models: Vec<FleetModelEntry>,
+    /// Per-GPU VRAM from Fleet `GET /v1/gpus`, fetched alongside the models.
+    /// Absent when the Fleet predates the route or could not sample its GPUs:
+    /// GPU info is then unavailable, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_inventory: Option<FleetGpuInventory>,
+}
+
+/// Fleet `GET /v1/gpus`, sanitized, and the dashboard's per-node GPU view.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct FleetGpuInventory {
+    /// Fleet's sample time (RFC3339).
+    pub sampled_at: String,
+    /// Fleet flagged the sample as stale.
+    #[serde(default)]
+    pub stale: bool,
+    /// Age of the sample in milliseconds when the dashboard answered.
+    /// Absent when it cannot be computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// PCIe groups as lists of GPU indices.
+    #[serde(default)]
+    pub groups: Vec<Vec<u32>>,
+    #[serde(default)]
+    pub gpus: Vec<FleetGpu>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct FleetGpu {
+    pub index: u32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub memory_total_mib: u64,
+    #[serde(default)]
+    pub memory_used_mib: u64,
+    #[serde(default)]
+    pub memory_free_mib: u64,
+    /// Absent when Fleet could not read it (never reported as 0).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_percent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub utilization_percent: Option<u32>,
+    /// Index into `groups`; absent when the GPU is in no known PCIe group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+    #[serde(default)]
+    pub assigned: Vec<FleetGpuAssignment>,
+    /// Mesh only: occupants hidden by the hub's model allowlist.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hidden_assignments: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct FleetGpuAssignment {
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Fleet reports utilization as an integer today; accept any JSON number (or
+/// null) and clamp so a float or out-of-range value cannot fail the sample.
+fn deserialize_percent<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Number>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|number| number.as_f64())
+        .filter(|value| value.is_finite())
+        .map(|value| value.round().clamp(0.0, 100.0) as u32))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -125,6 +201,10 @@ pub struct FleetOperationResponse {
     /// Fleet omits this for an already-satisfied no-op.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<FleetOperation>,
+    /// Fleet's advisory warnings (e.g. a GPU pick spanning PCIe groups),
+    /// capped and sanitized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -144,15 +224,33 @@ pub struct FleetOperation {
     pub instances: Option<u32>,
 }
 
+/// Dashboard load body: at least one of `instances` and `gpus`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FleetLoadModelRequest {
-    pub instances: u32,
+    /// Desired replica count, 1..=64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
+    /// Manual GPU pick for the newly started instances, in assignment order
+    /// (`gpu_count` x new instances). Empty or omitted: Fleet places
+    /// automatically on the GPUs with the most free VRAM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<Vec<u32>>,
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct FleetLoadModelPayload {
-    instances: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instances: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    gpus: Vec<u32>,
+}
+
+/// Parsed dashboard load options.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FleetLoadOptions {
+    pub(crate) instances: Option<u32>,
+    pub(crate) gpus: Vec<u32>,
 }
 
 impl FleetClient {
@@ -194,30 +292,53 @@ impl FleetClient {
         self.request(reqwest::Method::GET, "/v1/models").await
     }
 
+    /// `GET /v1/gpus`: per-GPU VRAM and placement. `Ok(None)` when this
+    /// Fleet predates the route (404), so an older Fleet never breaks the
+    /// model inventory. The answer is bounded and sanitized.
+    pub async fn list_gpus(&self) -> Result<Option<FleetGpuInventory>, FleetProxyError> {
+        match self
+            .request::<FleetGpuInventory>(reqwest::Method::GET, "/v1/gpus")
+            .await
+        {
+            Ok(inventory) => Ok(Some(sanitize_gpu_inventory(inventory))),
+            Err(error) if error.status == StatusCode::NOT_FOUND => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn load_model(
         &self,
         model_id: &str,
     ) -> Result<FleetOperationResponse, FleetProxyError> {
-        self.load_model_instances(model_id, None).await
+        self.load_model_instances(model_id, None, None).await
     }
 
     pub async fn load_model_instances(
         &self,
         model_id: &str,
         instances: Option<u32>,
+        gpus: Option<Vec<u32>>,
     ) -> Result<FleetOperationResponse, FleetProxyError> {
         validate_model_id(model_id)?;
         validate_optional_instances(instances)?;
+        let gpus = gpus.unwrap_or_default();
+        validate_gpus(&gpus)?;
         // An explicit count, including 1, must reach Fleet: an empty load body
         // means "keep the current replica count", so dropping `{"instances":1}`
         // would make scaling a model back down to one replica impossible.
-        let body = instances.map(|instances| FleetLoadModelPayload { instances });
-        self.request_json(
-            reqwest::Method::POST,
-            &format!("/v1/models/{model_id}/load"),
-            body.as_ref(),
-        )
-        .await
+        // An empty GPU list means automatic placement and stays off the wire.
+        let body = (instances.is_some() || !gpus.is_empty())
+            .then_some(FleetLoadModelPayload { instances, gpus });
+        let mut response: FleetOperationResponse = self
+            .request_json(
+                reqwest::Method::POST,
+                &format!("/v1/models/{model_id}/load"),
+                body.as_ref(),
+            )
+            .await?;
+        response.warnings =
+            crate::mesh::protocol::sanitize_warnings(std::mem::take(&mut response.warnings));
+        Ok(response)
     }
 
     pub async fn unload_model(
@@ -422,6 +543,14 @@ fn fleet_status_error(status: u16, body: &[u8]) -> FleetProxyError {
         (StatusCode::CONFLICT, Some("insufficient_resources")) => {
             "Fleet has insufficient GPU capacity"
         }
+        (StatusCode::CONFLICT, Some("gpus_unavailable")) => "Requested GPUs are not available",
+        (StatusCode::BAD_REQUEST, Some("gpus_not_supported")) => {
+            "Fleet does not support GPU selection for this model"
+        }
+        (StatusCode::BAD_REQUEST, Some("gpus_not_applicable")) => {
+            "GPU selection does not apply to this load"
+        }
+        (StatusCode::BAD_REQUEST, Some("invalid_gpus")) => "Fleet rejected the GPU selection",
         _ => message,
     };
     FleetProxyError {
@@ -474,8 +603,23 @@ pub async fn fleet_models(
     let Some(fleet) = gateway.fleet() else {
         return fleet_error(StatusCode::NOT_FOUND, "Fleet is not configured");
     };
-    match fleet.list_models().await {
-        Ok(models) => json_no_store(StatusCode::OK, &models),
+    let (models, gpus) = tokio::join!(fleet.list_models(), fleet.list_gpus());
+    match models {
+        Ok(mut models) => {
+            models.gpu_inventory = match gpus {
+                Ok(inventory) => inventory.map(|mut inventory| {
+                    inventory.age_ms = sample_age_ms(&inventory.sampled_at);
+                    inventory
+                }),
+                Err(error) => {
+                    // nvidia-smi failures (503 gpu_query_failed) degrade to
+                    // "GPU info unavailable"; the model inventory still works.
+                    tracing::debug!(error = %error, "Fleet GPU inventory unavailable");
+                    None
+                }
+            };
+            json_no_store(StatusCode::OK, &models)
+        }
         Err(error) => error.into_response(),
     }
 }
@@ -489,11 +633,11 @@ pub async fn fleet_models(
     responses(
         (status = 200, body = FleetOperationResponse),
         (status = 202, body = FleetOperationResponse),
-        (status = 400, body = crate::openapi::DashboardError),
+        (status = 400, body = crate::openapi::DashboardError, description = "Invalid body, or Fleet refused the GPU pick (`invalid_gpus`, `gpus_not_supported`, `gpus_not_applicable`)."),
         (status = 401, body = crate::openapi::DashboardError),
         (status = 403, body = crate::openapi::DashboardError),
         (status = 404, body = crate::openapi::DashboardError),
-        (status = 409, body = crate::openapi::DashboardError),
+        (status = 409, body = crate::openapi::DashboardError, description = "Fleet is busy, short on GPUs, or `gpus_unavailable`."),
         (status = 429, body = crate::openapi::DashboardError),
         (status = 502, body = crate::openapi::DashboardError),
         (status = 504, body = crate::openapi::DashboardError)
@@ -506,11 +650,11 @@ pub async fn fleet_load_model(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Response {
-    let instances = match parse_fleet_load_body(&body) {
-        Ok(instances) => instances,
+    let options = match parse_fleet_load_body(&body) {
+        Ok(options) => options,
         Err(error) => return error.into_response(),
     };
-    fleet_model_action(gateway, actor, id, true, instances).await
+    fleet_model_action(gateway, actor, id, Some(options)).await
 }
 
 #[utoipa::path(
@@ -537,27 +681,30 @@ pub async fn fleet_unload_model(
     Extension(actor): Extension<ManagementActor>,
     Path(id): Path<String>,
 ) -> Response {
-    fleet_model_action(gateway, actor, id, false, None).await
+    fleet_model_action(gateway, actor, id, None).await
 }
 
+/// `load` carries the load options; `None` is an unload.
 async fn fleet_model_action(
     gateway: Arc<Gateway>,
     actor: ManagementActor,
     model_id: String,
-    load: bool,
-    instances: Option<u32>,
+    load: Option<FleetLoadOptions>,
 ) -> Response {
-    let permission = fleet_action_permission(load);
+    let permission = fleet_action_permission(load.is_some());
     if !actor.allows(permission) {
         return fleet_error(StatusCode::FORBIDDEN, "management permission denied");
     }
     let Some(fleet) = gateway.fleet() else {
         return fleet_error(StatusCode::NOT_FOUND, "Fleet is not configured");
     };
-    let result = if load {
-        fleet.load_model_instances(&model_id, instances).await
-    } else {
-        fleet.unload_model(&model_id).await
+    let result = match load {
+        Some(options) => {
+            fleet
+                .load_model_instances(&model_id, options.instances, Some(options.gpus))
+                .await
+        }
+        None => fleet.unload_model(&model_id).await,
     };
     match result {
         Ok(operation) => json_no_store(
@@ -572,18 +719,128 @@ async fn fleet_model_action(
     }
 }
 
-fn parse_fleet_load_body(body: &[u8]) -> Result<Option<u32>, FleetProxyError> {
+fn parse_fleet_load_body(body: &[u8]) -> Result<FleetLoadOptions, FleetProxyError> {
     if body.is_empty() {
-        return Ok(None);
+        return Ok(FleetLoadOptions::default());
     }
-    let request: FleetLoadModelRequest = serde_json::from_slice(body).map_err(|_| {
+    let shape_error = || {
         FleetProxyError::new(
             StatusCode::BAD_REQUEST,
-            "load body must be empty or JSON with only instances",
+            "load body must be empty or JSON with instances and/or gpus",
         )
-    })?;
-    validate_optional_instances(Some(request.instances))?;
-    Ok(Some(request.instances))
+    };
+    let request: FleetLoadModelRequest = serde_json::from_slice(body).map_err(|_| shape_error())?;
+    if request.instances.is_none() && request.gpus.is_none() {
+        return Err(shape_error());
+    }
+    validate_optional_instances(request.instances)?;
+    let gpus = request.gpus.unwrap_or_default();
+    validate_gpus(&gpus)?;
+    Ok(FleetLoadOptions {
+        instances: request.instances,
+        gpus,
+    })
+}
+
+fn validate_gpus(gpus: &[u32]) -> Result<(), FleetProxyError> {
+    crate::mesh::protocol::validate_gpu_selection(gpus).map_err(|_| FleetProxyError {
+        status: StatusCode::BAD_REQUEST,
+        message: "gpus must list at most 64 distinct GPU indices between 0 and 255",
+        code: Some("invalid_gpus".to_string()),
+    })
+}
+
+/// Milliseconds since an RFC3339 sample time, clamped at zero for clock
+/// skew; `None` if Fleet sent an unparseable time.
+pub(crate) fn sample_age_ms(sampled_at: &str) -> Option<u64> {
+    let sampled = chrono::DateTime::parse_from_rfc3339(sampled_at).ok()?;
+    let age = chrono::Utc::now().signed_duration_since(sampled);
+    Some(age.num_milliseconds().max(0) as u64)
+}
+
+/// Bounds a Fleet GPU answer the same way the mesh wire is bounded, so the
+/// local dashboard and the hub see identical limits: truncates instead of
+/// rejecting (a long GPU name must not hide the whole inventory).
+fn sanitize_gpu_inventory(inventory: FleetGpuInventory) -> FleetGpuInventory {
+    use crate::mesh::protocol::{
+        MAX_GPU_ASSIGNMENTS, MAX_GPU_GROUPS, MAX_GPU_INDEX, MAX_GPU_NAME_BYTES,
+        MAX_GPU_SAMPLED_AT_BYTES, MAX_GPUS_PER_NODE,
+    };
+    let mut gpus: Vec<FleetGpu> = Vec::new();
+    for gpu in inventory.gpus {
+        if gpus.len() == MAX_GPUS_PER_NODE {
+            break;
+        }
+        if gpu.index > MAX_GPU_INDEX || gpus.iter().any(|seen| seen.index == gpu.index) {
+            continue;
+        }
+        let mut assigned: Vec<FleetGpuAssignment> = Vec::new();
+        for assignment in gpu.assigned {
+            if assigned.len() == MAX_GPU_ASSIGNMENTS {
+                break;
+            }
+            if validate_model_id(&assignment.model_id).is_err() {
+                continue;
+            }
+            let instance_id = assignment.instance_id.filter(|id| {
+                id.len() <= crate::mesh::protocol::MAX_RESOURCE_ID_BYTES
+                    && !id.trim().is_empty()
+                    && !id.chars().any(char::is_control)
+            });
+            assigned.push(FleetGpuAssignment {
+                model_id: assignment.model_id,
+                instance_id,
+            });
+        }
+        gpus.push(FleetGpu {
+            index: gpu.index,
+            name: sanitize_text(&gpu.name, MAX_GPU_NAME_BYTES),
+            memory_total_mib: gpu.memory_total_mib,
+            memory_used_mib: gpu.memory_used_mib,
+            memory_free_mib: gpu.memory_free_mib,
+            utilization_percent: gpu.utilization_percent.map(|value| value.min(100)),
+            group: gpu.group.filter(|group| (*group as usize) < MAX_GPU_GROUPS),
+            assigned,
+            hidden_assignments: 0,
+        });
+    }
+    let groups = inventory
+        .groups
+        .into_iter()
+        .take(MAX_GPU_GROUPS)
+        .map(|group| {
+            group
+                .into_iter()
+                .filter(|gpu| *gpu <= MAX_GPU_INDEX)
+                .take(MAX_GPUS_PER_NODE)
+                .collect()
+        })
+        .collect();
+    let sampled_at = Some(sanitize_text(
+        &inventory.sampled_at,
+        MAX_GPU_SAMPLED_AT_BYTES,
+    ))
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| "unknown".to_string());
+    FleetGpuInventory {
+        sampled_at,
+        stale: inventory.stale,
+        age_ms: None,
+        groups,
+        gpus,
+    }
+}
+
+fn sanitize_text(value: &str, max: usize) -> String {
+    let mut normalized = String::new();
+    for ch in value.trim().chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if normalized.len() + ch.len_utf8() > max {
+            break;
+        }
+        normalized.push(ch);
+    }
+    normalized.trim().to_owned()
 }
 
 fn validate_optional_instances(instances: Option<u32>) -> Result<(), FleetProxyError> {
@@ -767,11 +1024,42 @@ mod tests {
 
     #[test]
     fn fleet_load_body_is_empty_legacy_or_strict_instances() {
-        assert_eq!(parse_fleet_load_body(b"").unwrap(), None);
+        assert_eq!(
+            parse_fleet_load_body(b"").unwrap(),
+            FleetLoadOptions::default()
+        );
         assert_eq!(
             parse_fleet_load_body(br#"{"instances":2}"#).unwrap(),
-            Some(2)
+            FleetLoadOptions {
+                instances: Some(2),
+                gpus: Vec::new()
+            }
         );
+        assert_eq!(
+            parse_fleet_load_body(br#"{"instances":2,"gpus":[3,1]}"#).unwrap(),
+            FleetLoadOptions {
+                instances: Some(2),
+                gpus: vec![3, 1]
+            }
+        );
+        assert_eq!(
+            parse_fleet_load_body(br#"{"gpus":[]}"#).unwrap(),
+            FleetLoadOptions::default()
+        );
+        for invalid in [
+            &br#"{"gpus":[1,1]}"#[..],
+            br#"{"gpus":[256]}"#,
+            br#"{"gpus":[-1]}"#,
+            br#"{"gpus":"0,1"}"#,
+        ] {
+            assert!(parse_fleet_load_body(invalid).is_err());
+        }
+        let too_many = serde_json::to_vec(&serde_json::json!({
+            "gpus": (0..65).collect::<Vec<u32>>()
+        }))
+        .unwrap();
+        let error = parse_fleet_load_body(&too_many).expect_err("65 GPUs");
+        assert_eq!(error.code(), Some("invalid_gpus"));
         assert!(parse_fleet_load_body(br#"{"instances":0}"#).is_err());
         assert!(parse_fleet_load_body(br#"{"instances":65}"#).is_err());
         assert!(parse_fleet_load_body(br#"{"instances":1,"token":"secret"}"#).is_err());
@@ -820,7 +1108,7 @@ mod tests {
             .await;
 
         let response = test_client(&server.uri())
-            .load_model_instances("qwen3-flash", Some(2))
+            .load_model_instances("qwen3-flash", Some(2), None)
             .await
             .expect("load operation");
         assert_eq!(
@@ -849,7 +1137,7 @@ mod tests {
         let client = test_client(&server.uri());
         for instances in [None, Some(1)] {
             client
-                .load_model_instances("qwen3-flash", instances)
+                .load_model_instances("qwen3-flash", instances, Some(Vec::new()))
                 .await
                 .expect("load operation");
         }
@@ -942,5 +1230,260 @@ mod tests {
             .await
             .expect_err("oversized response rejected");
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn load_request_round_trips_with_optional_gpus() {
+        for value in [
+            serde_json::json!({"instances": 2}),
+            serde_json::json!({"instances": 2, "gpus": [4, 5]}),
+            serde_json::json!({"gpus": [0]}),
+        ] {
+            let decoded: FleetLoadModelRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), value);
+        }
+    }
+
+    fn gpu_inventory_json() -> serde_json::Value {
+        serde_json::json!({
+            "sampled_at": "2026-10-10T00:00:00Z",
+            "groups": [[0, 1, 6, 7], [2, 3, 4, 5]],
+            "gpus": [{
+                "index": 0,
+                "name": "NVIDIA RTX PRO 6000 Blackwell",
+                "memory_total_mib": 97887,
+                "memory_used_mib": 1234,
+                "memory_free_mib": 96000,
+                "utilization_percent": 0,
+                "group": 0,
+                "assigned": [{"model_id": "ds41-flash-tp4-ssd", "instance_id": "ds41-flash-tp4-ssd"}]
+            }, {
+                "index": 2,
+                "name": "NVIDIA RTX PRO 6000 Blackwell",
+                "memory_total_mib": 97887,
+                "memory_used_mib": 0,
+                "memory_free_mib": 97887,
+                "utilization_percent": null,
+                "group": null,
+                "assigned": []
+            }]
+        })
+    }
+
+    #[test]
+    fn gpu_inventory_round_trips_and_tolerates_missing_optionals() {
+        let decoded: FleetGpuInventory = serde_json::from_value(gpu_inventory_json()).unwrap();
+        assert!(!decoded.stale);
+        assert_eq!(decoded.gpus[0].utilization_percent, Some(0));
+        assert_eq!(decoded.gpus[1].utilization_percent, None);
+        assert_eq!(decoded.gpus[1].group, None);
+        assert_eq!(
+            decoded.gpus[0].assigned[0].instance_id.as_deref(),
+            Some("ds41-flash-tp4-ssd")
+        );
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<FleetGpuInventory>(encoded.clone()).unwrap(),
+            decoded
+        );
+        // Unknown utilization stays absent on the dashboard wire, never 0.
+        assert!(encoded["gpus"][1].get("utilization_percent").is_none());
+        let minimal: FleetGpuInventory = serde_json::from_value(serde_json::json!({
+            "sampled_at": "2026-10-10T00:00:00Z",
+            "gpus": [{"index": 3, "utilization_percent": 37.6}]
+        }))
+        .unwrap();
+        assert!(minimal.groups.is_empty());
+        assert_eq!(minimal.gpus[0].utilization_percent, Some(38));
+        assert!(minimal.gpus[0].assigned.is_empty());
+        // The models response stays parseable without an inventory.
+        let models: FleetModelsResponse =
+            serde_json::from_value(serde_json::json!({"models": []})).unwrap();
+        assert_eq!(models.gpu_inventory, None);
+        assert!(
+            serde_json::to_value(&models)
+                .unwrap()
+                .get("gpu_inventory")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn gpu_inventory_sanitization_bounds_fleet_text() {
+        let mut gpus = Vec::new();
+        for index in 0..70u32 {
+            gpus.push(serde_json::json!({
+                "index": index,
+                "name": format!("GPU\n{}", "x".repeat(300)),
+                "assigned": (0..20).map(|n| serde_json::json!({"model_id": format!("m{n}")}))
+                    .chain([serde_json::json!({"model_id": "../bad"})])
+                    .collect::<Vec<_>>(),
+                "group": 999
+            }));
+        }
+        gpus.push(serde_json::json!({"index": 1}));
+        let raw: FleetGpuInventory = serde_json::from_value(serde_json::json!({
+            "sampled_at": "2026-10-10T00:00:00Z\n",
+            "gpus": gpus,
+            "groups": [[0, 300]]
+        }))
+        .unwrap();
+        let clean = sanitize_gpu_inventory(raw);
+        assert_eq!(clean.gpus.len(), crate::mesh::protocol::MAX_GPUS_PER_NODE);
+        assert_eq!(clean.sampled_at, "2026-10-10T00:00:00Z");
+        assert_eq!(clean.groups, vec![vec![0]]);
+        let gpu = &clean.gpus[0];
+        assert!(gpu.name.len() <= crate::mesh::protocol::MAX_GPU_NAME_BYTES);
+        assert!(!gpu.name.contains('\n'));
+        assert_eq!(gpu.group, None);
+        assert_eq!(
+            gpu.assigned.len(),
+            crate::mesh::protocol::MAX_GPU_ASSIGNMENTS
+        );
+        assert!(gpu.assigned.iter().all(|a| a.model_id != "../bad"));
+    }
+
+    #[tokio::test]
+    async fn list_gpus_treats_missing_route_as_unavailable_and_surfaces_failures() {
+        let server = MockServer::start().await;
+        let client = test_client(&server.uri());
+        // An older Fleet without the route.
+        assert_eq!(client.list_gpus().await.expect("404 is not an error"), None);
+        Mock::given(method("GET"))
+            .and(path("/v1/gpus"))
+            .and(header("authorization", "Bearer secret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gpu_inventory_json()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let inventory = client.list_gpus().await.unwrap().expect("inventory");
+        assert_eq!(inventory.gpus.len(), 2);
+        assert_eq!(inventory.groups.len(), 2);
+        Mock::given(method("GET"))
+            .and(path("/v1/gpus"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(serde_json::json!({"error": "gpu_query_failed"})),
+            )
+            .mount(&server)
+            .await;
+        let error = client.list_gpus().await.expect_err("503 surfaces");
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(error.code(), Some("gpu_query_failed"));
+    }
+
+    #[tokio::test]
+    async fn gpu_pick_is_forwarded_only_when_non_empty_and_warnings_are_sanitized() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/models/qwen3-flash/load"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "changed": true,
+                "warnings": [
+                    "selected GPUs span PCIe groups\n0 and 1",
+                    "",
+                    "w".repeat(1000),
+                    "a", "b", "c", "d", "e", "f", "g", "h"
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server.uri());
+        let response = client
+            .load_model_instances("qwen3-flash", Some(2), Some(vec![2, 3, 4, 5]))
+            .await
+            .expect("load");
+        assert_eq!(
+            response.warnings.len(),
+            crate::mesh::protocol::MAX_LOAD_WARNINGS
+        );
+        assert_eq!(
+            response.warnings[0],
+            "selected GPUs span PCIe groups 0 and 1"
+        );
+        assert!(
+            response
+                .warnings
+                .iter()
+                .all(|w| w.len() <= crate::mesh::protocol::MAX_LOAD_WARNING_BYTES)
+        );
+        client
+            .load_model_instances("qwen3-flash", None, Some(Vec::new()))
+            .await
+            .expect("auto placement");
+        client
+            .load_model_instances("qwen3-flash", None, Some(vec![7]))
+            .await
+            .expect("gpus without instances");
+        assert!(
+            client
+                .load_model_instances("qwen3-flash", None, Some(vec![1, 1]))
+                .await
+                .is_err(),
+            "duplicates are rejected before Fleet"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let body = |index: usize| -> serde_json::Value {
+            serde_json::from_slice(&requests[index].body).unwrap()
+        };
+        assert_eq!(
+            body(0),
+            serde_json::json!({"instances": 2, "gpus": [2, 3, 4, 5]})
+        );
+        assert!(
+            requests[1].body.is_empty(),
+            "empty pick means automatic placement"
+        );
+        assert_eq!(body(2), serde_json::json!({"gpus": [7]}));
+    }
+
+    #[tokio::test]
+    async fn gpu_placement_errors_map_to_sanitized_codes() {
+        let server = MockServer::start().await;
+        for (model, status, code) in [
+            ("unavailable", 409, "gpus_unavailable"),
+            ("unsupported", 400, "gpus_not_supported"),
+            ("not-applicable", 400, "gpus_not_applicable"),
+            ("invalid", 400, "invalid_gpus"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/v1/models/{model}/load")))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "error": {"code": code, "message": "GPU 3 used by /secret"}
+                    })),
+                )
+                .mount(&server)
+                .await;
+        }
+        let client = test_client(&server.uri());
+        for (model, status, code) in [
+            ("unavailable", StatusCode::CONFLICT, "gpus_unavailable"),
+            ("unsupported", StatusCode::BAD_REQUEST, "gpus_not_supported"),
+            (
+                "not-applicable",
+                StatusCode::BAD_REQUEST,
+                "gpus_not_applicable",
+            ),
+            ("invalid", StatusCode::BAD_REQUEST, "invalid_gpus"),
+        ] {
+            let error = client
+                .load_model_instances(model, Some(1), Some(vec![3]))
+                .await
+                .expect_err("Fleet refusal");
+            assert_eq!(error.status(), status, "{model}");
+            assert_eq!(error.code(), Some(code), "{model}");
+            assert!(!error.to_string().contains("secret"));
+        }
+        let error = client
+            .load_model_instances("unavailable", Some(1), Some(vec![3]))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Requested GPUs are not available")
+        );
     }
 }

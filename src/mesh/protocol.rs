@@ -28,6 +28,24 @@ pub const MAX_SWITCHING_DESCRIPTION_BYTES: usize = 1024;
 pub const MAX_SWITCHING_STATE_BYTES: usize = 64;
 pub const MAX_CAPACITY_PER_RESOURCE: u32 = 65_535;
 pub const MAX_SWITCH_MODEL_INSTANCES: u32 = 64;
+/// GPU inventory bounds. A node with more GPUs than this is not a single
+/// Fleet host; the worker truncates and the hub rejects anything larger.
+pub const MAX_GPUS_PER_NODE: usize = 64;
+pub const MAX_GPU_NAME_BYTES: usize = 128;
+pub const MAX_GPU_ASSIGNMENTS: usize = 16;
+pub const MAX_GPU_INDEX: u32 = 255;
+pub const MAX_GPU_GROUPS: usize = 64;
+pub const MAX_GPU_SAMPLED_AT_BYTES: usize = 64;
+/// Largest serialized inventory a worker will advertise. Realistic nodes
+/// (8 GPUs) need ~2 KiB; the cap keeps a pathological Fleet answer from
+/// pushing the hello past [`MAX_CONTROL_FRAME_BYTES`] and locking the worker
+/// out of the mesh.
+pub const MAX_GPU_INVENTORY_BYTES: usize = 16 * 1024;
+/// A manual GPU pick names at most this many devices.
+pub const MAX_GPU_SELECTION: usize = 64;
+/// Fleet load warnings relayed to the dashboard.
+pub const MAX_LOAD_WARNINGS: usize = 8;
+pub const MAX_LOAD_WARNING_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollRequest {
@@ -74,6 +92,10 @@ pub struct WorkerAdvertisement {
 /// The worker answers [`StreamOpen::FleetOperation`] lookups and reports the
 /// Fleet operation in [`SwitchModelResponse::operation`].
 pub const CAPABILITY_FLEET_OPERATIONS: &str = "fleet_operations";
+/// The worker forwards [`SwitchModelRequest::gpus`] to Fleet. An older worker
+/// would silently ignore the field and place automatically, so the hub refuses
+/// a manual GPU pick for workers without this capability.
+pub const CAPABILITY_GPU_PLACEMENT: &str = "gpu_placement";
 pub const MAX_CAPABILITIES: usize = 16;
 pub const MAX_CAPABILITY_BYTES: usize = 64;
 pub const MAX_OPERATION_ID_BYTES: usize = 128;
@@ -114,6 +136,119 @@ pub struct ModelSwitchingAdvertisement {
     pub provider: String,
     pub models: Vec<SwitchableModelAdvertisement>,
     pub revision: u64,
+    /// Latest per-GPU VRAM sample from the worker's Fleet. Optional both
+    /// ways: older workers omit it (no inventory) and older hubs ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_inventory: Option<GpuInventoryAdvertisement>,
+}
+
+/// A bounded snapshot of Fleet `GET /v1/gpus` as relayed by a worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuInventoryAdvertisement {
+    /// Fleet's sample time (RFC3339, worker clock).
+    pub sampled_at: String,
+    /// Age of the sample in milliseconds when the worker sent it, measured on
+    /// the worker's own clock so the hub can show staleness without trusting
+    /// cross-host clock agreement.
+    #[serde(default)]
+    pub age_ms: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
+    /// PCIe groups (lists of GPU indices).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<Vec<u32>>,
+    #[serde(default)]
+    pub gpus: Vec<GpuAdvertisement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuAdvertisement {
+    pub index: u32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub memory_total_mib: u64,
+    #[serde(default)]
+    pub memory_used_mib: u64,
+    #[serde(default)]
+    pub memory_free_mib: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization_percent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+    /// Fleet model ids occupying this GPU.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigned: Vec<String>,
+    /// Occupants the hub hid because its model allowlist does not expose
+    /// them; set by the hub only, so the GPU still reads as occupied.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hidden_assignments: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+impl GpuInventoryAdvertisement {
+    /// Builds the bounded wire form of a sanitized Fleet sample. Returns
+    /// `None` if it would still exceed [`MAX_GPU_INVENTORY_BYTES`].
+    pub(crate) fn from_fleet(
+        value: crate::dashboard_fleet::FleetGpuInventory,
+        age_ms: u64,
+    ) -> Option<Self> {
+        let inventory = Self {
+            sampled_at: value.sampled_at,
+            age_ms,
+            stale: value.stale,
+            groups: value.groups,
+            gpus: value
+                .gpus
+                .into_iter()
+                .map(|gpu| GpuAdvertisement {
+                    index: gpu.index,
+                    name: gpu.name,
+                    memory_total_mib: gpu.memory_total_mib,
+                    memory_used_mib: gpu.memory_used_mib,
+                    memory_free_mib: gpu.memory_free_mib,
+                    utilization_percent: gpu.utilization_percent,
+                    group: gpu.group,
+                    assigned: {
+                        let mut models: Vec<String> = Vec::new();
+                        for assignment in gpu.assigned {
+                            if !models.contains(&assignment.model_id) {
+                                models.push(assignment.model_id);
+                            }
+                        }
+                        models.truncate(MAX_GPU_ASSIGNMENTS);
+                        models
+                    },
+                    hidden_assignments: 0,
+                })
+                .collect(),
+        };
+        let size = serde_json::to_vec(&inventory).map_or(usize::MAX, |bytes| bytes.len());
+        (size <= MAX_GPU_INVENTORY_BYTES && validate_gpu_inventory(&inventory).is_ok())
+            .then_some(inventory)
+    }
+
+    /// Replaces occupants the caller may not see with a count, so a GPU used
+    /// by a model outside the hub's allowlist still reads as occupied without
+    /// naming that model.
+    pub fn hide_assignments_except<F>(&mut self, visible: F)
+    where
+        F: Fn(&str) -> bool,
+    {
+        for gpu in &mut self.gpus {
+            let before = gpu.assigned.len();
+            gpu.assigned.retain(|model| visible(model));
+            let hidden = (before - gpu.assigned.len()) as u32;
+            gpu.hidden_assignments = gpu.hidden_assignments.saturating_add(hidden);
+        }
+    }
+
+    pub fn has_gpu(&self, index: u32) -> bool {
+        self.gpus.iter().any(|gpu| gpu.index == index)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +533,11 @@ pub struct SwitchModelRequest {
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instances: Option<u32>,
+    /// Manual GPU pick for the newly started instances, in assignment order.
+    /// Empty means Fleet places automatically. Only sent to workers that
+    /// advertise [`CAPABILITY_GPU_PLACEMENT`]; older workers ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +568,44 @@ pub struct SwitchModelResponse {
     /// an already-satisfied no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<LifecycleOperation>,
+    /// Fleet's advisory warnings for an accepted load (e.g. a GPU pick that
+    /// spans PCIe groups). Optional both ways; bounded by
+    /// [`sanitize_warnings`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Keeps at most [`MAX_LOAD_WARNINGS`] non-blank warnings, each truncated to
+/// [`MAX_LOAD_WARNING_BYTES`] with control characters replaced.
+pub fn sanitize_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .filter_map(|warning| bounded_text(Some(warning), MAX_LOAD_WARNING_BYTES))
+        .take(MAX_LOAD_WARNINGS)
+        .collect()
+}
+
+/// A manual GPU pick: at most [`MAX_GPU_SELECTION`] distinct indices in
+/// `0..=MAX_GPU_INDEX`. Whether the count fits the model is Fleet's call.
+pub fn validate_gpu_selection(gpus: &[u32]) -> Result<(), ProtocolError> {
+    if gpus.len() > MAX_GPU_SELECTION {
+        return Err(ProtocolError::InvalidGpuSelection(
+            "gpus must list at most 64 GPU indices",
+        ));
+    }
+    for (position, gpu) in gpus.iter().enumerate() {
+        if *gpu > MAX_GPU_INDEX {
+            return Err(ProtocolError::InvalidGpuSelection(
+                "gpus indices must be between 0 and 255",
+            ));
+        }
+        if gpus[..position].contains(gpu) {
+            return Err(ProtocolError::InvalidGpuSelection(
+                "gpus must not repeat an index",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl SwitchModelResponse {
@@ -542,6 +720,9 @@ pub fn validate_model_switching(
         |len, max| ProtocolError::SwitchingProviderTooLong { len, max },
     )?;
     reject_control_characters(&switching.provider, "switching provider")?;
+    if let Some(inventory) = &switching.gpu_inventory {
+        validate_gpu_inventory(inventory)?;
+    }
     if switching.models.len() > MAX_SWITCHABLE_MODELS {
         return Err(ProtocolError::TooManyModels {
             count: switching.models.len(),
@@ -659,6 +840,61 @@ pub fn validate_model_switching(
     Ok(())
 }
 
+pub fn validate_gpu_inventory(inventory: &GpuInventoryAdvertisement) -> Result<(), ProtocolError> {
+    let invalid = ProtocolError::InvalidGpuInventory;
+    validate_bounded_string(
+        &inventory.sampled_at,
+        MAX_GPU_SAMPLED_AT_BYTES,
+        invalid("sampled_at must not be blank"),
+        |_, _| invalid("sampled_at is too long"),
+    )?;
+    reject_control_characters(&inventory.sampled_at, "gpu sampled_at")?;
+    if inventory.gpus.len() > MAX_GPUS_PER_NODE {
+        return Err(invalid("too many GPUs"));
+    }
+    if inventory.groups.len() > MAX_GPU_GROUPS {
+        return Err(invalid("too many GPU groups"));
+    }
+    for group in &inventory.groups {
+        if group.len() > MAX_GPUS_PER_NODE || group.iter().any(|gpu| *gpu > MAX_GPU_INDEX) {
+            return Err(invalid("GPU group is out of range"));
+        }
+    }
+    for (position, gpu) in inventory.gpus.iter().enumerate() {
+        if gpu.index > MAX_GPU_INDEX {
+            return Err(invalid("GPU index is out of range"));
+        }
+        if inventory.gpus[..position]
+            .iter()
+            .any(|other| other.index == gpu.index)
+        {
+            return Err(invalid("GPU index is repeated"));
+        }
+        if gpu.name.len() > MAX_GPU_NAME_BYTES {
+            return Err(invalid("GPU name is too long"));
+        }
+        reject_control_characters(&gpu.name, "gpu name")?;
+        if gpu.utilization_percent.is_some_and(|value| value > 100) {
+            return Err(invalid("GPU utilization is out of range"));
+        }
+        if gpu
+            .group
+            .is_some_and(|group| group as usize >= MAX_GPU_GROUPS)
+        {
+            return Err(invalid("GPU group is out of range"));
+        }
+        if gpu.assigned.len() > MAX_GPU_ASSIGNMENTS
+            || gpu.hidden_assignments as usize > MAX_GPU_ASSIGNMENTS
+        {
+            return Err(invalid("too many GPU assignments"));
+        }
+        for model in &gpu.assigned {
+            validate_model_id(model)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_heartbeat(heartbeat: &Heartbeat) -> Result<(), ProtocolError> {
     if heartbeat.resources.len() > MAX_RESOURCES_PER_NODE {
         return Err(ProtocolError::TooManyResources {
@@ -728,7 +964,7 @@ pub fn validate_switch_model_request(request: &SwitchModelRequest) -> Result<(),
     if let Some(instances) = request.instances {
         validate_instance_count("instances", instances)?;
     }
-    Ok(())
+    validate_gpu_selection(&request.gpus)
 }
 
 pub fn validate_fleet_operation_request(
@@ -972,6 +1208,10 @@ pub enum ProtocolError {
     TooManyCapabilities { count: usize, max: usize },
     #[error("invalid Fleet operation id")]
     InvalidOperationId,
+    #[error("invalid GPU inventory: {0}")]
+    InvalidGpuInventory(&'static str),
+    #[error("{0}")]
+    InvalidGpuSelection(&'static str),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1109,6 +1349,7 @@ mod tests {
                 }],
             }],
             revision: 1,
+            gpu_inventory: None,
         };
         validate_model_switching(&switching).unwrap();
         switching.models[0].description = Some("x".repeat(MAX_SWITCHING_DESCRIPTION_BYTES + 1));
@@ -1171,6 +1412,7 @@ mod tests {
                 provider: "lil-fleet".to_string(),
                 models: vec![model],
                 revision: 1,
+                gpu_inventory: None,
             })
             .unwrap();
         }
@@ -1183,6 +1425,7 @@ mod tests {
             request_id: Uuid::nil(),
             model_id: "qwen3-flash".to_string(),
             instances: Some(2),
+            gpus: Vec::new(),
         };
         let value = serde_json::to_value(StreamOpen::UnloadModel(request.clone()))
             .expect("serialize unload request");
@@ -1279,6 +1522,7 @@ mod tests {
             error_status: Some(400),
             error_code: None,
             operation: None,
+            warnings: Vec::new(),
         };
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["error_status"], serde_json::json!(400));
@@ -1506,5 +1750,272 @@ mod tests {
             finished_at: None,
         };
         assert_eq!(invalid.sanitized(), None);
+    }
+
+    fn sample_gpu_inventory() -> GpuInventoryAdvertisement {
+        GpuInventoryAdvertisement {
+            sampled_at: "2026-10-10T00:00:00Z".into(),
+            age_ms: 1500,
+            stale: false,
+            groups: vec![vec![0, 1, 6, 7], vec![2, 3, 4, 5]],
+            gpus: vec![
+                GpuAdvertisement {
+                    index: 0,
+                    name: "NVIDIA RTX PRO 6000".into(),
+                    memory_total_mib: 97887,
+                    memory_used_mib: 1234,
+                    memory_free_mib: 96000,
+                    utilization_percent: Some(0),
+                    group: Some(0),
+                    assigned: vec!["ds41-flash-tp4-ssd".into()],
+                    hidden_assignments: 0,
+                },
+                GpuAdvertisement {
+                    index: 2,
+                    name: "NVIDIA RTX PRO 6000".into(),
+                    memory_total_mib: 97887,
+                    memory_used_mib: 0,
+                    memory_free_mib: 97887,
+                    utilization_percent: None,
+                    group: None,
+                    assigned: Vec::new(),
+                    hidden_assignments: 0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn gpu_inventory_round_trips_and_is_optional_both_ways() {
+        let switching = ModelSwitchingAdvertisement {
+            provider: "lil-fleet".into(),
+            models: Vec::new(),
+            revision: 3,
+            gpu_inventory: Some(sample_gpu_inventory()),
+        };
+        validate_model_switching(&switching).unwrap();
+        let update = WorkerToHub::ModelSwitchingUpdate(switching.clone());
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            value["payload"]["gpu_inventory"]["gpus"][0]["assigned"],
+            serde_json::json!(["ds41-flash-tp4-ssd"])
+        );
+        // Unknown utilization and group stay off the wire instead of 0.
+        let second = &value["payload"]["gpu_inventory"]["gpus"][1];
+        assert!(second.get("utilization_percent").is_none());
+        assert!(second.get("group").is_none());
+        assert!(second.get("hidden_assignments").is_none());
+        assert_eq!(
+            serde_json::from_value::<WorkerToHub>(value.clone()).unwrap(),
+            update
+        );
+
+        // An older worker omits the inventory: a newer hub reads "none".
+        let mut legacy = value["payload"].clone();
+        legacy.as_object_mut().unwrap().remove("gpu_inventory");
+        let legacy: ModelSwitchingAdvertisement = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.gpu_inventory, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("gpu_inventory")
+                .is_none()
+        );
+
+        // An older hub's struct ignores the new field.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct LegacySwitching {
+            provider: String,
+            models: Vec<SwitchableModelAdvertisement>,
+            revision: u64,
+        }
+        serde_json::from_value::<LegacySwitching>(value["payload"].clone())
+            .expect("older hub ignores the inventory");
+
+        // Minimal sample: every optional per-GPU field may be absent.
+        let minimal: GpuInventoryAdvertisement = serde_json::from_value(serde_json::json!({
+            "sampled_at": "2026-10-10T00:00:00Z",
+            "gpus": [{"index": 1}]
+        }))
+        .unwrap();
+        assert_eq!(minimal.age_ms, 0);
+        assert!(minimal.groups.is_empty());
+        validate_gpu_inventory(&minimal).unwrap();
+    }
+
+    #[test]
+    fn gpu_inventory_validation_enforces_bounds() {
+        let check = |mutate: &dyn Fn(&mut GpuInventoryAdvertisement)| {
+            let mut inventory = sample_gpu_inventory();
+            mutate(&mut inventory);
+            validate_gpu_inventory(&inventory)
+        };
+        assert!(check(&|_| {}).is_ok());
+        assert!(
+            check(&|inv| inv.gpus = (0..65)
+                .map(|index| {
+                    let mut gpu = inv.gpus[1].clone();
+                    gpu.index = index;
+                    gpu
+                })
+                .collect())
+            .is_err()
+        );
+        assert!(check(&|inv| inv.gpus[0].name = "x".repeat(MAX_GPU_NAME_BYTES + 1)).is_err());
+        assert!(check(&|inv| inv.gpus[0].name = "GPU\nforged".into()).is_err());
+        assert!(
+            check(&|inv| inv.gpus[0].assigned = vec!["m".into(); MAX_GPU_ASSIGNMENTS + 1]).is_err()
+        );
+        assert!(check(&|inv| inv.gpus[0].assigned = vec!["bad\nmodel".into()]).is_err());
+        assert!(check(&|inv| inv.gpus[1].index = 0).is_err());
+        assert!(check(&|inv| inv.gpus[0].index = MAX_GPU_INDEX + 1).is_err());
+        assert!(check(&|inv| inv.gpus[0].utilization_percent = Some(101)).is_err());
+        assert!(check(&|inv| inv.groups = vec![vec![0]; MAX_GPU_GROUPS + 1]).is_err());
+        assert!(check(&|inv| inv.groups = vec![vec![MAX_GPU_INDEX + 1]]).is_err());
+        assert!(check(&|inv| inv.sampled_at = " ".into()).is_err());
+        assert!(check(&|inv| inv.sampled_at = "x".repeat(MAX_GPU_SAMPLED_AT_BYTES + 1)).is_err());
+        // A bad inventory invalidates the switching update it rides on.
+        let switching = ModelSwitchingAdvertisement {
+            provider: "lil-fleet".into(),
+            models: Vec::new(),
+            revision: 1,
+            gpu_inventory: Some({
+                let mut inventory = sample_gpu_inventory();
+                inventory.gpus[0].name = "GPU\nforged".into();
+                inventory
+            }),
+        };
+        assert!(validate_model_switching(&switching).is_err());
+    }
+
+    #[test]
+    fn hidden_gpu_occupants_stay_counted_but_unnamed() {
+        let mut inventory = sample_gpu_inventory();
+        inventory.gpus[1].assigned = vec!["secret-model".into(), "visible".into()];
+        inventory.hide_assignments_except(|model| model == "visible");
+        assert!(inventory.gpus[0].assigned.is_empty());
+        assert_eq!(inventory.gpus[0].hidden_assignments, 1);
+        assert_eq!(inventory.gpus[1].assigned, vec!["visible".to_string()]);
+        assert_eq!(inventory.gpus[1].hidden_assignments, 1);
+        let encoded = serde_json::to_value(&inventory).unwrap();
+        assert_eq!(encoded["gpus"][0]["hidden_assignments"], 1);
+        assert!(!encoded.to_string().contains("secret-model"));
+    }
+
+    #[test]
+    fn worker_side_inventory_is_bounded_and_deduplicated() {
+        let fleet: crate::dashboard_fleet::FleetGpuInventory =
+            serde_json::from_value(serde_json::json!({
+                "sampled_at": "2026-10-10T00:00:00Z",
+                "gpus": [{"index": 0, "assigned": [
+                    {"model_id": "tp4", "instance_id": "tp4--0"},
+                    {"model_id": "tp4", "instance_id": "tp4--1"}
+                ]}]
+            }))
+            .unwrap();
+        let wire = GpuInventoryAdvertisement::from_fleet(fleet, 42).expect("bounded");
+        assert_eq!(wire.gpus[0].assigned, vec!["tp4".to_string()]);
+        assert_eq!(wire.age_ms, 42);
+        // Anything that would not fit the frame budget is dropped whole.
+        let huge: crate::dashboard_fleet::FleetGpuInventory =
+            serde_json::from_value(serde_json::json!({
+                "sampled_at": "2026-10-10T00:00:00Z",
+                "gpus": (0..64).map(|index| serde_json::json!({
+                    "index": index,
+                    "name": "n".repeat(MAX_GPU_NAME_BYTES),
+                    "assigned": (0..16).map(|n| serde_json::json!({"model_id": format!("{}-{n}", "m".repeat(60))})).collect::<Vec<_>>()
+                })).collect::<Vec<_>>()
+            }))
+            .unwrap();
+        assert_eq!(GpuInventoryAdvertisement::from_fleet(huge, 0), None);
+    }
+
+    #[test]
+    fn switch_request_gpus_and_response_warnings_round_trip_and_stay_optional() {
+        let request = SwitchModelRequest {
+            protocol_version: REQUEST_PROTOCOL_VERSION,
+            request_id: Uuid::nil(),
+            model_id: "big".into(),
+            instances: Some(1),
+            gpus: vec![3, 1],
+        };
+        let value = serde_json::to_value(StreamOpen::SwitchModel(request.clone())).unwrap();
+        assert_eq!(value["payload"]["gpus"], serde_json::json!([3, 1]));
+        assert_eq!(
+            serde_json::from_value::<StreamOpen>(value.clone()).unwrap(),
+            StreamOpen::SwitchModel(request.clone())
+        );
+        validate_switch_model_request(&request).unwrap();
+        // Automatic placement keeps the exact legacy request shape.
+        let auto = SwitchModelRequest {
+            gpus: Vec::new(),
+            ..request.clone()
+        };
+        assert!(serde_json::to_value(&auto).unwrap().get("gpus").is_none());
+        // An older worker's struct ignores `gpus` (hence the capability gate).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct LegacyRequest {
+            protocol_version: u16,
+            request_id: Uuid,
+            model_id: String,
+            instances: Option<u32>,
+        }
+        serde_json::from_value::<LegacyRequest>(value["payload"].clone()).unwrap();
+        for bad in [vec![1, 1], vec![MAX_GPU_INDEX + 1], (0..65).collect()] {
+            let request = SwitchModelRequest {
+                gpus: bad,
+                ..request.clone()
+            };
+            assert!(matches!(
+                validate_switch_model_request(&request),
+                Err(ProtocolError::InvalidGpuSelection(_))
+            ));
+        }
+
+        let legacy: SwitchModelResponse = serde_json::from_value(serde_json::json!({
+            "request_id": Uuid::nil(),
+            "model_id": "big",
+            "accepted": true,
+            "changed": true,
+            "error": null,
+            "model_switching": null
+        }))
+        .unwrap();
+        assert!(legacy.warnings.is_empty());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("warnings")
+                .is_none()
+        );
+        let current = SwitchModelResponse {
+            warnings: vec!["spans PCIe groups".into()],
+            ..legacy
+        };
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(
+            encoded["warnings"],
+            serde_json::json!(["spans PCIe groups"])
+        );
+        assert_eq!(
+            serde_json::from_value::<SwitchModelResponse>(encoded).unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn warnings_are_capped_and_single_line() {
+        let warnings = sanitize_warnings(
+            std::iter::once("line1\nline2".to_string())
+                .chain(std::iter::once(" ".to_string()))
+                .chain(std::iter::once("w".repeat(MAX_LOAD_WARNING_BYTES * 2)))
+                .chain((0..20).map(|n| format!("w{n}")))
+                .collect(),
+        );
+        assert_eq!(warnings.len(), MAX_LOAD_WARNINGS);
+        assert_eq!(warnings[0], "line1 line2");
+        assert_eq!(warnings[1].len(), MAX_LOAD_WARNING_BYTES);
     }
 }
