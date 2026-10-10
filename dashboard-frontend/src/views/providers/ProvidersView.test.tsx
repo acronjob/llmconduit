@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { getConnection, queryKeys } from '../../api/connection';
+import { DashboardApiError } from '../../api/client';
 import type { ConfiguredProvider, ConfiguredProvidersResponse, FleetModelsResponse, ProviderInventoryEntry } from '../../api/types';
 import { renderWithQuery, resetWorld } from '../../components/testHarness';
 import { authStore } from '../../store/authStore';
@@ -684,7 +685,9 @@ describe('ProvidersView', () => {
     vi.spyOn(client, 'providers').mockResolvedValue({ providers: [slot(`mesh:${endpoint}`, 'North lab', 'gpu-a')] });
     renderWithQuery(<ProvidersView />);
 
-    const switcher = await screen.findByTestId('remote-model-switcher');
+    const switcherRoot = await screen.findByTestId('remote-model-switcher');
+    await waitFor(() => expect(switcherRoot.querySelector(`[data-endpoint="${endpoint}"]`)).not.toBeNull());
+    const switcher = switcherRoot.querySelector(`[data-endpoint="${endpoint}"]`) as HTMLElement;
     await waitFor(() => expect(within(switcher).getAllByTestId('remote-switch-model')).toHaveLength(6));
 
     const ready = within(switcher).getByText('remote-ready').closest('[data-testid="remote-switch-model"]') as HTMLElement;
@@ -700,5 +703,142 @@ describe('ProvidersView', () => {
     expect(within(failed).getByRole('status', { name: 'model status: failed (failed)' })).toHaveAttribute('data-status', 'failed');
     expect(within(unhealthy).getByRole('status', { name: 'model status: failed (unhealthy)' })).toHaveAttribute('data-status', 'failed');
     expect(within(unloaded).getByRole('status', { name: 'model status: unloaded' })).toHaveAttribute('data-status', 'unloaded');
+  });
+});
+
+describe('ProvidersView GPU VRAM + placement', () => {
+  it('renders the local per-GPU VRAM board grouped by PCIe group with occupants', async () => {
+    renderWithQuery(<ProvidersView />);
+    const board = await screen.findByTestId('fleet-gpu-vram');
+    expect(board).toHaveAttribute('data-available', 'true');
+    expect(within(board).getAllByTestId('gpu-group').map((group) => group.getAttribute('data-group'))).toEqual(['0', '1']);
+    expect(within(board).getAllByTestId('gpu-row')).toHaveLength(8);
+    const gpu0 = board.querySelector('[data-gpu="0"]') as HTMLElement;
+    expect(gpu0).toHaveTextContent('used by qwen3-8b-flash');
+    expect(gpu0).toHaveTextContent('/95.6 GiB');
+    expect(within(gpu0).getByTestId('gpu-util')).toBeVisible();
+    // GPU 5 reports no utilization: omitted, never rendered as 0%.
+    expect(within(board.querySelector('[data-gpu="5"]') as HTMLElement).queryByTestId('gpu-util')).toBeNull();
+    expect(within(board).getByTestId('gpu-vram-freshness')).toHaveAttribute('data-quality', 'measured');
+  });
+
+  it('shows an explicit unavailable state when Fleet has no GPU inventory', async () => {
+    const client = getConnection().client;
+    const fleet = await client.fleet();
+    vi.spyOn(client, 'fleet').mockResolvedValue({ models: fleet.models });
+    renderWithQuery(<ProvidersView />);
+    const board = await screen.findByTestId('fleet-gpu-vram');
+    expect(board).toHaveAttribute('data-available', 'false');
+    expect(board).toHaveTextContent('— GPU info unavailable');
+    expect(within(board).queryAllByTestId('gpu-row')).toHaveLength(0);
+  });
+
+  it('shows mesh inventories per node and unavailable for older workers', async () => {
+    renderWithQuery(<ProvidersView />);
+    const switcher = await screen.findByTestId('remote-model-switcher');
+    await waitFor(() => expect(within(switcher).getAllByTestId('mesh-gpu-vram')).toHaveLength(2));
+    const nodeA = switcher.querySelector('[data-endpoint="vllm-a"]') as HTMLElement;
+    const nodeC = switcher.querySelector('[data-endpoint="vllm-c"]') as HTMLElement;
+    expect(within(nodeA).getByTestId('mesh-gpu-vram')).toHaveAttribute('data-available', 'true');
+    expect(within(nodeC).getByTestId('mesh-gpu-vram')).toHaveTextContent('GPU info unavailable');
+  });
+
+  it('flags a stale mesh inventory', async () => {
+    const client = getConnection().client;
+    const mesh = await client.mesh();
+    vi.spyOn(client, 'mesh').mockResolvedValue({
+      ...mesh,
+      nodes: mesh.nodes.map((node) => node.model_switching?.gpu_inventory ? {
+        ...node,
+        model_switching: { ...node.model_switching, gpu_inventory: { ...node.model_switching.gpu_inventory, age_ms: 600_000 } },
+      } : node),
+    });
+    renderWithQuery(<ProvidersView />);
+    const switcher = await screen.findByTestId('remote-model-switcher');
+    const nodeA = await waitFor(() => switcher.querySelector('[data-endpoint="vllm-a"]') as HTMLElement);
+    await waitFor(() => expect(within(nodeA).getByTestId('gpu-vram-freshness')).toHaveTextContent('stale'));
+    expect(within(nodeA).getByTestId('mesh-gpu-vram')).toHaveAttribute('data-stale', 'true');
+  });
+
+  it('scales a local model onto a picked free GPU and shows Fleet warnings', async () => {
+    const client = getConnection().client;
+    const loadModel = vi.spyOn(client, 'loadFleetModel').mockResolvedValue({ changed: true, warnings: ['selected GPUs span PCIe groups'] });
+    renderWithQuery(<ProvidersView />);
+    const panel = await screen.findByTestId('fleet-panel');
+    const model = within(panel).getByText('qwen3-8b-flash').closest('[data-testid="fleet-model-card"]') as HTMLElement;
+    fireEvent.change(within(model).getByLabelText('Instances'), { target: { value: '2' } });
+    fireEvent.click(within(model).getByRole('button', { name: 'Scale' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('radio', { name: 'Auto (most free VRAM)' })).toBeChecked();
+    fireEvent.click(within(dialog).getByRole('radio', { name: 'Pick GPUs' }));
+    expect(within(dialog).getByRole('checkbox', { name: 'GPU 0' })).toBeDisabled();
+    expect(within(dialog).getByTestId('gpu-picker-error')).toHaveTextContent('select exactly 1 GPU (0 selected)');
+    expect(within(dialog).getByRole('button', { name: 'Confirm load' })).toBeDisabled();
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: 'GPU 3' }));
+    expect(within(dialog).queryByTestId('gpu-picker-error')).toBeNull();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm load' }));
+
+    await waitFor(() => expect(loadModel).toHaveBeenCalledWith('qwen3-8b-flash', 2, [3]));
+    expect(await within(panel).findByTestId('fleet-load-warnings')).toHaveTextContent('selected GPUs span PCIe groups');
+  });
+
+  it('keeps automatic placement as the default load body', async () => {
+    const client = getConnection().client;
+    const loadModel = vi.spyOn(client, 'loadFleetModel');
+    renderWithQuery(<ProvidersView />);
+    const panel = await screen.findByTestId('fleet-panel');
+    const model = within(panel).getByText('qwen3-8b-flash').closest('[data-testid="fleet-model-card"]') as HTMLElement;
+    fireEvent.change(within(model).getByLabelText('Instances'), { target: { value: '2' } });
+    fireEvent.click(within(model).getByRole('button', { name: 'Scale' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm load' }));
+    await waitFor(() => expect(loadModel).toHaveBeenCalledWith('qwen3-8b-flash', 2));
+  });
+
+  it('offers manual picking when a scale-up starts new instances', async () => {
+    renderWithQuery(<ProvidersView />);
+    const panel = await screen.findByTestId('fleet-panel');
+    const model = within(panel).getByText('qwen3-8b-flash').closest('[data-testid="fleet-model-card"]') as HTMLElement;
+    fireEvent.change(within(model).getByLabelText('Instances'), { target: { value: '2' } });
+    fireEvent.click(within(model).getByRole('button', { name: 'Scale' }));
+    expect(within(screen.getByRole('dialog')).getByRole('radio', { name: 'Pick GPUs' })).toBeEnabled();
+  });
+
+  it('disables manual picking for models without GPU placement', async () => {
+    const client = getConnection().client;
+    const fleet = await client.fleet();
+    vi.spyOn(client, 'fleet').mockResolvedValue({
+      ...fleet,
+      models: fleet.models.map((entry) => ({ ...entry, model: { ...entry.model, gpu_count: undefined } })),
+    });
+    renderWithQuery(<ProvidersView />);
+    const panel = await screen.findByTestId('fleet-panel');
+    const idle = await waitFor(() => within(panel).getByText('qwen3-32b').closest('[data-testid="fleet-model-card"]') as HTMLElement);
+    fireEvent.click(within(idle).getByRole('button', { name: 'Load' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('radio', { name: 'Pick GPUs' })).toBeDisabled();
+    expect(within(dialog).getByTestId('gpu-picker-unavailable')).toHaveTextContent('no GPU placement');
+  });
+
+  it('sends a mesh GPU pick and surfaces Fleet placement errors', async () => {
+    const client = getConnection().client;
+    vi.spyOn(client, 'providers').mockResolvedValue({ providers: [slot('mesh:vllm-a', 'North lab', 'gpu-a')] });
+    const loadModel = vi.spyOn(client, 'loadMeshModel').mockRejectedValue(
+      new DashboardApiError('POST /mesh/nodes/vllm-a/models/qwen3-14b/load failed: 409', 409, 'gpus_unavailable', 'Requested GPUs are not available'),
+    );
+    renderWithQuery(<ProvidersView />);
+    const switcher = await screen.findByTestId('remote-model-switcher');
+    const nodeA = await waitFor(() => switcher.querySelector('[data-endpoint="vllm-a"]') as HTMLElement);
+    const model = await waitFor(() => within(nodeA).getByText('qwen3-14b').closest('[data-testid="remote-switch-model"]') as HTMLElement);
+    fireEvent.click(within(model).getByRole('button', { name: 'Load' }));
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('radio', { name: 'Pick GPUs' }));
+    expect(within(dialog).getByRole('checkbox', { name: 'GPU 6' })).toBeDisabled();
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: 'GPU 2' }));
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: 'GPU 3' }));
+    expect(within(dialog).queryByTestId('gpu-picker-cross-group')).toBeNull();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm load' }));
+
+    await waitFor(() => expect(loadModel).toHaveBeenCalledWith('vllm-a', 'qwen3-14b', 1, [2, 3]));
+    expect(await screen.findByTestId('mesh-mutation-error')).toHaveTextContent('Requested GPUs are not available (gpus_unavailable)');
   });
 });
