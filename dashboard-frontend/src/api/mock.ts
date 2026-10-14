@@ -28,6 +28,7 @@ import type {
   DebugWsMessage,
   FleetModelEntry,
   FleetOperationResponse,
+  GpuInventory,
   FlowDetail,
   FlowSummary,
   ActiveSessionsResponse,
@@ -127,10 +128,13 @@ let MESH_NODES: MeshNode[] = [
       models: [
         { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', phase: 'ready', desired_state: 'loaded', gpu_count: 4, max_instances: 2, desired_instances: 1, ready_instances: 1, assigned_gpus: [0, 1, 6, 7], instances: [{ instance_id: 'qwen3-8b-flash-0', index: 0, port: 8101, phase: 'ready', container_status: 'running', assigned_gpus: [0, 1, 6, 7] }] },
         { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 8, max_instances: 1, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] },
+        { id: 'qwen3-14b', description: 'mid-size TP2 lane', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 2, max_instances: 2, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] },
       ],
     },
   },
   { endpoint_id: 'vllm-b', label: 'mesh worker b', enabled: true, joined_at_ms: Date.now() - 2_400_000, join_key_id: 'jk_mock_spare', last_seen_at_ms: Date.now() - 45_000 },
+  // An older worker: advertises switching but no GPU inventory ("GPU info unavailable").
+  { endpoint_id: 'vllm-c', label: 'mesh worker c', enabled: true, joined_at_ms: Date.now() - 1_800_000, join_key_id: 'jk_mock_used', last_seen_at_ms: Date.now() - 8_000, model_switching: { provider: 'lil-fleet', revision: 3, models: [{ id: 'llama3-70b', description: 'legacy worker lane', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 2, max_instances: 1, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] }] } },
 ];
 
 let MESH_DISABLED_MODELS: MeshDisabledModel[] = [
@@ -799,7 +803,7 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   }
 
   if (path === '/dashboard/api/mesh') {
-    const resp: MeshAdminState = { join_keys: MESH_JOIN_KEYS, nodes: MESH_NODES, disabled_models: MESH_DISABLED_MODELS };
+    const resp: MeshAdminState = { join_keys: MESH_JOIN_KEYS, nodes: MESH_NODES.map(withMockGpuInventory), disabled_models: MESH_DISABLED_MODELS };
     return json(resp);
   }
   if (path === '/dashboard/api/configured-providers' && method === 'GET') {
@@ -921,6 +925,17 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     if (!node?.model_switching?.models.some((model) => model.id === modelId)) {
       return json({ error: 'model is not advertised as switchable' }, 400);
     }
+    const target = node.model_switching.models.find((model) => model.id === modelId)!;
+    let placed: MockPlacement | undefined;
+    if (!unload) {
+      if (Array.isArray(body.gpus) && body.gpus.length > 0 && !MOCK_GPU_NODES.has(endpointId)) {
+        return json({ error: 'worker does not support GPU placement', code: 'gpus_not_supported' }, 400);
+      }
+      const others = node.model_switching.models.filter((model) => model.id !== modelId).map((model) => ({ id: model.id, instances: model.instances ?? [] }));
+      const outcome = mockPlace(target.id, target.gpu_count ?? 1, requestedInstances ?? Math.max(1, target.desired_instances ?? 1), target.instances ?? [], others, body.gpus, 8200);
+      if ('error' in outcome) return json(outcome.error.body, outcome.error.status);
+      placed = outcome;
+    }
     node.model_switching = {
       ...node.model_switching,
       revision: node.model_switching.revision + 1,
@@ -930,11 +945,11 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
         desired_state: model.id === modelId ? (unload ? 'unloaded' : 'ready') : model.desired_state,
         desired_instances: model.id === modelId ? (unload ? 0 : requestedInstances ?? model.desired_instances ?? 1) : model.desired_instances,
         ready_instances: model.id === modelId ? (unload ? 0 : 0) : model.ready_instances,
-        assigned_gpus: model.id === modelId ? (unload ? [] : mockAssignedGpus(model.gpu_count ?? 1, requestedInstances ?? model.desired_instances ?? 1)) : model.assigned_gpus,
-        instances: model.id === modelId ? (unload ? [] : mockInstances(model.id, model.gpu_count ?? 1, requestedInstances ?? model.desired_instances ?? 1, 8200, 'loading')) : model.instances,
+        assigned_gpus: model.id === modelId ? (unload ? [] : placed?.assigned ?? []) : model.assigned_gpus,
+        instances: model.id === modelId ? (unload ? [] : placed?.instances ?? []) : model.instances,
       })),
     };
-    return json({ endpoint_id: endpointId, model_id: modelId, accepted: true, changed: true });
+    return json({ endpoint_id: endpointId, model_id: modelId, accepted: true, changed: true, ...(placed?.warnings.length ? { warnings: placed.warnings } : {}) });
   }
   const meshModelMatch = path.match(/^\/dashboard\/api\/mesh\/models\/(disable|enable)$/);
   if (meshModelMatch && method === 'POST') {
@@ -975,7 +990,12 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   if (path === '/dashboard/api/topology') return json(buildTopology());
   if (path === '/dashboard/api/providers') return json({ providers: PROVIDERS });
   if (path === '/dashboard/api/provider-metrics') return json({ generated_at_ms: Date.now(), providers: PROVIDER_METRICS });
-  if (path === '/dashboard/api/fleet' && method === 'GET') return json({ models: FLEET_MODELS });
+  if (path === '/dashboard/api/fleet' && method === 'GET') {
+    return json({
+      models: FLEET_MODELS,
+      gpu_inventory: mockGpuInventory(FLEET_MODELS.map((entry) => ({ id: entry.model.id, instances: entry.status.instances ?? [] })), true),
+    });
+  }
   const fleetAction = path.match(/^\/dashboard\/api\/fleet\/models\/([^/]+)\/(load|unload)$/);
   if (fleetAction && method === 'POST') {
     const csrf = headerValue(init?.headers, 'X-CSRF-Token');
@@ -986,6 +1006,13 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     const requestedInstances = positiveInstanceCount(body.instances);
     const found = FLEET_MODELS.find((entry) => entry.model.id === id);
     if (!found) return json({ error: 'unknown Fleet model' }, 404);
+    let placed: MockPlacement | undefined;
+    if (load) {
+      const others = FLEET_MODELS.filter((entry) => entry.model.id !== id).map((entry) => ({ id: entry.model.id, instances: entry.status.instances ?? [] }));
+      const outcome = mockPlace(id, found.model.gpu_count ?? 1, requestedInstances ?? Math.max(1, found.status.desired_instances ?? 1), found.status.instances ?? [], others, body.gpus, 8101);
+      if ('error' in outcome) return json(outcome.error.body, outcome.error.status);
+      placed = outcome;
+    }
     const now = new Date().toISOString();
     FLEET_MODELS = FLEET_MODELS.map((entry) => entry.model.id === id ? {
       ...entry,
@@ -995,13 +1022,14 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
         desired_state: load ? 'loaded' : 'unloaded',
         desired_instances: load ? requestedInstances ?? entry.status.desired_instances ?? 1 : 0,
         ready_instances: load ? 0 : 0,
-        assigned_gpus: load ? mockAssignedGpus(entry.model.gpu_count ?? 1, requestedInstances ?? entry.status.desired_instances ?? 1) : [],
-        instances: load ? mockInstances(entry.model.id, entry.model.gpu_count ?? 1, requestedInstances ?? entry.status.desired_instances ?? 1, 8101, 'loading') : [],
+        assigned_gpus: load ? placed?.assigned ?? [] : [],
+        instances: load ? placed?.instances ?? [] : [],
         last_checked: now,
       },
     } : entry);
     const response: FleetOperationResponse = {
       changed: true,
+      ...(placed?.warnings.length ? { warnings: placed.warnings } : {}),
       operation: {
         id: `op_${Date.now()}`,
         kind: load ? 'activate' : 'unload',
@@ -1225,19 +1253,118 @@ function positiveInstanceCount(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
-function mockAssignedGpus(gpuCount: number, instances: number): number[] {
-  return Array.from({ length: Math.max(0, gpuCount * instances) }, (_, index) => index);
+// -- Mock GPU inventory: 8 GPUs in two PCIe groups, occupancy derived from model instances.
+const MOCK_GPU_COUNT = 8;
+const MOCK_GPU_GROUPS = [[0, 1, 6, 7], [2, 3, 4, 5]];
+const MOCK_GPU_TOTAL_MIB = 97_887;
+/** Mesh workers that push a GPU inventory (vllm-c impersonates an older worker). */
+const MOCK_GPU_NODES = new Set(['vllm-a']);
+
+interface MockInstance {
+  instance_id?: string;
+  index: number;
+  port?: number;
+  phase: string;
+  container_status?: string;
+  assigned_gpus?: number[];
 }
 
-function mockInstances(modelId: string, gpuCount: number, instances: number, basePort: number, phase: string) {
-  return Array.from({ length: instances }, (_, index) => ({
-    instance_id: `${modelId}-${index}`,
-    index,
-    port: basePort + index,
-    phase,
-    container_status: phase === 'ready' ? 'running' : 'starting',
-    assigned_gpus: Array.from({ length: gpuCount }, (_unused, gpuIndex) => index * gpuCount + gpuIndex),
-  }));
+function mockGroupOf(gpu: number): number | undefined {
+  const found = MOCK_GPU_GROUPS.findIndex((members) => members.includes(gpu));
+  return found >= 0 ? found : undefined;
+}
+
+function mockGpuInventory(models: Array<{ id: string; instances: MockInstance[] }>, withInstanceIds: boolean): GpuInventory {
+  return {
+    sampled_at: new Date(Date.now() - 4_000).toISOString(),
+    stale: false,
+    age_ms: 4_000,
+    groups: MOCK_GPU_GROUPS,
+    gpus: Array.from({ length: MOCK_GPU_COUNT }, (_, index) => {
+      const assigned = models.flatMap((model) => model.instances
+        .filter((instance) => instance.assigned_gpus?.includes(index))
+        .map((instance) => (withInstanceIds && instance.instance_id ? { model_id: model.id, instance_id: instance.instance_id } : { model_id: model.id })));
+      const used = assigned.length ? 88_120 + index * 37 : 1_234;
+      return {
+        index,
+        name: 'NVIDIA RTX PRO 6000 Blackwell Workstation Edition',
+        memory_total_mib: MOCK_GPU_TOTAL_MIB,
+        memory_used_mib: used,
+        memory_free_mib: MOCK_GPU_TOTAL_MIB - used,
+        // GPU 5 reports no utilization: the UI must omit it rather than show 0%.
+        ...(index === 5 ? {} : { utilization_percent: assigned.length ? 41 + index : 0 }),
+        group: mockGroupOf(index),
+        assigned,
+      };
+    }),
+  };
+}
+
+function withMockGpuInventory(node: MeshNode): MeshNode {
+  if (!node.model_switching || !MOCK_GPU_NODES.has(node.endpoint_id)) return node;
+  return {
+    ...node,
+    model_switching: {
+      ...node.model_switching,
+      gpu_inventory: mockGpuInventory(node.model_switching.models.map((model) => ({ id: model.id, instances: model.instances ?? [] })), false),
+    },
+  };
+}
+
+interface MockPlacement {
+  instances: MockInstance[];
+  assigned: number[];
+  warnings: string[];
+}
+
+/**
+ * Mirrors Fleet's placement contract: `gpus` must list exactly gpu_count × newly started
+ * instances, all free; empty/omitted means automatic (most-free = lowest free index here).
+ */
+function mockPlace(
+  modelId: string,
+  gpuCount: number,
+  requested: number,
+  existing: MockInstance[],
+  others: Array<{ id: string; instances: MockInstance[] }>,
+  rawGpus: unknown,
+  basePort: number,
+): MockPlacement | { error: { status: number; body: { error: string; code: string } } } {
+  const keep = existing.slice(0, requested);
+  const added = requested - keep.length;
+  const occupied = new Set([...others, { id: modelId, instances: keep }].flatMap((model) => model.instances.flatMap((instance) => instance.assigned_gpus ?? [])));
+  const invalid = (error: string) => ({ error: { status: 400, body: { error, code: 'invalid_gpus' } } });
+  let picked: number[];
+  if (Array.isArray(rawGpus) && rawGpus.length > 0) {
+    if (!rawGpus.every((gpu): gpu is number => Number.isInteger(gpu) && gpu >= 0 && gpu < MOCK_GPU_COUNT)) return invalid('unknown GPU index');
+    if (new Set(rawGpus).size !== rawGpus.length) return invalid('duplicate GPU');
+    if (added <= 0) return { error: { status: 400, body: { error: 'no instances are being started', code: 'gpus_not_applicable' } } };
+    if (rawGpus.length !== gpuCount * added) return invalid(`expected ${gpuCount * added} GPUs`);
+    if (rawGpus.some((gpu) => occupied.has(gpu))) return { error: { status: 409, body: { error: 'Requested GPUs are not available', code: 'gpus_unavailable' } } };
+    picked = rawGpus;
+  } else {
+    picked = Array.from({ length: MOCK_GPU_COUNT }, (_, index) => index).filter((gpu) => !occupied.has(gpu)).slice(0, Math.max(0, gpuCount * added));
+  }
+  const instances: MockInstance[] = [
+    ...keep,
+    ...Array.from({ length: Math.max(0, added) }, (_, offset) => {
+      const index = keep.length + offset;
+      return {
+        instance_id: `${modelId}-${index}`,
+        index,
+        port: basePort + index,
+        phase: 'loading',
+        container_status: 'starting',
+        assigned_gpus: picked.slice(offset * gpuCount, (offset + 1) * gpuCount),
+      };
+    }),
+  ];
+  const groups = new Set(picked.map(mockGroupOf).filter((group) => group !== undefined));
+  return {
+    instances,
+    assigned: instances.flatMap((instance) => instance.assigned_gpus ?? []),
+    warnings: Array.isArray(rawGpus) && rawGpus.length > 0 && groups.size > 1 ? ['selected GPUs span PCIe groups'] : [],
+  };
 }
 
 /** The mock's signed-in user (null after a token login). */
@@ -1288,10 +1415,13 @@ export function resetMockAccounts(): void {
         models: [
           { id: 'qwen3-8b-flash', description: 'fast local Qwen lane', phase: 'ready', desired_state: 'loaded', gpu_count: 4, max_instances: 2, desired_instances: 1, ready_instances: 1, assigned_gpus: [0, 1, 6, 7], instances: [{ instance_id: 'qwen3-8b-flash-0', index: 0, port: 8101, phase: 'ready', container_status: 'running', assigned_gpus: [0, 1, 6, 7] }] },
           { id: 'qwen3-32b', description: 'larger local model', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 8, max_instances: 1, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] },
+          { id: 'qwen3-14b', description: 'mid-size TP2 lane', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 2, max_instances: 2, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] },
         ],
       },
     },
     { endpoint_id: 'vllm-b', label: 'mesh worker b', enabled: true, joined_at_ms: Date.now() - 2_400_000, join_key_id: 'jk_mock_spare', last_seen_at_ms: Date.now() - 45_000 },
+    // An older worker: advertises switching but no GPU inventory ("GPU info unavailable").
+    { endpoint_id: 'vllm-c', label: 'mesh worker c', enabled: true, joined_at_ms: Date.now() - 1_800_000, join_key_id: 'jk_mock_used', last_seen_at_ms: Date.now() - 8_000, model_switching: { provider: 'lil-fleet', revision: 3, models: [{ id: 'llama3-70b', description: 'legacy worker lane', phase: 'unloaded', desired_state: 'unloaded', gpu_count: 2, max_instances: 1, desired_instances: 0, ready_instances: 0, assigned_gpus: [], instances: [] }] } },
   ];
   FLEET_MODELS = [
     {

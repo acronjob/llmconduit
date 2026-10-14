@@ -250,6 +250,9 @@ impl utoipa::Modify for SecuritySchemes {
         crate::dashboard_fleet::FleetOperationResponse,
         crate::dashboard_fleet::FleetOperation,
         crate::dashboard_fleet::FleetLoadModelRequest,
+        crate::dashboard_fleet::FleetGpuInventory,
+        crate::dashboard_fleet::FleetGpu,
+        crate::dashboard_fleet::FleetGpuAssignment,
         crate::dashboard_flow::FlowStatus,
         crate::dashboard_flow::FlowUsage,
         crate::dashboard_flow::ClientSource,
@@ -433,6 +436,38 @@ mod tests {
         let schemas = &json["components"]["schemas"];
         for name in ["ApiError", "AnthropicError", "DashboardError"] {
             assert!(schemas.get(name).is_some(), "missing schema {name}");
+        }
+    }
+
+    #[test]
+    fn gpu_inventory_and_gpu_picks_are_documented() {
+        let json = serde_json::to_value(document()).expect("serializable");
+        let schemas = &json["components"]["schemas"];
+        for (schema, field) in [
+            ("FleetModelsResponse", "gpu_inventory"),
+            ("MeshModelSwitching", "gpu_inventory"),
+            ("FleetGpuInventory", "gpus"),
+            ("FleetGpuInventory", "groups"),
+            ("FleetGpuInventory", "age_ms"),
+            ("FleetGpu", "memory_free_mib"),
+            ("FleetGpu", "assigned"),
+            ("FleetLoadModelRequest", "gpus"),
+            ("MeshModelLoadRequest", "gpus"),
+            ("FleetOperationResponse", "warnings"),
+            ("SwitchMeshModelResponse", "warnings"),
+        ] {
+            assert!(
+                schemas[schema]["properties"].get(field).is_some(),
+                "{schema}.{field} is not documented"
+            );
+        }
+        // Both load fields are optional.
+        for schema in ["FleetLoadModelRequest", "MeshModelLoadRequest"] {
+            let required = schemas[schema]["required"].as_array();
+            assert!(
+                required.is_none_or(|required| required.is_empty()),
+                "{schema} must not require fields"
+            );
         }
     }
 }

@@ -33,6 +33,7 @@ import type {
   CreateAuthUserRequest,
   CreatedAuthApiKey,
   CreatedKeyResponse,
+  FleetLoadRequest,
   FleetModelsResponse,
   FleetOperationResponse,
   FlowDetail,
@@ -131,6 +132,54 @@ export class UnauthorizedError extends Error {
   }
 }
 
+/**
+ * A non-2xx dashboard response. `message` keeps the historical `METHOD path failed: status`
+ * shape (callers match on it); the server's sanitized `{error, code}` body rides alongside so
+ * a view can explain e.g. `gpus_unavailable` instead of a bare status.
+ */
+/**
+ * Load body: absent when nothing was requested; `gpus` only for a non-empty manual pick (empty
+ * means automatic placement), and a pick always carries its explicit instance count.
+ */
+export function loadBody(instances?: number, gpus?: number[]): FleetLoadRequest | undefined {
+  const picked = gpus && gpus.length > 0 ? gpus : undefined;
+  if (instances === undefined && !picked) return undefined;
+  if (picked) return { instances: instances ?? 1, gpus: picked };
+  return { instances };
+}
+
+export class DashboardApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly serverMessage?: string;
+  constructor(message: string, status: number, code?: string, serverMessage?: string) {
+    super(message);
+    this.name = 'DashboardApiError';
+    this.status = status;
+    this.code = code;
+    this.serverMessage = serverMessage;
+  }
+}
+
+const MAX_ERROR_FIELD_CHARS = 200;
+
+function errorBodyField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, MAX_ERROR_FIELD_CHARS) : undefined;
+}
+
+async function readErrorBody(res: Response): Promise<{ code?: string; message?: string }> {
+  try {
+    const text = await res.text();
+    if (!text) return {};
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object') return {};
+    const body = parsed as Record<string, unknown>;
+    return { code: errorBodyField(body.code), message: errorBodyField(body.error) };
+  } catch {
+    return {};
+  }
+}
+
 export interface DashboardClientOptions {
   /** Base path the API is mounted under. Default `/dashboard/api`. */
   basePath?: string;
@@ -167,7 +216,8 @@ export class DashboardClient {
       throw new UnauthorizedError();
     }
     if (!res.ok) {
-      throw new Error(`${init?.method ?? 'GET'} ${path} failed: ${res.status}`);
+      const body = await readErrorBody(res);
+      throw new DashboardApiError(`${init?.method ?? 'GET'} ${path} failed: ${res.status}`, res.status, body.code, body.message);
     }
     // 204/empty bodies decode to `undefined as T` at the call sites that allow it.
     const text = await res.text();
@@ -349,8 +399,8 @@ export class DashboardClient {
     return this.request('/fleet', undefined, isFleetModelsResponse);
   }
 
-  loadFleetModel(id: string, instances?: number): Promise<FleetOperationResponse> {
-    return this.mutate(`/fleet/models/${encodeURIComponent(id)}/load`, 'POST', instances === undefined ? undefined : { instances }).then((value) => {
+  loadFleetModel(id: string, instances?: number, gpus?: number[]): Promise<FleetOperationResponse> {
+    return this.mutate(`/fleet/models/${encodeURIComponent(id)}/load`, 'POST', loadBody(instances, gpus)).then((value) => {
       if (!isFleetOperationResponse(value)) throw new Error('/fleet/models/:id/load returned an invalid response');
       return value;
     });
@@ -404,8 +454,8 @@ export class DashboardClient {
     });
   }
 
-  loadMeshModel(endpointId: string, modelId: string, instances?: number): Promise<SwitchMeshModelResponse> {
-    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/load`, 'POST', instances === undefined ? undefined : { instances }).then((value) => {
+  loadMeshModel(endpointId: string, modelId: string, instances?: number, gpus?: number[]): Promise<SwitchMeshModelResponse> {
+    return this.mutate(`/mesh/nodes/${encodeURIComponent(endpointId)}/models/${encodeURIComponent(modelId)}/load`, 'POST', loadBody(instances, gpus)).then((value) => {
       if (!isSwitchMeshModelResponse(value)) throw new Error('/mesh/nodes/:endpoint_id/models/:model_id/load returned an invalid response');
       return value;
     });

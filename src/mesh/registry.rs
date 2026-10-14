@@ -54,10 +54,15 @@ pub(crate) struct WorkerSession {
     /// The worker advertised `fleet_operations` (operation lookups and the
     /// operation field on switch responses).
     supports_fleet_operations: bool,
+    /// The worker advertised `gpu_placement` (forwards manual GPU picks).
+    supports_gpu_placement: bool,
     connected_at: Instant,
     last_seen: Mutex<Instant>,
     resources: Mutex<HashMap<String, ResourceState>>,
     model_switching: Mutex<Option<ModelSwitchingAdvertisement>>,
+    /// When `model_switching` (and so its GPU sample) last arrived, so the
+    /// dashboard can age the sample without trusting the worker's clock.
+    model_switching_received_at: Mutex<Instant>,
     notify: Arc<Notify>,
 }
 
@@ -210,6 +215,8 @@ impl MeshRegistry {
             advertisement.accepts_request_encoding(crate::mesh::protocol::REQUEST_ENCODING_ZSTD);
         let supports_fleet_operations =
             advertisement.has_capability(crate::mesh::protocol::CAPABILITY_FLEET_OPERATIONS);
+        let supports_gpu_placement =
+            advertisement.has_capability(crate::mesh::protocol::CAPABILITY_GPU_PLACEMENT);
         Arc::new(WorkerSession {
             endpoint_id,
             connection,
@@ -218,9 +225,11 @@ impl MeshRegistry {
             enrollment_label: advertised_worker_name(enrollment_label.as_deref()),
             accepts_zstd,
             supports_fleet_operations,
+            supports_gpu_placement,
             connected_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
             model_switching: Mutex::new(advertisement.model_switching.clone()),
+            model_switching_received_at: Mutex::new(Instant::now()),
             resources: Mutex::new(resources_from_advertisement(
                 advertisement,
                 Arc::clone(&self.notify),
@@ -642,32 +651,64 @@ impl MeshRegistry {
             .clone()
     }
 
+    /// The switching inventory plus how long ago the hub received it.
+    pub(crate) fn model_switching_snapshot(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Option<(ModelSwitchingAdvertisement, Duration)> {
+        let session = self.current_session_any_generation(endpoint_id)?;
+        if session.is_stale(Instant::now(), self.heartbeat_timeout) {
+            return None;
+        }
+        let switching = session
+            .model_switching
+            .lock()
+            .expect("mesh model-switching lock poisoned")
+            .clone()?;
+        let received_at = *session
+            .model_switching_received_at
+            .lock()
+            .expect("mesh model-switching lock poisoned");
+        Some((switching, received_at.elapsed()))
+    }
+
     pub(crate) async fn switch_model(
         &self,
         endpoint_id: EndpointId,
         model_id: String,
     ) -> crate::error::AppResult<SwitchModelResponse> {
-        self.switch_model_instances(endpoint_id, model_id, None)
+        self.switch_model_instances(endpoint_id, model_id, None, Vec::new())
             .await
     }
 
+    /// Loads `model_id` on a worker. `gpus` is a manual GPU pick (empty means
+    /// automatic placement); picks the hub already knows are invalid fail
+    /// here with a 400 instead of a round trip to Fleet.
     pub(crate) async fn switch_model_instances(
         &self,
         endpoint_id: EndpointId,
         model_id: String,
         instances: Option<u32>,
+        gpus: Vec<u32>,
     ) -> crate::error::AppResult<SwitchModelResponse> {
-        if let Some(instances) = instances {
+        if instances.is_some() || !gpus.is_empty() {
             crate::mesh::protocol::validate_switch_model_request(&SwitchModelRequest {
                 protocol_version: crate::mesh::protocol::REQUEST_PROTOCOL_VERSION,
                 request_id: uuid::Uuid::nil(),
                 model_id: model_id.clone(),
-                instances: Some(instances),
+                instances,
+                gpus: gpus.clone(),
             })
             .map_err(|err| crate::error::AppError::bad_request(err.to_string()))?;
         }
-        self.set_model_state(endpoint_id, model_id, ModelLifecycleAction::Load, instances)
-            .await
+        self.set_model_state(
+            endpoint_id,
+            model_id,
+            ModelLifecycleAction::Load,
+            instances,
+            gpus,
+        )
+        .await
     }
 
     pub(crate) async fn unload_model(
@@ -675,8 +716,14 @@ impl MeshRegistry {
         endpoint_id: EndpointId,
         model_id: String,
     ) -> crate::error::AppResult<SwitchModelResponse> {
-        self.set_model_state(endpoint_id, model_id, ModelLifecycleAction::Unload, None)
-            .await
+        self.set_model_state(
+            endpoint_id,
+            model_id,
+            ModelLifecycleAction::Unload,
+            None,
+            Vec::new(),
+        )
+        .await
     }
 
     async fn set_model_state(
@@ -685,6 +732,7 @@ impl MeshRegistry {
         model_id: String,
         action: ModelLifecycleAction,
         instances: Option<u32>,
+        gpus: Vec<u32>,
     ) -> crate::error::AppResult<SwitchModelResponse> {
         let session = self
             .current_session_any_generation(endpoint_id)
@@ -707,11 +755,22 @@ impl MeshRegistry {
                 "model is not advertised as switchable",
             ));
         }
+        if !gpus.is_empty() {
+            if !session.supports_gpu_placement {
+                // An older worker would drop the pick and place automatically.
+                return Err(crate::error::AppError::bad_request(
+                    "mesh worker does not support GPU selection",
+                ));
+            }
+            check_gpu_selection(&advertised, &model_id, instances, &gpus)
+                .map_err(crate::error::AppError::bad_request)?;
+        }
         let request = SwitchModelRequest {
             protocol_version: crate::mesh::protocol::REQUEST_PROTOCOL_VERSION,
             request_id: uuid::Uuid::new_v4(),
             model_id,
             instances,
+            gpus,
         };
         let connection = session.connection.as_ref().ok_or_else(|| {
             crate::error::AppError::upstream("mesh worker connection is unavailable")
@@ -755,9 +814,19 @@ impl MeshRegistry {
                     .iter()
                     .any(|allowed| allowed.id.eq_ignore_ascii_case(&model.id))
             });
+            if let Some(inventory) = update.gpu_inventory.as_mut() {
+                inventory.hide_assignments_except(|model| {
+                    advertised
+                        .models
+                        .iter()
+                        .any(|allowed| allowed.id.eq_ignore_ascii_case(model))
+                });
+            }
             session.update_model_switching(update.clone());
             response.model_switching = Some(update);
         }
+        response.warnings =
+            crate::mesh::protocol::sanitize_warnings(std::mem::take(&mut response.warnings));
         // Worker-controlled: keep only a well-formed operation, bounded.
         response.operation = response
             .operation
@@ -1371,12 +1440,62 @@ impl WorkerSession {
             return;
         }
         *current = Some(update);
+        *self
+            .model_switching_received_at
+            .lock()
+            .expect("mesh model-switching lock poisoned") = Instant::now();
     }
 
     fn is_stale(&self, now: Instant, timeout: Duration) -> bool {
         let last_seen = *self.last_seen.lock().expect("mesh last_seen lock poisoned");
         now.duration_since(last_seen) > timeout
     }
+}
+
+/// Rejects a manual GPU pick the hub already knows Fleet would refuse: an
+/// index missing from the node's last inventory, or a count that does not
+/// equal `gpu_count x newly started instances` when both are known. Anything
+/// less certain is left to Fleet, which owns placement.
+pub(crate) fn check_gpu_selection(
+    advertised: &ModelSwitchingAdvertisement,
+    model_id: &str,
+    instances: Option<u32>,
+    gpus: &[u32],
+) -> Result<(), &'static str> {
+    if let Some(inventory) = &advertised.gpu_inventory
+        && gpus.iter().any(|gpu| !inventory.has_gpu(*gpu))
+    {
+        return Err("gpus include an index that is not in the node's GPU inventory");
+    }
+    let Some(model) = advertised.models.iter().find(|model| model.id == model_id) else {
+        return Ok(());
+    };
+    let Some(requested) = instances else {
+        return Ok(());
+    };
+    if model.gpu_count == 0 {
+        return Ok(());
+    }
+    let fully_unloaded = model.phase.eq_ignore_ascii_case("unloaded")
+        && model.desired_state.eq_ignore_ascii_case("unloaded")
+        && model.ready_instances == 0
+        && model.instances.is_empty();
+    let current = if fully_unloaded {
+        0
+    } else if model.desired_instances > 0 {
+        model.desired_instances
+    } else {
+        return Ok(());
+    };
+    let added = requested.saturating_sub(current);
+    if added == 0 {
+        // Nothing new starts: Fleet answers `gpus_not_applicable`.
+        return Ok(());
+    }
+    if gpus.len() as u64 != u64::from(model.gpu_count) * u64::from(added) {
+        return Err("gpus count must equal the model's gpu_count times the newly started replicas");
+    }
+    Ok(())
 }
 
 fn min_known_limit(current: Option<i64>, next: Option<i64>) -> Option<i64> {
@@ -2670,6 +2789,7 @@ mod tests {
                         vec![0],
                     )],
                     revision: 5,
+                    gpu_inventory: None,
                 }),
                 request_encodings: Vec::new(),
                 capabilities: Vec::new(),
@@ -2686,6 +2806,7 @@ mod tests {
                 Vec::new(),
             )],
             revision: 4,
+            gpu_inventory: None,
         });
         let advertised = registry
             .model_switching(endpoint)
