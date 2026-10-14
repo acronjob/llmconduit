@@ -1124,8 +1124,49 @@ export interface FleetModelEntry {
   status: FleetDeploymentStatus;
 }
 
+/** One process (model instance) occupying a GPU. Mesh inventories carry `model_id` only. */
+export interface GpuAssignment {
+  model_id: string;
+  instance_id?: string;
+}
+
+/** One physical GPU as sampled by Fleet's `GET /v1/gpus`. */
+export interface GpuInfo {
+  index: number;
+  name: string;
+  memory_total_mib: number;
+  memory_used_mib: number;
+  memory_free_mib: number;
+  /** Absent when nvidia-smi could not report it (never rendered as 0). */
+  utilization_percent?: number;
+  /** Index into `GpuInventory.groups`; absent when the topology is unknown. */
+  group?: number;
+  assigned: GpuAssignment[];
+  /** Mesh only: occupants hidden by the hub's model allowlist (> 0 means occupied). */
+  hidden_assignments?: number;
+}
+
+/** Per-node GPU inventory. Absent on the parent object means GPU info is unavailable. */
+export interface GpuInventory {
+  sampled_at: string;
+  stale: boolean;
+  /** Server-computed sample age at response time (preferred over a client clock diff). */
+  age_ms?: number;
+  /** PCIe groups, e.g. `[[0,1,6,7],[2,3,4,5]]`. */
+  groups: number[][];
+  gpus: GpuInfo[];
+}
+
 export interface FleetModelsResponse {
   models: FleetModelEntry[];
+  /** Absent when Fleet predates `/v1/gpus` or nvidia-smi failed. */
+  gpu_inventory?: GpuInventory;
+}
+
+/** Optional load body: `gpus` pins placement; empty/omitted means automatic placement. */
+export interface FleetLoadRequest {
+  instances?: number;
+  gpus?: number[];
 }
 
 export interface FleetOperation {
@@ -1142,6 +1183,8 @@ export interface FleetOperation {
 export interface FleetOperationResponse {
   changed: boolean;
   operation?: FleetOperation;
+  /** Short Fleet placement warnings (e.g. a GPU pick spanning PCIe groups). */
+  warnings?: string[];
 }
 
 export interface MeshJoinKey {
@@ -1168,6 +1211,8 @@ export interface MeshModelSwitching {
   provider: string;
   models: MeshSwitchableModel[];
   revision: number;
+  /** Latest per-node GPU inventory the worker pushed (absent: old worker / unavailable). */
+  gpu_inventory?: GpuInventory;
 }
 
 export interface MeshSwitchableModel {
@@ -1258,6 +1303,8 @@ export interface SwitchMeshModelResponse {
   accepted: boolean;
   changed: boolean;
   error?: string;
+  /** Short Fleet placement warnings relayed by the worker. */
+  warnings?: string[];
 }
 
 export type ProviderMetricsSource = 'vllm' | 'sglang';
@@ -1795,11 +1842,33 @@ function isFleetOperation(v: unknown): v is FleetOperation {
     && isOptStr(v.error) && isStr(v.created_at) && isOptStr(v.started_at) && isOptStr(v.finished_at);
 }
 
+function isGpuAssignment(v: unknown): v is GpuAssignment {
+  return isObj(v) && isStr(v.model_id) && isOptStr(v.instance_id);
+}
+
+function isGpuInfo(v: unknown): v is GpuInfo {
+  return isObj(v) && isUint(v.index) && isStr(v.name)
+    && isUint(v.memory_total_mib) && isUint(v.memory_used_mib) && isUint(v.memory_free_mib)
+    && isOptNum(v.utilization_percent) && isOptUint(v.group)
+    && Array.isArray(v.assigned) && v.assigned.every(isGpuAssignment)
+    && isOptUint(v.hidden_assignments);
+}
+
+export function isGpuInventory(v: unknown): v is GpuInventory {
+  return isObj(v) && isStr(v.sampled_at) && typeof v.stale === 'boolean' && isOptUint(v.age_ms)
+    && Array.isArray(v.groups) && v.groups.every((group) => Array.isArray(group) && group.every(isUint))
+    && Array.isArray(v.gpus) && v.gpus.every(isGpuInfo);
+}
+
+const isOptWarnings = (v: unknown): boolean => v === undefined || isStringArray(v);
+
 export const isFleetModelsResponse = (v: unknown): v is FleetModelsResponse =>
-  isArrayEnvelope(v, 'models', isFleetModelEntry);
+  isArrayEnvelope(v, 'models', isFleetModelEntry)
+  && (isObj(v) && (v.gpu_inventory === undefined || isGpuInventory(v.gpu_inventory)));
 
 export const isFleetOperationResponse = (v: unknown): v is FleetOperationResponse =>
-  isObj(v) && typeof v.changed === 'boolean' && (v.operation === undefined || isFleetOperation(v.operation));
+  isObj(v) && typeof v.changed === 'boolean' && (v.operation === undefined || isFleetOperation(v.operation))
+  && isOptWarnings(v.warnings);
 
 function isMeshJoinKey(v: unknown): v is MeshJoinKey {
   return isObj(v) && isStr(v.id) && isOptStr(v.label) && typeof v.enabled === 'boolean'
@@ -1815,6 +1884,7 @@ function isMeshNode(v: unknown): v is MeshNode {
 
 function isMeshModelSwitching(v: unknown): v is MeshModelSwitching {
   return isObj(v) && isStr(v.provider) && isUint(v.revision)
+    && (v.gpu_inventory === undefined || isGpuInventory(v.gpu_inventory))
     && Array.isArray(v.models) && v.models.every((model) => isObj(model) && isStr(model.id)
       && isOptStr(model.description) && isStr(model.phase) && isStr(model.desired_state)
       && (model.gpu_count === undefined || isUint(model.gpu_count))
@@ -1851,7 +1921,7 @@ export const isSetMeshModelResponse = (v: unknown): v is SetMeshModelResponse =>
 
 export const isSwitchMeshModelResponse = (v: unknown): v is SwitchMeshModelResponse =>
   isObj(v) && isStr(v.endpoint_id) && isStr(v.model_id) && typeof v.accepted === 'boolean'
-  && typeof v.changed === 'boolean' && isOptStr(v.error);
+  && typeof v.changed === 'boolean' && isOptStr(v.error) && isOptWarnings(v.warnings);
 
 // ---------------------------------------------------------------------------
 // Runtime validation (the WS pipe must NOT trust the wire — findings 4/5/6).

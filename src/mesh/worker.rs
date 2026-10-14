@@ -10,8 +10,9 @@ use crate::mesh::io::{
     write_switch_response,
 };
 use crate::mesh::protocol::{
-    AdmissionRejectCode, CAPABILITY_FLEET_OPERATIONS, ENROLL_ALPN, EnrollRequest, EnrollResponse,
-    FleetOperationRequest, FleetOperationResponse, Heartbeat, HubToWorker, LifecycleOperation,
+    AdmissionRejectCode, CAPABILITY_FLEET_OPERATIONS, CAPABILITY_GPU_PLACEMENT, ENROLL_ALPN,
+    EnrollRequest, EnrollResponse, FleetOperationRequest, FleetOperationResponse,
+    GpuInventoryAdvertisement, Heartbeat, HubToWorker, LifecycleOperation,
     MAX_CAPACITY_PER_RESOURCE, ModelAdvertisement, ModelLifecycleAction,
     ModelSwitchingAdvertisement, PROTOCOL_VERSION, REQUEST_ENCODING_ZSTD, ResourceAdvertisement,
     ResourceRuntimeState, StreamOpen, SwitchModelRequest, SwitchModelResponse,
@@ -41,7 +42,21 @@ pub(super) struct WorkerRuntime {
     /// no model is mid-transition) so the hub sees the phase change promptly.
     fast_refresh_until: std::sync::Mutex<Option<TokioInstant>>,
     refresh_wakeup: tokio::sync::Notify,
+    /// When the advertised switching inventory was last pushed to the hub;
+    /// paces GPU-only refreshes (see [`gpu_inventory_push_due`]).
+    last_switching_push: std::sync::Mutex<Option<TokioInstant>>,
+    /// Whether this Fleet serves `GET /v1/gpus` (`None` until known). A
+    /// Fleet without it predates manual GPU placement too, so a pick is
+    /// refused here instead of being silently ignored.
+    fleet_gpu_support: std::sync::Mutex<Option<bool>>,
 }
+
+/// Minimum spacing of GPU-only refreshes whose free VRAM moved by less than
+/// [`GPU_FREE_PUSH_DELTA_MIB`]: VRAM jitters constantly and every push costs
+/// hub CPU and mesh bandwidth.
+const GPU_REFRESH_PUSH_INTERVAL: Duration = Duration::from_secs(60);
+/// A free-VRAM move this large is pushed immediately.
+const GPU_FREE_PUSH_DELTA_MIB: u64 = 1024;
 
 /// Poll cadence while a requested model transition is in flight.
 const FAST_MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -104,6 +119,8 @@ impl WorkerRuntime {
             model_switching: Mutex::new(None),
             fast_refresh_until: std::sync::Mutex::new(None),
             refresh_wakeup: tokio::sync::Notify::new(),
+            last_switching_push: std::sync::Mutex::new(None),
+            fleet_gpu_support: std::sync::Mutex::new(None),
         };
         runtime.refresh_model_switching().await;
         runtime
@@ -119,19 +136,59 @@ impl WorkerRuntime {
             node_name: self.config.node_name.clone(),
             agent_version: crate::VERSION.to_string(),
             resources,
-            model_switching: self.model_switching.lock().await.clone(),
+            model_switching: self.current_model_switching().await,
             request_encodings: vec![REQUEST_ENCODING_ZSTD.to_string()],
             capabilities: if self.fleet.is_some() {
-                vec![CAPABILITY_FLEET_OPERATIONS.to_string()]
+                vec![
+                    CAPABILITY_FLEET_OPERATIONS.to_string(),
+                    CAPABILITY_GPU_PLACEMENT.to_string(),
+                ]
             } else {
                 Vec::new()
             },
         }
     }
 
+    /// The last pushed switching inventory with its GPU sample age brought
+    /// up to date, for frames that resend it (hello, switch responses).
+    async fn current_model_switching(&self) -> Option<ModelSwitchingAdvertisement> {
+        let mut switching = self.model_switching.lock().await.clone()?;
+        if let Some(inventory) = switching.gpu_inventory.as_mut()
+            && let Some(age) = crate::dashboard_fleet::sample_age_ms(&inventory.sampled_at)
+        {
+            inventory.age_ms = age;
+        }
+        Some(switching)
+    }
+
+    /// Polls Fleet models and GPUs and returns an update only when the hub
+    /// needs one: the model inventory changed, or the GPU inventory changed
+    /// per [`gpu_inventory_push_due`].
     async fn refresh_model_switching(&self) -> Option<ModelSwitchingAdvertisement> {
         let fleet = self.fleet.as_ref()?;
-        let models = match fleet.list_models().await {
+        let (models, gpus) = tokio::join!(fleet.list_models(), fleet.list_gpus());
+        let gpus = match gpus {
+            Ok(Some(inventory)) => {
+                self.set_fleet_gpu_support(true);
+                let age = crate::dashboard_fleet::sample_age_ms(&inventory.sampled_at).unwrap_or(0);
+                let inventory = GpuInventoryAdvertisement::from_fleet(inventory, age);
+                if inventory.is_none() {
+                    tracing::warn!("mesh worker dropped an oversized Fleet GPU inventory");
+                }
+                Some(inventory)
+            }
+            Ok(None) => {
+                self.set_fleet_gpu_support(false);
+                Some(None)
+            }
+            Err(err) => {
+                // Transient (e.g. 503 gpu_query_failed): keep the last pushed
+                // sample; its age keeps growing on the hub.
+                tracing::debug!(error = %err, "mesh worker failed to sample Fleet GPUs");
+                None
+            }
+        };
+        let models = match models {
             Ok(response) => response
                 .models
                 .into_iter()
@@ -163,8 +220,25 @@ impl WorkerRuntime {
                 return None;
             }
         };
+        let now = TokioInstant::now();
         let mut current = self.model_switching.lock().await;
-        if current.as_ref().is_some_and(|value| value.models == models) {
+        let previous_gpus = current
+            .as_ref()
+            .and_then(|value| value.gpu_inventory.clone());
+        let gpu_inventory = gpus.unwrap_or_else(|| previous_gpus.clone());
+        let mut last_push = self
+            .last_switching_push
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let models_changed = current.as_ref().is_none_or(|value| value.models != models);
+        if !models_changed
+            && !gpu_inventory_push_due(
+                previous_gpus.as_ref(),
+                gpu_inventory.as_ref(),
+                *last_push,
+                now,
+            )
+        {
             return None;
         }
         let revision = current
@@ -174,9 +248,26 @@ impl WorkerRuntime {
             provider: "lil-fleet".to_string(),
             models,
             revision,
+            gpu_inventory,
         };
         *current = Some(update.clone());
+        *last_push = Some(now);
         Some(update)
+    }
+
+    fn set_fleet_gpu_support(&self, supported: bool) {
+        *self
+            .fleet_gpu_support
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(supported);
+    }
+
+    fn fleet_lacks_gpu_support(&self) -> bool {
+        *self
+            .fleet_gpu_support
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == Some(false)
     }
 
     async fn heartbeat(&self, sequence: u64) -> Heartbeat {
@@ -495,6 +586,45 @@ async fn model_refresh_task(
         refresh.as_mut().reset(TokioInstant::now() + delay);
     }
     Ok(())
+}
+
+/// Whether a GPU inventory change is worth a hub update. Structural changes
+/// (GPUs appearing or disappearing, names, PCIe groups, occupants, Fleet's
+/// stale flag) and free-VRAM moves of at least [`GPU_FREE_PUSH_DELTA_MIB`]
+/// on any GPU go out at once; otherwise a fresh sample is pushed at most once
+/// per [`GPU_REFRESH_PUSH_INTERVAL`] so the hub's view stays bounded-stale
+/// without a frame per poll.
+fn gpu_inventory_push_due(
+    previous: Option<&GpuInventoryAdvertisement>,
+    next: Option<&GpuInventoryAdvertisement>,
+    last_push: Option<TokioInstant>,
+    now: TokioInstant,
+) -> bool {
+    let (previous, next) = match (previous, next) {
+        (None, None) => return false,
+        (Some(previous), Some(next)) => (previous, next),
+        _ => return true,
+    };
+    if previous.stale != next.stale
+        || previous.groups != next.groups
+        || previous.gpus.len() != next.gpus.len()
+    {
+        return true;
+    }
+    for (before, after) in previous.gpus.iter().zip(&next.gpus) {
+        if before.index != after.index
+            || before.name != after.name
+            || before.group != after.group
+            || before.assigned != after.assigned
+            || before.memory_total_mib != after.memory_total_mib
+            || before.memory_free_mib.abs_diff(after.memory_free_mib) >= GPU_FREE_PUSH_DELTA_MIB
+        {
+            return true;
+        }
+    }
+    previous.sampled_at != next.sampled_at
+        && last_push
+            .is_none_or(|pushed| now.saturating_duration_since(pushed) >= GPU_REFRESH_PUSH_INTERVAL)
 }
 
 /// Whether Fleet still reports this model moving toward its desired state.
@@ -1012,6 +1142,7 @@ async fn handle_switch_model(
         error_status: None,
         error_code: None,
         operation: None,
+        warnings: Vec::new(),
     };
     let Some(fleet) = runtime.fleet.as_ref() else {
         response.error = Some("model switching is not configured".to_string());
@@ -1031,10 +1162,26 @@ async fn handle_switch_model(
         write_switch_response(&mut send, &response).await?;
         return Ok(());
     }
+    if action == ModelLifecycleAction::Load
+        && !request.gpus.is_empty()
+        && runtime.fleet_lacks_gpu_support()
+    {
+        // This Fleet has no `/v1/gpus`, so it predates manual placement and
+        // could ignore the pick; refuse rather than place automatically.
+        response.error = Some("Fleet does not support GPU selection".to_string());
+        response.error_status = Some(400);
+        response.error_code = Some("gpus_not_supported".to_string());
+        write_switch_response(&mut send, &response).await?;
+        return Ok(());
+    }
     let operation = match action {
         ModelLifecycleAction::Load => {
             fleet
-                .load_model_instances(&request.model_id, request.instances)
+                .load_model_instances(
+                    &request.model_id,
+                    request.instances,
+                    Some(request.gpus.clone()),
+                )
                 .await
         }
         ModelLifecycleAction::Unload => fleet.unload_model(&request.model_id).await,
@@ -1043,12 +1190,13 @@ async fn handle_switch_model(
         Ok(operation) => {
             response.accepted = true;
             response.changed = operation.changed;
+            response.warnings = operation.warnings;
             response.operation = operation
                 .operation
                 .map(LifecycleOperation::from_fleet)
                 .and_then(LifecycleOperation::sanitized);
             runtime.refresh_model_switching().await;
-            response.model_switching = runtime.model_switching.lock().await.clone();
+            response.model_switching = runtime.current_model_switching().await;
             if operation.changed {
                 runtime.begin_fast_model_refresh();
             }
@@ -1574,6 +1722,8 @@ mod tests {
             model_switching: Mutex::new(None),
             fast_refresh_until: std::sync::Mutex::new(None),
             refresh_wakeup: tokio::sync::Notify::new(),
+            last_switching_push: std::sync::Mutex::new(None),
+            fleet_gpu_support: std::sync::Mutex::new(None),
         }
     }
 
@@ -1743,6 +1893,7 @@ mod tests {
                 Vec::new(),
             )],
             revision: 1,
+            gpu_inventory: None,
         });
         runtime.begin_fast_model_refresh();
         let now = TokioInstant::now();
@@ -1980,6 +2131,8 @@ mod tests {
             model_switching: Mutex::new(None),
             fast_refresh_until: std::sync::Mutex::new(None),
             refresh_wakeup: tokio::sync::Notify::new(),
+            last_switching_push: std::sync::Mutex::new(None),
+            fleet_gpu_support: std::sync::Mutex::new(None),
         };
 
         let advertisement = runtime.advertisement().await;
@@ -2055,5 +2208,156 @@ mod tests {
         assert_eq!(effective_capacity_at(&schedule, before_jump), 8);
         assert_eq!(effective_capacity_at(&schedule, after_jump), 8);
         assert_eq!(effective_capacity_at(&schedule, after_window), 1);
+    }
+
+    fn gpu_sample(free: &[u64], sampled_at: &str) -> GpuInventoryAdvertisement {
+        GpuInventoryAdvertisement {
+            sampled_at: sampled_at.into(),
+            age_ms: 0,
+            stale: false,
+            groups: vec![vec![0, 1]],
+            gpus: free
+                .iter()
+                .enumerate()
+                .map(|(index, free)| crate::mesh::protocol::GpuAdvertisement {
+                    index: index as u32,
+                    name: "gpu".into(),
+                    memory_total_mib: 97887,
+                    memory_used_mib: 97887 - free,
+                    memory_free_mib: *free,
+                    utilization_percent: Some(10),
+                    group: Some(0),
+                    assigned: Vec::new(),
+                    hidden_assignments: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn gpu_pushes_follow_significant_changes_and_a_slow_refresh() {
+        let now = TokioInstant::now();
+        let just_pushed = Some(now);
+        let base = gpu_sample(&[90_000, 90_000], "t0");
+        let due = |next: &GpuInventoryAdvertisement, last_push| {
+            gpu_inventory_push_due(Some(&base), Some(next), last_push, now)
+        };
+        // Jitter below 1 GiB within the refresh window is not pushed, even
+        // with a new sample time and utilization change.
+        let mut jitter = gpu_sample(&[89_100, 90_900], "t1");
+        jitter.gpus[0].utilization_percent = Some(90);
+        assert!(!due(&jitter, just_pushed));
+        // ...but is pushed once the 60 s refresh is due.
+        let a_minute_ago = now.checked_sub(GPU_REFRESH_PUSH_INTERVAL);
+        assert!(due(&jitter, a_minute_ago));
+        // The same sample again (e.g. Fleet unreachable) is never re-pushed.
+        assert!(!due(&base, a_minute_ago));
+        // A >= 1 GiB move on any GPU goes out at once.
+        assert!(due(&gpu_sample(&[90_000, 88_976], "t1"), just_pushed));
+        // Structural changes go out at once.
+        let mut occupied = base.clone();
+        occupied.gpus[1].assigned = vec!["qwen".into()];
+        assert!(due(&occupied, just_pushed));
+        assert!(due(&gpu_sample(&[90_000], "t1"), just_pushed));
+        let mut regrouped = base.clone();
+        regrouped.groups = vec![vec![0], vec![1]];
+        assert!(due(&regrouped, just_pushed));
+        let mut stale = base.clone();
+        stale.stale = true;
+        assert!(due(&stale, just_pushed));
+        // Appearing or disappearing inventory is a change; none-to-none is not.
+        assert!(gpu_inventory_push_due(None, Some(&base), just_pushed, now));
+        assert!(gpu_inventory_push_due(Some(&base), None, just_pushed, now));
+        assert!(!gpu_inventory_push_due(None, None, None, now));
+    }
+
+    #[tokio::test]
+    async fn worker_polls_gpus_with_models_and_suppresses_vram_jitter() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{
+                    "model": {"id": "qwen", "image": "vllm", "gpu_count": 1},
+                    "status": {"model_id": "qwen", "phase": "unloaded", "desired_state": "unloaded"}
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let gpus = |free: u64| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sampled_at": Utc::now().to_rfc3339(),
+                "groups": [[0]],
+                "gpus": [{"index": 0, "name": "gpu", "memory_total_mib": 97887,
+                          "memory_used_mib": 97887 - free, "memory_free_mib": free, "group": 0,
+                          "assigned": []}]
+            }))
+        };
+        let mut runtime = test_runtime(test_resource(
+            "127.0.0.1:9".parse().unwrap(),
+            MeshWorkerCapacitySource::Configured,
+        ));
+        runtime.fleet = Some(Arc::new(crate::dashboard_fleet::FleetClient::for_test(
+            reqwest::Client::new(),
+            &server.uri(),
+            "token",
+        )));
+        // Older Fleet without /v1/gpus: models still advertised, no inventory,
+        // and manual picks are known to be unsupported.
+        let first = runtime.refresh_model_switching().await.expect("first push");
+        assert_eq!(first.gpu_inventory, None);
+        assert!(runtime.fleet_lacks_gpu_support());
+        assert!(runtime.refresh_model_switching().await.is_none());
+
+        Mock::given(method("GET"))
+            .and(path("/v1/gpus"))
+            .respond_with(gpus(90_000))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let with_gpus = runtime
+            .refresh_model_switching()
+            .await
+            .expect("inventory appears");
+        assert_eq!(with_gpus.revision, first.revision + 1);
+        assert_eq!(
+            with_gpus.gpu_inventory.as_ref().unwrap().gpus[0].memory_free_mib,
+            90_000
+        );
+        assert!(!runtime.fleet_lacks_gpu_support());
+        let advertised = runtime.advertisement().await;
+        assert!(advertised.has_capability(CAPABILITY_GPU_PLACEMENT));
+        assert!(advertised.model_switching.unwrap().gpu_inventory.is_some());
+
+        Mock::given(method("GET"))
+            .and(path("/v1/gpus"))
+            .respond_with(gpus(89_500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        assert!(
+            runtime.refresh_model_switching().await.is_none(),
+            "sub-GiB jitter inside the refresh window is not pushed"
+        );
+        Mock::given(method("GET"))
+            .and(path("/v1/gpus"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(serde_json::json!({"error": "gpu_query_failed"})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        assert!(
+            runtime.refresh_model_switching().await.is_none(),
+            "a transient nvidia-smi failure keeps the last sample"
+        );
+        Mock::given(method("GET"))
+            .and(path("/v1/gpus"))
+            .respond_with(gpus(40_000))
+            .mount(&server)
+            .await;
+        let moved = runtime.refresh_model_switching().await.expect("1 GiB move");
+        assert_eq!(moved.gpu_inventory.unwrap().gpus[0].memory_free_mib, 40_000);
     }
 }

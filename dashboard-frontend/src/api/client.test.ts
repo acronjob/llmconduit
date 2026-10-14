@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { DashboardClient, UnauthorizedError, readCsrfCookie } from './client';
+import { DashboardApiError, DashboardClient, UnauthorizedError, loadBody, readCsrfCookie } from './client';
 import { mockFetch, mockKillLog } from './mock';
 
 describe('DashboardClient — kill includes X-CSRF-Token', () => {
@@ -87,6 +87,36 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     await client.loadFleetModel('qwen');
 
     expect(bodies).toEqual([{ instances: 2 }, { instances: 3 }, undefined]);
+  });
+
+  it('sends GPU picks with an explicit instance count and omits empty picks', async () => {
+    const bodies: Array<Record<string, unknown> | undefined> = [];
+    const fetchMutations: typeof fetch = async (input, init) => {
+      const path = String(input);
+      bodies.push(init?.body === undefined ? undefined : JSON.parse(String(init.body)) as Record<string, unknown>);
+      if (path.includes('/fleet/')) return new Response(JSON.stringify({ changed: true, warnings: ['spans PCIe groups'] }), { status: 202 });
+      return new Response(JSON.stringify({ endpoint_id: 'vllm-a', model_id: 'qwen', accepted: true, changed: true, warnings: ['spans PCIe groups'] }), { status: 202 });
+    };
+    const client = new DashboardClient({ fetchImpl: fetchMutations, getCsrfToken: () => 'test-csrf' });
+
+    const local = await client.loadFleetModel('qwen', 2, [3, 4]);
+    const mesh = await client.loadMeshModel('vllm-a', 'qwen', undefined, [1]);
+    await client.loadFleetModel('qwen', 1, []);
+
+    expect(bodies).toEqual([{ instances: 2, gpus: [3, 4] }, { instances: 1, gpus: [1] }, { instances: 1 }]);
+    expect(local.warnings).toEqual(['spans PCIe groups']);
+    expect(mesh.warnings).toEqual(['spans PCIe groups']);
+    expect(loadBody()).toBeUndefined();
+  });
+
+  it('keeps the historical error message while exposing the sanitized error code', async () => {
+    const fetchError: typeof fetch = async () => new Response(JSON.stringify({ error: 'Requested GPUs are not available', code: 'gpus_unavailable' }), { status: 409 });
+    const client = new DashboardClient({ fetchImpl: fetchError, getCsrfToken: () => 'test-csrf' });
+    const error = await client.loadFleetModel('qwen', 1, [0]).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(DashboardApiError);
+    expect((error as DashboardApiError).message).toBe('POST /fleet/models/qwen/load failed: 409');
+    expect((error as DashboardApiError).code).toBe('gpus_unavailable');
+    expect((error as DashboardApiError).serverMessage).toBe('Requested GPUs are not available');
   });
 
   it('streams chat deltas, usage, and the terminal reason through the dashboard route', async () => {

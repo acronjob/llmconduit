@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { getConnection, queryKeys } from '../../api/connection';
-import type { ConfiguredProvider, ConfiguredProvidersResponse, CreateConfiguredProviderRequest, FleetDeploymentStatus, FleetModelEntry, FleetModelsResponse, MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, MeshSwitchableModel, ProviderHealth, UpdateConfiguredProviderRequest } from '../../api/types';
+import type { ConfiguredProvider, ConfiguredProvidersResponse, CreateConfiguredProviderRequest, FleetDeploymentStatus, FleetModelEntry, FleetModelsResponse, GpuInventory, MeshAdminState, MeshDisabledModel, MeshJoinKey, MeshNode, MeshSwitchableModel, ProviderHealth, UpdateConfiguredProviderRequest } from '../../api/types';
 import { EMPTY_FILTERS } from '../../components/FlowTable/filterTypes';
 import { useFlowRows } from '../../components/FlowTable/useFlowRows';
 import { fmtCost, fmtElapsed, fmtTokens } from '../../components/FlowTable/format';
@@ -19,6 +19,16 @@ import {
   type ProviderInventoryRow,
   type ProviderInventorySummary,
 } from './providersModel';
+import { GpuPicker, GpuVramPanel, LoadWarnings } from './GpuVram';
+import {
+  AUTO_GPU_PICK,
+  describeLoadError,
+  gpuPickAvailability,
+  gpusToSend,
+  instancesAdded,
+  validateGpuSelection,
+  type GpuPickState,
+} from './gpuModel';
 
 const authPoliciesKey = ['auth', 'policies', 'providers-view'] as const;
 const DASH = '—';
@@ -62,14 +72,14 @@ export function ProvidersView() {
     onSuccess: invalidateMesh,
   });
   const changeMeshModel = useMutation({
-    mutationFn: async ({ endpointId, modelId, unloadIds, unloadOnly, instances }: { endpointId: string; modelId: string; unloadIds: string[]; unloadOnly?: boolean; instances?: number }) => {
+    mutationFn: async ({ endpointId, modelId, unloadIds, unloadOnly, instances, gpus }: { endpointId: string; modelId: string; unloadIds: string[]; unloadOnly?: boolean; instances?: number; gpus?: number[] }) => {
       for (const unloadId of unloadIds) {
         await client.unloadMeshModel(endpointId, unloadId);
         if (!unloadOnly || unloadId !== unloadIds.at(-1)) {
           await waitForRemoteModelUnloaded(() => client.mesh(), endpointId, unloadId);
         }
       }
-      if (!unloadOnly) return client.loadMeshModel(endpointId, modelId, instances);
+      if (!unloadOnly) return gpus ? client.loadMeshModel(endpointId, modelId, instances, gpus) : client.loadMeshModel(endpointId, modelId, instances);
       return null;
     },
     onSuccess: invalidateMesh,
@@ -79,7 +89,10 @@ export function ProvidersView() {
     void queryClient.invalidateQueries({ queryKey: queryKeys.providers });
     void queryClient.invalidateQueries({ queryKey: queryKeys.topology });
   };
-  const loadFleetModel = useMutation({ mutationFn: ({ id, instances }: { id: string; instances?: number }) => client.loadFleetModel(id, instances), onSuccess: invalidateFleet });
+  const loadFleetModel = useMutation({
+    mutationFn: ({ id, instances, gpus }: { id: string; instances?: number; gpus?: number[] }) => gpus ? client.loadFleetModel(id, instances, gpus) : client.loadFleetModel(id, instances),
+    onSuccess: invalidateFleet,
+  });
   const unloadFleetModel = useMutation({ mutationFn: (id: string) => client.unloadFleetModel(id), onSuccess: invalidateFleet });
   const invalidateConfiguredProviders = () => {
     return Promise.all([
@@ -167,13 +180,14 @@ export function ProvidersView() {
           mutationsEnabled={mutationsEnabled}
           createdToken={createdToken}
           busy={createJoinKey.isPending || revokeJoinKey.isPending || setNodeEnabled.isPending || setModelDisabled.isPending || changeMeshModel.isPending}
-          mutationError={String(createJoinKey.error ?? revokeJoinKey.error ?? setNodeEnabled.error ?? setModelDisabled.error ?? changeMeshModel.error ?? '') || null}
+          mutationError={String(createJoinKey.error ?? revokeJoinKey.error ?? setNodeEnabled.error ?? setModelDisabled.error ?? '') || describeLoadError(changeMeshModel.error) || null}
+          loadWarnings={changeMeshModel.data?.warnings}
           onCreate={(body) => createJoinKey.mutate(body)}
           onDismissToken={() => setCreatedToken(null)}
           onRevoke={(id) => revokeJoinKey.mutate(id)}
           onSetNode={(endpointId, enabled) => setNodeEnabled.mutate({ endpointId, enabled })}
           onSetModel={(endpointId, resourceId, model, disabled) => setModelDisabled.mutate({ endpointId, resourceId, model, disabled })}
-          onLoadModel={(endpointId, modelId, unloadIds, instances) => changeMeshModel.mutate({ endpointId, modelId, unloadIds, instances })}
+          onLoadModel={(endpointId, modelId, unloadIds, instances, gpus) => changeMeshModel.mutate({ endpointId, modelId, unloadIds, instances, gpus })}
           onUnloadModel={(endpointId, modelId) => changeMeshModel.mutate({ endpointId, modelId, unloadIds: [modelId], unloadOnly: true })}
         />
         <FleetPanel
@@ -182,8 +196,9 @@ export function ProvidersView() {
           error={fleetQuery.error ? String(fleetQuery.error) : null}
           mutationsEnabled={mutationsEnabled}
           busy={loadFleetModel.isPending || unloadFleetModel.isPending}
-          mutationError={String(loadFleetModel.error ?? unloadFleetModel.error ?? '') || null}
-          onLoad={(id, instances) => loadFleetModel.mutate({ id, instances })}
+          mutationError={describeLoadError(loadFleetModel.error) || String(unloadFleetModel.error ?? '') || null}
+          loadWarnings={loadFleetModel.data?.warnings}
+          onLoad={(id, instances, gpus) => loadFleetModel.mutate({ id, instances, gpus })}
           onUnload={(id) => unloadFleetModel.mutate(id)}
         />
         <ProviderTable allRows={inventory.rows} />
@@ -411,6 +426,7 @@ function FleetPanel({
   mutationsEnabled,
   busy,
   mutationError,
+  loadWarnings,
   onLoad,
   onUnload,
 }: {
@@ -420,7 +436,8 @@ function FleetPanel({
   mutationsEnabled: boolean;
   busy: boolean;
   mutationError: string | null;
-  onLoad: (id: string, instances?: number) => void;
+  loadWarnings?: string[];
+  onLoad: (id: string, instances?: number, gpus?: number[]) => void;
   onUnload: (id: string) => void;
 }) {
   const unavailable = error && error.includes('404');
@@ -444,14 +461,17 @@ function FleetPanel({
       {loading && <p className="mt-3 text-xs text-text-muted">Loading Fleet state...</p>}
       {unavailable && <p className="mt-3 text-xs text-text-muted" data-quality="unavailable">Local Fleet is not configured on this gateway.</p>}
       {error && !unavailable && <p className="mt-3 text-xs text-status-down">Could not load Fleet state: {error}</p>}
-      {mutationError && <p className="mt-2 text-xs text-status-down">{mutationError}</p>}
+      {mutationError && <p className="mt-2 text-xs text-status-down" data-testid="fleet-mutation-error">{mutationError}</p>}
+      <LoadWarnings warnings={loadWarnings} testId="fleet-load-warnings" />
 
+      {fleet && <GpuVramPanel inventory={fleet.gpu_inventory} testId="fleet-gpu-vram" />}
       {fleet && (
         <div className="mt-3 grid gap-2 lg:grid-cols-2">
           {fleet.models.map((entry) => (
             <FleetModelCard
               key={entry.model.id}
               entry={entry}
+              inventory={fleet.gpu_inventory}
               busy={busy}
               mutationsEnabled={mutationsEnabled}
               onLoad={onLoad}
@@ -467,18 +487,21 @@ function FleetPanel({
 
 function FleetModelCard({
   entry,
+  inventory,
   busy,
   mutationsEnabled,
   onLoad,
   onUnload,
 }: {
   entry: FleetModelEntry;
+  inventory?: GpuInventory;
   busy: boolean;
   mutationsEnabled: boolean;
-  onLoad: (id: string, instances?: number) => void;
+  onLoad: (id: string, instances?: number, gpus?: number[]) => void;
   onUnload: (id: string) => void;
 }) {
   const [confirming, setConfirming] = useState<'load' | 'unload' | null>(null);
+  const [gpuPick, setGpuPick] = useState<GpuPickState>(AUTO_GPU_PICK);
   const desiredInstanceCount = modelDesiredInstances(entry);
   const [instanceText, setInstanceText] = useState(String(desiredInstanceCount));
   useEffect(() => setInstanceText(String(desiredInstanceCount)), [desiredInstanceCount]);
@@ -491,6 +514,13 @@ function FleetModelCard({
   const requestedInstances = instanceValidation.value ?? desiredInstanceCount;
   const scaling = active && requestedInstances !== desiredInstanceCount;
   const gpus = entry.status.assigned_gpus.length ? entry.status.assigned_gpus.map((gpu) => `GPU ${gpu}`).join(', ') : DASH;
+  const pickAvailability = gpuPickAvailability(inventory, entry.model.gpu_count, instancesAdded(requestedInstances, active, desiredInstanceCount));
+  const pickValidation = gpuPick.mode === 'manual' && pickAvailability.kind === 'available' ? validateGpuSelection(gpuPick.selected, pickAvailability.required, inventory) : null;
+  const pickBlocked = gpuPick.mode === 'manual' && !pickValidation?.ok;
+  const openConfirm = (action: 'load' | 'unload') => {
+    setGpuPick(AUTO_GPU_PICK);
+    setConfirming(action);
+  };
   return (
     <div className="min-w-0 rounded border border-line/70 bg-bg p-3" data-testid="fleet-model-card">
       <div className="flex items-start justify-between gap-3">
@@ -529,8 +559,8 @@ function FleetModelCard({
           error={instanceValidation.error}
         />
         <div className="flex justify-end gap-2">
-          <Button type="button" disabled={!mutationsEnabled || busy || transitioning || Boolean(instanceValidation.error) || (active && !scaling)} onClick={() => setConfirming('load')} className="px-2 py-1 text-[10px]">{active ? 'Scale' : 'Load'}</Button>
-          <Button type="button" variant="danger" disabled={!mutationsEnabled || busy || !canUnload} onClick={() => setConfirming('unload')} className="px-2 py-1 text-[10px]">Unload</Button>
+          <Button type="button" disabled={!mutationsEnabled || busy || transitioning || Boolean(instanceValidation.error) || (active && !scaling)} onClick={() => openConfirm('load')} className="px-2 py-1 text-[10px]">{active ? 'Scale' : 'Load'}</Button>
+          <Button type="button" variant="danger" disabled={!mutationsEnabled || busy || !canUnload} onClick={() => openConfirm('unload')} className="px-2 py-1 text-[10px]">Unload</Button>
         </div>
       </div>
       {confirming && (
@@ -539,34 +569,45 @@ function FleetModelCard({
           message={confirming === 'load' ? `This will set the desired Fleet instance count to ${requestedInstances}.` : 'This will stop every instance and remove the model from routing until it is loaded again.'}
           confirmLabel={`Confirm ${confirming}`}
           danger={confirming === 'unload'}
+          confirmDisabled={confirming === 'load' && pickBlocked}
           onCancel={() => setConfirming(null)}
           onConfirm={() => {
-            if (confirming === 'load') onLoad(entry.model.id, requestedInstances);
-            else onUnload(entry.model.id);
+            if (confirming === 'load') {
+              const picked = gpusToSend(gpuPick, pickValidation);
+              if (picked) onLoad(entry.model.id, requestedInstances, picked);
+              else onLoad(entry.model.id, requestedInstances);
+            } else onUnload(entry.model.id);
             setConfirming(null);
           }}
-        />
+        >
+          {confirming === 'load' && (
+            <GpuPicker inventory={inventory} availability={pickAvailability} value={gpuPick} validation={pickValidation} onChange={setGpuPick} />
+          )}
+        </SimpleConfirmationDialog>
       )}
     </div>
   );
 }
 
-function SimpleConfirmationDialog({ title, message, confirmLabel, danger, onCancel, onConfirm }: {
+function SimpleConfirmationDialog({ title, message, confirmLabel, danger, confirmDisabled, onCancel, onConfirm, children }: {
   title: string;
   message: string;
   confirmLabel: string;
   danger?: boolean;
+  confirmDisabled?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
+  children?: ReactNode;
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
       <div className="w-full max-w-md rounded-lg border border-line bg-panel p-4 shadow-2xl" role="dialog" aria-modal="true" aria-label={title} data-testid="confirmation-dialog">
         <h3 className="text-sm font-semibold text-text">{title}</h3>
         <p className="mt-2 text-xs leading-relaxed text-text-muted">{message}</p>
+        {children}
         <div className="mt-4 flex justify-end gap-2">
           <Button type="button" variant="ghost" onClick={onCancel}>Cancel</Button>
-          <Button type="button" variant={danger ? 'danger' : 'default'} onClick={onConfirm}>{confirmLabel}</Button>
+          <Button type="button" variant={danger ? 'danger' : 'default'} disabled={confirmDisabled} onClick={onConfirm}>{confirmLabel}</Button>
         </div>
       </div>
     </div>
@@ -713,6 +754,7 @@ function MeshAdminPanel({
   createdToken,
   busy,
   mutationError,
+  loadWarnings,
   onCreate,
   onDismissToken,
   onRevoke,
@@ -729,12 +771,13 @@ function MeshAdminPanel({
   createdToken: { label: string | null; token: string } | null;
   busy: boolean;
   mutationError: string | null;
+  loadWarnings?: string[];
   onCreate: (body: { label?: string; max_uses?: number; expires_in_secs?: number }) => void;
   onDismissToken: () => void;
   onRevoke: (id: string) => void;
   onSetNode: (endpointId: string, enabled: boolean) => void;
   onSetModel: (endpointId: string, resourceId: string, model: string, disabled: boolean) => void;
-  onLoadModel: (endpointId: string, modelId: string, unloadIds: string[], instances?: number) => void;
+  onLoadModel: (endpointId: string, modelId: string, unloadIds: string[], instances?: number, gpus?: number[]) => void;
   onUnloadModel: (endpointId: string, modelId: string) => void;
 }) {
   const [label, setLabel] = useState('');
@@ -796,7 +839,8 @@ function MeshAdminPanel({
             <input aria-label="Expires hours" value={expiresHours} onChange={(event) => setExpiresHours(event.target.value)} inputMode="numeric" className={INPUT} />
             <Button type="submit" disabled={!mutationsEnabled || busy} className="text-xs">Create token</Button>
           </form>
-          {mutationError && <p className="mt-2 text-xs text-status-down">{mutationError}</p>}
+          {mutationError && <p className="mt-2 text-xs text-status-down" data-testid="mesh-mutation-error">{mutationError}</p>}
+          <LoadWarnings warnings={loadWarnings} testId="mesh-load-warnings" />
           <div className="mt-3 grid gap-3 xl:grid-cols-3">
             <JoinKeyList keys={mesh.join_keys} busy={busy} mutationsEnabled={mutationsEnabled} onRevoke={onRevoke} />
             <NodeList nodes={namedNodes} busy={busy} mutationsEnabled={mutationsEnabled} onSetNode={onSetNode} />
@@ -895,7 +939,7 @@ function SwitchableModelList({
   nodes: MeshNode[];
   busy: boolean;
   mutationsEnabled: boolean;
-  onLoadModel: (endpointId: string, modelId: string, unloadIds: string[], instances?: number) => void;
+  onLoadModel: (endpointId: string, modelId: string, unloadIds: string[], instances?: number, gpus?: number[]) => void;
   onUnloadModel: (endpointId: string, modelId: string) => void;
 }) {
   const [pending, setPending] = useState<PendingRemoteAction | null>(null);
@@ -925,7 +969,7 @@ function SwitchableModelList({
       </div>
       <div className={cn('grid gap-3 p-3', providers.length > 1 && 'xl:grid-cols-2')}>
         {providers.map((node) => (
-          <section key={node.endpoint_id} className="min-w-0 rounded-md border border-line/70 bg-panel/40 p-3">
+          <section key={node.endpoint_id} className="min-w-0 rounded-md border border-line/70 bg-panel/40 p-3" data-testid="remote-switch-node" data-endpoint={node.endpoint_id}>
             <div className="mb-2 flex min-w-0 items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="truncate text-xs font-medium text-text" title={node.endpoint_id}>{node.label || node.endpoint_id}</div>
@@ -933,6 +977,7 @@ function SwitchableModelList({
               </div>
               <span className="shrink-0 rounded-full bg-status-healthy/10 px-2 py-0.5 text-[9px] uppercase tracking-wide text-status-healthy">connected</span>
             </div>
+            <div className="mb-2"><GpuVramPanel inventory={node.model_switching?.gpu_inventory} testId="mesh-gpu-vram" /></div>
             <div className="grid gap-2 sm:grid-cols-2">
               {node.model_switching?.models.map((model) => {
                 const status = modelRuntimeStatus(model);
@@ -966,7 +1011,7 @@ function SwitchableModelList({
                       <Button
                         type="button"
                         disabled={!mutationsEnabled || busy || transitioning || Boolean(instanceValidation.error) || (loaded && !scaling)}
-                        onClick={() => setPending({ kind: 'load', endpointId: node.endpoint_id, model, models: node.model_switching?.models ?? [], instances: requestedInstances })}
+                        onClick={() => setPending({ kind: 'load', endpointId: node.endpoint_id, model, models: node.model_switching?.models ?? [], instances: requestedInstances, inventory: node.model_switching?.gpu_inventory })}
                         className="shrink-0 px-2.5 py-1 text-[10px]"
                       >
                         {loaded ? 'Scale' : transitioning ? model.phase : 'Load'}
@@ -1005,9 +1050,11 @@ function SwitchableModelList({
           action={pending}
           busy={busy}
           onCancel={() => setPending(null)}
-          onConfirm={(unloadIds) => {
-            if (pending.kind === 'load') onLoadModel(pending.endpointId, pending.model.id, unloadIds, pending.instances);
-            else onUnloadModel(pending.endpointId, pending.model.id);
+          onConfirm={(unloadIds, gpus) => {
+            if (pending.kind === 'load') {
+              if (gpus) onLoadModel(pending.endpointId, pending.model.id, unloadIds, pending.instances, gpus);
+              else onLoadModel(pending.endpointId, pending.model.id, unloadIds, pending.instances);
+            } else onUnloadModel(pending.endpointId, pending.model.id);
             setPending(null);
           }}
         />
@@ -1022,15 +1069,21 @@ interface PendingRemoteAction {
   model: MeshSwitchableModel;
   models: MeshSwitchableModel[];
   instances?: number;
+  inventory?: GpuInventory;
 }
 
 function ModelLifecycleDialog({ action, busy, onCancel, onConfirm }: {
   action: PendingRemoteAction;
   busy: boolean;
   onCancel: () => void;
-  onConfirm: (unloadIds: string[]) => void;
+  onConfirm: (unloadIds: string[], gpus?: number[]) => void;
 }) {
   const plan = useMemo(() => capacityPlan(action.models, action.model, action.instances ?? 1), [action.models, action.model, action.instances]);
+  const [gpuPick, setGpuPick] = useState<GpuPickState>(AUTO_GPU_PICK);
+  const targetActive = modelRuntimeStatus(action.model).state === 'loaded';
+  const pickAvailability = gpuPickAvailability(action.inventory, action.model.gpu_count, instancesAdded(action.instances ?? 1, targetActive, meshDesiredInstances(action.model)));
+  const pickValidation = gpuPick.mode === 'manual' && pickAvailability.kind === 'available' ? validateGpuSelection(gpuPick.selected, pickAvailability.required, action.inventory) : null;
+  const pickBlocked = action.kind === 'load' && gpuPick.mode === 'manual' && !pickValidation?.ok;
   const [selected, setSelected] = useState<string[]>(plan.defaultUnloadIds);
   const freed = plan.candidates.filter((model) => selected.includes(model.id)).reduce((sum, model) => sum + modelGPUCount(model), 0);
   const enoughCapacity = action.kind === 'unload' || freed >= plan.shortfall;
@@ -1072,9 +1125,16 @@ function ModelLifecycleDialog({ action, busy, onCancel, onConfirm }: {
         {action.kind === 'load' && unloadIds.length > 0 && (
           <p className="mt-3 text-[10px] text-text-muted">Unload first: {unloadIds.join(', ')}</p>
         )}
+        {action.kind === 'load' && (
+          <GpuPicker inventory={action.inventory} availability={pickAvailability} value={gpuPick} validation={pickValidation} onChange={setGpuPick} disabled={busy} />
+        )}
         <div className="mt-4 flex justify-end gap-2">
           <Button type="button" variant="ghost" disabled={busy} onClick={onCancel}>Cancel</Button>
-          <Button type="button" variant={action.kind === 'unload' || unloadIds.length > 0 ? 'danger' : 'default'} disabled={busy || !enoughCapacity} onClick={() => onConfirm(unloadIds)}>
+          <Button type="button" variant={action.kind === 'unload' || unloadIds.length > 0 ? 'danger' : 'default'} disabled={busy || !enoughCapacity || pickBlocked} onClick={() => {
+            const picked = action.kind === 'load' ? gpusToSend(gpuPick, pickValidation) : undefined;
+            if (picked) onConfirm(unloadIds, picked);
+            else onConfirm(unloadIds);
+          }}>
             Confirm {action.kind}
           </Button>
         </div>
